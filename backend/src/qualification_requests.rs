@@ -16,7 +16,7 @@ pub(crate) fn in_controlled_round<T>(round: usize, run: impl FnOnce() -> T) -> T
 /// The audit covers every managed publication, not unrelated typed commands.
 /// IDs come from this process's actual loaded application schema.
 pub(crate) fn trace_scope() {
-    if !cfg!(any(feature = "hitl_mode", feature = "firmware_sim"))
+    if !(crate::runtime_mode::is_hitl() || cfg!(feature = "firmware_sim"))
         || std::env::var("GS_SIM_TRACE_API_REQUESTS").as_deref() != Ok("1")
     {
         return;
@@ -67,7 +67,7 @@ pub(crate) fn prime_initial_cache(
     router: &Router,
     run: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    if !cfg!(any(feature = "hitl_mode", feature = "firmware_sim"))
+    if !(crate::runtime_mode::is_hitl() || cfg!(feature = "firmware_sim"))
         || std::env::var("GS_SIM_TRACE_API_REQUESTS").as_deref() != Ok("1")
         || std::env::var("GS_SIM_POLICY_CORRECT_CONTROLS").as_deref() != Ok("1")
     {
@@ -131,7 +131,7 @@ pub(crate) struct Request {
 impl Request {
     pub(crate) fn begin(publisher: &'static str) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
-        let token = (cfg!(any(feature = "hitl_mode", feature = "firmware_sim"))
+        let token = ((crate::runtime_mode::is_hitl() || cfg!(feature = "firmware_sim"))
             && std::env::var("GS_SIM_TRACE_API_REQUESTS").as_deref() == Ok("1"))
         .then(|| NEXT.fetch_add(1, Ordering::Relaxed));
         if let Some(token) = token {
@@ -143,6 +143,19 @@ impl Request {
         Self {
             token,
             submissions: std::cell::Cell::new(0),
+        }
+    }
+    pub(crate) fn bind_prepared(&self, packet: &Packet) -> u64 {
+        let id = packet.packet_id();
+        if let Some(token) = self.token {
+            emit(serde_json::json!({"event":"bind","token":token,"packet_id":id,"submit_ms":crate::simulation_clock_ms(),"data_type":packet.data_type().as_u32()}));
+            self.submissions.set(self.submissions.get() + 1);
+        }
+        id
+    }
+    pub(crate) fn prepared_result(&self, id: u64, accepted: bool) {
+        if let Some(token) = self.token {
+            emit(serde_json::json!({"event":"submit_result","token":token,"packet_id":id,"ok":accepted,"at_ms":crate::simulation_clock_ms()}));
         }
     }
     pub(crate) fn submit(&self, router: &Router, packet: Packet) -> anyhow::Result<()> {

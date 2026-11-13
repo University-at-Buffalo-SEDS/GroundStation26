@@ -71,12 +71,12 @@ impl Moments {
             (s.timestamp_ms - self.first_ms) as f64 / 1000.0,
         ];
         let delta = std::array::from_fn::<_, 3, _>(|i| values[i] - self.mean[i]);
-        for i in 0..3 {
-            self.mean[i] += delta[i] / self.n as f64;
+        for (i, value) in delta.iter().enumerate() {
+            self.mean[i] += value / self.n as f64;
         }
-        for i in 0..3 {
-            for j in 0..3 {
-                self.cov[i][j] += delta[i] * (values[j] - self.mean[j]);
+        for (i, delta_value) in delta.iter().enumerate() {
+            for (j, value) in values.iter().enumerate() {
+                self.cov[i][j] += delta_value * (value - self.mean[j]);
             }
         }
         true
@@ -224,11 +224,23 @@ pub struct Status {
     pub error: Option<String>,
     pub report: Report,
 }
+/// Original source time is distinct from the receipt timestamp retained in CSV.
+/// A capture follows one selected DAQ channel; another channel cannot advance it.
+pub struct SourceSample<'a> {
+    pub sender: &'a str,
+    pub sensor: &'a str,
+    pub timestamp_ms: i64,
+    pub source_timestamp_ms: Option<i64>,
+    pub received_network_ms: i64,
+    pub raw: f32,
+    pub temperature: Option<f32>,
+}
 struct Session {
     status: Arc<Mutex<Status>>,
     tx: SyncSender<Sample>,
     stop: Arc<AtomicBool>,
     dropped: Arc<AtomicU64>,
+    last_source_ms: Option<i64>,
 }
 #[derive(Default)]
 pub struct Service {
@@ -406,6 +418,7 @@ impl Service {
             tx,
             stop,
             dropped,
+            last_source_ms: None,
         });
         Ok(result)
     }
@@ -418,6 +431,12 @@ impl Service {
         s.stop.store(true, Ordering::Relaxed);
         Ok(())
     }
+    pub fn observe_source(&self, sample: SourceSample<'_>) {
+        self.observe_inner(sample, true);
+    }
+    // Existing statistics fixtures deliberately supply synthetic sample times.
+    // Production ingress must always supply original source provenance.
+    #[cfg(test)]
     pub fn observe(
         &self,
         sender: &str,
@@ -426,30 +445,66 @@ impl Service {
         raw: f32,
         temperature: Option<f32>,
     ) {
-        if sender != "DAQ" {
+        self.observe_inner(
+            SourceSample {
+                sender,
+                sensor,
+                timestamp_ms,
+                source_timestamp_ms: None,
+                received_network_ms: timestamp_ms,
+                raw,
+                temperature,
+            },
+            false,
+        );
+    }
+    fn observe_inner(&self, sample: SourceSample<'_>, require_source: bool) {
+        if sample.sender != "DAQ" {
             return;
         }
-        let slot = self.session.lock().unwrap();
-        let Some(s) = slot.as_ref() else {
+        let mut slot = self.session.lock().unwrap();
+        let Some(s) = slot.as_mut() else {
             return;
         };
         let mut status = s.status.lock().unwrap();
-        if !status.running || status.sensor_id != sensor {
+        if !status.running || status.sensor_id != sample.sensor {
             return;
         }
-        if !raw.is_finite() || temperature.is_none_or(|v| !v.is_finite()) {
+        let source_valid = !require_source
+            || sample.source_timestamp_ms.is_some_and(|source| {
+                source >= 0
+                    && s.last_source_ms.is_none_or(|last| source > last)
+                    && if source >= 1_577_836_800_000
+                        && sample.received_network_ms >= 1_577_836_800_000
+                    {
+                        sample
+                            .received_network_ms
+                            .checked_sub(source)
+                            .is_some_and(|age| (-100..=2000).contains(&age))
+                    } else {
+                        true
+                    }
+            });
+        if !source_valid
+            || !sample.raw.is_finite()
+            || sample.temperature.is_none_or(|value| !value.is_finite())
+        {
             status.rejected_samples += 1;
             return;
         }
         if s.tx
             .try_send(Sample {
-                timestamp_ms,
-                raw: raw as f64,
-                temperature: temperature.unwrap() as f64,
+                timestamp_ms: sample.timestamp_ms,
+                raw: sample.raw as f64,
+                temperature: sample.temperature.unwrap() as f64,
             })
             .is_err()
         {
             s.dropped.fetch_add(1, Ordering::Relaxed);
+        } else if require_source {
+            // Only accepted source observations advance this capture. Replays,
+            // stale inputs and queue refusals cannot refresh its provenance.
+            s.last_source_ms = sample.source_timestamp_ms;
         }
     }
     pub fn apply(
@@ -728,6 +783,167 @@ mod lifecycle_tests {
         assert_eq!(cfg.noise["KG1000"].tau_ms, 100.);
         assert!(cfg.ch1_zero_raw.is_some());
         assert_eq!(cfg.temperature_captures["KG1000"][0].expected, 0.);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod source_provenance_tests {
+    use super::*;
+
+    fn input(source: Option<i64>, network: i64, receipt: i64) -> SourceSample<'static> {
+        SourceSample {
+            sender: "DAQ",
+            sensor: "KG1000",
+            timestamp_ms: receipt,
+            source_timestamp_ms: source,
+            received_network_ms: network,
+            raw: 0.2,
+            temperature: Some(20.),
+        }
+    }
+    fn wait_samples(service: &Service, count: u64) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while service.status().report.samples < count && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(service.status().report.samples, count);
+    }
+    fn finish(service: &Service, capture: &Status) -> Status {
+        service.stop(&capture.session_id).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while service.status().running && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let status = service.status();
+        assert!(!status.running);
+        status
+    }
+    fn directory(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "gs-source-capture-{label}-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ))
+    }
+
+    #[test]
+    fn reordered_stale_unknown_and_invalid_inputs_do_not_replace_fresh_constant_observations() {
+        let dir = directory("utc");
+        let service = Service::default();
+        let capture = service.start_in_dir("KG1000", 60, dir.clone()).unwrap();
+        let epoch = 1_793_000_000_000;
+        service.observe_source(input(Some(epoch), epoch, 1000));
+        service.observe_source(input(Some(epoch), epoch + 1, 1001)); // repeated original
+        service.observe_source(input(Some(epoch - 1), epoch + 2, 1002)); // reordered
+        service.observe_source(input(Some(epoch + 1), epoch + 2002, 1003)); // 2001ms stale
+        service.observe_source(input(Some(epoch + 101), epoch, 1004)); // 101ms future
+        service.observe_source(input(None, epoch + 3, 1005));
+        let mut invalid = input(Some(epoch + 100), epoch + 100, 1006);
+        invalid.raw = f32::NAN;
+        service.observe_source(invalid); // must not advance the source watermark
+        let mut other = input(Some(epoch + 999), epoch + 999, 1007);
+        other.sensor = "KG50";
+        service.observe_source(other); // another channel must not advance it
+        let mut foreign = input(Some(epoch + 999), epoch + 999, 1008);
+        foreign.sender = "GB";
+        service.observe_source(foreign);
+        service.observe_source(input(Some(epoch + 1), epoch + 2001, 1009)); // 2000ms accepted
+        service.observe_source(input(Some(epoch + 2), epoch + 2, 1010));
+        service.observe_source(input(Some(epoch + 3), epoch - 97, 1011)); // 100ms future accepted
+        wait_samples(&service, 4);
+        let done = finish(&service, &capture);
+        assert_eq!(done.rejected_samples, 6);
+        assert_eq!(done.dropped_samples, 0);
+        assert!(!done.report.noise_ready && !done.report.thermal_ready);
+        let mut cfg = LoadcellCalibrationFile::default();
+        let before = serde_json::to_value(&cfg).unwrap();
+        assert!(
+            service
+                .apply(&capture.session_id, &mut cfg, false, 100.)
+                .is_err()
+        );
+        assert_eq!(serde_json::to_value(&cfg).unwrap(), before);
+        let csv = std::fs::read_to_string(&done.csv_path).unwrap();
+        let receipts: Vec<_> = csv
+            .lines()
+            .skip(1)
+            .map(|line| line.split(',').next().unwrap())
+            .collect();
+        assert_eq!(
+            receipts,
+            vec!["1000", "1009", "1010", "1011"],
+            "CSV retains original receipt timestamps"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn fresh_constant_samples_with_distinct_source_times_keep_noise_quality_and_saved_conversion() {
+        let dir = directory("fresh");
+        let service = Service::default();
+        let capture = service.start_in_dir("KG1000", 60, dir.clone()).unwrap();
+        let epoch = 1_793_000_000_000;
+        for index in 0..1200 {
+            let time = index * 100;
+            service.observe_source(input(Some(epoch + time), epoch + time, 1000 + time));
+        }
+        wait_samples(&service, 1200);
+        let done = finish(&service, &capture);
+        assert_eq!((done.rejected_samples, done.dropped_samples), (0, 0));
+        assert!(done.report.noise_ready && !done.report.thermal_ready);
+        let mut cfg = LoadcellCalibrationFile::default();
+        cfg.ch1.m = Some(100.);
+        cfg.ch1.b = Some(2.);
+        service
+            .apply(&capture.session_id, &mut cfg, false, 100.)
+            .unwrap();
+        assert_eq!(cfg.ch1.m, Some(100.), "tare preserves the saved slope");
+        assert!(
+            crate::loadcell::calibrated_weight_kg(&cfg, "KG1000", 0.2)
+                .unwrap()
+                .abs()
+                < 0.0001
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn uptime_clock_reset_requires_new_capture_and_channel_watermarks_remain_separate() {
+        let dir = directory("uptime");
+        let service = Service::default();
+        let first = service.start_in_dir("KG1000", 60, dir.clone()).unwrap();
+        let network = 1_793_000_000_000;
+        service.observe_source(input(Some(100), network, 1000));
+        service.observe_source(input(Some(101), network + 1, 1001));
+        service.observe_source(input(Some(0), network + 2, 1002));
+        service.observe_source(input(Some(101), network + 3, 1003));
+        wait_samples(&service, 2);
+        let done = finish(&service, &first);
+        assert_eq!(done.rejected_samples, 2);
+        let restarted = service.start_in_dir("KG1000", 60, dir.clone()).unwrap();
+        service.observe_source(input(Some(0), network + 4, 1004));
+        wait_samples(&service, 1);
+        let done = finish(&service, &restarted);
+        assert_eq!(done.rejected_samples, 0);
+        let second = service.start_in_dir("KG50", 60, dir.clone()).unwrap();
+        let mut selected = input(Some(0), network + 4, 1004);
+        selected.sensor = "KG50";
+        service.observe_source(selected);
+        wait_samples(&service, 1);
+        let done = finish(&service, &second);
+        assert_eq!(done.rejected_samples, 0);
+        // The existing physical-input switch invalidates the previous report;
+        // a new capture for another KG50 connector starts its own watermark.
+        service.reset_kg50_input();
+        assert!(service.status().session_id.is_empty());
+        let third = service.start_in_dir("KG50", 60, dir.clone()).unwrap();
+        let mut selected = input(Some(0), network + 5, 1005);
+        selected.sensor = "KG50";
+        service.observe_source(selected);
+        wait_samples(&service, 1);
+        let done = finish(&service, &third);
+        assert_eq!(done.rejected_samples, 0);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -1,0 +1,81 @@
+{
+  "active_errors": [
+    {
+      "board": "RF",
+      "board_label": "RF Board",
+      "dismissible": true,
+      "launch_blocking": true,
+      "message": "RF Board reports Abort. New launch is disabled until a fresh actual non-Abort state is confirmed.",
+      "source": "board_abort:RF",
+      "timestamp_ms": 1767225600000
+    },
+    {
+      "board": "FC",
+      "board_label": "Flight Computer",
+      "dismissible": true,
+      "launch_blocking": true,
+      "message": "Flight Computer reports Abort. New launch is disabled until a fresh actual non-Abort state is confirmed.",
+      "source": "board_abort:FC",
+      "timestamp_ms": 1767225601000
+    },
+    {
+      "board": "PB",
+      "board_label": "Power Board",
+      "dismissible": true,
+      "launch_blocking": true,
+      "message": "Power Board reports Abort. New launch is disabled until a fresh actual non-Abort state is confirmed.",
+      "source": "board_abort:PB",
+      "timestamp_ms": 1767225602000
+    },
+    {
+      "board": "AB",
+      "board_label": "Actuator Board",
+      "dismissible": true,
+      "launch_blocking": true,
+      "message": "Actuator Board reports Abort. New launch is disabled until a fresh actual non-Abort state is confirmed.",
+      "source": "board_abort:AB",
+      "timestamp_ms": 1767225603000
+    },
+    {
+      "board": "VB",
+      "board_label": "Valve Board",
+      "dismissible": true,
+      "launch_blocking": true,
+      "message": "Valve Board reports Abort. New launch is disabled until a fresh actual non-Abort state is confirmed.",
+      "source": "board_abort:VB",
+      "timestamp_ms": 1767225604000
+    },
+    {
+      "board": "GB",
+      "board_label": "Gateway Board",
+      "dismissible": true,
+      "launch_blocking": true,
+      "message": "Gateway Board reports Abort. New launch is disabled until a fresh actual non-Abort state is confirmed.",
+      "source": "board_abort:GB",
+      "timestamp_ms": 1767225605000
+    },
+    {
+      "board": "DAQ",
+      "board_label": "DAQ Board",
+      "dismissible": true,
+      "launch_blocking": true,
+      "message": "DAQ Board reports Abort. New launch is disabled until a fresh actual non-Abort state is confirmed.",
+      "source": "board_abort:DAQ",
+      "timestamp_ms": 1767225606000
+    }
+  ],
+  "history_blocks_launch": false,
+  "history_error": null,
+  "history_unknown_boards": [],
+  "missing_required_state": [],
+  "required_boards": [],
+  "retraction": {
+    "allowed": true,
+    "configured": false,
+    "enforced": false,
+    "message": "Fill plumbing is not configured; its retraction delay is inactive.",
+    "phase": "not_configured",
+    "remaining_ms": null
+  },
+  "version": 7
+}

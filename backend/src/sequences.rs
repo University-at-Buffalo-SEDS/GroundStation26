@@ -32,14 +32,31 @@ pub enum BlinkMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActionControl {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
     pub cmd: String,
     pub enabled: bool,
     pub blink: BlinkMode,
     pub actuated: Option<bool>,
+    /// Stored request for network-variable outputs (underglow, buzzer);
+    /// `actuated` stays None until the network carries this value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested: Option<bool>,
+    /// Network-variable outputs only: "Waiting for network confirmation"
+    /// while the GS has seen no network value for the variable at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActionPolicyMsg {
+    #[serde(default)]
+    pub local_phase_controls: bool,
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    pub local_phase_controls_reason: Option<String>,
+    /// A Launch press held behind the opt-in loadcell zero. Presentation only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_zero: Option<crate::auto_zero::before_launch::Status>,
     pub key_enabled: bool,
     pub software_buttons_enabled: bool,
     pub controls: Vec<ActionControl>,
@@ -58,6 +75,20 @@ fn backend_blink_for(cmd: &str, enabled: bool, recommended: Option<&BlinkMode>) 
     BlinkMode::None
 }
 
+/// Publish explanations from the same server policy that denied the command.
+/// Presentation metadata never changes admission or enables a control.
+pub(crate) fn explain_disabled_policy(policy: &mut ActionPolicyMsg) {
+    for control in &mut policy.controls {
+        if control.enabled { control.disabled_reason = None; continue; }
+        if control.disabled_reason.is_some() { continue; }
+        control.disabled_reason = Some(if matches!(control.cmd.as_str(), "AdvanceFlightState" | "RewindFlightState")
+            && policy.local_phase_controls_reason.is_some() {
+            policy.local_phase_controls_reason.clone().unwrap()
+        } else if !policy.key_enabled { "GroundStation key control is disabled.".into() }
+        else if !policy.software_buttons_enabled { "Software controls are disabled by GroundStation.".into() }
+        else { "This command is unavailable under the current GroundStation policy.".into() });
+    }
+}
 fn is_recording_command(cmd: &str) -> bool {
     matches!(
         cmd,
@@ -72,7 +103,6 @@ pub(crate) fn is_station_utility_command(cmd: &str) -> bool {
     )
 }
 
-#[cfg_attr(feature = "hitl_mode", allow(dead_code))]
 fn default_recording_command_enabled(cmd: &str) -> Option<bool> {
     match cmd {
         "StartWritingNow" | "StartWritingLastTwoMinutes" => Some(true),
@@ -81,7 +111,6 @@ fn default_recording_command_enabled(cmd: &str) -> Option<bool> {
     }
 }
 
-#[cfg_attr(feature = "hitl_mode", allow(dead_code))]
 fn default_recording_command_actuated(cmd: &str) -> Option<bool> {
     match cmd {
         "StartWritingNow" | "StartWritingLastTwoMinutes" => Some(true),
@@ -93,10 +122,30 @@ fn default_recording_command_actuated(cmd: &str) -> Option<bool> {
 fn default_command_actuated(cmd: &str) -> Option<bool> {
     match cmd {
         "ResetSim" => Some(true),
-        "ToggleAvBayUnderglow" => Some(crate::network_variables::underglow_enabled()),
-        "ToggleFlightBuzzer" => Some(crate::network_variables::flight_buzzer_enabled()),
+        "ToggleAvBayUnderglow" | "ToggleFlightBuzzer" => None,
         _ => default_recording_command_actuated(cmd),
     }
+}
+
+/// Underglow and buzzer are SEDSnet network variables with no owner board:
+/// the view compares the GS request with the value seen on the network.
+pub(crate) fn network_output_view(cmd: &str) -> Option<crate::network_variables::NetworkOutputView> {
+    use crate::network_variables::NetworkOutput;
+    let output = match cmd {
+        "ToggleAvBayUnderglow" => NetworkOutput::Underglow,
+        "ToggleFlightBuzzer" => NetworkOutput::FlightBuzzer,
+        _ => return None,
+    };
+    Some(crate::network_variables::network_output_view(output))
+}
+
+pub(crate) const WAITING_FOR_NETWORK: &str = "Waiting for network confirmation";
+
+/// Note for an unconfirmed network-variable output: only when the GS has no
+/// network value for the variable at all. Otherwise the plain "Unconfirmed"
+/// state applies and no note is sent.
+pub(crate) fn network_output_note(view: crate::network_variables::NetworkOutputView) -> Option<String> {
+    (view.confirmed.is_none() && !view.readback_seen).then(|| WAITING_FOR_NETWORK.to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -134,8 +183,9 @@ pub(crate) enum SequenceStep {
     ArmedReady,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SequencePolicyState {
+    pub generation: u64,
     pub step: SequenceStep,
     pub calibration_ready: bool,
 }
@@ -143,6 +193,7 @@ pub(crate) struct SequencePolicyState {
 impl Default for SequencePolicyState {
     fn default() -> Self {
         Self {
+            generation: 0,
             step: SequenceStep::SetupValves,
             calibration_ready: false,
         }
@@ -378,6 +429,7 @@ impl SequenceConfig {
 
 #[derive(Clone, Debug)]
 struct SequenceRuntime {
+    generation: u64,
     step: SequenceStep,
     next_step_after_dump: Option<SequenceStep>,
     step_started_at: Option<Instant>,
@@ -413,6 +465,7 @@ struct SequenceRuntime {
 impl Default for SequenceRuntime {
     fn default() -> Self {
         Self {
+            generation: 0,
             step: SequenceStep::SetupValves,
             next_step_after_dump: None,
             step_started_at: None,
@@ -448,8 +501,24 @@ impl Default for SequenceRuntime {
 }
 
 impl SequenceRuntime {
+    fn for_generation(generation: u64) -> Self {
+        Self {
+            generation,
+            ..Self::default()
+        }
+    }
+
+    fn bind_generation(&mut self, generation: u64) -> bool {
+        if self.generation == generation {
+            return false;
+        }
+        *self = Self::for_generation(generation);
+        true
+    }
+
     fn policy_state(&self) -> SequencePolicyState {
         SequencePolicyState {
+            generation: self.generation,
             step: self.step,
             calibration_ready: self.calibration_ready,
         }
@@ -457,6 +526,7 @@ impl SequenceRuntime {
 
     fn from_policy_state(policy: SequencePolicyState) -> Self {
         Self {
+            generation: policy.generation,
             step: policy.step,
             calibration_ready: policy.calibration_ready,
             ..Self::default()
@@ -464,7 +534,439 @@ impl SequenceRuntime {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+/// Own all state publication from a legacy tick, not only its queued closes.
+/// Recovery quiesces this existing owner count before changing the epoch.
+fn begin_sequence_tick(
+    state: &AppState,
+    runtime: &mut SequenceRuntime,
+    last_flight_state: &mut Option<FlightState>,
+) -> Option<crate::automatic_flight_state::Observation> {
+    let claim = crate::automatic_flight_state::Observation::begin(state)?;
+    let generation = claim.generation();
+    if runtime.bind_generation(generation) {
+        *last_flight_state = None;
+    }
+    Some(claim)
+}
+
+#[cfg(test)]
+mod network_note_tests {
+    use super::*;
+    use crate::network_variables::NetworkOutputView;
+
+    #[test]
+    fn network_outputs_have_no_owner_board_text() {
+        assert!(network_output_view("ToggleAvBayUnderglow").is_some());
+        assert!(network_output_view("ToggleFlightBuzzer").is_some());
+        assert!(network_output_view("Launch").is_none());
+        let none = NetworkOutputView { requested: true, confirmed: None, readback_seen: false };
+        assert_eq!(network_output_note(none).as_deref(), Some(WAITING_FOR_NETWORK));
+        let stale = NetworkOutputView { readback_seen: true, ..none };
+        assert_eq!(network_output_note(stale), None, "plain Unconfirmed carries no note");
+        let ok = NetworkOutputView { requested: true, confirmed: Some(true), readback_seen: true };
+        assert_eq!(network_output_note(ok), None);
+        for view in [none, stale, ok] {
+            let note = network_output_note(view).unwrap_or_default();
+            assert!(!note.contains("Board") && !note.contains("reconnect") && !note.contains("Owner"));
+        }
+    }
+
+    #[test]
+    fn network_note_round_trips_and_is_omitted_when_absent() {
+        let mut control = ActionControl { disabled_reason: None, requested: None, network_note: None,
+            cmd: "ToggleAvBayUnderglow".into(), enabled: true, blink: BlinkMode::None, actuated: None };
+        let json = serde_json::to_string(&control).unwrap();
+        assert!(!json.contains("network_note") && !json.contains("owner_note"));
+        control.network_note = Some(WAITING_FOR_NETWORK.into());
+        let json = serde_json::to_string(&control).unwrap();
+        assert_eq!(serde_json::from_str::<ActionControl>(&json).unwrap(), control);
+    }
+}
+
+#[cfg(test)]
+mod generation_lifecycle_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test]
+    async fn gse_owned_policy_refresh_never_reenters_dispatch() {
+        let _owned_entry: fn(&Arc<AppState>) = refresh_action_policy_under_dispatch;
+        if std::env::var("GS_SEQUENCE_GATE_CHILD").as_deref() == Ok("1") {
+            let state = crate::state::tests::test_app_state().await;
+            assert!(state.topology_router.get().is_none());
+            assert!(crate::gse::handle_command(
+                &state,
+                &TelemetryCommand::CancelFill
+            ));
+            assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 0);
+            return;
+        }
+        // A regression must fail without leaving the parent suite's global
+        // mutex locked. This child runs the actual serialized GSE command.
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "sequences::generation_lifecycle_tests::gse_owned_policy_refresh_never_reenters_dispatch", "--nocapture", "--test-threads=1"])
+            .env("GS_SEQUENCE_GATE_CHILD", "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "GSE refresh re-entered the dispatch gate: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn fill_decision(
+        state: &AppState,
+        generation: u64,
+        branch: usize,
+    ) -> (
+        SequenceRuntime,
+        SequenceConfig,
+        ValveSnapshot,
+        Option<f32>,
+        Option<f32>,
+    ) {
+        let mut cfg = SequenceConfig::from_env();
+        cfg.nitrogen_autoclose_mode = NitrogenAutocloseMode::Pressure;
+        cfg.nitrogen_pressure_target_psi = 100.0;
+        cfg.nitrous_level_duration = Duration::ZERO;
+        let mut runtime = SequenceRuntime::for_generation(generation);
+        runtime.step = if branch == 0 {
+            SequenceStep::NitrogenFill
+        } else {
+            SequenceStep::OpenNitrous
+        };
+        let valves = ValveSnapshot {
+            normally_open: Some(branch != 0),
+            dump_open: Some(false),
+            nitrogen_open: Some(branch == 0),
+            nitrous_open: Some(branch != 0),
+            ..ValveSnapshot::default()
+        };
+        let mass = if branch == 1 {
+            let (target, _) = nitrous_fill_status(state, 0.0);
+            Some(target + if target >= 0.0 { 1.0 } else { -1.0 })
+        } else {
+            None
+        };
+        let pressure = if branch == 0 {
+            101.0
+        } else {
+            cfg.nitrous_pressure_min_psi + 1.0
+        };
+        (runtime, cfg, valves, Some(pressure), mass)
+    }
+
+    async fn assert_old_decision_rejected(branch: usize) {
+        crate::telemetry_schema::initialize().unwrap();
+        let mut state = crate::state::tests::test_app_state().await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        Arc::get_mut(&mut state).unwrap().cmd_tx = tx;
+        state.set_local_flight_state(FlightState::NitrogenFill);
+        let before = crate::gse::automatic_generation(&state);
+        // These decisions originated before the reset; no outputs or transport
+        // are present in this fixture. Advance the actual owner generation.
+        state
+            .automatic_generation
+            .store(before + 1, Ordering::Release);
+        let (mut runtime, cfg, valves, pressure, mass) = fill_decision(&state, before, branch);
+        update_sequence_runtime(
+            &state,
+            &mut runtime,
+            &cfg,
+            valves,
+            pressure,
+            mass,
+            Instant::now(),
+        );
+        let queued = rx.try_recv().expect("actual automatic close was queued");
+        let origin = queued
+            .automatic_generation()
+            .expect("automatic origin retained");
+        assert!(
+            crate::telemetry_task::command_at_dispatch(&state, queued).is_none(),
+            "pre-reset branch {branch} acquired the post-reset dispatch generation"
+        );
+        assert_eq!(
+            origin, before,
+            "no new origin may be minted from old observations"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn old_nitrogen_pressure_decision_cannot_acquire_new_epoch() {
+        assert_old_decision_rejected(0).await;
+    }
+    #[tokio::test]
+    async fn old_nitrous_weight_decision_cannot_acquire_new_epoch() {
+        assert_old_decision_rejected(1).await;
+    }
+    #[tokio::test]
+    async fn old_nitrous_plateau_decision_cannot_acquire_new_epoch() {
+        assert_old_decision_rejected(2).await;
+    }
+
+    /// RRLS role runs the same sequence task but has no fill telemetry, so the
+    /// fill-sequence calibration check must not raise its warning there.
+    #[tokio::test]
+    async fn rrls_role_never_raises_fill_sequence_calibration_warning() {
+        const CHILD: &str = "GS_RRLS_CALIBRATION_WARNING_TEST_CHILD";
+        const NAME: &str = "sequences::generation_lifecycle_tests::rrls_role_never_raises_fill_sequence_calibration_warning";
+        if std::env::var_os(CHILD).is_none() {
+            let root = std::env::temp_dir().join(format!(
+                "rrls-calibration-warning-{}-{}",
+                std::process::id(),
+                rand::random::<u128>()
+            ));
+            for role in ["rrls", "primary"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                    .env(CHILD, role)
+                    .env("GS_RRLS_ROLE", role)
+                    .env("GS_SIM_MODE", "0")
+                    .env_remove("GS_SIM_CLOCK_FILE")
+                    .env("GS_NETWORK_VARIABLE_CACHE", root.join("variables.json"))
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success()
+                        && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                    "{role}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            let _ = std::fs::remove_dir_all(root);
+            return;
+        }
+        let rrls = std::env::var(CHILD).unwrap() == "rrls";
+        assert_eq!(crate::rrls::is_rrls(), rrls);
+        crate::telemetry_schema::initialize().unwrap();
+        let state = crate::state::tests::test_app_state().await;
+        let cfg = SequenceConfig::from_env();
+        let mut runtime = SequenceRuntime::default();
+        assert!(matches!(runtime.step, SequenceStep::SetupValves));
+        // RRLS has no fill telemetry: mass and pressure are always absent.
+        for _ in 0..3 {
+            update_sequence_runtime(
+                &state,
+                &mut runtime,
+                &cfg,
+                ValveSnapshot::default(),
+                None,
+                None,
+                Instant::now(),
+            );
+        }
+        let warned = state
+            .notifications_snapshot()
+            .iter()
+            .any(|n| n.message.contains("Check sequence sensor calibration"));
+        if rrls {
+            assert!(!warned, "RRLS raised the fill calibration warning");
+            assert!(runtime.calibration_block_message.is_none());
+            assert!(!runtime.calibration_ready, "RRLS never claims fill readiness");
+            assert!(matches!(runtime.step, SequenceStep::SetupValves));
+        } else {
+            assert!(warned, "primary keeps the calibration warning");
+            assert!(runtime.calibration_block_message.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_fill_decisions_remain_dispatchable_in_all_close_branches() {
+        crate::telemetry_schema::initialize().unwrap();
+        let mut state = crate::state::tests::test_app_state().await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        Arc::get_mut(&mut state).unwrap().cmd_tx = tx;
+        state.set_local_flight_state(FlightState::NitrogenFill);
+        let generation = crate::gse::automatic_generation(&state);
+        for branch in 0..3 {
+            let (mut runtime, cfg, valves, pressure, mass) =
+                fill_decision(&state, generation, branch);
+            update_sequence_runtime(
+                &state,
+                &mut runtime,
+                &cfg,
+                valves,
+                pressure,
+                mass,
+                Instant::now(),
+            );
+            let queued = rx.try_recv().expect("fresh automatic close was queued");
+            assert_eq!(queued.automatic_generation(), Some(generation));
+            let expected = if branch == 0 {
+                TelemetryCommand::NitrogenClose
+            } else {
+                TelemetryCommand::NitrousClose
+            };
+            let actual = crate::telemetry_task::command_at_dispatch(&state, queued)
+                .expect("fresh decision allowed");
+            assert_eq!(
+                std::mem::discriminant(&actual),
+                std::mem::discriminant(&expected)
+            );
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_admission_blocks_actual_sequence_tick_without_state_publication() {
+        let state = crate::state::tests::test_app_state().await;
+        let generation = crate::gse::automatic_generation(&state);
+        let mut runtime = SequenceRuntime::for_generation(generation);
+        runtime.step = SequenceStep::NitrogenLeakCheck;
+        let mut previous = Some(FlightState::NitrogenFill);
+        let before = state.local_flight_state_snapshot();
+        crate::gse::reset_generation::close_operator_admission(&state, generation, 83).unwrap();
+        assert!(begin_sequence_tick(&state, &mut runtime, &mut previous).is_none());
+        assert_eq!(runtime.generation, generation);
+        assert!(matches!(runtime.step, SequenceStep::NitrogenLeakCheck));
+        assert_eq!(previous, Some(FlightState::NitrogenFill));
+        assert_eq!(state.local_flight_state_snapshot(), before);
+        assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 0);
+        state.manual_abort_intent.request();
+        assert!(state.manual_abort_intent.pending_epoch().is_some());
+        // Model only the completed journal/epoch/reopen boundary here. Actual
+        // durable-prefix ownership is covered by the clock-worker regressions.
+        state
+            .automatic_generation
+            .store(generation + 1, Ordering::Release);
+        assert!(begin_sequence_tick(&state, &mut runtime, &mut previous).is_none());
+        state.operator_admission_barrier.store(0, Ordering::Release);
+        let claim = begin_sequence_tick(&state, &mut runtime, &mut previous).unwrap();
+        assert_eq!(runtime.generation, generation + 1);
+        assert!(matches!(runtime.step, SequenceStep::SetupValves));
+        assert!(previous.is_none());
+        assert!(state.manual_abort_intent.pending_epoch().is_some());
+        drop(claim);
+    }
+
+    #[tokio::test]
+    async fn sequence_tick_claim_quiesces_before_verified_epoch_change() {
+        let state = crate::state::tests::test_app_state().await;
+        let generation = crate::gse::automatic_generation(&state);
+        let mut runtime = SequenceRuntime::for_generation(generation);
+        runtime.step = SequenceStep::NitrogenLeakCheck;
+        let mut previous = Some(FlightState::NitrogenFill);
+        let claim = begin_sequence_tick(&state, &mut runtime, &mut previous).unwrap();
+        assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 1);
+        assert!(
+            crate::gse::reset_generation::invalidate_capture_epoch(&state, generation).is_err()
+        );
+        drop(claim);
+        let next =
+            crate::gse::reset_generation::invalidate_capture_epoch(&state, generation).unwrap();
+        let claim = begin_sequence_tick(&state, &mut runtime, &mut previous).unwrap();
+        assert_eq!(runtime.generation, next);
+        assert!(matches!(runtime.step, SequenceStep::SetupValves));
+        assert!(previous.is_none());
+        drop(claim);
+        assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn policy_refresh_cannot_republish_pre_reset_armed_stage() {
+        crate::mode_suite!(Normal, Testing);
+        if crate::operator_queue::isolated_case(module_path!(), "policy_refresh_cannot_republish_pre_reset_armed_stage") { return; }
+        // This positive publication uses the same initialized managed Store,
+        // public SDK and network clock as the actual host, not an empty state.
+        let (state, router) = crate::automatic_flight_state::tests::ready().await;
+        let generation = crate::gse::automatic_generation(&state);
+        let mut old = SequenceRuntime::for_generation(generation);
+        old.step = SequenceStep::ArmedReady;
+        state.set_sequence_policy_state(old.policy_state());
+        state
+            .automatic_generation
+            .store(generation + 1, Ordering::Release);
+        state.set_local_flight_state(FlightState::Idle);
+        assert_eq!(crate::network_variables::flight_state(), FlightState::Idle as u8);
+        let before_automatic = crate::network_variables::automatic_idle_test_snapshot();
+        refresh_action_policy_now(&state);
+        assert_eq!(
+            state.local_flight_state_snapshot(),
+            FlightState::Idle,
+            "old policy must not republish Armed after recovery"
+        );
+        let snapshot = state.sequence_policy_state_snapshot();
+        assert_eq!(snapshot.generation, generation + 1);
+        assert!(matches!(snapshot.step, SequenceStep::SetupValves));
+        // Current-generation readiness still drives the existing state path.
+        let mut fresh = SequenceRuntime::for_generation(generation + 1);
+        fresh.step = SequenceStep::ArmedReady;
+        state.set_sequence_policy_state(fresh.policy_state());
+        refresh_action_policy_now(&state);
+        assert_eq!(state.local_flight_state_snapshot(), FlightState::Armed);
+        let packet = router.get_cached_network_variable(
+            crate::telemetry_schema::data_type("FLIGHT_STATE")
+        ).unwrap().expect("fresh phase admitted by actual managed SDK");
+        assert_eq!(packet.payload(), &[FlightState::Armed as u8]);
+        assert_eq!(crate::network_variables::flight_state(), FlightState::Idle as u8);
+        assert!(crate::network_variables::automatic_idle_test_snapshot()
+            .durable_unchanged(&before_automatic));
+    }
+
+    #[tokio::test]
+    async fn policy_refresh_without_initialized_transport_cannot_publish_armed_stage() {
+        crate::mode_suite!(Normal, Testing);
+        if crate::operator_queue::isolated_case(module_path!(), "policy_refresh_without_initialized_transport_cannot_publish_armed_stage") { return; }
+        let state = crate::state::tests::test_app_state().await;
+        state.set_local_flight_state(FlightState::Idle);
+        let mut fresh = SequenceRuntime::for_generation(crate::gse::automatic_generation(&state));
+        fresh.step = SequenceStep::ArmedReady;
+        state.set_sequence_policy_state(fresh.policy_state());
+        assert!(state.topology_router.get().is_none());
+        refresh_action_policy_now(&state);
+        assert_eq!(state.local_flight_state_snapshot(), FlightState::Idle);
+    }
+
+    #[test]
+    fn new_generation_discards_previous_sequence_observations_and_timers() {
+        let mut runtime = SequenceRuntime::for_generation(7);
+        runtime.step = SequenceStep::NitrogenLeakCheck;
+        runtime.step_started_at = Some(Instant::now());
+        runtime.pressure_at_close_psi = Some(120.0);
+        runtime.mass_at_close_kg = Some(10.0);
+        runtime.nitrous_level_since = Some(Instant::now());
+        runtime.calibration_ready = true;
+        runtime.auto_close_nitrogen_sent = true;
+        runtime.auto_close_nitrous_sent = true;
+        assert!(!runtime.bind_generation(7));
+        assert!(matches!(runtime.step, SequenceStep::NitrogenLeakCheck));
+        assert!(runtime.bind_generation(8));
+        assert_eq!(runtime.generation, 8);
+        assert!(matches!(runtime.step, SequenceStep::SetupValves));
+        assert!(runtime.step_started_at.is_none() && runtime.pressure_at_close_psi.is_none());
+        assert!(runtime.mass_at_close_kg.is_none() && runtime.nitrous_level_since.is_none());
+        assert!(
+            !runtime.calibration_ready
+                && !runtime.auto_close_nitrogen_sent
+                && !runtime.auto_close_nitrous_sent
+        );
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 struct ValveSnapshot {
     normally_open: Option<bool>,
     pending_normally_open: Option<bool>,
@@ -482,26 +984,6 @@ struct ValveSnapshot {
     pending_retract: Option<bool>,
 }
 
-impl Default for ValveSnapshot {
-    fn default() -> Self {
-        Self {
-            normally_open: None,
-            pending_normally_open: None,
-            dump_open: None,
-            pending_dump_open: None,
-            nitrogen_open: None,
-            pending_nitrogen_open: None,
-            nitrous_open: None,
-            pending_nitrous_open: None,
-            pilot_open: None,
-            pending_pilot_open: None,
-            igniter_on: None,
-            pending_igniter_on: None,
-            retract: None,
-            pending_retract: None,
-        }
-    }
-}
 
 impl ValveSnapshot {
     fn read(state: &AppState) -> Self {
@@ -552,15 +1034,19 @@ fn is_fill_state(state: FlightState) -> bool {
 
 pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
     match cmd {
+        TelemetryCommand::OperatorPhase{intent} => intent.name(),
+        TelemetryCommand::ColdFlowPanelRelease { .. } => "ColdFlowPanelRelease",
+        TelemetryCommand::QueuedOperator { command, .. } => command_name(command),
         TelemetryCommand::Postinit => "Postinit",
         TelemetryCommand::Launch => "Launch",
         TelemetryCommand::Dump => "Dump",
         TelemetryCommand::Abort => "Abort",
-        TelemetryCommand::AutomaticAbort => "AutomaticAbort",
+        TelemetryCommand::AutomaticAbort { .. } => "AutomaticAbort",
+        TelemetryCommand::AutomaticNitrogenClose { .. } => "AutomaticNitrogenClose",
+        TelemetryCommand::AutomaticNitrousClose { .. } => "AutomaticNitrousClose",
         TelemetryCommand::NormallyOpen => "NormallyOpen",
         TelemetryCommand::Pilot => "Pilot",
         TelemetryCommand::Igniter => "Igniter",
-        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::IgniterSequence => "IgniterSequence",
         TelemetryCommand::RetractPlumbing => "RetractPlumbing",
         TelemetryCommand::Nitrogen | TelemetryCommand::NitrogenClose => "Nitrogen",
@@ -571,11 +1057,12 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         TelemetryCommand::StopWritingDb => "StopWritingDb",
         TelemetryCommand::ResetSim => "ResetSim",
         TelemetryCommand::ContinueFillSequence => "ContinueFillSequence",
-        TelemetryCommand::StartFill => "StartFill",
+        TelemetryCommand::StartFill | TelemetryCommand::FillWithRecording { .. } => "StartFill",
         TelemetryCommand::PauseFill => "PauseFill",
         TelemetryCommand::CancelFill => "CancelFill",
         TelemetryCommand::ValveSelfTest => "ValveSelfTest",
         TelemetryCommand::NitrogenTest => "NitrogenTest",
+        TelemetryCommand::Turbocharge => "Turbocharge",
         TelemetryCommand::MonitorAltitude => "MonitorAltitude",
         TelemetryCommand::RevokeMonitorAltitude => "RevokeMonitorAltitude",
         TelemetryCommand::ConsecutiveSamples => "ConsecutiveSamples",
@@ -584,62 +1071,53 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         TelemetryCommand::RevokeResetFailures => "RevokeResetFailures",
         TelemetryCommand::ValidateMeasms => "ValidateMeasms",
         TelemetryCommand::RevokeValidateMeasms => "RevokeValidateMeasms",
-        #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
         TelemetryCommand::GroundStationLaunch => "GroundStationLaunch",
-        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ToggleButtonInterlock => "ToggleButtonInterlock",
-        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ToggleGroundStationControl => "ToggleGroundStationControl",
-        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ToggleLaunchInterlock => "ToggleLaunchInterlock",
-        #[cfg(feature = "hitl_mode")]
+        TelemetryCommand::TogglePlumbingDelayInterlock => "TogglePlumbingDelayInterlock",
+        TelemetryCommand::ToggleChecklistInterlock => "ToggleChecklistInterlock",
+        TelemetryCommand::ToggleSupplyInterlock => "ToggleSupplyInterlock",
+        TelemetryCommand::ToggleBoardStateProofInterlock => "ToggleBoardStateProofInterlock",
         TelemetryCommand::TogglePhysicalLaunchMode => "TogglePhysicalLaunchMode",
         TelemetryCommand::ToggleAvBayUnderglow => "ToggleAvBayUnderglow",
         TelemetryCommand::ToggleFlightBuzzer => "ToggleFlightBuzzer",
-        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ResetLaunchLatch => "ResetLaunchLatch",
-        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ResetFlightState => "ResetFlightState",
         TelemetryCommand::ResetTClock => "ResetTClock",
-        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::DeployParachute => "DeployParachute",
-        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ExpandParachute => "ExpandParachute",
-        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::EvaluationRelax => "EvaluationRelax",
-        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::EvaluationFocus => "EvaluationFocus",
-        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::EvaluationAbort => "EvaluationAbort",
-        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ReinitSensors => "ReinitSensors",
-        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ReinitBarometer => "ReinitBarometer",
-        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::EnableIMU => "EnableIMU",
-        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::DisableIMU => "DisableIMU",
-        #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
         TelemetryCommand::AdvanceFlightState => "AdvanceFlightState",
-        #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
         TelemetryCommand::RewindFlightState => "RewindFlightState",
-        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::AbortAfter100 => "AbortAfter100",
-        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::AbortAfter40 => "AbortAfter40",
-        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::AbortAfter250 => "AbortAfter250",
-        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ReinitAfter15 => "ReinitAfter15",
-        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ReinitAfter30 => "ReinitAfter30",
-        #[cfg(feature = "hitl_mode")]
         TelemetryCommand::ReinitAfter50 => "ReinitAfter50",
     }
 }
 
-#[cfg(all(not(feature = "hitl_mode"), not(feature = "test_fire_mode")))]
+/// Commands the current station mode offers (each mode keeps the list its old
+/// build had).
 pub fn all_command_names() -> Vec<&'static str> {
+    if crate::runtime_mode::is_hitl() {
+        all_command_names_hitl()
+    } else if crate::runtime_mode::is_test_fire() {
+        all_command_names_test_fire()
+    } else {
+        all_command_names_default()
+    }
+}
+
+fn all_command_names_default() -> Vec<&'static str> {
     let mut names = vec![
         "ToggleAvBayUnderglow",
         "ToggleFlightBuzzer",
@@ -674,8 +1152,7 @@ pub fn all_command_names() -> Vec<&'static str> {
     names
 }
 
-#[cfg(feature = "hitl_mode")]
-pub fn all_command_names() -> Vec<&'static str> {
+fn all_command_names_hitl() -> Vec<&'static str> {
     vec![
         "Dump",
         "Abort",
@@ -705,6 +1182,10 @@ pub fn all_command_names() -> Vec<&'static str> {
         "ToggleButtonInterlock",
         "ToggleGroundStationControl",
         "ToggleLaunchInterlock",
+        "TogglePlumbingDelayInterlock",
+        "ToggleChecklistInterlock",
+        "ToggleSupplyInterlock",
+        "ToggleBoardStateProofInterlock",
         "TogglePhysicalLaunchMode",
         "ToggleAvBayUnderglow",
         "ToggleFlightBuzzer",
@@ -731,8 +1212,7 @@ pub fn all_command_names() -> Vec<&'static str> {
     ]
 }
 
-#[cfg(all(not(feature = "hitl_mode"), feature = "test_fire_mode"))]
-pub fn all_command_names() -> Vec<&'static str> {
+fn all_command_names_test_fire() -> Vec<&'static str> {
     vec![
         "ToggleAvBayUnderglow",
         "ToggleFlightBuzzer",
@@ -766,10 +1246,19 @@ pub fn all_command_names() -> Vec<&'static str> {
     ]
 }
 
+/// Controls owned by the Valve master while its actual launch scheduler runs.
+/// A retained flight phase/recovery record is not evidence of that ownership.
+pub(crate) fn is_fill_system_control(name: &str) -> bool {
+    matches!(name,
+        "Dump" | "NormallyOpen" | "Pilot" | "Igniter" | "IgniterSequence"
+        | "RetractPlumbing" | "Nitrogen" | "NitrogenClose" | "Nitrous" | "NitrousClose"
+        | "StartFill" | "ContinueFillSequence" | "NitrogenTest" | "ValveSelfTest"
+        | "Turbocharge")
+}
+
 pub fn default_action_policy() -> ActionPolicyMsg {
-    #[cfg(feature = "hitl_mode")]
-    {
-        return hitl_action_policy(ValveSnapshot {
+    if crate::runtime_mode::is_hitl() {
+        hitl_action_policy(ValveSnapshot {
             normally_open: None,
             dump_open: None,
             nitrogen_open: None,
@@ -778,17 +1267,15 @@ pub fn default_action_policy() -> ActionPolicyMsg {
             igniter_on: None,
             retract: None,
             ..ValveSnapshot::default()
-        });
-    }
-    #[cfg(not(feature = "hitl_mode"))]
-    {
+        })
+    } else {
         let controls = all_command_names()
             .into_iter()
             .map(|cmd| {
                 let enabled = is_station_utility_command(cmd)
                     || default_recording_command_enabled(cmd)
-                        .unwrap_or_else(|| matches!(cmd, "Abort" | "Postinit" | "ResetSim"));
-                ActionControl {
+                        .unwrap_or(matches!(cmd, "Abort" | "Postinit" | "ResetSim"));
+                ActionControl { disabled_reason: None, requested: None, network_note: None,
                     cmd: cmd.to_string(),
                     enabled,
                     blink: backend_blink_for(cmd, enabled, None),
@@ -797,6 +1284,9 @@ pub fn default_action_policy() -> ActionPolicyMsg {
             })
             .collect();
         ActionPolicyMsg {
+            local_phase_controls: false,
+            local_phase_controls_reason: None,
+            launch_zero: None,
             key_enabled: true,
             software_buttons_enabled: true,
             controls,
@@ -832,7 +1322,7 @@ fn policy_with_overrides(
             } else {
                 key_enabled
             };
-            ActionControl {
+            ActionControl { disabled_reason: None, requested: None, network_note: None,
                 cmd: cmd.to_string(),
                 enabled,
                 blink: backend_blink_for(cmd, enabled, recommended.get(cmd)),
@@ -842,6 +1332,9 @@ fn policy_with_overrides(
         .collect();
 
     ActionPolicyMsg {
+        local_phase_controls: false,
+        local_phase_controls_reason: None,
+        launch_zero: None,
         key_enabled,
         software_buttons_enabled,
         controls,
@@ -904,7 +1397,7 @@ fn sequence_expects_normally_open(step: SequenceStep) -> bool {
 }
 
 fn sequence_expects_normally_closed(step: SequenceStep) -> bool {
-    if cfg!(feature = "test_fire_mode") {
+    if crate::runtime_mode::is_test_fire() {
         return false;
     }
     matches!(
@@ -930,7 +1423,7 @@ fn sequence_blocks_until_normally_open(step: SequenceStep) -> bool {
 }
 
 fn sequence_blocks_until_normally_closed(step: SequenceStep) -> bool {
-    if cfg!(feature = "test_fire_mode") {
+    if crate::runtime_mode::is_test_fire() {
         return false;
     }
     matches!(
@@ -958,7 +1451,7 @@ fn dump_open_fails_nitrous_step(step: SequenceStep) -> bool {
 }
 
 fn first_fill_step_after_setup() -> SequenceStep {
-    if cfg!(feature = "test_fire_mode") {
+    if crate::runtime_mode::is_test_fire() {
         SequenceStep::OpenNitrous
     } else {
         SequenceStep::NitrogenFill
@@ -975,11 +1468,11 @@ fn nitrous_close_accepted_for_vent_prompt(valves: ValveSnapshot) -> bool {
 
 fn setup_valves_ready(valves: ValveSnapshot) -> bool {
     valves.dump_open == Some(false)
-        && (cfg!(feature = "test_fire_mode") || valves.normally_open == Some(false))
+        && (crate::runtime_mode::is_test_fire() || valves.normally_open == Some(false))
 }
 
 fn mass_is_vented(current_mass_kg: Option<f32>, cfg: &SequenceConfig) -> bool {
-    if cfg!(feature = "test_fire_mode") {
+    if crate::runtime_mode::is_test_fire() {
         return true;
     }
     current_mass_kg
@@ -1071,14 +1564,18 @@ fn mass_target_reached(current_mass_kg: f32, target_mass_kg: f32, epsilon_kg: f3
 
 /// The one-button GSE fill uses the same thresholds and signed mass target as
 /// the main fill: immediate target cutoff, or a pressure/weight plateau.
+#[cfg_attr(not(test), derive(Default))]
 pub(crate) struct FillCutoff {
+    #[cfg(test)]
     cfg: SequenceConfig,
     previous: Option<(f32, f32)>,
     level_since: Option<Instant>,
 }
+#[cfg(test)]
 impl Default for FillCutoff {
     fn default() -> Self {
         Self {
+            #[cfg(test)]
             cfg: SequenceConfig::from_env(),
             previous: None,
             level_since: None,
@@ -1086,6 +1583,7 @@ impl Default for FillCutoff {
     }
 }
 impl FillCutoff {
+    #[cfg(test)]
     pub fn target_met(&self, mass: f32, target: f32) -> bool {
         mass.is_finite()
             && target.is_finite()
@@ -1097,6 +1595,7 @@ impl FillCutoff {
         self.previous = None;
         self.level_since = None;
     }
+    #[cfg(test)]
     pub fn reached(&mut self, now: Instant, mass: f32, pressure: f32, target: f32) -> bool {
         if !mass.is_finite() || !pressure.is_finite() || !target.is_finite() || target == 0.0 {
             self.reset();
@@ -1231,6 +1730,15 @@ fn update_sequence_runtime(
         runtime.notified_reopen_normally_open = false;
     }
 
+    if matches!(runtime.step, SequenceStep::SetupValves) && crate::rrls::is_rrls() {
+        // RRLS has no fill telemetry, so mass is always absent there and the
+        // check could only ever warn. It also never starts the fill sequence
+        // (it previously stopped here on that same missing mass). Synced
+        // calibration settings cannot change this; skip the local evaluation.
+        runtime.calibration_ready = false;
+        runtime.calibration_block_message = None;
+        return;
+    }
     if matches!(runtime.step, SequenceStep::SetupValves) {
         if let Some(issue) =
             fill_sequence_calibration_issue(state, cfg, pressure_psi, current_mass_kg)
@@ -1296,7 +1804,11 @@ fn update_sequence_runtime(
             };
 
             if should_close && !runtime.auto_close_nitrogen_sent {
-                match state.cmd_tx.try_send(TelemetryCommand::NitrogenClose) {
+                match state
+                    .cmd_tx
+                    .try_send(TelemetryCommand::AutomaticNitrogenClose {
+                        generation: runtime.generation,
+                    }) {
                     Ok(_) => {
                         runtime.auto_close_nitrogen_sent = true;
                         match cfg.nitrogen_autoclose_mode {
@@ -1389,7 +1901,7 @@ fn update_sequence_runtime(
                 }
             }
             let mass_warning_active =
-                !cfg!(feature = "test_fire_mode") && mass_shift_kg > cfg.max_leak_mass_delta_kg;
+                !crate::runtime_mode::is_test_fire() && mass_shift_kg > cfg.max_leak_mass_delta_kg;
             if mass_warning_active && !runtime.warned_mass_shift {
                 runtime.warned_mass_shift = true;
                 if runtime.mass_shift_notification_id.is_none() {
@@ -1408,7 +1920,7 @@ fn update_sequence_runtime(
             }
 
             let pressure_ok = current >= baseline - allowed_pressure_drop;
-            let mass_ok = cfg!(feature = "test_fire_mode")
+            let mass_ok = crate::runtime_mode::is_test_fire()
                 || current_mass_kg.is_none()
                 || mass_shift_kg <= allowed_mass_shift;
 
@@ -1559,7 +2071,11 @@ fn update_sequence_runtime(
             });
             if let Some((target_mass_kg, fill_percent, true)) = nitrous_full_by_loadcell {
                 if !runtime.auto_close_nitrous_sent {
-                    match state.cmd_tx.try_send(TelemetryCommand::NitrousClose) {
+                    match state
+                        .cmd_tx
+                        .try_send(TelemetryCommand::AutomaticNitrousClose {
+                            generation: runtime.generation,
+                        }) {
                         Ok(_) => {
                             runtime.auto_close_nitrous_sent = true;
                             state.add_notification(format!(
@@ -1596,7 +2112,11 @@ fn update_sequence_runtime(
             ) {
                 runtime.notified_close_nitrous = false;
                 if !runtime.auto_close_nitrous_sent {
-                    match state.cmd_tx.try_send(TelemetryCommand::NitrousClose) {
+                    match state
+                        .cmd_tx
+                        .try_send(TelemetryCommand::AutomaticNitrousClose {
+                            generation: runtime.generation,
+                        }) {
                         Ok(_) => {
                             runtime.auto_close_nitrous_sent = true;
                             state.add_notification(
@@ -1716,7 +2236,7 @@ fn update_sequence_runtime(
         }
         SequenceStep::RetractFillLines => {
             if !runtime.notified_retract_fill_lines {
-                if cfg!(feature = "test_fire_mode") {
+                if crate::runtime_mode::is_test_fire() {
                     state.add_notification("Retract fill lines.");
                 } else {
                     state.add_notification("Vent valve closed. Retract fill lines.");
@@ -1729,7 +2249,7 @@ fn update_sequence_runtime(
         }
         SequenceStep::ArmedReady => {
             if !runtime.notified_armed {
-                if cfg!(feature = "test_fire_mode") {
+                if crate::runtime_mode::is_test_fire() {
                     state.add_notification(
                         "Fill sequence complete: nitrous closed and fill lines removed. Launch state is ready.",
                     );
@@ -1744,17 +2264,17 @@ fn update_sequence_runtime(
     }
 }
 
-fn maybe_drive_local_prelaunch_state(
+fn selected_prelaunch_state(
     state: &AppState,
     runtime: &SequenceRuntime,
     valves: ValveSnapshot,
     current_state: FlightState,
 ) -> FlightState {
-    if cfg!(feature = "hitl_mode") {
+    if crate::runtime_mode::is_hitl() {
         return current_state;
     }
 
-    if cfg!(feature = "test_fire_mode")
+    if crate::runtime_mode::is_test_fire()
         && matches!(current_state, FlightState::Startup | FlightState::Idle)
     {
         return current_state;
@@ -1765,7 +2285,6 @@ fn maybe_drive_local_prelaunch_state(
     }
 
     if current_state == FlightState::Startup && state.all_required_boards_seen() {
-        state.set_local_flight_state(FlightState::Idle);
         return FlightState::Idle;
     }
 
@@ -1803,11 +2322,39 @@ fn maybe_drive_local_prelaunch_state(
     if let Some(next_state) = desired_state
         && current_state != next_state
     {
-        state.set_local_flight_state(next_state);
         return next_state;
     }
 
     current_state
+}
+
+fn drive_observed_prelaunch_state(
+    state: &Arc<AppState>,
+    runtime: &SequenceRuntime,
+    valves: ValveSnapshot,
+    current_state: FlightState,
+    captured: Option<crate::automatic_flight_state::Captured>,
+) -> FlightState {
+    let next = selected_prelaunch_state(state, runtime, valves, current_state);
+    if let Some(original) = captured
+        && original.expected == current_state
+        && let Some(proposal) = original.proposal(next,
+            crate::automatic_flight_state::Cause::LegacySequence { next_policy: runtime.policy_state() }) {
+        crate::automatic_flight_state::publish(state, proposal);
+    }
+    // Never report an unadmitted proposal as the current actual phase.
+    state.local_flight_state_snapshot()
+}
+#[cfg(test)]
+fn maybe_drive_local_prelaunch_state(
+    state: &Arc<AppState>, runtime: &SequenceRuntime, valves: ValveSnapshot, current_state: FlightState,
+) -> FlightState {
+    // Match main's initialized desired Store for this legacy direct-helper
+    // fixture. The actual production driver still uses the original entry owner.
+    let _ = crate::network_variables::flight_state();
+    let observation = crate::automatic_flight_state::Observation::begin(state);
+    drive_observed_prelaunch_state(state, runtime, valves, current_state,
+        observation.as_ref().and_then(|o| o.captured()))
 }
 
 fn hitl_action_policy(valves: ValveSnapshot) -> ActionPolicyMsg {
@@ -1815,7 +2362,7 @@ fn hitl_action_policy(valves: ValveSnapshot) -> ActionPolicyMsg {
         .into_iter()
         .map(|cmd| {
             let actuated = default_command_actuated(cmd).or_else(|| valves.actuated_for_cmd(cmd));
-            ActionControl {
+            ActionControl { disabled_reason: None, requested: None, network_note: None,
                 cmd: cmd.to_string(),
                 enabled: true,
                 blink: BlinkMode::None,
@@ -1825,6 +2372,9 @@ fn hitl_action_policy(valves: ValveSnapshot) -> ActionPolicyMsg {
         .collect();
 
     ActionPolicyMsg {
+        local_phase_controls: false,
+        local_phase_controls_reason: None,
+        launch_zero: None,
         key_enabled: true,
         software_buttons_enabled: true,
         controls,
@@ -1900,7 +2450,7 @@ fn build_policy(
         }
         // In Idle, make the first fill-transition action the only illuminated action.
         // All other controls remain available (dimmed client-side when not blinking).
-        if !cfg!(feature = "test_fire_mode")
+        if !crate::runtime_mode::is_test_fire()
             && inputs.flight_state == FlightState::Idle
             && let Some(blink) = command_prompt_blink(
                 state,
@@ -1913,7 +2463,7 @@ fn build_policy(
         {
             enabled.insert("NormallyOpen", blink);
         }
-        if !cfg!(feature = "test_fire_mode")
+        if !crate::runtime_mode::is_test_fire()
             && inputs.flight_state == FlightState::Idle
             && let Some(blink) =
                 command_prompt_blink(state, cfg, inputs.valves, "Dump", false, inputs.now_ms)
@@ -1926,7 +2476,7 @@ fn build_policy(
             inputs.valves,
             enabled,
         );
-        if !cfg!(feature = "test_fire_mode") && inputs.flight_state != FlightState::Idle {
+        if !crate::runtime_mode::is_test_fire() && inputs.flight_state != FlightState::Idle {
             set_control_enabled(&mut policy, "Launch", false);
             set_control_enabled(&mut policy, "GroundStationLaunch", false);
         }
@@ -1963,8 +2513,8 @@ fn build_policy(
 
     match runtime.step {
         SequenceStep::SetupValves => {
-            if !cfg!(feature = "test_fire_mode") {
-                if let Some(blink) = command_prompt_blink(
+            if !crate::runtime_mode::is_test_fire()
+                && let Some(blink) = command_prompt_blink(
                     state,
                     cfg,
                     inputs.valves,
@@ -1974,7 +2524,6 @@ fn build_policy(
                 ) {
                     recommended.insert("NormallyOpen", blink);
                 }
-            }
             if let Some(blink) =
                 command_prompt_blink(state, cfg, inputs.valves, "Dump", false, inputs.now_ms)
             {
@@ -2130,12 +2679,12 @@ fn read_key_enabled(state: &AppState, cfg: &SequenceConfig) -> bool {
     if crate::flight_sim::sim_mode_enabled() {
         return true;
     }
-    if cfg!(feature = "testing") {
+    if crate::runtime_mode::is_testing() {
         return true;
     }
     if cfg!(feature = "raspberry_pi")
-        || cfg!(feature = "hitl_mode")
-        || cfg!(feature = "test_fire_mode")
+        || crate::runtime_mode::is_hitl()
+        || crate::runtime_mode::is_test_fire()
     {
         return true;
     }
@@ -2152,10 +2701,10 @@ fn read_software_buttons_enabled(state: &AppState, cfg: &SequenceConfig) -> bool
     if crate::flight_sim::sim_mode_enabled() {
         return true;
     }
-    if cfg!(feature = "testing") {
+    if crate::runtime_mode::is_testing() {
         return true;
     }
-    if cfg!(feature = "hitl_mode") || cfg!(feature = "test_fire_mode") {
+    if crate::runtime_mode::is_hitl() || crate::runtime_mode::is_test_fire() {
         return true;
     }
     if cfg!(feature = "raspberry_pi") {
@@ -2171,169 +2720,278 @@ fn read_software_buttons_enabled(state: &AppState, cfg: &SequenceConfig) -> bool
         .unwrap_or(true)
 }
 
+/// Why one mode's sequence loop ended.
+enum SequenceExit {
+    Shutdown,
+    ModeChanged,
+}
+
+/// GPIO inputs the sequence reads, set up once each (setting a pin up again
+/// would reset the simulated input).
+#[derive(Default)]
+struct SequenceGpio {
+    key: bool,
+    software_disable: bool,
+}
+
+fn setup_sequence_gpio(state: &AppState, cfg: &SequenceConfig, done: &mut SequenceGpio) {
+    if !done.key
+        && cfg.key_required
+        && !crate::runtime_mode::is_hitl()
+        && !crate::runtime_mode::is_test_fire()
+    {
+        done.key = true;
+        if let Err(err) = state.gpio.setup_input_pin(cfg.key_enable_pin) {
+            eprintln!(
+                "Sequence key GPIO setup failed (pin {}): {}",
+                cfg.key_enable_pin, err
+            );
+        }
+    }
+
+    if !done.software_disable
+        && !crate::runtime_mode::is_testing()
+        && !cfg!(feature = "raspberry_pi")
+        && !crate::runtime_mode::is_hitl()
+        && !crate::runtime_mode::is_test_fire()
+    {
+        done.software_disable = true;
+        if let Err(err) = state.gpio.setup_input_pin(cfg.software_disable_pin) {
+            eprintln!(
+                "Software disable GPIO setup failed (pin {}): {}",
+                cfg.software_disable_pin, err
+            );
+        }
+    }
+}
+
+/// Runs the GSE sequence for the station's lifetime. Each station mode runs
+/// the loop its old build ran (HITL: manual policy only; otherwise the
+/// automatic sequence). A mode switch ends the loop and starts the new mode's
+/// loop with fresh local state, as a restarted process would.
 pub fn start_sequence_task(
     state: Arc<AppState>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) -> tokio::task::JoinHandle<()> {
+    // RUNTIME-MODE-BOOT: gse::initialize restores qualification state for the
+    // boot mode; the station mode switch re-runs the mode-dependent part.
     crate::gse::initialize(&state);
     let cfg = SequenceConfig::from_env();
-    if cfg!(feature = "hitl_mode") {
-        return tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_millis(200));
-            loop {
-                tokio::select! {
-                    _ = tick.tick() => {
-                        state.expire_pending_umbilical_valve_states(UMBILICAL_PENDING_VALVE_TIMEOUT);
-                        #[cfg(feature = "hitl_mode")]
-                        crate::gse::tick(&state, state.hitl_button_interlock_satisfied());
-                        let valves = ValveSnapshot::read(&state);
-                        state.set_action_policy(hitl_action_policy(valves));
-                    }
-                    recv = shutdown_rx.recv() => {
-                        match recv {
-                            Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) | Err(broadcast::error::RecvError::Closed) => break,
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    if cfg.key_required
-        && !cfg!(feature = "hitl_mode")
-        && !cfg!(feature = "test_fire_mode")
-        && let Err(err) = state.gpio.setup_input_pin(cfg.key_enable_pin)
-    {
-        eprintln!(
-            "Sequence key GPIO setup failed (pin {}): {}",
-            cfg.key_enable_pin, err
-        );
-    }
-
-    if !cfg!(feature = "testing")
-        && !cfg!(feature = "raspberry_pi")
-        && !cfg!(feature = "hitl_mode")
-        && !cfg!(feature = "test_fire_mode")
-        && let Err(err) = state.gpio.setup_input_pin(cfg.software_disable_pin)
-    {
-        eprintln!(
-            "Software disable GPIO setup failed (pin {}): {}",
-            cfg.software_disable_pin, err
-        );
-    }
+    let mut gpio = SequenceGpio::default();
+    setup_sequence_gpio(&state, &cfg, &mut gpio);
 
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_millis(200));
-        let mut runtime = SequenceRuntime::default();
-        let mut last_flight_state: Option<FlightState> = None;
-
+        let mut modes = crate::runtime_mode::subscribe();
         loop {
-            tokio::select! {
-                _ = tick.tick() => {}
-                recv = shutdown_rx.recv() => {
-                    match recv {
-                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) | Err(broadcast::error::RecvError::Closed) => break,
-                    }
-                }
+            let token = crate::runtime_mode::token();
+            modes.borrow_and_update();
+            let exit = if token.mode == crate::station_mode::Mode::Hitl {
+                hitl_sequence_loop(&state, &mut shutdown_rx, token).await
+            } else {
+                setup_sequence_gpio(&state, &cfg, &mut gpio);
+                sequence_loop(&state, &cfg, &mut shutdown_rx, token).await
+            };
+            match exit {
+                SequenceExit::Shutdown => break,
+                SequenceExit::ModeChanged => continue,
             }
-
-            state.expire_pending_umbilical_valve_states(UMBILICAL_PENDING_VALVE_TIMEOUT);
-            let mut flight_state = *state.state.lock().unwrap();
-            let valves = ValveSnapshot::read(&state);
-            let pressure_psi = *state.latest_fuel_tank_pressure.lock().unwrap();
-            let current_mass_kg = *state.latest_fill_mass_kg.lock().unwrap();
-            let now = Instant::now();
-            let now_ms = crate::telemetry_task::get_current_timestamp_ms();
-            let key_enabled = read_key_enabled(&state, &cfg);
-            let software_buttons_enabled = read_software_buttons_enabled(&state, &cfg);
-            let sequence_active = !cfg!(feature = "test_fire_mode")
-                || !matches!(flight_state, FlightState::Startup | FlightState::Idle);
-
-            if cfg!(feature = "test_fire_mode") {
-                if flight_state == FlightState::Startup && state.all_required_boards_seen() {
-                    state.set_local_flight_state(FlightState::Idle);
-                    flight_state = FlightState::Idle;
-                    runtime = SequenceRuntime::default();
-                    state.set_sequence_policy_state(runtime.policy_state());
-                }
-
-                if flight_state == FlightState::Idle {
-                    runtime = SequenceRuntime::default();
-                    state.set_sequence_policy_state(runtime.policy_state());
-                } else if last_flight_state != Some(FlightState::PreFill)
-                    && flight_state == FlightState::PreFill
-                {
-                    runtime = SequenceRuntime::default();
-                    state.set_sequence_policy_state(runtime.policy_state());
-                    state.add_temporary_notification(
-                        "Test-fire sequence started. Use the sequencing LEDs to move valves into the required starting positions.",
-                    );
-                }
-            }
-
-            crate::gse::tick(&state, key_enabled && software_buttons_enabled);
-            if sequence_active && !crate::gse::claimed(&state) {
-                update_sequence_runtime(
-                    &state,
-                    &mut runtime,
-                    &cfg,
-                    valves,
-                    pressure_psi,
-                    current_mass_kg,
-                    now,
-                );
-            }
-            if !crate::gse::claimed(&state) {
-                flight_state =
-                    maybe_drive_local_prelaunch_state(&state, &runtime, valves, flight_state);
-            }
-            state.set_sequence_policy_state(runtime.policy_state());
-            let policy = build_policy(
-                &state,
-                &cfg,
-                &runtime,
-                PolicyInputs {
-                    flight_state,
-                    key_enabled,
-                    software_buttons_enabled,
-                    valves,
-                    now_ms,
-                },
-            );
-            state.set_action_policy(policy);
-            last_flight_state = Some(flight_state);
         }
     })
 }
 
+async fn hitl_sequence_loop(
+    state: &Arc<AppState>,
+    shutdown_rx: &mut broadcast::Receiver<()>,
+    token: crate::runtime_mode::ModeToken,
+) -> SequenceExit {
+    let mut tick = tokio::time::interval(Duration::from_millis(200));
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {
+                if !token.is_current() {
+                    return SequenceExit::ModeChanged;
+                }
+                #[cfg(test)]
+                if crate::runtime_mode::is_test_fire() {
+                    crate::recovery_pending_probe::sequence_tick(state);
+                }
+                state.expire_pending_umbilical_valve_states(UMBILICAL_PENDING_VALVE_TIMEOUT);
+                crate::gse::tick(state, state.hitl_button_interlock_satisfied());
+                let valves = ValveSnapshot::read(state);
+                let _admission = crate::runtime_mode::admission();
+                if !token.is_current() {
+                    return SequenceExit::ModeChanged;
+                }
+                state.set_action_policy(hitl_action_policy(valves));
+            }
+            recv = shutdown_rx.recv() => {
+                match recv {
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) | Err(broadcast::error::RecvError::Closed) => return SequenceExit::Shutdown,
+                }
+            }
+        }
+    }
+}
+
+async fn sequence_loop(
+    state: &Arc<AppState>,
+    cfg: &SequenceConfig,
+    shutdown_rx: &mut broadcast::Receiver<()>,
+    token: crate::runtime_mode::ModeToken,
+) -> SequenceExit {
+    let mut tick = tokio::time::interval(Duration::from_millis(200));
+    let mut runtime = SequenceRuntime::default();
+    let mut last_flight_state: Option<FlightState> = None;
+
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {}
+            recv = shutdown_rx.recv() => {
+                match recv {
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) | Err(broadcast::error::RecvError::Closed) => return SequenceExit::Shutdown,
+                }
+            }
+        }
+        if !token.is_current() {
+            return SequenceExit::ModeChanged;
+        }
+
+        // Acquire before observations/GSE waits. Recovery cannot advance
+        // the epoch while this tick can still publish managed state.
+        let Some(sequence_observation) =
+            begin_sequence_tick(state, &mut runtime, &mut last_flight_state)
+        else {
+            continue;
+        };
+        #[cfg(test)]
+        if crate::runtime_mode::is_test_fire() {
+            crate::recovery_pending_probe::sequence_tick(state);
+        }
+        let generation = runtime.generation;
+        state.expire_pending_umbilical_valve_states(UMBILICAL_PENDING_VALVE_TIMEOUT);
+        let mut flight_state = *state.state.lock().unwrap();
+        #[cfg(all(test, not(feature = "firmware_sim")))]
+        if !crate::runtime_mode::is_hitl_or_test_fire() {
+            crate::normal_publication_probe::point(state, crate::normal_publication_probe::Site::CountedTick, flight_state as u8).await;
+        }
+        let valves = ValveSnapshot::read(state);
+        let pressure_psi = *state.latest_fuel_tank_pressure.lock().unwrap();
+        let current_mass_kg = *state.latest_fill_mass_kg.lock().unwrap();
+        let now = Instant::now();
+        let now_ms = crate::telemetry_task::get_current_timestamp_ms();
+        let key_enabled = read_key_enabled(state, &cfg);
+        let software_buttons_enabled = read_software_buttons_enabled(state, &cfg);
+        let sequence_active = !crate::runtime_mode::is_test_fire()
+            || !matches!(flight_state, FlightState::Startup | FlightState::Idle);
+
+        if crate::runtime_mode::is_test_fire() {
+            // Readiness is published only by the original dequeued event
+            // owner. The live policy timer must not manufacture intent.
+            if flight_state == FlightState::Idle {
+                runtime = SequenceRuntime::for_generation(generation);
+                sequence_observation.update_policy(state, flight_state, runtime.policy_state());
+            } else if last_flight_state != Some(FlightState::PreFill)
+                && flight_state == FlightState::PreFill
+            {
+                runtime = SequenceRuntime::for_generation(generation);
+                sequence_observation.update_policy(state, flight_state, runtime.policy_state());
+                state.add_temporary_notification(
+                    "Test-fire sequence started. Use the sequencing LEDs to move valves into the required starting positions.",
+                );
+            }
+        }
+
+        crate::gse::tick(state, key_enabled && software_buttons_enabled);
+        if sequence_active && !crate::gse::claimed(state) {
+            update_sequence_runtime(
+                &state,
+                &mut runtime,
+                &cfg,
+                valves,
+                pressure_psi,
+                current_mass_kg,
+                now,
+            );
+        }
+        if !crate::gse::claimed(state) {
+            flight_state =
+                drive_observed_prelaunch_state(state, &runtime, valves, flight_state, sequence_observation.captured());
+        }
+        sequence_observation.update_policy(state, flight_state, runtime.policy_state());
+        let policy = build_policy(
+            &state,
+            &cfg,
+            &runtime,
+            PolicyInputs {
+                flight_state,
+                key_enabled,
+                software_buttons_enabled,
+                valves,
+                now_ms,
+            },
+        );
+        {
+            // A switch re-derives the policy for the new mode; never
+            // overwrite it with this tick's old-mode policy.
+            let _admission = crate::runtime_mode::admission();
+            if !token.is_current() {
+                return SequenceExit::ModeChanged;
+            }
+            state.set_action_policy(policy);
+        }
+        last_flight_state = Some(flight_state);
+    }
+}
+
 pub fn refresh_action_policy_now(state: &Arc<AppState>) {
+    let Some(observation) = crate::automatic_flight_state::Observation::begin(state) else { return; };
+    refresh_action_policy_at_generation(state, observation.generation(), Some(&observation));
+}
+
+/// Only GSE's existing serialized command owner calls this entry point.
+/// Its dispatch gate already excludes reset epoch changes; reacquiring that
+/// non-reentrant gate here would deadlock the command owner.
+pub(crate) fn refresh_action_policy_under_dispatch(_state: &Arc<AppState>) {
+    // The actual public command wrapper carries the original observation and
+    // refreshes after dropping Dispatch. No config/provider/publisher reentry.
+}
+pub(crate) fn refresh_action_policy_with_observation(
+    state: &Arc<AppState>, observation: &crate::automatic_flight_state::Observation,
+) {
+    refresh_action_policy_at_generation(state, observation.generation(), Some(observation));
+}
+pub(crate) fn refresh_action_policy_projection(state: &Arc<AppState>) {
+    // This is UI projection only; it cannot select/admit another phase.
+    refresh_action_policy_at_generation(state, crate::gse::automatic_generation(state), None);
+}
+
+fn refresh_action_policy_at_generation(
+    state: &Arc<AppState>, generation: u64,
+    observation: Option<&crate::automatic_flight_state::Observation>,
+) {
     let cfg = SequenceConfig::from_env();
-    if cfg!(feature = "hitl_mode") {
+    if crate::runtime_mode::is_hitl() {
         let valves = ValveSnapshot::read(state);
         state.set_action_policy(hitl_action_policy(valves));
         return;
     }
 
     let mut runtime = SequenceRuntime::from_policy_state(state.sequence_policy_state_snapshot());
+    runtime.bind_generation(generation);
     let mut flight_state = *state.state.lock().unwrap();
     let valves = ValveSnapshot::read(state);
     let now_ms = crate::telemetry_task::get_current_timestamp_ms();
     let key_enabled = read_key_enabled(state, &cfg);
     let software_buttons_enabled = read_software_buttons_enabled(state, &cfg);
 
-    if cfg!(feature = "test_fire_mode")
-        && flight_state == FlightState::Startup
-        && state.all_required_boards_seen()
-    {
-        state.set_local_flight_state(FlightState::Idle);
-        flight_state = FlightState::Idle;
-        runtime = SequenceRuntime::default();
-        state.set_sequence_policy_state(runtime.policy_state());
+    // TF readiness state is owned solely by a fresh dequeued packet's original
+    // generation/Stop/SDK admission. Policy refresh never mints that authority.
+    if !crate::gse::claimed(state) && let Some(observation) = observation {
+        flight_state = drive_observed_prelaunch_state(state, &runtime, valves, flight_state, observation.captured());
     }
-    if !crate::gse::claimed(state) {
-        flight_state = maybe_drive_local_prelaunch_state(state, &runtime, valves, flight_state);
+    if let Some(observation) = observation {
+        observation.update_policy(state, flight_state, runtime.policy_state());
     }
-    state.set_sequence_policy_state(runtime.policy_state());
     let policy = build_policy(
         state,
         &cfg,
@@ -2353,6 +3011,7 @@ pub fn refresh_action_policy_now(state: &Arc<AppState>) {
 mod tests {
     #[tokio::test]
     async fn captured_normal_startup_reset_policy_republishes_idle_but_hitl_preserves_startup() {
+        if crate::operator_queue::isolated_case(module_path!(), "captured_normal_startup_reset_policy_republishes_idle_but_hitl_preserves_startup") { return; }
         crate::telemetry_schema::initialize().unwrap();
         let state = crate::state::tests::test_app_state().await;
         for board in crate::types::Board::ALL {
@@ -2360,6 +3019,10 @@ mod tests {
         }
         assert!(state.all_required_boards_seen());
         let router = std::sync::Arc::new(sedsnet::router::Router::new(Default::default()));
+        crate::telemetry_task::refresh_host_network_time(
+            &router,
+            crate::telemetry_task::get_current_timestamp_ms(),
+        );
         let ty = crate::telemetry_schema::data_type("FLIGHT_STATE");
         router
             .enable_network_variable(ty, sedsnet::router::NetworkVariablePermissions::READ_WRITE)
@@ -2378,7 +3041,7 @@ mod tests {
             super::ValveSnapshot::default(),
             crate::types::FlightState::Startup,
         );
-        if cfg!(feature = "hitl_mode") || cfg!(feature = "test_fire_mode") {
+        if crate::runtime_mode::is_hitl() || crate::runtime_mode::is_test_fire() {
             assert_eq!(next, crate::types::FlightState::Startup);
             assert_eq!(
                 state.local_flight_state_snapshot(),
@@ -2425,15 +3088,15 @@ mod tests {
     }
     use super::*;
 
-    #[cfg(feature = "test_fire_mode")]
     #[test]
     fn test_fire_sequence_starts_with_nitrous_fill_after_setup() {
+        crate::mode_suite!(TestFire);
         assert_eq!(first_fill_step_after_setup(), SequenceStep::OpenNitrous);
     }
 
-    #[cfg(feature = "test_fire_mode")]
     #[test]
     fn test_fire_setup_does_not_require_closing_vent_valve() {
+        crate::mode_suite!(TestFire);
         assert!(!sequence_expects_normally_closed(SequenceStep::SetupValves));
         assert!(!sequence_blocks_until_normally_closed(
             SequenceStep::SetupValves
@@ -2449,9 +3112,9 @@ mod tests {
         }));
     }
 
-    #[cfg(feature = "test_fire_mode")]
     #[test]
     fn test_fire_prompts_vent_close_after_nitrous_closes() {
+        crate::mode_suite!(TestFire);
         assert_eq!(
             step_after_nitrous_valve_closed(),
             SequenceStep::CloseNormallyOpen
@@ -2476,9 +3139,9 @@ mod tests {
         }));
     }
 
-    #[cfg(not(feature = "test_fire_mode"))]
     #[test]
     fn normal_sequence_starts_with_nitrogen_fill_after_setup() {
+        crate::mode_suite!(Normal, Hitl, Testing);
         assert_eq!(first_fill_step_after_setup(), SequenceStep::NitrogenFill);
     }
 
@@ -2522,13 +3185,14 @@ mod tests {
                 .map(|control| control.enabled)
         };
         assert_eq!(enabled("Launch"), Some(true));
-        #[cfg(any(feature = "hitl_mode", feature = "test_fire_mode"))]
-        assert_eq!(enabled("GroundStationLaunch"), Some(true));
+        if crate::runtime_mode::is_hitl_or_test_fire() {
+            assert_eq!(enabled("GroundStationLaunch"), Some(true));
+        }
     }
 
-    #[cfg(feature = "hitl_mode")]
     #[test]
     fn hitl_policy_enables_manual_igniter_sequence() {
+        crate::mode_suite!(Hitl);
         let policy = default_action_policy();
         let enabled = |cmd: &str| {
             policy
@@ -2540,5 +3204,30 @@ mod tests {
 
         assert_eq!(enabled("GroundStationLaunch"), Some(true));
         assert_eq!(enabled("IgniterSequence"), Some(true));
+    }
+}
+
+#[cfg(test)]
+mod automatic_phase_tests;
+
+#[cfg(test)]
+mod disabled_reason_tests {
+    use super::*;
+    #[test]
+    fn disabled_reasons_are_presentation_only_and_preserve_precise_server_causes() {
+        let mut policy: ActionPolicyMsg = serde_json::from_value(serde_json::json!({
+            "key_enabled":true,"software_buttons_enabled":true,
+            "controls":[{"cmd":"Launch","enabled":false,"blink":"none","actuated":null,
+                "disabled_reason":"VB reports Abort; review recovery."},
+                {"cmd":"Nitrogen","enabled":true,"blink":"none","actuated":null,
+                "disabled_reason":"old blocker"},
+                {"cmd":"StartFill","enabled":false,"blink":"none","actuated":null}]
+        })).unwrap();
+        explain_disabled_policy(&mut policy);
+        assert_eq!(policy.controls[0].disabled_reason.as_deref(),Some("VB reports Abort; review recovery."));
+        assert!(policy.controls[1].enabled);
+        assert_eq!(policy.controls[1].disabled_reason,None);
+        assert!(!policy.controls[2].enabled);
+        assert!(policy.controls[2].disabled_reason.as_deref().unwrap().contains("GroundStation policy"));
     }
 }

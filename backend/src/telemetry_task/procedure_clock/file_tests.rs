@@ -2,6 +2,9 @@
 use super::*;
 #[test]
 fn explicit_file_clock_and_saved_replay_are_isolated() {
+    if !cfg!(feature = "firmware_sim") {
+        crate::mode_suite!(Hitl);
+    }
     const NAME: &str = "telemetry_task::procedure_clock::file_tests::explicit_file_clock_and_saved_replay_are_isolated";
     if std::env::var_os("GS_MODEL_CLOCK_CHILD").is_some() {
         tokio::runtime::Builder::new_current_thread()

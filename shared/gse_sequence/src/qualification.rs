@@ -183,6 +183,28 @@ impl Qualification {
         };
         Ok(())
     }
+    /// Invalidate only evidence affected by a nitrogen procedure edit.
+    pub fn invalidate_nitrogen(&mut self) -> Result<(), &'static str> {
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .ok_or("Qualification generation exhausted")?;
+        self.nitrogen_test = false;
+        self.nitrogen_override = None;
+        self.fill_target = false;
+        self.filling_started = false;
+        Ok(())
+    }
+    /// A changed fill target never erases an unrelated self-test or cold flow.
+    pub fn invalidate_fill(&mut self) -> Result<(), &'static str> {
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .ok_or("Qualification generation exhausted")?;
+        self.fill_target = false;
+        self.filling_started = false;
+        Ok(())
+    }
     pub fn stage(&self) -> MissionStage {
         if self.fire_started {
             MissionStage::Fire
@@ -426,5 +448,40 @@ mod workflow_tests {
             })
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod invalidation_tests {
+    use super::*;
+    fn qualified() -> Qualification {
+        let mut q = Qualification::default();
+        for stage in [
+            Milestone::SelfTest,
+            Milestone::NitrogenTest,
+            Milestone::FillTarget,
+        ] {
+            q.complete(stage, q.generation()).unwrap();
+        }
+        q
+    }
+    #[test]
+    fn edits_invalidate_only_linked_evidence_and_reject_old_completions() {
+        let mut q = qualified();
+        let old = q.generation();
+        q.invalidate_fill().unwrap();
+        assert!(q.completed(Milestone::SelfTest) && q.completed(Milestone::NitrogenTest));
+        assert!(!q.completed(Milestone::FillTarget));
+        assert_eq!(q.stage(), MissionStage::Idle);
+        assert!(q.complete(Milestone::FillTarget, old).is_err());
+        let mut q = qualified();
+        q.latch(Fault::UnsafeSupplyFlow);
+        q.invalidate_nitrogen().unwrap();
+        assert!(q.completed(Milestone::SelfTest));
+        assert!(!q.nitrogen_satisfied());
+        assert!(!q.completed(Milestone::FillTarget));
+        assert_eq!(q.fault(), Some(Fault::UnsafeSupplyFlow));
+        let saved = serde_json::to_string(&q).unwrap();
+        assert_eq!(serde_json::from_str::<Qualification>(&saved).unwrap(), q);
     }
 }

@@ -46,8 +46,23 @@ path until RRLS confirms readiness for the current session. That readiness
 expires after two seconds: an unplugged relay cannot retain the command path.
 RRLS sends readiness only during requested recovery, keeping standby silent.
 RRLS forwards while that request's two-second lease
-is fresh. Two seconds of continuous direct reception restores the direct path.
+is fresh. Five seconds of continuous direct reception (no gap of 1.5 s or more)
+restores the direct path, and only after the relay request has stood for at
+least 10 s. After a restore, a new relay request needs both the three-second
+loss and 10 s on the direct path. A marginal link therefore changes at most once
+per 10 s instead of flapping; one-Hz direct reports still count as continuous,
+sparse discovery bursts every 2–3 s do not.
 A relayed reception never counts as proof that the direct path has recovered.
+
+RRLS offers readiness, and relays the primary's uplink, only while it has heard
+a CRC-valid AV-bay frame itself in the last 5 s. With all three radios in one
+room and a silent AV bay, a relay cannot help and would only repeat every
+primary uplink on the same air (more collisions and CRC rejections); those
+frames are counted in `relay_decision.rrls_suppressed_no_av_bay` instead.
+`GET /api/rrls/status` reports `relay_decision`: the current request, the
+reason and age of its last change (also logged and shown on the topology
+page's RRLS node), the transition count, and the direct-frame age and
+continuous span.
 If the main station disappears altogether, RRLS stops forwarding when the lease
 expires but continues receiving and serving its own local recovery data.
 
@@ -67,11 +82,19 @@ transport frames retain their order because timestamp deltas may depend on prior
 frames. A bounded 256-entry header classification cache recognizes compact GPS
 without expanding its payload. It is limited to 64
 frames / 64 KiB, drops lower-priority work first, and expires stale pending work.
-Forwarding is capped at 2,000 framed UART bytes/second, with a 4,160-byte burst,
-to leave airtime for the original rocket transmission and return traffic. This
-is an application budget; modem RF overhead is additional. Normal traffic
-expires after 250 ms; GPS after 1.5 seconds. Equal-priority work
-keeps FIFO order. Queue drops are observable rather than an allocation failure.
+Forwarding uses the shared UART capacity controller, including per-frame air
+cost, outstanding byte debt and the serial quiet interval. With the matched
+32 kbit/s application profile, RRLS starts at 35% and can negotiate 50% while
+the primary holds 15%; RF uses 35%. Returning to primary 25% requires a
+confirmed relay downshift. See [application airtime allocation](radio-budget-operation.md)
+for deployment compatibility, conservative startup and configuration faults.
+
+Sparse downlink telemetry and GPS normally expire after 1.5 seconds; other
+ordinary work and interactive control retain the default 250 ms deadline. Independent address discovery uses 3 seconds,
+operating-mode replies use 5 seconds, and context-bound budget negotiation uses
+8 seconds. Started settings transfers retain their existing ownership policy.
+Equal-priority work keeps FIFO order. Queue drops are observable rather than an
+allocation failure.
 
 RRLS local clients can view recovery telemetry, maps, and recordings and control
 local recording. Flight/GSE commands are issued at the main station and relayed;
@@ -128,7 +151,8 @@ it always enables RRLS mode. As with `build.py`, the frontend defaults to `main`
 `--frontend-dev` selects the matching development WebUI. Run `python3 run_rrls.py --help` to list options.
 
 For boot-time operation, adapt [rrls.service](rrls.service) to the installed user
-and paths. `GS_USERS_FILE` selects RRLS's own users file; provision accounts using
+and paths. To switch the RRLS build or run it against a simulated paired primary
+from the UI, see [Station mode switch](station-modes.md). `GS_USERS_FILE` selects RRLS's own users file; provision accounts using
 the existing GroundStation authentication process. Serve the existing frontend
 bundle at `frontend/dist/public` under the service working directory. Connect the
 phone/tablet to RRLS's router and use `https://<pi-address>` for a native
@@ -166,8 +190,35 @@ before starting RRLS. Both builds use the same isolated frontend revision.
 
 ## Native app handover and application identity
 
-Pairing is opt-in. Provision a persistent application signing identity, independent
-of HTTP, HTTPS certificates, or a reverse proxy:
+Pairing is opt-in. It gives both stations one persistent application signing
+identity, independent of HTTP, HTTPS certificates, or a reverse proxy.
+
+**From the UI (no file copying).** Both stations need their radio roles and the
+RRLS must hear the primary. On each station an application administrator opens
+**Administration > Station pairing**, checks the station's own address (as apps
+reach it, prefilled from the current connection) and selects **Start pairing**
+within five minutes of each other. The stations exchange keys over the radio
+and each shows the same six-digit code. Compare the two screens, type the code
+on each station and confirm. Nothing is saved until both admins confirm: the
+primary saves after its admin confirmed and the RRLS proved, with the new
+identity, that its admin confirmed the same code; the RRLS saves on the
+primary's signed reply. Then restart both services so signed control, settings
+and checklist sync, mode sync and handover start with the new identity. The
+page shows paired or not paired, the peer and its address, a short identity
+fingerprint (the same on both stations), whether a restart is still needed and,
+on RRLS, whether the primary accepts signed requests. **Unpair** deletes that
+station's identity; unpair the other station too and restart both.
+
+How it works: an ephemeral X25519 agreement over the existing settings channel.
+The RRLS commits to its key before it sees the primary's, so a relay in the
+middle gets one guess in a million at matching the codes. The primary generates
+the seed and installation id and sends them encrypted under the agreed key
+(ChaCha20-Poly1305). The result is exactly the `pair_stations.py` layout,
+written to `data/station-pairing/` under the service working directory
+(`GS_STATION_PAIRING_DIR` overrides), with the seed file mode 0600. The
+exchange adds a few hundred bytes of radio traffic only while a window is open.
+
+**From the command line.** Provision both bundles on a trusted machine:
 
 ```sh
 python3 backend/tools/pair_stations.py --output /private/path/station-pair \
@@ -175,12 +226,25 @@ python3 backend/tools/pair_stations.py --output /private/path/station-pair \
 ```
 
 Install `primary/` on the primary station and `rrls/` on RRLS, outside the source
-checkout. Set `GS_STATION_PAIRING_FILE` to each station's `pairing.json` and restart
-the service. Keep `identity.seed` private; it is the installation's application
+checkout. Set `GS_STATION_PAIRING_FILE` to each station's `pairing.json` (or pass
+`--pairing FILE` to `run_groundstation.py` / `run_rrls.py`; see
+[rrls.service](rrls.service) for systemd) and restart the service.
+`GS_STATION_PAIRING_FILE` takes priority over a pairing saved from the UI, and
+the UI cannot unpair it.
+
+Keep `identity.seed` private; it is the installation's application
 identity and session-signing key. Do not regenerate it for HTTPS certificate
 renewal. The configured URLs may use HTTP or HTTPS and may point at a proxy.
 TLS trust is still governed by the app's connection settings. HTTP retains its
 normal lack of transport encryption.
+
+A broken or partial pairing never blocks login or primary operation: the
+station logs it, shows it on the pairing page and runs unpaired (local
+sessions, no shared checklist requirement, its own abort-history identity).
+Paired-only features stay off until the pairing is fixed: signed RRLS control,
+mode and clock sync, settings and checklist sync, and handover. If one station
+saved and the other did not (for example a window expired after one confirm),
+unpair the saved one and pair again.
 
 Provision the same username on both servers with the intended local permissions.
 Sign in once after enabling pairing to obtain a portable session. The destination
@@ -223,9 +287,14 @@ GS–RF edge. Direct reception must be observed before the direct edge is shown
 again. A delayed READY can establish radio presence without renewing command
 readiness. The detail panel distinguishes relayed telemetry from confirmed
 command readiness; stale peer observations become offline after 15 seconds.
-A previously observed RRLS remains visible in standby. A never-observed standby
-radio cannot be inferred from configuration alone because standby does not
-advertise SDK discovery. Downstream board connections still come from discovery.
+A previously observed RRLS remains visible in standby. Besides READY and
+relayed traffic, a station-mode or command-capability frame from the RRLS that
+the primary verified (pairing signature, or the mesh session for an unpaired
+mode display) also counts as observation; this adds no radio traffic and grants
+no lease. Because standby is otherwise silent, the node is labelled with the age
+of that last verified exchange ("RRLS · Standby · seen N s ago") rather than as
+live. A never-observed standby radio cannot be inferred from configuration
+alone because standby does not advertise SDK discovery. Downstream board connections still come from discovery.
 
 The status API's `forwarded_frames` is a cumulative count of all successful mesh
 transmissions, including presence and settings. It does not prove that RRLS is
@@ -235,3 +304,70 @@ application envelopes. These counters exclude presence/settings messages,
 failed writes, cancelled queued work, and the outer UART header. `forwarding`
 reports the current relay lease decision; inspect its freshness separately from
 cumulative counts.
+
+### Requests through the primary station
+
+With the existing pairing configured on both stations, RRLS automatically negotiates
+signed control capabilities from its paired primary. Each station must have exactly
+one paired counterparty of the expected role. No additional feature flag is needed.
+A connected RRLS sends operator requests through the primary; it does not execute
+those hardware commands locally. A normal RRLS build can request commands supported
+by a HITL primary without running local HITL behavior.
+
+Both stations check the operator's current enabled account and permissions. The
+primary also checks its current mode and interlocks before admitting a command.
+Network UTC changes use the primary's existing time-setting policy. Local bearer
+tokens are never sent over the radio. Only one request can be pending; radio retries
+retain its exact identity and cannot dispatch the same request twice.
+
+`GET /api/rrls/control` distinguishes a pending request, acceptance by the primary,
+rejection and an unknown outcome. Acceptance means the primary admitted the request,
+not that a board actuated or acknowledged it. A timeout or disconnect must be resolved
+by inspecting actual state before issuing a new request; unknown commands are not
+replayed automatically. Temporary capability-discovery loss uses bounded retry
+bursts with a cooldown and stops after negotiation succeeds.
+
+The UI polls this local status endpoint without sending radio traffic. Existing
+policy controls remain subject to fresh displayed state. The separate **Request
+execution at primary** action can actuate if the primary permits it; it uses the
+current local account allowlist and signed command catalog while the primary checks
+its live policy. It does not claim that an expired displayed interlock is enabled.
+
+Primary valve, fill-board, topology and host-temperature observations can accompany
+signed capability and command replies. They retain source ages, add the original
+request's whole elapsed time, and expire instead of confirming a requested target.
+These are sparse observations, not a continuous telemetry stream. While the
+primary's HEALTH is fresh and reports its own direct link (RRLS not relaying)
+and no readiness check or command is pending, a paired RRLS sends one signed
+observation query every 10 s with a fresh nonce. Query plus reply stay under
+55 B/s worst case, about a fifth of the 256 B/s settings allowance. A lost reply
+is not retried; rows simply age and expire as before. Host temperature
+currently travels from primary to RRLS only. Unknown pressures,
+baselines and primary configuration are not replaced by RRLS-local values. A later
+host receipt is not proof that a board generated its report after a command.
+
+Besides the command catalog, an RRLS operator can ask the primary to **Clear GSE
+abort** (`/api/gse/abort/clear` on RRLS). It travels as the proxy-only catalog
+entry `ClearGseAbort` and the primary runs exactly its local endpoint: the
+account needs the ValveSelfTest command, the GroundStation must be aborted with
+no sequence active and no abort delivery pending, and network time must be
+synchronized. It never clears board aborts or the launch lock. An older primary
+does not advertise it and the RRLS refuses the request.
+
+Launch, GroundStation Launch and phase steps requested from RRLS are admitted by
+the same primary code as a local Launch: a present board reporting Abort blocks
+it, the launch lock still needs its release (Reset all boards, or every
+present board verified healthy at the primary), and Launch is refused while
+turbocharge runs. The RRLS additionally needs fresh signed primary board state.
+
+These stay at the primary on purpose: **Reset all boards** and per-board
+recovery (their frozen-ticket confirmation is bound to the primary session, and
+the launch lock clears only at the primary), GSE sequence start,
+pause and cancel, cold-flow override, the dry self-test confirmation,
+qualification reset and pressure-limit configuration.
+
+Standalone physical command authority is unavailable: the existing RRLS identity
+and board GS-heartbeat ownership do not provide a safe takeover/handover protocol.
+Local recording and the separate durable T-clock reset workflow retain their
+existing policies. Display-mode synchronization alone does not grant hardware
+control authority.

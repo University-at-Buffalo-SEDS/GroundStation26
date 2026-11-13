@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use base64::{
     Engine,
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
@@ -45,23 +45,11 @@ pub enum Action {
     Offer(bool),
     Disconnect,
 }
-#[derive(Clone)]
-pub struct Controller {
-    pub tx: mpsc::UnboundedSender<Action>,
-    pub view: Arc<Mutex<View>>,
-}
-impl Controller {
-    pub fn start() -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let view = Arc::new(Mutex::new(View::default()));
-        let shared = view.clone();
-        std::thread::spawn(move || {
-            let runtime = tokio::runtime::Runtime::new().expect("worker runtime");
-            runtime.block_on(control(rx, shared));
-        });
-        Self { tx, view }
-    }
-}
+#[path = "owned_worker.rs"]
+mod owned_worker;
+pub use owned_worker::{Controller, ShutdownPoll, WorkerOwner};
+use owned_worker::{LocalScope, OwnedJobTask, OwnedProcess, WorkerExit};
+
 #[derive(Clone)]
 struct Session {
     client: reqwest::Client,
@@ -69,6 +57,9 @@ struct Session {
     base: Url,
     token: String,
     host: Option<String>,
+    generation: Option<String>,
+    local: Arc<LocalScope>,
+    shutdown: CancellationToken,
 }
 #[derive(Deserialize)]
 struct Challenge {
@@ -88,6 +79,8 @@ struct Proof<'a> {
 }
 #[derive(Clone, Deserialize)]
 struct Job {
+    #[serde(default)]
+    generation: Option<String>,
     id: String,
     input: String,
     output: String,
@@ -96,6 +89,12 @@ struct Job {
 struct Heartbeat {
     selected: bool,
     jobs: Vec<Job>,
+    #[serde(default)]
+    generation: Option<String>,
+    #[serde(default)]
+    stopped_generation: Option<String>,
+    #[serde(default)]
+    cleanup_complete: bool,
 }
 fn update(view: &Arc<Mutex<View>>, f: impl FnOnce(&mut View)) {
     if let Ok(mut v) = view.lock() {
@@ -157,12 +156,27 @@ async fn bytes(response: reqwest::Response, maximum: usize) -> Result<Vec<u8>> {
 async fn json<T: serde::de::DeserializeOwned>(response: reqwest::Response) -> Result<T> {
     Ok(serde_json::from_slice(&bytes(response, 65536).await?)?)
 }
-async fn connect(
-    station: String,
-    username: String,
-    password: String,
-    local_certificate: bool,
+#[cfg(test)]
+async fn connect(station: String, username: String, password: String, local_certificate: bool) -> Result<Session> {
+    connect_scoped(station, username, password, local_certificate, &CancellationToken::new()).await
+}
+async fn network<T>(shutdown: &CancellationToken, deadline: Option<tokio::time::Instant>, operation: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => anyhow::bail!("video_processing_shutdown_requested"),
+        _ = async { if let Some(deadline) = deadline { tokio::time::sleep_until(deadline).await; } else { std::future::pending::<()>().await; } } => anyhow::bail!("video_processing_phase_deadline"),
+        result = operation => result,
+    }
+}
+fn open(shutdown: &CancellationToken) -> Result<()> {
+    ensure!(!shutdown.is_cancelled(), "video_processing_shutdown_requested");
+    Ok(())
+}
+async fn connect_scoped(
+    station: String, username: String, password: String, local_certificate: bool,
+    shutdown: &CancellationToken,
 ) -> Result<Session> {
+    open(shutdown)?;
     let base = Url::parse(station.trim())?;
     ensure!(
         matches!(base.scheme(), "http" | "https")
@@ -194,7 +208,7 @@ async fn connect(
         .danger_accept_invalid_certs(local_certificate)
         .build()?;
     let username = username.trim().to_lowercase();
-    let challenge: Challenge = json(
+    let challenge: Challenge = network(shutdown, None, async { json(
         client
             .post(endpoint(&base, "/api/auth/challenge")?)
             .json(&serde_json::json!({"username":username}))
@@ -202,7 +216,8 @@ async fn connect(
             .await
             .context("Cannot contact station")?,
     )
-    .await?;
+    .await }).await?;
+    open(shutdown)?;
     ensure!(
         challenge.algorithm == "pbkdf2_sha256"
             && (10_000..=2_000_000).contains(&challenge.iterations),
@@ -238,7 +253,9 @@ async fn connect(
         .as_ref(),
     );
     key.fill(0);
-    let result:serde_json::Value=json(client.post(endpoint(&base,"/api/auth/login")?).json(&serde_json::json!({"username":username,"challenge_id":challenge.challenge_id,"client_nonce_b64":nonce,"remember_me":false,"proof_b64":proof})).send().await.context("Station login failed")?).await?;
+    open(shutdown)?;
+    let result:serde_json::Value=network(shutdown,None,async {json(client.post(endpoint(&base,"/api/auth/login")?).json(&serde_json::json!({"username":username,"challenge_id":challenge.challenge_id,"client_nonce_b64":nonce,"remember_me":false,"proof_b64":proof})).send().await.context("Station login failed")?).await}).await?;
+    open(shutdown)?;
     let token = result["token"]
         .as_str()
         .context("Station did not return a session")?
@@ -249,82 +266,61 @@ async fn connect(
         base,
         token,
         host: None,
+        generation: None,
+        local: Arc::new(LocalScope::default()),
+        shutdown: shutdown.clone(),
     };
-    let response = session
+    let _: serde_json::Value = network(shutdown,None,async { let response = session
         .client
         .get(endpoint(&session.base, "/api/video/transcode/hosts")?)
         .bearer_auth(&session.token)
         .send()
         .await
         .context("Cannot check stream-manager access")?;
-    let _: serde_json::Value = json(response).await?;
+    json(response).await }).await?;
+    open(shutdown)?;
     Ok(session)
 }
+#[cfg(test)]
 async fn test(session: &mut Session, name: String) -> Result<serde_json::Value> {
-    let begin: serde_json::Value = json(
-        session
-            .client
-            .post(endpoint(&session.base, "/api/video/transcode/test")?)
-            .bearer_auth(&session.token)
-            .json(&serde_json::json!({"name":name}))
-            .send()
-            .await?,
-    )
-    .await?;
+    let result = test_scoped(session, name, &CancellationToken::new(), tokio::time::Instant::now() + Duration::from_secs(60)).await;
+    session.local.settle().await;
+    result
+}
+async fn test_scoped(session: &mut Session, name: String, shutdown: &CancellationToken, deadline: tokio::time::Instant) -> Result<serde_json::Value> {
+    open(shutdown)?;
+    let begin: serde_json::Value = network(shutdown,Some(deadline),async {json(session.client.post(endpoint(&session.base,"/api/video/transcode/test")?).bearer_auth(&session.token).json(&serde_json::json!({"name":name})).send().await?).await}).await?;
+    open(shutdown)?;
     let id = begin["id"].as_str().context("Invalid test ID")?;
     let count = begin["test_bytes"].as_u64().context("Invalid test size")? as usize;
     ensure!(count <= 8 * 1024 * 1024, "Network test too large");
-    let download = endpoint(
-        &session.base,
-        &format!("/api/video/transcode/test/{id}/download"),
-    )?;
-    let start = Instant::now();
-    let data = bytes(
-        session
-            .client
-            .get(download)
-            .bearer_auth(&session.token)
-            .header("Accept-Encoding", "identity")
-            .send()
-            .await?,
-        count,
-    )
-    .await?;
-    ensure!(data.len() == count, "Incomplete download test");
-    let down = (count as f64 * 8.0 / start.elapsed().as_secs_f64().max(0.001)) as u64;
-    let response = session
-        .client
-        .post(endpoint(
-            &session.base,
-            &format!("/api/video/transcode/test/{id}/upload"),
-        )?)
-        .bearer_auth(&session.token)
-        .body(data)
-        .send()
-        .await?;
-    ensure!(response.status().is_success(), "Upload test failed");
-    let encoding_ms = benchmark().await?;
-    let report: serde_json::Value = json(
-        session
-            .client
-            .post(endpoint(
-                &session.base,
-                &format!("/api/video/transcode/test/{id}/complete"),
-            )?)
-            .bearer_auth(&session.token)
-            .json(&serde_json::json!({"encoding_ms":encoding_ms,"download_bps":down}))
-            .send()
-            .await?,
-    )
-    .await?;
-    session.host = Some(id.to_owned());
+    let download = endpoint(&session.base,&format!("/api/video/transcode/test/{id}/download"))?;
+    let start=Instant::now();
+    let data=network(shutdown,Some(deadline),async {bytes(session.client.get(download).bearer_auth(&session.token).header("Accept-Encoding","identity").send().await?,count).await}).await?;
+    open(shutdown)?;
+    ensure!(data.len()==count,"Incomplete download test");
+    let down=(count as f64 * 8.0 / start.elapsed().as_secs_f64().max(0.001)) as u64;
+    let response=network(shutdown,Some(deadline),async {Ok(session.client.post(endpoint(&session.base,&format!("/api/video/transcode/test/{id}/upload"))?).bearer_auth(&session.token).body(data).send().await?)}).await?;
+    open(shutdown)?;
+    ensure!(response.status().is_success(),"Upload test failed");
+    let encoding_ms=benchmark_scoped(shutdown,&session.local,deadline.min(tokio::time::Instant::now()+Duration::from_secs(30))).await?;
+    open(shutdown)?;
+    let report:serde_json::Value=network(shutdown,Some(deadline),async {json(session.client.post(endpoint(&session.base,&format!("/api/video/transcode/test/{id}/complete"))?).bearer_auth(&session.token).json(&serde_json::json!({"encoding_ms":encoding_ms,"download_bps":down})).send().await?).await}).await?;
+    open(shutdown)?;
+    session.host=Some(id.to_owned());
+    session.generation=match report.get("generation") {
+        None|Some(serde_json::Value::Null)=>None,
+        Some(serde_json::Value::String(value))if valid_generation(value)=>Some(value.clone()),
+        _=>anyhow::bail!("Invalid station processing generation"),
+    };
     Ok(report)
 }
-pub async fn benchmark() -> Result<u64> {
-    let start = Instant::now();
-    let status = tokio::time::timeout(
-        Duration::from_secs(30),
-        Command::new("ffmpeg")
+async fn benchmark_scoped(shutdown: &CancellationToken, local: &Arc<LocalScope>, deadline: tokio::time::Instant) -> Result<u64> {
+    open(shutdown)?;
+    let start=Instant::now();
+    let mut command=Command::new("ffmpeg");
+    #[cfg(unix)] { use std::os::unix::process::CommandExt; command.as_std_mut().process_group(0); }
+    let spawned=command
             .args([
                 "-hide_banner",
                 "-loglevel",
@@ -360,42 +356,50 @@ pub async fn benchmark() -> Result<u64> {
                 "null",
                 "-",
             ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .status(),
-    )
-    .await
-    .context("Encoding test timed out")?
-    .context("Install FFmpeg with libx264 and AAC support")?;
-    ensure!(
-        status.success(),
-        "FFmpeg could not complete the encoding test"
-    );
-    Ok(start.elapsed().as_millis().max(1) as u64)
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).spawn().context("Install FFmpeg with libx264 and AAC support")?;
+    let mut child=OwnedProcess::new(spawned,local.clone());
+    #[cfg(unix)]
+    if !child.id().is_some_and(encoder_group::verified) {
+        let cleanup=stop_encoder(&mut child).await;
+        anyhow::bail!(cleanup.err().map(CleanupUncertain::code).unwrap_or("video_processing_benchmark_group_unverified"));
+    }
+    #[cfg(test)] owned_worker::observe_benchmark_spawned(child.id().expect("live benchmark child"));
+    let status={
+        tokio::select! {
+            biased;
+            _=shutdown.cancelled()=>None,
+            _=tokio::time::sleep_until(deadline)=>None,
+            status=child.wait()=>Some(status),
+        }
+    };
+    match status {
+        Some(Ok(status)) if status.success()=>Ok(start.elapsed().as_millis().max(1)as u64),
+        _=>{
+            let cleanup=stop_encoder(&mut child).await;
+            anyhow::bail!(cleanup.err().map(CleanupUncertain::code).unwrap_or("video_processing_benchmark_cancelled_or_failed"))
+        }
+    }
 }
 async fn heartbeat(session: &Session, offered: bool) -> Result<Heartbeat> {
     let id = session.host.as_deref().context("Test this host first")?;
-    json(
-        session
-            .client
-            .post(endpoint(
-                &session.base,
-                &format!("/api/video/transcode/host/{id}"),
-            )?)
-            .bearer_auth(&session.token)
-            .json(&serde_json::json!({"offered":offered}))
-            .send()
-            .await?,
-    )
-    .await
+    let reply: Heartbeat = json(session.client.post(endpoint(&session.base, &format!("/api/video/transcode/host/{id}"))?)
+        .bearer_auth(&session.token)
+        .timeout(Duration::from_secs(15))
+        .json(&serde_json::json!({"offered":offered,"generation":session.generation}))
+        .send().await?).await?;
+    if offered && session.generation.is_some() {
+        ensure!(reply.generation == session.generation, "Station returned a different processing generation");
+    }
+    #[cfg(test)] owned_worker::observe_stop_ack(session,offered,&reply);
+    Ok(reply)
 }
 // FFmpeg must see the complete HLS master, including alternate audio renditions.
 // Keep station credentials inside this bounded loopback proxy, never in argv.
 #[derive(Clone)]
+struct NetworkSession { client: reqwest::Client, base: Url, token: String }
+#[derive(Clone)]
 struct HlsProxy {
-    session: Session,
+    session: NetworkSession,
     prefix: String,
     origin: String,
     capability: String,
@@ -518,6 +522,7 @@ async fn proxy_request(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     tokio::select! {
+        biased;
         _ = proxy.cancelled.cancelled() => axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(),
         result = tokio::time::timeout(Duration::from_secs(15), proxy.response(uri.path(), &headers)) => {
             match result {
@@ -527,12 +532,94 @@ async fn proxy_request(
         }
     }
 }
-struct ProxyGuard(CancellationToken);
-impl Drop for ProxyGuard {
-    fn drop(&mut self) {
-        self.0.cancel();
+#[derive(Clone, Copy, Debug)]
+enum CleanupUncertain {
+    #[cfg(unix)]
+    EncoderGroup,
+    EncoderKillAndWait,
+    EncoderWait,
+    EncoderTimeout,
+    ProxyJoin,
+    ProxyTimeout,
+    RemoteCompletion,
+    JobJoin,
+}
+impl CleanupUncertain {
+    fn code(self) -> &'static str {
+        match self {
+            #[cfg(unix)]
+            Self::EncoderGroup => "video_processing_encoder_group_cleanup_unverified",
+            Self::EncoderKillAndWait => "video_processing_encoder_kill_and_wait_unverified",
+            Self::EncoderWait => "video_processing_encoder_wait_unverified",
+            Self::EncoderTimeout => "video_processing_encoder_cleanup_timeout",
+            Self::ProxyJoin => "video_processing_proxy_join_unverified",
+            Self::ProxyTimeout => "video_processing_proxy_cleanup_timeout",
+            Self::RemoteCompletion => "video_processing_remote_completion_unverified",
+            Self::JobJoin => "video_processing_job_join_unverified",
+        }
     }
 }
+#[derive(Clone, Copy, Debug)]
+enum JobOutcome {
+    Completed,
+    Cancelled,
+    Failed(&'static str),
+    CleanupUncertain(CleanupUncertain),
+}
+#[derive(Default)]
+struct StopReport {
+    failed: Option<&'static str>,
+    uncertain: Option<CleanupUncertain>,
+}
+impl StopReport {
+    fn add_uncertainty(&mut self, reason: CleanupUncertain) {
+        // Local cleanup uncertainty cannot be overwritten by an unrelated
+        // remote-only uncertainty whose acknowledgement could later clear it.
+        if self.uncertain.is_none() || matches!(self.uncertain, Some(CleanupUncertain::RemoteCompletion)) {
+            self.uncertain = Some(reason);
+        }
+    }
+    fn observe(&mut self, outcome: Result<JobOutcome, tokio::task::JoinError>) {
+        match outcome {
+            Ok(JobOutcome::Completed | JobOutcome::Cancelled) => {},
+            Ok(JobOutcome::Failed(code)) => self.failed = Some(code),
+            Ok(JobOutcome::CleanupUncertain(reason)) => self.add_uncertainty(reason),
+            Err(_) => self.uncertain = Some(CleanupUncertain::JobJoin),
+        }
+    }
+}
+fn publish_cleanup_blocked(view: &Arc<Mutex<View>>, reason: CleanupUncertain) {
+    update(view, |v| {
+        v.offered = false;
+        v.passed = false;
+        v.busy = false;
+        v.message = format!("{}: cleanup was not verified; new processing work is blocked.", reason.code());
+    });
+}
+
+struct ProxyGuard {
+    cancelled: CancellationToken,
+    task: Option<JoinHandle<std::io::Result<()>>>,
+    local: Arc<LocalScope>,
+}
+impl ProxyGuard {
+    async fn close(mut self) -> Result<(), CleanupUncertain> {
+        self.cancelled.cancel();
+        let Some(mut task)=self.task.take()else{return Ok(());};
+        match tokio::time::timeout(Duration::from_secs(15),&mut task).await {
+            Ok(Ok(Ok(())))=>{self.local.complete_proxy();Ok(())},
+            Ok(_)=>{self.local.fail(CleanupUncertain::ProxyJoin.code());self.local.complete_proxy();Err(CleanupUncertain::ProxyJoin)},
+            Err(_)=>{self.local.retain_proxy(task);Err(CleanupUncertain::ProxyTimeout)},
+        }
+    }
+}
+impl Drop for ProxyGuard {
+    fn drop(&mut self) {
+        self.cancelled.cancel();
+        if let Some(task)=self.task.take(){self.local.retain_proxy(task);}
+    }
+}
+
 async fn proxy(session: Session, input: &str) -> Result<(ProxyGuard, String)> {
     let input = endpoint(&session.base, input)?;
     ensure!(
@@ -555,26 +642,142 @@ async fn proxy(session: Session, input: &str) -> Result<(ProxyGuard, String)> {
         ),
         origin: format!("http://{}", listener.local_addr()?),
         capability: URL_SAFE_NO_PAD.encode(random),
-        session,
+        session: NetworkSession { client:session.client.clone(),base:session.base.clone(),token:session.token.clone() },
         cancelled: CancellationToken::new(),
         requests: Arc::new(tokio::sync::Semaphore::new(8)),
     };
     let url = state.address(&input, input.as_str())?;
     let cancelled = state.cancelled.clone();
-    let guard = ProxyGuard(cancelled.clone());
     let app = axum::Router::new()
         .fallback(axum::routing::get(proxy_request))
         .with_state(state);
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app)
-            .with_graceful_shutdown(cancelled.cancelled_owned())
+    let server_cancelled = cancelled.clone();
+    let task = tokio::spawn(async move {
+        let result=axum::serve(listener, app)
+            .with_graceful_shutdown(server_cancelled.cancelled_owned())
             .await;
+        #[cfg(test)] owned_worker::observe_proxy_return().await;
+        result
     });
-    Ok((guard, url))
+    session.local.track_proxy();
+    Ok((ProxyGuard { cancelled, task: Some(task), local:session.local.clone() }, url))
 }
+#[cfg(test)]
 async fn transcode(session: Session, job: Job) -> Result<()> {
-    let (_proxy, input) = proxy(session.clone(), &job.input).await?;
-    let mut child = Command::new("ffmpeg")
+    match transcode_until_cancelled(session, job, CancellationToken::new()).await {
+        JobOutcome::Completed | JobOutcome::Cancelled => Ok(()),
+        JobOutcome::Failed(code) => Err(anyhow::anyhow!(code)),
+        JobOutcome::CleanupUncertain(reason) => Err(anyhow::anyhow!(reason.code())),
+    }
+}
+// No crate dependency is added for POSIX group ownership. These calls use
+// only an owned/unreaped Child id, and are never compiled on non-Unix hosts.
+#[cfg(unix)]
+mod encoder_group {
+    unsafe extern "C" {
+        fn getpgid(pid: std::ffi::c_int) -> std::ffi::c_int;
+        fn getpgrp() -> std::ffi::c_int;
+        fn kill(pid: std::ffi::c_int, signal: std::ffi::c_int) -> std::ffi::c_int;
+    }
+    pub fn verified(pid: u32) -> bool {
+        // SAFETY: caller holds the unreaped Child that supplied this id.
+        unsafe { getpgid(pid as std::ffi::c_int) == pid as std::ffi::c_int
+            && pid as std::ffi::c_int != getpgrp() }
+    }
+    pub fn terminate(pid: u32) -> bool {
+        if !verified(pid) { return false; }
+        // SIGKILL is 9 on the supported Unix platforms. Revalidate first so a
+        // failed setpgid or parent group can never receive a group signal.
+        unsafe { kill(-(pid as std::ffi::c_int), 9) == 0 }
+    }
+}
+async fn stop_encoder(child: &mut OwnedProcess) -> Result<(), CleanupUncertain> {
+    #[cfg(unix)]
+    let group_failed = child.id().is_some_and(|pid| !encoder_group::terminate(pid));
+    #[cfg(not(unix))]
+    let group_failed = false;
+    // A direct-kill error never bypasses wait. A completed child can make the
+    // kill redundant; actual wait is authoritative for reaping its pid.
+    let killed = child.start_kill();
+    let waited = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+    let result=match waited {
+        Ok(Ok(_)) if !group_failed => Ok(()),
+        #[cfg(unix)]
+        Ok(Ok(_)) => Err(CleanupUncertain::EncoderGroup),
+        #[cfg(not(unix))]
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(_)) if killed.is_err() => Err(CleanupUncertain::EncoderKillAndWait),
+        Ok(Err(_)) => Err(CleanupUncertain::EncoderWait),
+        Err(_) => Err(CleanupUncertain::EncoderTimeout),
+    };
+    if let Err(reason)=result { child.cleanup_error(reason); }
+    result
+}
+async fn rejected_upload(response: reqwest::Response, cancelled: &CancellationToken) -> JobOutcome {
+    let status = response.status();
+    // Auth rejection is pre-spawn or follows known cleanup in this backend.
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return JobOutcome::Failed("video_processing_authorization_rejected");
+    }
+    // Read only the bounded stable error code, never log an error body. Unknown
+    // remote completion is not evidence that another remux process is gone.
+    let read = async {
+        let mut response = response;
+        if response.content_length().is_some_and(|length| length > 256) { return None; }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.ok()? {
+            if body.len() + chunk.len() > 256 { return None; }
+            body.extend_from_slice(&chunk);
+        }
+        String::from_utf8(body).ok()
+    };
+    let code = tokio::select! {
+        biased;
+        _ = cancelled.cancelled() => None,
+        code = tokio::time::timeout(Duration::from_secs(15), read) => code.ok().flatten(),
+    };
+    match (status.as_u16(), code.as_deref()) {
+        (400, Some("Invalid source camera" | "IDs must be 1–64 ASCII letters, digits, hyphens or underscores" | "video_upload_interrupted"))
+        | (409, Some("Host is no longer selected" | "video_processing_assignment_revoked" | "video_processing_generation_revoked" | "video_processing_generation_stale" | "video_processing_previous_upload_not_reaped"))
+        | (408, Some("video_upload_cancelled"))
+        | (502, Some("video_remux_failed" | "video_remux_ended_before_input" | "video_remux_input_failed" | "video_remux_pipe_missing"))
+        | (503, Some("FFmpeg remuxer is unavailable" | "Invalid local video receiver" | "Invalid receiver"))
+        | (504, Some("video_remux_timeout")) => JobOutcome::Failed("video_processing_upload_rejected_after_known_cleanup"),
+        _ => JobOutcome::CleanupUncertain(CleanupUncertain::RemoteCompletion),
+    }
+}
+
+async fn transcode_until_cancelled(
+    session: Session,
+    job: Job,
+    cancelled: CancellationToken,
+) -> JobOutcome {
+    if job.generation != session.generation {
+        return JobOutcome::Failed("video_processing_job_generation_mismatch");
+    }
+    let destination = match endpoint(&session.base, &job.output) {
+        Ok(destination) => destination,
+        Err(_) => return JobOutcome::Failed("video_processing_output_address_rejected"),
+    };
+    if cancelled.is_cancelled() || session.shutdown.is_cancelled() { return JobOutcome::Cancelled; }
+    let (proxy, input) = tokio::select! {
+        biased;
+        _ = cancelled.cancelled() => return JobOutcome::Cancelled,
+        _ = session.shutdown.cancelled() => return JobOutcome::Cancelled,
+        input = proxy(session.clone(), &job.input) => match input {
+            Ok(input) => input,
+            Err(_) => return JobOutcome::Failed("video_processing_proxy_start_failed"),
+        },
+    };
+    let work = async {
+        if cancelled.is_cancelled() || session.shutdown.is_cancelled() { return JobOutcome::Cancelled; }
+        let mut command = Command::new("ffmpeg");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.as_std_mut().process_group(0);
+        }
+        let spawned = command
         .args([
             "-hide_banner",
             "-loglevel",
@@ -634,57 +837,374 @@ async fn transcode(session: Session, job: Job) -> Result<()> {
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(if cfg!(test) {
+        .stderr(if cfg!(test) && std::env::var_os("GS_VIDEO_COMPLETION_TEST").is_some() {
+            Stdio::null()
+        } else if cfg!(test) {
             Stdio::inherit()
         } else {
             Stdio::null()
         })
-        .kill_on_drop(true)
-        .spawn()
-        .context("Cannot start FFmpeg")?;
-    let output = child.stdout.take().unwrap();
-    let upload = session
-        .upload_client
-        .post(endpoint(&session.base, &job.output)?)
-        .bearer_auth(&session.token)
-        .header("Content-Type", "video/x-matroska")
-        .body(reqwest::Body::wrap_stream(
-            tokio_util::io::ReaderStream::new(output),
-        ))
-        .send();
-    let result = tokio::select! {response=upload=>{let response=response.context("Encoded upload interrupted")?;ensure!(response.status().is_success(),"Station rejected encoded video (HTTP {})", response.status().as_u16());Ok(())},status=child.wait()=>{status.context("Encoder stopped")?;bail!("Encoder stopped")}};
-    let _ = child.kill().await;
-    result
+
+            .kill_on_drop(true)
+            .spawn();
+        let mut child = match spawned {
+            Ok(child) => OwnedProcess::new(child,session.local.clone()),
+            Err(_) => return JobOutcome::Failed("video_processing_encoder_spawn_failed"),
+        };
+        #[cfg(unix)]
+        if !child.id().is_some_and(encoder_group::verified) {
+            return match stop_encoder(&mut child).await {
+                Ok(()) => JobOutcome::Failed("video_processing_encoder_group_unverified"),
+                Err(reason) => JobOutcome::CleanupUncertain(reason),
+            };
+        }
+        let Some(output) = child.stdout.take() else {
+            return match stop_encoder(&mut child).await {
+                Ok(()) => JobOutcome::Failed("video_processing_encoder_pipe_missing"),
+                Err(reason) => JobOutcome::CleanupUncertain(reason),
+            };
+        };
+
+        let mut request = session.upload_client.post(destination)
+            .bearer_auth(&session.token)
+            .header("Content-Type", "video/x-matroska")
+            .body(reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(output)));
+        if let Some(generation) = &job.generation {
+            request = request.header("X-Station-Transcode-Generation", generation);
+        }
+        let mut upload = Box::pin(request.send());
+        let mut encoder_status = None;
+        enum Transfer {
+            Cancelled,
+            Reply(Result<reqwest::Response, reqwest::Error>),
+            EncoderFailed,
+            UploadTimedOut,
+        }
+        let transfer = tokio::select! {
+            biased;
+            _ = cancelled.cancelled() => Transfer::Cancelled,
+            _ = session.shutdown.cancelled() => Transfer::Cancelled,
+            response = &mut upload => Transfer::Reply(response),
+            status = child.wait() => {
+                match status {
+                    Ok(status) if status.success() => {
+                        encoder_status = Some(status);
+                        tokio::select! {
+                            biased;
+                            _ = cancelled.cancelled() => Transfer::Cancelled,
+            _ = session.shutdown.cancelled() => Transfer::Cancelled,
+                            response = tokio::time::timeout(Duration::from_secs(15), &mut upload) => {
+                                match response {
+                                    Ok(response) => Transfer::Reply(response),
+                                    Err(_) => Transfer::UploadTimedOut,
+                                }
+                            }
+                        }
+                    }
+                    _ => Transfer::EncoderFailed,
+                }
+            }
+        };
+        drop(upload);
+        match transfer {
+            Transfer::Cancelled => {
+                proxy.cancelled.cancel();
+                match stop_encoder(&mut child).await {
+                    // The upload may already have reached the station. A
+                    // local reap does not acknowledge its asynchronous remux
+                    // cleanup after the request future is dropped.
+                    Ok(()) => JobOutcome::CleanupUncertain(CleanupUncertain::RemoteCompletion),
+                    Err(reason) => JobOutcome::CleanupUncertain(reason),
+                }
+            }
+            Transfer::EncoderFailed => {
+                proxy.cancelled.cancel();
+                match stop_encoder(&mut child).await {
+                    // No backend completion response was received before
+                    // encoder failure, so remote cleanup remains unverified.
+                    Ok(()) => JobOutcome::CleanupUncertain(CleanupUncertain::RemoteCompletion),
+                    Err(reason) => JobOutcome::CleanupUncertain(reason),
+                }
+            }
+            Transfer::Reply(Err(_)) | Transfer::UploadTimedOut => {
+                proxy.cancelled.cancel();
+                match stop_encoder(&mut child).await {
+                    Ok(()) => JobOutcome::CleanupUncertain(CleanupUncertain::RemoteCompletion),
+                    Err(reason) => JobOutcome::CleanupUncertain(reason),
+                }
+            }
+            Transfer::Reply(Ok(response)) if !response.status().is_success() => {
+                // Stop/join local work BEFORE reading any rejection body. The
+                // existing control budget bounds that small completion read;
+                // it adds no delay or timeout to a healthy live upload.
+                proxy.cancelled.cancel();
+                match stop_encoder(&mut child).await {
+                    Ok(()) => rejected_upload(response, &cancelled).await,
+                    Err(reason) => JobOutcome::CleanupUncertain(reason),
+                }
+            }
+            Transfer::Reply(Ok(_)) => {
+                let completion = if let Some(status) = encoder_status {
+                    Some(Ok(Ok(status)))
+                } else {
+                    tokio::select! {
+                        biased;
+                        _ = cancelled.cancelled() => None,
+                        _ = session.shutdown.cancelled() => None,
+                        completion = tokio::time::timeout(Duration::from_secs(5), child.wait()) => Some(completion),
+                    }
+                };
+                match completion {
+                    None => {
+                        proxy.cancelled.cancel();
+                        match stop_encoder(&mut child).await {
+                            Ok(()) => JobOutcome::Cancelled,
+                            Err(reason) => JobOutcome::CleanupUncertain(reason),
+                        }
+                    }
+                    Some(Ok(Ok(status))) if status.success() => JobOutcome::Completed,
+                    Some(Ok(Ok(_))) => JobOutcome::Failed("video_processing_encoder_failed"),
+                    Some(_) => {
+                        proxy.cancelled.cancel();
+                        match stop_encoder(&mut child).await {
+                            Ok(()) => JobOutcome::Failed("video_processing_encoder_completion_failed"),
+                            Err(reason) => JobOutcome::CleanupUncertain(reason),
+                        }
+                    }
+                }
+            }
+        }
+    }.await;
+    let proxy_closed = proxy.close().await;
+    with_proxy_completion(work, proxy_closed)
 }
-async fn control(mut rx: mpsc::UnboundedReceiver<Action>, view: Arc<Mutex<View>>) {
-    let mut session: Option<Session> = None;
-    let mut jobs = HashMap::<String, JoinHandle<Result<()>>>::new();
-    let mut tick = tokio::time::interval(Duration::from_secs(3));
-    let mut offered = false;
-    loop {
-        tokio::select! {
-        action=rx.recv()=>{let Some(action)=action else{break;};
-         match action{
-          Action::Connect{station,username,password,local_certificate}=>{for(_,job)in jobs.drain(){job.abort();}offered=false;update(&view,|v|{*v=View::default();v.busy=true;v.message="Connecting…".into();});match connect(station,username,password,local_certificate).await{Ok(s)=>{session=Some(s);update(&view,|v|{v.connected=true;v.message="Connected. Test encoding and network capacity before offering this host.".into();});},Err(_)=>{session=None;update(&view,|v|v.message="Connection failed. Check the station address, certificate, account and stream-manager permission.".into());}}update(&view,|v|v.busy=false);},
-          Action::Test{name}=>{if let Some(s)=session.as_mut(){update(&view,|v|{v.busy=true;v.message="Testing network bandwidth and H.264/AAC encoding…".into();});match tokio::time::timeout(Duration::from_secs(60),test(s,name)).await{Ok(Ok(report))=>update(&view,|v|{v.passed=report["passed"].as_bool().unwrap_or(false);v.capacity=report["capacity"].as_u64().unwrap_or(0)as usize;v.encoding_ms=report["encoding_ms"].as_u64().unwrap_or(0);v.upload_bps=report["upload_bps"].as_u64().unwrap_or(0);v.download_bps=report["download_bps"].as_u64().unwrap_or(0);v.message=if v.passed{"Tests passed. Make this computer available, then select it in Stream Manager."}else{"Insufficient compute or bandwidth. This host cannot be selected."}.into();}),_=>update(&view,|v|{v.passed=false;v.message="Test failed. Check FFmpeg availability and the network connection.".into();})}update(&view,|v|v.busy=false);}},
-          Action::Offer(value)=>{offered=value;update(&view,|v|v.offered=value);if !value{for(_,job)in jobs.drain(){job.abort();}if let Some(s)=&session{let _=heartbeat(s,false).await;}}},
-          Action::Disconnect=>{offered=false;for(_,job)in jobs.drain(){job.abort();}if let Some(s)=&session{let _=heartbeat(s,false).await;}session=None;update(&view,|v|*v=View::default());}
-         }
-        },
-        _=tick.tick()=>{if offered && let Some(s)=&session{match heartbeat(s,true).await{Ok(reply)=>{
-           let wanted:HashSet<_>=reply.jobs.iter().map(|j|j.id.clone()).collect();let remove:Vec<_>=jobs.iter().filter(|(id,h)|!wanted.contains(*id)||h.is_finished()).map(|(id,_)|id.clone()).collect();for id in remove{if let Some(task)=jobs.remove(&id){task.abort();}}
-           for job in reply.jobs{if !jobs.contains_key(&job.id){jobs.insert(job.id.clone(),tokio::spawn(transcode(s.clone(),job)));}}
-           update(&view,|v|{v.jobs=jobs.len();v.message=if reply.selected{format!("Selected by GroundStation · encoding {} camera(s)",jobs.len())}else{"Available · waiting for Stream Manager selection".into()};});
-          },Err(_)=>{for(_,job)in jobs.drain(){job.abort();}update(&view,|v|{v.jobs=0;v.message="Station unavailable or permission changed. Encoding stopped; reconnect if the station restarted.".into();});}}}}
+fn with_proxy_completion(work: JobOutcome, proxy_closed: Result<(), CleanupUncertain>) -> JobOutcome {
+    match (work, proxy_closed) {
+        (JobOutcome::CleanupUncertain(reason), _) if !matches!(reason, CleanupUncertain::RemoteCompletion) => JobOutcome::CleanupUncertain(reason),
+        (_, Err(reason)) => JobOutcome::CleanupUncertain(reason),
+        (outcome, Ok(())) => outcome,
+    }
+}
+
+struct EncodingJob {
+    cancelled: CancellationToken,
+    task: OwnedJobTask,
+}
+async fn stop_jobs(jobs: &mut HashMap<String, EncodingJob>) -> StopReport {
+    for job in jobs.values() { job.cancelled.cancel(); }
+    let mut report = StopReport::default();
+    for (_, job) in jobs.drain() { report.observe(job.task.await); }
+    report
+}
+fn valid_generation(value: &str) -> bool {
+    value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+fn stop_acknowledges(original: &str, reply: &Heartbeat) -> bool {
+    reply.cleanup_complete && !reply.selected && reply.jobs.is_empty()
+        && reply.stopped_generation.as_deref() == Some(original)
+        && reply.generation.as_deref().is_some_and(|next| valid_generation(next) && next != original)
+}
+async fn stop_with_fence(
+    session: Option<&mut Session>, jobs: &mut HashMap<String, EncodingJob>,
+    prior: Option<CleanupUncertain>,
+) -> StopReport {
+    let mut report = stop_jobs(jobs).await;
+    if let Some(reason) = prior { report.add_uncertainty(reason); }
+    if let Some(session) = session {
+        let original = session.generation.clone();
+        let reply = heartbeat(session, false).await;
+        let acknowledged = original.as_deref().zip(reply.as_ref().ok())
+            .is_some_and(|(original, reply)| stop_acknowledges(original, reply));
+        if acknowledged {
+            // This mutable session remains owned by the single controller
+            // throughout the await. No replacement session adopts this ack.
+            if report.uncertain.is_none() || matches!(report.uncertain, Some(CleanupUncertain::RemoteCompletion)) {
+                session.generation = reply.unwrap().generation;
+                report.uncertain = None;
+            }
+        } else if original.is_some() {
+            report.add_uncertainty(CleanupUncertain::RemoteCompletion);
         }
     }
-    for (_, job) in jobs {
-        job.abort();
-    }
+    report
 }
+#[cfg(test)]
+async fn control(rx: mpsc::UnboundedReceiver<Action>, view: Arc<Mutex<View>>) -> Result<()> {
+    let local=Arc::new(LocalScope::default());
+    let exit=control_owned(rx,view,CancellationToken::new(),local.clone()).await;
+    local.settle().await;
+    exit.legacy(&local)
+}
+fn control_owned(mut rx: mpsc::UnboundedReceiver<Action>, view: Arc<Mutex<View>>, shutdown: CancellationToken, local: Arc<LocalScope>) -> std::pin::Pin<Box<dyn std::future::Future<Output=WorkerExit> + Send>> {
+    Box::pin(async move {
+    let mut session: Option<Session> = None;
+    let mut jobs = HashMap::<String, EncodingJob>::new();
+    let mut tick = tokio::time::interval(Duration::from_secs(3));
+    let mut offered = false;
+    // Only an authenticated acknowledgement of the original offer generation
+    // can clear remote-only uncertainty; local cleanup failures remain latched.
+    let mut uncertain: Option<CleanupUncertain> = None;
+    'control: loop {
+        tokio::select! {
+            biased;
+            _=shutdown.cancelled()=>break,
+            action = rx.recv() => {
+                let Some(action) = action else { break; };
+                if shutdown.is_cancelled(){break;}
+                match action {
+                    Action::Connect { station, username, password, local_certificate } => {
+                        if let Some(reason) = uncertain { publish_cleanup_blocked(&view,reason); continue; }
+                        let stopped = stop_with_fence(session.as_mut(), &mut jobs, uncertain).await;
+                        if let Some(reason) = stopped.uncertain {
+                            uncertain = Some(reason); offered = false;
+                            publish_cleanup_blocked(&view,reason); continue;
+                        }
+                        if shutdown.is_cancelled(){break;}
+                        offered = false;
+                        update(&view,|v|{*v=View::default();v.busy=true;v.message="Connecting…".into();});
+let result=network(&shutdown,None,connect_scoped(station,username,password,local_certificate,&shutdown)).await;
+if shutdown.is_cancelled(){break;}
+match result{Ok(mut s)=>{s.local=local.clone();s.shutdown=shutdown.clone();session=Some(s);update(&view,|v|{v.connected=true;v.message="Connected. Test encoding and network capacity before offering this host.".into();});},Err(_)=>{session=None;update(&view,|v|v.message="Connection failed. Check the station address, certificate, account and stream-manager permission.".into());}}update(&view,|v|v.busy=false);
+                    }
+                    Action::Test { name } => {
+                        if let Some(reason) = uncertain { publish_cleanup_blocked(&view,reason); continue; }
+                        // The real UI already disables Test while offered. Keep
+                        // that guard in the worker too, before any benchmark.
+                        if offered || !jobs.is_empty() {
+                            update(&view,|v|v.message="Stop offering and finish current processing before testing this host.".into());
+                            continue;
+                        }
+if let Some(s)=session.as_mut(){update(&view,|v|{v.busy=true;v.message="Testing network bandwidth and H.264/AAC encoding…".into();});let result=test_scoped(s,name,&shutdown,tokio::time::Instant::now()+Duration::from_secs(60)).await;
+if shutdown.is_cancelled(){break;}
+match result{Ok(report)=>update(&view,|v|{v.passed=report["passed"].as_bool().unwrap_or(false);v.capacity=report["capacity"].as_u64().unwrap_or(0)as usize;v.encoding_ms=report["encoding_ms"].as_u64().unwrap_or(0);v.upload_bps=report["upload_bps"].as_u64().unwrap_or(0);v.download_bps=report["download_bps"].as_u64().unwrap_or(0);v.message=if v.passed{"Tests passed. Make this computer available, then select it in Stream Manager."}else{"Insufficient compute or bandwidth. This host cannot be selected."}.into();}),_=>update(&view,|v|{v.passed=false;v.message="Test failed. Check FFmpeg availability and the network connection.".into();})}update(&view,|v|v.busy=false);}
+                    }
+                    Action::Offer(value) => {
+                        if value && let Some(reason)=uncertain { publish_cleanup_blocked(&view,reason);continue; }
+                        offered=value; update(&view,|v|v.offered=value);
+                        if !value {
+                            update(&view,|v|v.busy=true);
+                            let stopped=stop_with_fence(session.as_mut(), &mut jobs, uncertain).await;
+                            uncertain=stopped.uncertain;
+                            if let Some(reason)=uncertain { publish_cleanup_blocked(&view,reason); }
+                            else { update(&view,|v|{v.busy=false;v.jobs=0;v.message=stopped.failed.unwrap_or("Processing stopped after acknowledged remote cleanup; this host is no longer offered.").into();}); }
+                        }
+                    }
+                    Action::Disconnect => {
+                        update(&view,|v|v.busy=true);
+                        offered=false;
+                        let stopped=stop_with_fence(session.as_mut(), &mut jobs, uncertain).await;
+                        uncertain=stopped.uncertain;
+                        session=None;
+                        if let Some(reason)=uncertain {
+                            update(&view,|v|v.connected=false);
+                            publish_cleanup_blocked(&view,reason);
+                        } else { update(&view,|v|*v=View::default()); }
+                    }
+                }
+            }
+            _ = tick.tick() => {
+                local.observe().await;
+                if shutdown.is_cancelled(){break;}
+                if uncertain.is_some() || !offered { continue; }
+                let Some(s)=session.clone() else { continue; };
+                let reply=network(&shutdown,None,heartbeat(&s,true)).await;
+                if shutdown.is_cancelled(){break;}
+                match reply {
+                    Ok(reply) => {
+                        let wanted:HashSet<_>=reply.jobs.iter().map(|job|job.id.clone()).collect();
+                        let remove:Vec<_>=jobs.iter().filter(|(id,job)|!wanted.contains(*id)||job.task.is_finished()).map(|(id,_)|id.clone()).collect();
+                        let mut report=StopReport::default();
+                        let mut completed=false;
+                        for id in remove {
+                            if let Some(job)=jobs.remove(&id) {
+                                job.cancelled.cancel();
+                                let outcome=job.task.await;
+                                completed |= matches!(&outcome,Ok(JobOutcome::Completed));
+                                report.observe(outcome);
+                            }
+                        }
+                        if let Some(reason)=report.uncertain {
+                            uncertain=Some(reason);offered=false;
+                            let remaining=stop_with_fence(session.as_mut(), &mut jobs, uncertain).await;
+                            uncertain=remaining.uncertain;
+                            if let Some(reason)=uncertain { publish_cleanup_blocked(&view,reason); }
+                            else { update(&view,|v|{v.offered=false;v.jobs=0;v.message="Processing stopped after acknowledged remote cleanup; offer again explicitly.".into();}); }
+                            continue;
+                        }
+                        // Only proven-cleanup failures can retry the same
+                        // assigned camera on the unchanged 3-second heartbeat.
+                        for job in reply.jobs {
+                            if shutdown.is_cancelled(){break 'control;}
+                            if let std::collections::hash_map::Entry::Vacant(entry) = jobs.entry(job.id.clone()) {
+                                let cancelled=CancellationToken::new();
+                                let task=tokio::spawn(transcode_until_cancelled(s.clone(),job.clone(),cancelled.clone()));
+                                let task=OwnedJobTask::new(task,cancelled.clone(),local.clone());
+                                entry.insert(EncodingJob{cancelled,task});
+                            }
+                        }
+                        update(&view,|v|{
+                            v.jobs=jobs.len();
+                            v.message=if !reply.selected {"Available · waiting for Stream Manager selection".into()}
+                            else if let Some(code)=report.failed {format!("{code}: processing failed after verified cleanup; retrying the assigned camera job.")}
+                            else if completed {"video_processing_finished: encoder and upload completed; restarting the assigned camera job.".into()}
+                            else {format!("Selected by GroundStation · encoding {} camera(s)",jobs.len())};
+                        });
+                    }
+                    Err(_) => {
+                        offered=false;
+                        update(&view,|v|v.offered=false);
+                        let stopped=stop_with_fence(session.as_mut(), &mut jobs, uncertain).await;
+                        // Assigned local jobs were drained independently of whether
+                        // the original remote generation could be acknowledged.
+                        // Keep remote uncertainty and its reoffer block unchanged.
+                        update(&view,|v|v.jobs=jobs.len());
+                        if let Some(reason)=stopped.uncertain {
+                            uncertain=Some(reason);offered=false;publish_cleanup_blocked(&view,reason);
+                        } else {
+                            update(&view,|v|{v.jobs=0;v.message="Station unavailable or permission changed. Encoding stopped; reconnect if the station restarted.".into();});
+                        }
+                    }
+                }
+            }
+        }
+    }
+    shutdown.cancel();
+    rx.close();
+    while rx.try_recv().is_ok() {}
+    let stopped=stop_with_fence(session.as_mut(), &mut jobs, uncertain).await;
+    update(&view,|v|{v.offered=false;v.jobs=0;});
+    WorkerExit::stopped(stopped,&local)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stop_ack_requires_original_generation_and_never_clears_local_uncertainty() {
+        let original = "11111111111111111111111111111111";
+        let mut reply = Heartbeat { selected: false, jobs: Vec::new(), generation: Some("22222222222222222222222222222222".into()),
+            stopped_generation: Some(original.into()), cleanup_complete: true };
+        assert!(stop_acknowledges(original, &reply));
+        assert!(!stop_acknowledges("33333333333333333333333333333333", &reply));
+        reply.cleanup_complete = false;
+        assert!(!stop_acknowledges(original, &reply));
+        reply.cleanup_complete = true;
+        reply.generation = Some(original.into());
+        assert!(!stop_acknowledges(original, &reply));
+        let combined = with_proxy_completion(JobOutcome::CleanupUncertain(CleanupUncertain::RemoteCompletion), Err(CleanupUncertain::ProxyTimeout));
+        assert!(matches!(combined, JobOutcome::CleanupUncertain(CleanupUncertain::ProxyTimeout)));
+        let preserved = with_proxy_completion(JobOutcome::CleanupUncertain(CleanupUncertain::EncoderTimeout), Err(CleanupUncertain::ProxyTimeout));
+        assert!(matches!(preserved, JobOutcome::CleanupUncertain(CleanupUncertain::EncoderTimeout)));
+        let mut report = StopReport::default();
+        report.add_uncertainty(CleanupUncertain::ProxyTimeout);
+        report.add_uncertainty(CleanupUncertain::RemoteCompletion);
+        assert!(matches!(report.uncertain, Some(CleanupUncertain::ProxyTimeout)));
+        let mut report = StopReport::default();
+        report.add_uncertainty(CleanupUncertain::RemoteCompletion);
+        report.add_uncertainty(CleanupUncertain::EncoderTimeout);
+        assert!(matches!(report.uncertain, Some(CleanupUncertain::EncoderTimeout)));
+    }
     #[tokio::test]
     #[ignore = "manual synthetic MediaMTX/backend roundtrip; loopback fixture only"]
     async fn native_worker_roundtrip() {
@@ -781,6 +1301,9 @@ mod tests {
                 .post(endpoint(&legacy_session.base, &legacy_job.output).unwrap())
                 .bearer_auth(&legacy_session.token)
                 .header("Content-Type", "video/mp2t")
+                // Legacy container compatibility still carries the genuine
+                // original assigned generation; it is not an unfenced helper.
+                .header("X-Station-Transcode-Generation", legacy_job.generation.as_deref().expect("original assigned job generation"))
                 .body(reqwest::Body::wrap_stream(
                     tokio_util::io::ReaderStream::new(legacy_output),
                 ))
@@ -885,7 +1408,9 @@ mod tests {
         let _ = heartbeat(&session, false).await.unwrap();
         for job in jobs {
             job.abort();
+            let _ = job.await;
         }
+        session.local.settle().await;
         tokio::time::sleep(Duration::from_secs(1)).await;
         let state: serde_json::Value = json(
             session
@@ -919,12 +1444,10 @@ mod tests {
     }
     fn fixture_proxy() -> HlsProxy {
         HlsProxy {
-            session: Session {
+            session: NetworkSession {
                 client: reqwest::Client::new(),
-                upload_client: reqwest::Client::new(),
                 base: Url::parse("http://127.0.0.1:19090").unwrap(),
                 token: "secret-token".into(),
-                host: None,
             },
             prefix: "/api/video/transcode/input/front/".into(),
             origin: "http://127.0.0.1:12345".into(),
@@ -1008,8 +1531,13 @@ mod tests {
             },
         ));
         let upstream = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let mut session = fixture_proxy().session;
-        session.base = Url::parse(&format!("http://{address}")).unwrap();
+        let network = fixture_proxy().session;
+        let session = Session {
+            upload_client: network.client.clone(), client: network.client,
+            base: Url::parse(&format!("http://{address}")).unwrap(), token: network.token,
+            host: None, generation: None, local: Arc::new(LocalScope::default()),
+            shutdown: CancellationToken::new(),
+        };
         let (guard, input) = proxy(session, "/api/video/transcode/input/front/index.m3u8")
             .await
             .unwrap();
@@ -1027,7 +1555,7 @@ mod tests {
             reqwest::StatusCode::BAD_GATEWAY
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-        drop(guard);
+        guard.close().await.unwrap();
         tokio::task::yield_now().await;
         assert!(
             client
@@ -1045,3 +1573,7 @@ mod tests {
         assert!(!local_host(&Url::parse("https://example.com").unwrap()));
     }
 }
+
+#[cfg(test)]
+#[path = "qualification_tests.rs"]
+mod qualification_tests;

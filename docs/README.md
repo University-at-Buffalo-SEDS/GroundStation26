@@ -16,6 +16,12 @@ independently.
 - [Model animations](backend/model-animations.md): single-stage default and backend
   binding configuration; custom multi-stage profiles remain supported.
 - [GSE sequences](backend/gse-sequences.md): grouped control and equipment scene.
+- [Per-account client settings](backend/client-settings.md): watch companion preferences
+  synced to the signed-in account.
+- [Frontend contract fixtures](backend/contract-fixtures.md): real replies the UI decodes;
+  how to regenerate and run them.
+- [Station mode switch](backend/station-modes.md): switch build and simulation
+  from the UI by a controlled restart, on the primary and the RRLS.
 
 - `docs/frontend/api.md`
   Frontend-facing API contract, endpoint details, websocket message shapes, bootstrap flow, and backend expectations.

@@ -339,7 +339,7 @@ mod linux {
                 "auto".into(),
             );
             assert_eq!(
-                automatic_profile("eth0", &[dhcp.clone()]),
+                automatic_profile("eth0", std::slice::from_ref(&dhcp)),
                 Some("wired-id".into())
             );
             assert!(

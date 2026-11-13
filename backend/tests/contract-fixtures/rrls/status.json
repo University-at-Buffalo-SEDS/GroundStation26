@@ -1,0 +1,12 @@
+{
+  "direct_age_ms": null,
+  "dropped_frames": 0,
+  "enabled": false,
+  "forwarded_frames": 0,
+  "forwarding": false,
+  "queued_frames": 0,
+  "relay_envelope_bytes": 0,
+  "relay_requested": false,
+  "relayed_frames": 0,
+  "role": null
+}

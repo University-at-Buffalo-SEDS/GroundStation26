@@ -583,6 +583,15 @@ pub(super) async fn emit_derived_battery_rows(
                 sender_id: sender_id.to_string(),
                 values,
             };
+            crate::telemetry_provenance::note(
+                &row,
+                source_timestamp_ms.and_then(|source| {
+                    crate::telemetry_provenance::canonical_source(
+                        source,
+                        super::procedure_clock::timestamp_ms(),
+                    )
+                }),
+            );
             state.cache_recent_telemetry(row.clone());
             let _ = state.ws_tx.send(row);
         }
@@ -596,19 +605,20 @@ pub(super) struct DerivedLoadcellSample<'a> {
     pub(super) sensor_id: &'a str,
     pub(super) raw_value: f32,
     pub(super) payload_json: &'a str,
+    pub(super) receipt: crate::gse::ValveReceipt,
 }
 
-pub(super) async fn emit_derived_loadcell_rows(
+pub(super) struct PreparedLoadcellRows {
+    rows: Vec<(&'static str, Vec<Option<f32>>)>,
+    calibration_sensor_id: String,
+    config_json: String,
+}
+
+/// Perform live conversion exactly once, before any recording await.
+pub(super) fn prepare_derived_loadcell_rows(
     state: &Arc<AppState>,
-    db_tx: &mpsc::Sender<DbQueueItem>,
-    db_overflow: &DbOverflow,
-    sample: DerivedLoadcellSample<'_>,
-) {
-    state
-        .auto_zero
-        .lock()
-        .unwrap()
-        .observe(sample.sensor_id, sample.raw_value);
+    sample: &DerivedLoadcellSample<'_>,
+) -> Option<PreparedLoadcellRows> {
     let calibration_sensor_id = if sample.sensor_id
         == &*crate::telemetry_schema::data_type("FUEL_TANK_PRESSURE").as_str()
     {
@@ -624,13 +634,15 @@ pub(super) async fn emit_derived_loadcell_rows(
         sample.sender_id,
         sample.ts_ms,
     );
-    state.loadcell_processing.observe(
-        sample.sender_id,
-        calibration_sensor_id,
-        sample.ts_ms,
-        sample.raw_value,
+    state.loadcell_processing.observe_source(crate::loadcell_zero::SourceSample {
+        sender: sample.sender_id,
+        sensor: calibration_sensor_id,
+        timestamp_ms: sample.ts_ms,
+        source_timestamp_ms: sample.source_timestamp_ms,
+        received_network_ms: sample.receipt.network_ms,
+        raw: sample.raw_value,
         temperature,
-    );
+    });
     let Some(calibrated_value) = loadcell::temperature_corrected_raw(
         &cfg,
         calibration_sensor_id,
@@ -655,7 +667,10 @@ pub(super) async fn emit_derived_loadcell_rows(
             f32::NAN,
         );
         match calibration_sensor_id {
-            sensor if sensor == fill_source.sensor() => {
+            sensor
+                if sensor == fill_source.sensor()
+                    && sample.sender_id == crate::types::Board::DaqBoard.sender_id() =>
+            {
                 let mut latest = state.latest_fill_mass_kg.lock().unwrap();
                 *latest = None;
                 state.gse.lock().unwrap().observe_mass(None);
@@ -667,7 +682,7 @@ pub(super) async fn emit_derived_loadcell_rows(
             }
             _ => {}
         }
-        return;
+        return None;
     };
     let mut rows: Vec<(&str, Vec<Option<f32>>)> = match calibration_sensor_id {
         loadcell::RAW_LOADCELL_DATA_TYPE_1000KG => vec![(
@@ -679,11 +694,11 @@ pub(super) async fn emit_derived_loadcell_rows(
             vec![Some(calibrated_value)],
         )],
         loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE => {
-            state
-                .gse
-                .lock()
-                .unwrap()
-                .observe_pressure(Some(calibrated_value));
+            state.gse.lock().unwrap().observe_pressure_source(
+                Some(calibrated_value),
+                sample.source_timestamp_ms,
+                super::recording_network_utc_ms().unwrap_or(sample.ts_ms),
+            );
             {
                 let mut pressure = state.latest_fuel_tank_pressure.lock().unwrap();
                 *pressure = Some(calibrated_value);
@@ -705,14 +720,43 @@ pub(super) async fn emit_derived_loadcell_rows(
         };
         let flight_state = *state.state.lock().unwrap();
         let target = loadcell::active_fill_target_mass_kg(&fill_targets, flight_state);
-        *state.latest_fill_mass_kg.lock().unwrap() = mass;
-        state.gse.lock().unwrap().observe_mass(mass);
+        if sample.sender_id == crate::types::Board::DaqBoard.sender_id() {
+            *state.latest_fill_mass_kg.lock().unwrap() = mass;
+            state.gse.lock().unwrap().observe_mass_source(
+                mass,
+                sample.source_timestamp_ms,
+                sample.receipt,
+                crate::gse::mass_calibration_signature(&cfg),
+            );
+        }
         rows.push((
             loadcell::DERIVED_FILL_PERCENT_DATA_TYPE,
             vec![mass.map(|mass| loadcell::fill_percent(target, mass))],
         ));
     }
 
+    let config_json = serde_json::json!({"calibration":cfg,
+        "fill_targets":fill_targets,"flight_state":format!("{:?}", *state.state.lock().unwrap())})
+    .to_string();
+    Some(PreparedLoadcellRows {
+        rows,
+        calibration_sensor_id: calibration_sensor_id.into(),
+        config_json,
+    })
+}
+
+pub(super) async fn emit_derived_loadcell_rows(
+    state: &Arc<AppState>,
+    db_tx: &mpsc::Sender<DbQueueItem>,
+    db_overflow: &DbOverflow,
+    sample: DerivedLoadcellSample<'_>,
+    prepared: PreparedLoadcellRows,
+) {
+    let PreparedLoadcellRows {
+        rows,
+        calibration_sensor_id,
+        config_json,
+    } = prepared;
     for (data_type, values) in rows {
         if should_persist_telemetry_sample(data_type, sample.sender_id, sample.ts_ms) {
             queue_db_write(
@@ -737,16 +781,19 @@ pub(super) async fn emit_derived_loadcell_rows(
             sender_id: sample.sender_id.to_string(),
             values,
         };
+        crate::telemetry_provenance::note(
+            &row,
+            sample.source_timestamp_ms.and_then(|source| {
+                crate::telemetry_provenance::canonical_source(
+                    source,
+                    super::procedure_clock::timestamp_ms(),
+                )
+            }),
+        );
         state.cache_recent_telemetry(row.clone());
         let _ = state.ws_tx.send(row);
     }
-    // Keep actual calibration provenance, never reconstruct it from today's
-    // settings at export time. Periodic snapshots also cover pre-roll recording.
     static RECORDED: OnceLock<Mutex<HashMap<String, (String, i64)>>> = OnceLock::new();
-    let config_json = serde_json::json!({"calibration":cfg,
-        "fill_targets":state.fill_targets_snapshot(),
-        "flight_state":format!("{:?}", *state.state.lock().unwrap())})
-    .to_string();
     let key = format!(
         "{}:{:?}:{}:{}",
         state.placeholder_db_path,
@@ -780,7 +827,7 @@ pub(super) async fn emit_derived_loadcell_rows(
             DbWrite::Calibration {
                 timestamp_ms: sample.ts_ms,
                 sender_id: sample.sender_id.into(),
-                sensor_id: calibration_sensor_id.into(),
+                sensor_id: calibration_sensor_id,
                 config_json,
             },
         )
@@ -821,6 +868,15 @@ pub(super) async fn emit_derived_vehicle_speed_row(
         sender_id: String::new(),
         values,
     };
+    crate::telemetry_provenance::note(
+        &row,
+        source_timestamp_ms.and_then(|source| {
+            crate::telemetry_provenance::canonical_source(
+                source,
+                super::procedure_clock::timestamp_ms(),
+            )
+        }),
+    );
     state.cache_recent_telemetry(row.clone());
     let _ = state.ws_tx.send(row);
 }
@@ -849,7 +905,7 @@ pub(super) fn f32_values_from_payload_bytes(bytes: &[u8]) -> Option<Vec<Option<f
 
     Some(
         bytes
-            .chunks_exact(size_of::<f32>())
+            .as_chunks::<{ size_of::<f32>() }>().0.iter()
             .map(|chunk| {
                 let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                 value.is_finite().then_some(value)
@@ -885,15 +941,160 @@ pub(super) fn split_imu_values(
     Some((values[..3].to_vec(), values[3..6].to_vec()))
 }
 
+// Combined publication occupies one existing DAQ load-cell packet slot.
+// Keep the original vector for raw exports plus canonical KG1000 so existing
+// calibration, derived mass, charts and recordings retain their exact path.
+fn chamber_pressure_rows(sender: &str, values: &[Option<f32>]) -> Vec<(String, Vec<Option<f32>>)> {
+    if sender != "DAQ" || values.len() != 3 {
+        return Vec::new();
+    }
+    let mut rows = vec![("DAQ_LOADCELL_CHAMBER".into(), values.to_vec())];
+    // The pressure input is independent of the load cell. A failed load-cell
+    // conversion must not hide an otherwise valid chamber-pressure sample.
+    if values[0].is_some_and(f32::is_finite) {
+        rows.push(("KG1000".into(), vec![values[0]]));
+    }
+    if values[1].is_some_and(|x| x.is_finite() && (-5280.0..=5280.0).contains(&x))
+        && values[2].is_some_and(|x| x.is_finite() && (-26.4..=26.4).contains(&x))
+    {
+        rows.push(("COMBUSTION_CHAMBER_PRESSURE".into(), vec![values[1]]));
+        rows.push(("COMBUSTION_CHAMBER_VOLTAGE".into(), vec![values[2]]));
+        // Source-owned idle suppression may report zero pressure while its
+        // raw connector voltage still reveals an electrical range fault.
+        let outside_nominal = values[1].is_some_and(|x| !(0.0..=1000.0).contains(&x))
+            || values[2].is_some_and(|x| !(0.0..=5.0).contains(&x));
+        rows.push((
+            "COMBUSTION_CHAMBER_RANGE_STATUS".into(),
+            vec![Some(if outside_nominal { 1.0 } else { 0.0 })],
+        ));
+    }
+    rows
+}
+
+#[cfg(test)]
+mod chamber_pressure_tests {
+    use super::chamber_pressure_rows;
+    #[test]
+    fn combined_preserves_loadcell_and_valid_zero_pressure() {
+        let rows = chamber_pressure_rows("DAQ", &[Some(-0.125), Some(0.0), Some(0.0)]);
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[1], ("KG1000".into(), vec![Some(-0.125)]));
+        assert_eq!(
+            rows[2],
+            ("COMBUSTION_CHAMBER_PRESSURE".into(), vec![Some(0.0)])
+        );
+    }
+    #[test]
+    fn omega_overrange_remains_visible_and_is_flagged() {
+        let rows = chamber_pressure_rows("DAQ", &[Some(1.0), Some(1020.0), Some(5.1)]);
+        assert!(
+            rows.iter()
+                .any(|(kind, v)| kind == "COMBUSTION_CHAMBER_PRESSURE" && v == &vec![Some(1020.0)])
+        );
+        assert!(rows.iter().any(|(kind,v)|kind=="COMBUSTION_CHAMBER_RANGE_STATUS"&&v==&vec![Some(1.0)]));
+    }
+    #[test]
+    fn invalid_loadcell_does_not_hide_valid_chamber_pressure() {
+        let rows = chamber_pressure_rows("DAQ", &[None, Some(500.0), Some(2.5)]);
+        assert!(!rows.iter().any(|(kind, _)| kind == "KG1000"));
+        assert!(
+            rows.iter()
+                .any(|(kind, values)| kind == "COMBUSTION_CHAMBER_PRESSURE"
+                    && values == &vec![Some(500.0)])
+        );
+        assert!(
+            rows.iter()
+                .any(|(kind, _)| kind == "COMBUSTION_CHAMBER_VOLTAGE")
+        );
+    }
+
+    #[test]
+    fn conditioned_zero_does_not_hide_raw_electrical_range_faults() {
+        for raw_voltage in [-0.03, 5.01] {
+            let rows = chamber_pressure_rows("DAQ", &[Some(1.25), Some(0.0), Some(raw_voltage)]);
+            assert!(
+                rows.iter()
+                    .any(|(kind, values)| kind == "COMBUSTION_CHAMBER_PRESSURE"
+                        && values == &vec![Some(0.0)])
+            );
+            assert!(
+                rows.iter()
+                    .any(|(kind, values)| kind == "COMBUSTION_CHAMBER_VOLTAGE"
+                        && values == &vec![Some(raw_voltage)])
+            );
+            assert!(
+                rows.iter()
+                    .any(|(kind, values)| kind == "COMBUSTION_CHAMBER_RANGE_STATUS"
+                        && values == &vec![Some(1.0)])
+            );
+            assert_eq!(rows[1], ("KG1000".into(), vec![Some(1.25)]));
+        }
+    }
+
+    #[test]
+    fn source_pressure_is_forwarded_without_a_second_cutoff_or_offset() {
+        for (pressure, raw_voltage) in [(3.0, 0.015), (0.0, 0.0224), (4.5, 0.0225), (500.0, 2.5)] {
+            let rows =
+                chamber_pressure_rows("DAQ", &[Some(1.25), Some(pressure), Some(raw_voltage)]);
+            // Historical/older-source readings stay as recorded; conditioning
+            // belongs to the DAQ firmware and is not silently applied twice.
+            assert_eq!(
+                rows[0].1,
+                vec![Some(1.25), Some(pressure), Some(raw_voltage)]
+            );
+            assert!(
+                rows.iter()
+                    .any(|(kind, values)| kind == "COMBUSTION_CHAMBER_PRESSURE"
+                        && values == &vec![Some(pressure)])
+            );
+            assert!(
+                rows.iter()
+                    .any(|(kind, values)| kind == "COMBUSTION_CHAMBER_RANGE_STATUS"
+                        && values == &vec![Some(0.0)])
+            );
+        }
+    }
+
+    #[test]
+    fn missing_or_nonfinite_chamber_source_is_never_fabricated_zero() {
+        for (pressure, voltage) in [
+            (None, None),
+            (Some(f32::NAN), Some(0.015)),
+            (Some(f32::INFINITY), Some(0.015)),
+            (Some(0.0), Some(f32::NAN)),
+            (Some(0.0), Some(f32::INFINITY)),
+        ] {
+            let rows = chamber_pressure_rows("DAQ", &[Some(1.25), pressure, voltage]);
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[1], ("KG1000".into(), vec![Some(1.25)]));
+        }
+    }
+
+    #[test]
+    fn malformed_or_other_sender_cannot_fabricate_pressure() {
+        assert!(chamber_pressure_rows("VB", &[Some(1.0); 3]).is_empty());
+        assert!(chamber_pressure_rows("DAQ", &[Some(1.0); 2]).is_empty());
+        let rows = chamber_pressure_rows("DAQ", &[Some(1.0), None, Some(f32::NAN)]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].0, "KG1000");
+    }
+}
+
 pub(super) fn telemetry_rows_from_packet_values(
     state: &Arc<AppState>,
     pkt: &Packet,
     sender_id: &str,
     mut values: Vec<Option<f32>>,
 ) -> Vec<(String, Vec<Option<f32>>)> {
+    if &*pkt.data_type().as_str() == "DAQ_LOADCELL_CHAMBER" {
+        return chamber_pressure_rows(sender_id, &values);
+    }
     if matches!(&*pkt.data_type().as_str(), "KG50" | "DAQ_KG50_SELECTED") {
         if sender_id != "DAQ" {
             return Vec::new();
+        }
+        if let Some(reported) = loadcell::reported_kg50_input(&pkt.data_type().as_str(), &values) {
+            state.kg50_input_sync.observe(reported);
         }
         let input = state.loadcell_calibration.lock().unwrap().kg50_input;
         return loadcell::selected_kg50_value(input, &pkt.data_type().as_str(), &values)

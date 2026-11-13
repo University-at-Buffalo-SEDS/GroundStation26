@@ -250,8 +250,8 @@ fn observe_at(row: &TelemetryRow, source_ms: Option<u64>, network_utc_ms: Option
     } else if matches!(
         row.data_type.as_str(),
         "RSSI_DBM" | "RFD_RSSI_DBM" | "RSSI" | "RFD_RSSI"
-    ) {
-        if let Some(value) = row
+    )
+        && let Some(value) = row
             .values
             .first()
             .copied()
@@ -274,7 +274,19 @@ fn observe_at(row: &TelemetryRow, source_ms: Option<u64>, network_utc_ms: Option
                 Instant::now(),
             ));
         }
+}
+/// What this station tells the other one where it is: its live GPS fix, or
+/// else its own administrator-saved position.
+pub fn advertised_fix() -> Option<Fix> {
+    // The saved-position store is process-wide; unit-test mesh ticks must not
+    // pick up positions other tests saved (the codec has its own test).
+    if cfg!(test) {
+        return local_fix();
     }
+    local_fix().filter(|fix| !fix.stale).or_else(|| {
+        let (gs, rrls) = positions::fallbacks();
+        if crate::rrls::is_rrls() { rrls } else { gs }
+    })
 }
 pub fn local_fix() -> Option<Fix> {
     cache()
@@ -288,10 +300,11 @@ pub fn accept_remote_fix(mut fix: Fix) {
     if !fix.valid() || fix.age_ms > FIX_FRESH_MS {
         return;
     }
-    fix.source = if crate::rrls::is_rrls() {
-        "GroundStation GPS"
-    } else {
-        "RRLS GPS"
+    fix.source = match (crate::rrls::is_rrls(), fix.manual) {
+        (true, false) => "GroundStation GPS",
+        (false, false) => "RRLS GPS",
+        (true, true) => "GroundStation saved position (via radio)",
+        (false, true) => "RRLS saved position (via radio)",
     }
     .to_string();
     cache().lock().unwrap().remote = Some(TimedFix {
@@ -326,20 +339,23 @@ pub fn snapshot() -> Snapshot {
     });
     drop(cache);
     let (saved_gs, saved_rrls) = positions::fallbacks();
-    let choose = |live: Option<Fix>, saved: Option<Fix>| {
-        live.as_ref()
-            .filter(|f| !f.stale)
-            .cloned()
-            .or(saved)
-            .or(live)
-    };
     Snapshot {
         rocket,
-        ground_station: choose(ground_station, saved_gs),
-        rrls: choose(rrls, saved_rrls),
+        ground_station: station_position(ground_station, saved_gs),
+        rrls: station_position(rrls, saved_rrls),
         rssi,
         gpsd_configured: std::env::var_os("GS_GPSD_ADDR").is_some(),
     }
+}
+
+/// Fresh station GPS wins; the administrator-saved position is only a fallback
+/// for an absent or stale fix, and a stale fix is shown only when nothing is saved.
+fn station_position(live: Option<Fix>, saved: Option<Fix>) -> Option<Fix> {
+    live.as_ref()
+        .filter(|f| !f.stale)
+        .cloned()
+        .or(saved)
+        .or(live)
 }
 
 fn gpsd_fix(line: &[u8]) -> Option<Fix> {
@@ -458,12 +474,14 @@ pub fn start_gpsd(
 
 // Fixed-size application-level RRLS position exchange. Age is relative, so
 // different host UTC offsets cannot silently turn an old fix into a fresh one.
+/// Version 1 is a live GPS fix; version 2 an administrator-saved position, so
+/// a station with no GPS still shows where it is on the other station's map.
 pub fn encode_position(fix: &Fix) -> Option<[u8; 38]> {
-    if !fix.valid() || fix.manual || fix.age_ms > FIX_FRESH_MS {
+    if !fix.valid() || (!fix.manual && fix.age_ms > FIX_FRESH_MS) {
         return None;
     }
     let mut out = [0; 38];
-    out[0] = 1;
+    out[0] = if fix.manual { 2 } else { 1 };
     out[1..9].copy_from_slice(&fix.latitude.to_le_bytes());
     out[9..17].copy_from_slice(&fix.longitude.to_le_bytes());
     out[17..25].copy_from_slice(&fix.altitude_m.unwrap_or(f64::NAN).to_le_bytes());
@@ -474,11 +492,11 @@ pub fn encode_position(fix: &Fix) -> Option<[u8; 38]> {
     };
     out[26..30].copy_from_slice(&(fix.accuracy_m.unwrap_or(f64::NAN) as f32).to_le_bytes());
     out[30..34].copy_from_slice(&(fix.geoid_separation_m.unwrap_or(f64::NAN) as f32).to_le_bytes());
-    out[34..38].copy_from_slice(&(fix.age_ms as u32).to_le_bytes());
+    out[34..38].copy_from_slice(&(if fix.manual { 0 } else { fix.age_ms } as u32).to_le_bytes());
     Some(out)
 }
 pub fn decode_position(data: &[u8]) -> Option<Fix> {
-    if data.len() != 38 || data[0] != 1 {
+    if data.len() != 38 || !matches!(data[0], 1 | 2) {
         return None;
     }
     let f64_at = |i| Some(f64::from_le_bytes(data.get(i..i + 8)?.try_into().ok()?));
@@ -498,10 +516,28 @@ pub fn decode_position(data: &[u8]) -> Option<Fix> {
         age_ms: u32::from_le_bytes(data[34..38].try_into().ok()?) as u64,
         stale: false,
         source: "Radio GPS".into(),
-        manual: false,
+        manual: data[0] == 2,
     };
     (fix.valid() && fix.age_ms <= FIX_FRESH_MS).then_some(fix)
+}/// RF only emits GPS_DATA when gps_has_fix() is true. FC's GPS_DATA contains
+/// filtered/relative coordinates and cannot prove a current receiver lock.
+pub fn rocket_launch_fix_locked() -> bool {
+    cache().lock().unwrap().rocket[0]
+        .as_ref()
+        .is_some_and(|value| {
+            let fix = value.snapshot();
+            fix.valid() && !fix.stale && fix.altitude_m.is_some()
+        })
 }
+
+#[cfg(test)]
+pub(crate) fn clear_rocket_fix_for_test() {
+    let mut cache = cache().lock().unwrap();
+    cache.rocket[0] = None;
+    cache.rf_no_fix = None;
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -761,8 +797,9 @@ mod tests {
         let decoded = decode_position(&encoded).unwrap();
         assert_eq!(decoded.latitude, 43.0);
         assert_eq!(decoded.altitude_reference, AltitudeReference::MeanSeaLevel);
+        assert!(!decoded.manual);
         let mut bad = encoded;
-        bad[0] = 2;
+        bad[0] = 3;
         assert!(decode_position(&bad).is_none());
         bad = encoded;
         bad[25] = 3;
@@ -774,23 +811,19 @@ mod tests {
         bad[34..38].copy_from_slice(&15_001u32.to_le_bytes());
         assert!(decode_position(&bad).is_none());
     }
-}
 
-/// RF only emits GPS_DATA when gps_has_fix() is true. FC's GPS_DATA contains
-/// filtered/relative coordinates and cannot prove a current receiver lock.
-#[cfg(not(feature = "hitl_mode"))]
-pub fn rocket_launch_fix_locked() -> bool {
-    cache().lock().unwrap().rocket[0]
-        .as_ref()
-        .is_some_and(|value| {
-            let fix = value.snapshot();
-            fix.valid() && !fix.stale && fix.altitude_m.is_some()
-        })
-}
-
-#[cfg(test)]
-pub(crate) fn clear_rocket_fix_for_test() {
-    let mut cache = cache().lock().unwrap();
-    cache.rocket[0] = None;
-    cache.rf_no_fix = None;
+    /// A station with no GPS still shows on the other station's map: its saved
+    /// position travels as version 2 and arrives marked saved, not live.
+    #[test]
+    fn a_saved_position_travels_marked_saved() {
+        let mut fix = gpsd_fix(br#"{"class":"TPV","mode":3,"lat":43,"lon":-78,"altMSL":150}"#).unwrap();
+        fix.manual = true;
+        fix.age_ms = u64::MAX;
+        let encoded = encode_position(&fix).expect("a saved position has no age limit");
+        assert_eq!(encoded[0], 2);
+        let decoded = decode_position(&encoded).unwrap();
+        assert!(decoded.manual);
+        assert_eq!(decoded.age_ms, 0);
+        assert_eq!(decoded.longitude, -78.0);
+    }
 }

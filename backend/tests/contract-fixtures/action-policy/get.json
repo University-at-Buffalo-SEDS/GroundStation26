@@ -1,0 +1,231 @@
+{
+  "controls": [
+    {
+      "actuated": null,
+      "blink": "none",
+      "cmd": "ToggleAvBayUnderglow",
+      "enabled": true,
+      "network_note": "Waiting for network confirmation",
+      "requested": true
+    },
+    {
+      "actuated": null,
+      "blink": "none",
+      "cmd": "ToggleFlightBuzzer",
+      "enabled": true,
+      "network_note": "Waiting for network confirmation",
+      "requested": true
+    },
+    {
+      "actuated": null,
+      "blink": "none",
+      "cmd": "ResetTClock",
+      "enabled": true
+    },
+    {
+      "actuated": null,
+      "blink": "none",
+      "cmd": "Dump",
+      "enabled": true
+    },
+    {
+      "actuated": null,
+      "blink": "none",
+      "cmd": "Abort",
+      "enabled": true
+    },
+    {
+      "actuated": null,
+      "blink": "none",
+      "cmd": "NormallyOpen",
+      "disabled_reason": "This command is unavailable under the current GroundStation policy.",
+      "enabled": false
+    },
+    {
+      "actuated": null,
+      "blink": "none",
+      "cmd": "Pilot",
+      "disabled_reason": "This command is unavailable under the current GroundStation policy.",
+      "enabled": false
+    },
+    {
+      "actuated": null,
+      "blink": "none",
+      "cmd": "Igniter",
+      "disabled_reason": "This command is unavailable under the current GroundStation policy.",
+      "enabled": false
+    },
+    {
+      "actuated": null,
+      "blink": "none",
+      "cmd": "RetractPlumbing",
+      "disabled_reason": "This command is unavailable under the current GroundStation policy.",
+      "enabled": false
+    },
+    {
+      "actuated": null,
+      "blink": "none",
+      "cmd": "Nitrogen",
+      "disabled_reason": "This command is unavailable under the current GroundStation policy.",
+      "enabled": false
+    },
+    {
+      "actuated": null,
+      "blink": "none",
+      "cmd": "Nitrous",
+      "disabled_reason": "This command is unavailable under the current GroundStation policy.",
+      "enabled": false
+    },
+    {
+      "actuated": true,
+      "blink": "none",
+      "cmd": "StartWritingNow",
+      "enabled": true
+    },
+    {
+      "actuated": true,
+      "blink": "none",
+      "cmd": "StartWritingLastTwoMinutes",
+      "enabled": true
+    },
+    {
+      "actuated": false,
+      "blink": "none",
+      "cmd": "PauseWritingDb",
+      "disabled_reason": "This command is unavailable under the current GroundStation policy.",
+      "enabled": false
+    },
+    {
+      "actuated": false,
+      "blink": "none",
+      "cmd": "StopWritingDb",
+      "disabled_reason": "This command is unavailable under the current GroundStation policy.",
+      "enabled": false
+    },
+    {
+      "actuated": null,
+      "blink": "none",
+      "cmd": "ContinueFillSequence",
+      "disabled_reason": "This command is unavailable under the current GroundStation policy.",
+      "enabled": false
+    },
+    {
+      "actuated": null,
+      "blink": "none",
+      "cmd": "Postinit",
+      "enabled": true
+    },
+    {
+      "actuated": null,
+      "blink": "none",
+      "cmd": "Launch",
+      "disabled_reason": "This command is unavailable under the current GroundStation policy.",
+      "enabled": false
+    },
+    {
+      "actuated": null,
+      "blink": "none",
+      "cmd": "MonitorAltitude",
+      "enabled": true
+    },
+    {
+      "actuated": null,
+      "blink": "none",
+      "cmd": "RevokeMonitorAltitude",
+      "enabled": true
+    },
+    {
+      "actuated": null,
+      "blink": "none",
+      "cmd": "ConsecutiveSamples",
+      "enabled": true
+    },
+    {
+      "actuated": null,
+      "blink": "none",
+      "cmd": "RevokeConsecutiveSamples",
+      "enabled": true
+    },
+    {
+      "actuated": null,
+      "blink": "none",
+      "cmd": "ResetFailures",
+      "enabled": true
+    },
+    {
+      "actuated": null,
+      "blink": "none",
+      "cmd": "RevokeResetFailures",
+      "enabled": true
+    },
+    {
+      "actuated": null,
+      "blink": "none",
+      "cmd": "ValidateMeasms",
+      "enabled": true
+    },
+    {
+      "actuated": null,
+      "blink": "none",
+      "cmd": "RevokeValidateMeasms",
+      "enabled": true
+    },
+    {
+      "actuated": false,
+      "blink": "none",
+      "cmd": "Turbocharge",
+      "disabled_reason": "Configure maximum added nitrogen mass before Turbocharge",
+      "enabled": false
+    },
+    {
+      "actuated": false,
+      "blink": "none",
+      "cmd": "StartFill",
+      "disabled_reason": "GSE action blocked: vehicle is not in a prelaunch state",
+      "enabled": false
+    },
+    {
+      "actuated": false,
+      "blink": "none",
+      "cmd": "PauseFill",
+      "disabled_reason": "GSE action blocked: vehicle is not in a prelaunch state",
+      "enabled": false
+    },
+    {
+      "actuated": false,
+      "blink": "none",
+      "cmd": "CancelFill",
+      "disabled_reason": "GSE action blocked: vehicle is not in a prelaunch state",
+      "enabled": false
+    },
+    {
+      "actuated": false,
+      "blink": "none",
+      "cmd": "ValveSelfTest",
+      "disabled_reason": "GSE action blocked: vehicle is not in a prelaunch state",
+      "enabled": false
+    },
+    {
+      "actuated": false,
+      "blink": "none",
+      "cmd": "NitrogenTest",
+      "disabled_reason": "GSE action blocked: vehicle is not in a prelaunch state",
+      "enabled": false
+    },
+    {
+      "actuated": null,
+      "blink": "none",
+      "cmd": "NitrogenClose",
+      "enabled": true
+    },
+    {
+      "actuated": null,
+      "blink": "none",
+      "cmd": "NitrousClose",
+      "enabled": true
+    }
+  ],
+  "key_enabled": true,
+  "local_phase_controls": false,
+  "software_buttons_enabled": true
+}

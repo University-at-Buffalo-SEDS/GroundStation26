@@ -1,0 +1,10 @@
+{
+  "body": {
+    "confirmed": true
+  },
+  "method": "POST",
+  "path": "/api/gse/self-test-confirmation",
+  "reply": {
+    "confirmed": true
+  }
+}

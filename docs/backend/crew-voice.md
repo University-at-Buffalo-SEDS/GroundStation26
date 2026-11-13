@@ -131,7 +131,10 @@ cargo test -p groundstation_backend media::tests::serve_synthetic_media -- --ign
 ```
 
 Create an MP4 fixture under
-`/tmp/gs-voice-fixture/recordings/test_camera/2026-09-17_12-00-00-000001.mp4`, wait
+`/tmp/gs-voice-fixture/recordings/test_camera/2026-09-17_12-00-00-000001.mp4`
+(any short H.264/AAC clip works, for example
+`ffmpeg -f lavfi -i testsrc2=size=320x240:rate=15 -f lavfi -i sine=frequency=440 -t 4 -c:v libx264 -pix_fmt yuv420p -c:a aac <path>`;
+the archive tests fail without it), wait
 at least five seconds for its modification time to settle, then run
 `(cd ui && node tests/station-voice_browser.mjs)` with Playwright installed. `PLAYWRIGHT_MODULE` can
 point to its `index.mjs`; `CHROME_BINARY` can select an installed Chrome executable.

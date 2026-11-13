@@ -29,40 +29,55 @@ pub enum Mode {
     TestFire,
     Testing,
 }
+/// The station mode in force now (see [`crate::runtime_mode`]).
 pub fn local_mode() -> Mode {
-    if cfg!(feature = "testing") {
-        Mode::Testing
-    } else if cfg!(feature = "hitl_mode") {
-        Mode::Hitl
-    } else if cfg!(feature = "test_fire_mode") {
-        Mode::TestFire
-    } else {
-        Mode::Normal
-    }
+    crate::runtime_mode::current()
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Snapshot {
     pub effective_mode: Option<Mode>,
     pub local_build_mode: Mode,
+    pub execution_mode: &'static str,
+    pub output_domain: &'static str,
     pub primary_station: Option<String>,
     pub synchronized: bool,
     pub persisted: bool,
     pub local_capabilities_match: bool,
     pub error: Option<String>,
     pub authority: &'static str,
+    pub(crate) retained_configuration: Option<crate::command_proxy::retained_config::Snapshot>,
 }
 impl Snapshot {
     fn unknown() -> Self {
         Self {
             effective_mode: None,
             local_build_mode: local_mode(),
+            execution_mode: execution_mode(),
+            output_domain: output_domain(),
             primary_station: None,
             synchronized: false,
             persisted: false,
             local_capabilities_match: false,
             error: None,
             authority: "unknown",
+            retained_configuration: None,
         }
+    }
+}
+fn execution_mode() -> &'static str {
+    if crate::flight_sim_runtime::enabled() {
+        "flight_sim"
+    } else if crate::rrls_sim_primary::enabled() {
+        "simulated_primary"
+    } else {
+        "compiled_mode"
+    }
+}
+fn output_domain() -> &'static str {
+    if crate::flight_sim_runtime::enabled() || crate::rrls_sim_primary::enabled() {
+        "simulated"
+    } else {
+        "build_defined"
     }
 }
 static STATUS: OnceLock<Mutex<Snapshot>> = OnceLock::new();
@@ -71,19 +86,24 @@ pub fn snapshot() -> Snapshot {
         return Snapshot {
             effective_mode: Some(local_mode()),
             local_build_mode: local_mode(),
+            execution_mode: execution_mode(),
+            output_domain: output_domain(),
             primary_station: None,
             synchronized: true,
             persisted: false,
             local_capabilities_match: true,
             error: None,
             authority: "local_primary",
+            retained_configuration: None,
         };
     }
-    STATUS
+    let mut snapshot = STATUS
         .get_or_init(|| Mutex::new(Snapshot::unknown()))
         .lock()
         .unwrap()
-        .clone()
+        .clone();
+    snapshot.retained_configuration = Some(crate::command_proxy::retained_config::snapshot(snapshot.effective_mode, snapshot.synchronized));
+    snapshot
 }
 pub(crate) fn recognizes(wire: &[u8]) -> bool {
     wire.starts_with(MAGIC) || wire.starts_with(DISPLAY_MAGIC)
@@ -258,12 +278,15 @@ impl Runtime {
         Snapshot {
             effective_mode: self.mode,
             local_build_mode: local_mode(),
+            execution_mode: execution_mode(),
+            output_domain: output_domain(),
             primary_station: self.primary.clone(),
             synchronized: self.connected && self.last_verified.is_some_and(|v| now >= v),
             persisted: self.persisted,
             local_capabilities_match: self.mode == Some(local_mode()),
             error: self.error.clone(),
             authority: "paired_signature",
+            retained_configuration: None,
         }
     }
     fn receive(&mut self, pairing: &Pairing, wire: &[u8], now: u64) -> anyhow::Result<()> {
@@ -400,6 +423,26 @@ impl Runtime {
             }
         }
         Ok(())
+    }
+}
+/// RRLS simulation only: the primary half of the signed mode protocol, held by
+/// the simulated primary with its own isolated generation file. It answers a
+/// verified RRLS query with this build's mode and can never author a change.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) struct SimulatedPrimaryMode(Runtime);
+#[cfg_attr(not(unix), allow(dead_code))]
+impl SimulatedPrimaryMode {
+    pub(crate) fn new(pairing: &Pairing, path: PathBuf) -> anyhow::Result<Self> {
+        Ok(Self(Runtime::new(pairing, false, path)?))
+    }
+    pub(crate) fn receive(&mut self, pairing: &Pairing, wire: &[u8], now: u64) -> Option<Vec<u8>> {
+        match self.0.receive(pairing, wire, now) {
+            Ok(()) => self.0.reply.take(),
+            Err(error) => {
+                log::debug!("Simulated primary ignored a mode frame: {error}");
+                None
+            }
+        }
     }
 }
 // This protocol is deliberately non-authorizing. Its session is the already
@@ -558,12 +601,15 @@ impl DisplayRuntime {
         Snapshot {
             effective_mode: self.mode,
             local_build_mode: local_mode(),
+            execution_mode: execution_mode(),
+            output_domain: output_domain(),
             primary_station: None,
             synchronized: self.session.is_some() && self.verified.is_some_and(|v| now >= v),
             persisted: self.persisted,
             local_capabilities_match: self.mode == Some(local_mode()),
             error: self.error.clone(),
             authority: "mesh_session",
+            retained_configuration: None,
         }
     }
 }
@@ -584,10 +630,12 @@ impl WorkerRuntime {
             None => Ok(Self::Display(DisplayRuntime::new(observer, path)?)),
         }
     }
+    /// `verified` is set when any peer frame passed verification.
     fn poll(
         &mut self,
         pairing: Option<&Pairing>,
         observation: Observation,
+        verified: &mut bool,
     ) -> anyhow::Result<Snapshot> {
         let Observation {
             now,
@@ -602,8 +650,9 @@ impl WorkerRuntime {
                 // Invalidate the old challenge before receiving any buffered reply.
                 rt.connect_mesh(connected, session);
                 for wire in frames {
-                    if let Err(error) = rt.receive(pairing, &wire, now) {
-                        rt.error = Some(error.to_string());
+                    match rt.receive(pairing, &wire, now) {
+                        Ok(_) => *verified = true,
+                        Err(error) => rt.error = Some(error.to_string()),
                     }
                 }
                 rt.step(pairing, connected, now)?;
@@ -613,8 +662,9 @@ impl WorkerRuntime {
                 anyhow::ensure!(pairing.is_none(), "Configured pairing cannot downgrade");
                 rt.connect(session);
                 for wire in frames {
-                    if let Err(error) = rt.receive(&wire, now) {
-                        rt.error = Some(error.to_string());
+                    match rt.receive(&wire, now) {
+                        Ok(_) => *verified = true,
+                        Err(error) => rt.error = Some(error.to_string()),
                     }
                 }
                 rt.step(now);
@@ -668,10 +718,11 @@ pub fn start(state: Arc<AppState>) -> Option<tokio::task::JoinHandle<()>> {
             let observation = {
                 let mut link = mesh.lock().unwrap();
                 let now = link.now();
+                let (connected, session) = mode_link(&link, now);
                 Observation {
                     now,
-                    connected: link.settings_available(now),
-                    session: link.operating_mode_session(now),
+                    connected,
+                    session,
                     frames: (0..4).filter_map(|_| link.take_operating_mode()).collect(),
                 }
             };
@@ -679,15 +730,18 @@ pub fn start(state: Arc<AppState>) -> Option<tokio::task::JoinHandle<()>> {
             let (runtime, pairing, path) = (runtime.clone(), pairing.clone(), path.clone());
             // Exactly one bounded blocking job per tick, awaited before another.
             // Persistence and signature operations never hold the radio lock.
-            let work = tokio::task::spawn_blocking(move || -> anyhow::Result<Snapshot> {
+            let mut peer_verified = false;
+            let work = tokio::task::spawn_blocking(move || -> anyhow::Result<(Snapshot, bool)> {
                 let mut runtime = runtime.lock().unwrap();
                 if runtime.is_none() {
                     *runtime = Some(WorkerRuntime::new(pairing.as_deref(), observer, path)?);
                 }
-                runtime
+                let mut verified = false;
+                let snapshot = runtime
                     .as_mut()
                     .unwrap()
-                    .poll(pairing.as_deref(), observation)
+                    .poll(pairing.as_deref(), observation, &mut verified)?;
+                Ok((snapshot, verified))
             })
             .await;
             {
@@ -696,12 +750,18 @@ pub fn start(state: Arc<AppState>) -> Option<tokio::task::JoinHandle<()>> {
                     .lock()
                     .unwrap();
                 match work {
-                    Ok(Ok(snapshot)) => *status = snapshot,
+                    Ok(Ok((snapshot, verified))) => {
+                        *status = snapshot;
+                        peer_verified = verified;
+                    }
                     other => {
                         status.synchronized = false;
                         status.error = Some(format!("Mode synchronization unavailable: {other:?}"));
                     }
                 }
+            }
+            if peer_verified && !observer {
+                mesh.lock().unwrap().note_verified_peer(now);
             }
             crate::mission_sync::wire::flush(&mesh, now);
         }
@@ -718,12 +778,17 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/api/station_mode", get(status))
 }
+/// The mesh link the mode worker follows (connected, session).
+fn mode_link(link: &crate::rrls::Mesh, now: u64) -> (bool, Option<u32>) {
+    link.mode_sync_link(now)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn testing_mode_is_explicit_in_local_signed_display_and_persisted_metadata() {
-        if cfg!(feature = "testing") {
+        if crate::runtime_mode::is_testing() {
             assert_eq!(local_mode(), Mode::Testing);
         }
         let root = root();
@@ -989,6 +1054,109 @@ mod tests {
         let root = root();
         let pair = fixture(&root, "rrls", 1);
         assert!(open(&pair, &display_frame(1, 2, Some(Mode::Hitl))).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn rrls_signed_mode_sync_follows_the_simulated_primary() {
+        use crate::rrls::{Mesh, Role};
+        let root = root();
+        crate::rrls_sim_primary::write_pairing(&root).unwrap();
+        let rr_pairing = Pairing::from_file(&root.join("rrls/pairing.json")).unwrap();
+        let gs_pairing = Pairing::from_file(&root.join("primary/pairing.json")).unwrap();
+        let mut gs =
+            crate::rrls_sim_primary::SimulatedPrimary::new(gs_pairing, root.join("generation"))
+                .unwrap();
+        let mut rr = Mesh::new(Role::Rrls, 5);
+        let mut observer = Runtime::new(&rr_pairing, true, root.join("rrls-mode")).unwrap();
+        let mut up = Vec::new();
+        for step in 0..40u64 {
+            let now = step * 50;
+            for frame in gs.step(now, std::mem::take(&mut up)) {
+                rr.incoming(frame.command, &frame.bytes, now);
+            }
+            observer.connect_mesh(rr.settings_available(now), rr.operating_mode_session(now));
+            while let Some(wire) = rr.take_operating_mode() {
+                observer.receive(&rr_pairing, &wire, now).unwrap();
+            }
+            if observer.connected && observer.last_verified.is_none() && observer.pending.is_none() {
+                let nonce = format!("{:032x}", rand::random::<u128>());
+                observer.pending = Some((nonce.clone(), now));
+                let query = seal(&rr_pairing, crate::rrls_sim_primary::PRIMARY_ID, Message::Query { nonce }).unwrap();
+                assert!(rr.queue_settings(&query, now));
+            }
+            rr.tick(now);
+            while let Some(frame) = rr.pop(now) {
+                up.push((frame.command, frame.bytes));
+            }
+        }
+        let snapshot = observer.snapshot(2_000);
+        assert_eq!(snapshot.effective_mode, Some(local_mode()));
+        assert!(snapshot.synchronized && snapshot.persisted);
+        assert_eq!(snapshot.primary_station.as_deref(), Some(crate::rrls_sim_primary::PRIMARY_ID));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    /// pyroI (candidate 7ad9582): RRLS-issued commands over the relay were
+    /// 503 "matching current mode". The relaying RRLS misses runs of HEALTH;
+    /// each 2 s gap dropped its mode session, cleared the verified mode, and
+    /// re-verifying needed a round trip across the hidden node. A 3 s gap must
+    /// keep the verified mode, like the paired control link (6 s).
+    #[test]
+    fn rrls_mode_sync_survives_a_three_second_health_gap() {
+        use crate::rrls::{Mesh, Role};
+        let root = root();
+        crate::rrls_sim_primary::write_pairing(&root).unwrap();
+        let rr_pairing = Pairing::from_file(&root.join("rrls/pairing.json")).unwrap();
+        let gs_pairing = Pairing::from_file(&root.join("primary/pairing.json")).unwrap();
+        let mut gs =
+            crate::rrls_sim_primary::SimulatedPrimary::new(gs_pairing, root.join("generation"))
+                .unwrap();
+        let mut rr = Mesh::new(Role::Rrls, 5);
+        let mut observer = Runtime::new(&rr_pairing, true, root.join("rrls-mode")).unwrap();
+        let mut up = Vec::new();
+        for step in 0..100u64 {
+            let now = step * 50;
+            let frames = gs.step(now, std::mem::take(&mut up));
+            // 2 s to 5 s: hidden-node collisions, the RRLS hears nothing.
+            if !(2_000..5_000).contains(&now) {
+                for frame in frames {
+                    rr.incoming(frame.command, &frame.bytes, now);
+                }
+            }
+            let (connected, session) = mode_link(&rr, now);
+            observer.connect_mesh(connected, session);
+            while let Some(wire) = rr.take_operating_mode() {
+                observer.receive(&rr_pairing, &wire, now).unwrap();
+            }
+            if observer.connected && observer.last_verified.is_none() && observer.pending.is_none() {
+                let nonce = format!("{:032x}", rand::random::<u128>());
+                observer.pending = Some((nonce.clone(), now));
+                let query = seal(&rr_pairing, crate::rrls_sim_primary::PRIMARY_ID, Message::Query { nonce }).unwrap();
+                assert!(rr.queue_settings(&query, now));
+            }
+            rr.tick(now);
+            while let Some(frame) = rr.pop(now) {
+                if !(2_000..5_000).contains(&now) {
+                    up.push((frame.command, frame.bytes));
+                }
+            }
+            if now == 1_950 {
+                assert!(observer.snapshot(now).synchronized, "synchronized before the gap");
+            }
+            if (2_000..5_000).contains(&now) {
+                assert!(observer.snapshot(now).synchronized, "still synchronized {} ms into the gap", now - 2_000);
+            }
+        }
+        // The bound holds the other way too: past PROXY_LEASE_MS without
+        // HEALTH the mode session ends and the verified mode is dropped.
+        let silent_from = 10_000;
+        for step in 0..80u64 {
+            let now = silent_from + step * 100;
+            let (connected, session) = mode_link(&rr, now);
+            observer.connect_mesh(connected, session);
+            rr.tick(now);
+            while rr.pop(now).is_some() {}
+        }
+        assert!(!observer.snapshot(silent_from + 7_900).synchronized, "mode dropped once HEALTH is gone for over 6 s");
         std::fs::remove_dir_all(root).unwrap();
     }
     fn fixture(root: &Path, id: &str, seed: u8) -> Pairing {

@@ -256,7 +256,7 @@
         "group": "Flight controls"
       },
       {
-        "label": "Flight State +1",
+        "label": "State +1",
         "cmd": "AdvanceFlightState",
         "border": "#38bdf8",
         "bg": "#0b1220",
@@ -264,7 +264,7 @@
         "group": "Flight controls"
       },
       {
-        "label": "Flight State -1",
+        "label": "State -1",
         "cmd": "RewindFlightState",
         "border": "#38bdf8",
         "bg": "#0b1220",
@@ -750,6 +750,88 @@
               "enabled": false,
               "kind": "raw"
             }
+          },
+          {
+            "id": "gps_status",
+            "label": "GPS Status",
+            "data_type": "GPS_STATUS",
+            "channels": [
+              "Module (0 no response, 1 silent, 2 no fix, 3 fix)",
+              "Satellites",
+              "Last byte age (s)",
+              "Last fix age (s)"
+            ],
+            "channel_formatters": [
+              {
+                "kind": "integer"
+              },
+              {
+                "kind": "integer"
+              },
+              {
+                "precision": 1
+              },
+              {
+                "precision": 1
+              }
+            ],
+            "chart": {
+              "enabled": false
+            },
+            "summary_items": [
+              {
+                "label": "Module (0 no response, 1 silent, 2 no fix, 3 fix)",
+                "data_type": "GPS_STATUS",
+                "index": 0,
+                "formatter": {
+                  "kind": "integer"
+                },
+                "display_filter": {
+                  "enabled": false,
+                  "kind": "raw"
+                }
+              },
+              {
+                "label": "Satellites",
+                "data_type": "GPS_STATUS",
+                "index": 1,
+                "formatter": {
+                  "kind": "integer"
+                },
+                "display_filter": {
+                  "enabled": false,
+                  "kind": "raw"
+                }
+              },
+              {
+                "label": "Last byte age (s, -1 never)",
+                "data_type": "GPS_STATUS",
+                "index": 2,
+                "formatter": {
+                  "precision": 1
+                },
+                "display_filter": {
+                  "enabled": false,
+                  "kind": "raw"
+                }
+              },
+              {
+                "label": "Last fix age (s, -1 never)",
+                "data_type": "GPS_STATUS",
+                "index": 3,
+                "formatter": {
+                  "precision": 1
+                },
+                "display_filter": {
+                  "enabled": false,
+                  "kind": "raw"
+                }
+              }
+            ],
+            "display_filter": {
+              "enabled": false,
+              "kind": "raw"
+            }
           }
         ],
         "chart": {
@@ -795,6 +877,27 @@
           "kind": "low_pass",
           "cutoff_hz": 8.0
         }
+      },
+      {
+        "id": "COMBUSTION_CHAMBER_PRESSURE",
+        "label": "Combustion chamber pressure",
+        "channels": [
+          "Pressure (psig)"
+        ],
+        "chart": {
+          "enabled": true
+        },
+        "display_filter": {
+          "enabled": true,
+          "kind": "low_pass",
+          "cutoff_hz": 8.0
+        },
+        "channel_formatters": [
+          {
+            "precision": 2,
+            "suffix": " psig"
+          }
+        ]
       },
       {
         "id": "BATTERY_VOLTAGE",
@@ -1475,6 +1578,76 @@
               "enabled": true,
               "kind": "low_pass",
               "cutoff_hz": 8.0
+            }
+          },
+          {
+            "id": "chamber_pressure",
+            "label": "Chamber pressure",
+            "data_type": "COMBUSTION_CHAMBER_PRESSURE",
+            "sender_id": "DAQ",
+            "channels": [
+              "Chamber pressure (psig)"
+            ],
+            "chart_groups": [
+              {
+                "title": "Pressure (psig)",
+                "data_type": "COMBUSTION_CHAMBER_PRESSURE",
+                "sender_id": "DAQ",
+                "labels": [
+                  "Pressure (psig)"
+                ],
+                "channels": [
+                  0
+                ]
+              },
+              {
+                "title": "Connector voltage (V)",
+                "data_type": "COMBUSTION_CHAMBER_VOLTAGE",
+                "sender_id": "DAQ",
+                "labels": [
+                  "Voltage (V)"
+                ],
+                "channels": [
+                  0
+                ]
+              }
+            ],
+            "summary_items": [
+              {
+                "label": "Chamber pressure",
+                "data_type": "COMBUSTION_CHAMBER_PRESSURE",
+                "sender_id": "DAQ",
+                "index": 0,
+                "formatter": {
+                  "kind": "number",
+                  "precision": 2,
+                  "suffix": " psig"
+                }
+              },
+              {
+                "label": "Raw connector voltage",
+                "data_type": "COMBUSTION_CHAMBER_VOLTAGE",
+                "sender_id": "DAQ",
+                "index": 0,
+                "formatter": {
+                  "kind": "number",
+                  "precision": 4,
+                  "suffix": " V"
+                }
+              },
+              {
+                "label": "Outside rated 0\u20131000 psig range (1=yes)",
+                "data_type": "COMBUSTION_CHAMBER_RANGE_STATUS",
+                "sender_id": "DAQ",
+                "index": 0,
+                "formatter": {
+                  "kind": "number",
+                  "precision": 0
+                }
+              }
+            ],
+            "chart": {
+              "enabled": true
             }
           }
         ],
@@ -2271,6 +2444,69 @@
         "chart": {
           "enabled": true
         }
+      },
+      {
+        "id": "IGNITER_SENSE_SIGNAL",
+        "label": "Igniter current sense",
+        "channels": [
+          "ADC counts",
+          "Signal voltage",
+          "Current (unavailable)"
+        ],
+        "show_min_max": true,
+        "channel_formatters": [
+          {
+            "kind": "integer"
+          },
+          {
+            "precision": 4,
+            "suffix": " V"
+          },
+          {
+            "suffix": " A"
+          }
+        ],
+        "chart": {
+          "enabled": true
+        },
+        "chart_groups": [
+          {
+            "title": "Measured current-sense signal",
+            "data_type": "IGNITER_SENSE_SIGNAL",
+            "sender_id": "AB",
+            "labels": [
+              "Signal voltage (V)"
+            ],
+            "channels": [
+              1
+            ]
+          },
+          {
+            "title": "ADC input",
+            "data_type": "IGNITER_SENSE_SIGNAL",
+            "sender_id": "AB",
+            "labels": [
+              "ADC counts"
+            ],
+            "channels": [
+              0
+            ]
+          }
+        ],
+        "subtabs": [
+          {
+            "id": "actuator_igniter_sense",
+            "label": "Actuator board",
+            "data_type": "IGNITER_SENSE_SIGNAL",
+            "sender_id": "AB",
+            "channels": [
+              "ADC counts",
+              "Signal voltage",
+              "Current (unavailable)"
+            ],
+            "show_min_max": true
+          }
+        ]
       }
     ],
     "default_display_filter": {
@@ -2947,8 +3183,8 @@
           "Ascent",
           "Coast",
           "Apogee",
-          "ParachuteDeploy",
-          "Descent"
+          "Descent",
+          "Reefing"
         ],
         "sections": [
           {
@@ -3296,5 +3532,6 @@
         "curve_exponent": 1.0
       }
     ]
-  }
+  },
+  "flight_phase_version": 1
 }

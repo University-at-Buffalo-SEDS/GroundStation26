@@ -23,30 +23,73 @@ const PBKDF2_OUTPUT_LEN: usize = 32;
 static PENDING_LOGIN_CHALLENGES: LazyLock<Mutex<HashMap<String, PendingLoginChallenge>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct Permissions {
-    #[serde(default)]
-    pub view_data: bool,
-    #[serde(default)]
-    pub send_commands: bool,
-    #[serde(default)]
-    pub set_system_time: bool,
-    #[serde(default)]
-    pub voice_transmit: bool,
-    #[serde(default)]
-    pub camera_publish: bool,
+/// Declares every grantable permission exactly once. The flag struct, the
+/// `Permission` enum, `Permission::ALL` and `Permissions::all()` are all
+/// generated from this one list, so an application administrator (who always
+/// receives `Permissions::all()`) cannot be missing a permission added later.
+macro_rules! permission_set {
+    ($($field:ident => $variant:ident),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+        pub struct Permissions {
+            $(#[serde(default)] pub $field: bool,)+
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum Permission {
+            $($variant,)+
+        }
+
+        impl Permission {
+            /// Every permission, in declaration order.
+            #[allow(dead_code)]
+            pub const ALL: &'static [Permission] = &[$(Permission::$variant,)+];
+
+            /// The stored/serialized flag name for this permission.
+            #[allow(dead_code)]
+            pub const fn field_name(self) -> &'static str {
+                match self {
+                    $(Permission::$variant => stringify!($field),)+
+                }
+            }
+        }
+
+        impl Permissions {
+            /// Every permission granted; the only grant an administrator holds.
+            pub const fn all() -> Self {
+                Self { $($field: true,)+ }
+            }
+
+            /// The raw stored flag, without dependency normalization.
+            #[allow(dead_code)]
+            pub const fn flag(self, permission: Permission) -> bool {
+                match permission {
+                    $(Permission::$variant => self.$field,)+
+                }
+            }
+
+            /// Grants held by both sides (paired sessions, revocation).
+            pub const fn intersect(self, other: Self) -> Self {
+                Self { $($field: self.$field && other.$field,)+ }
+            }
+        }
+    };
+}
+
+permission_set! {
+    view_data => ViewData,
+    send_commands => SendCommands,
+    set_system_time => SetSystemTime,
+    voice_transmit => VoiceTransmit,
+    camera_publish => CameraPublish,
+    sign_checklists => SignChecklists,
 }
 
 impl Permissions {
+    /// Effective permissions for an account. Administrators always hold every
+    /// permission regardless of the stored flags; other roles use their flags.
     pub fn for_roles(self, roles: &[StreamRole]) -> Self {
         if roles.contains(&StreamRole::Admin) {
-            Self {
-                view_data: true,
-                send_commands: true,
-                set_system_time: true,
-                voice_transmit: true,
-                camera_publish: true,
-            }
+            Self::all()
         } else {
             self.normalized()
         }
@@ -66,6 +109,7 @@ impl Permissions {
             Permission::SetSystemTime => normalized.set_system_time,
             Permission::VoiceTransmit => normalized.view_data && normalized.voice_transmit,
             Permission::CameraPublish => normalized.view_data && normalized.camera_publish,
+            Permission::SignChecklists => normalized.view_data && normalized.sign_checklists,
         }
     }
 }
@@ -109,15 +153,6 @@ impl CalibrationAccess {
         }
         self
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Permission {
-    ViewData,
-    SendCommands,
-    SetSystemTime,
-    VoiceTransmit,
-    CameraPublish,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,6 +225,7 @@ pub struct SessionStatus {
     pub station_role: &'static str,
     pub station_pairing: Option<crate::station_pairing::Public>,
     pub operating_mode: crate::station_mode::Snapshot,
+    pub command_proxy: crate::command_proxy::Status,
     pub roles: Vec<StreamRole>,
     pub authenticated: bool,
     pub username: Option<String>,
@@ -215,8 +251,32 @@ pub struct AuthPrincipal {
 }
 
 impl AuthPrincipal {
+    /// A signed-in application administrator.
+    pub fn is_admin(&self) -> bool {
+        !self.anonymous && self.roles.contains(&StreamRole::Admin)
+    }
+
+    /// Every authenticated principal is finished here. An administrator always
+    /// holds every permission, unrestricted commands and full calibration
+    /// access; no stored flag, stale session row or paired claim can narrow it.
+    /// Station/mode/proxy admission rules are enforced separately and still apply.
+    fn with_role_authority(mut self) -> Self {
+        if self.is_admin() {
+            self.permissions = Permissions::all();
+            self.command_access = CommandAccess::default();
+            self.calibration_access = CalibrationAccess {
+                view: true,
+                edit: true,
+            };
+            self.roles.retain(|role| *role != StreamRole::StreamViewer);
+        }
+        self
+    }
+
     pub fn can_publish_camera(&self) -> bool {
-        !self.anonymous && (self.roles.contains(&StreamRole::Admin) || self.permissions.allows(Permission::CameraPublish))
+        !self.anonymous
+            && (self.roles.contains(&StreamRole::Admin)
+                || self.permissions.allows(Permission::CameraPublish))
     }
 
     pub fn can_manage_stream(&self) -> bool {
@@ -250,6 +310,7 @@ impl AuthPrincipal {
             },
             station_pairing: crate::station_pairing::public(),
             operating_mode: crate::station_mode::snapshot(),
+            command_proxy: crate::command_proxy::status(),
             roles: self.roles.clone(),
             authenticated: !self.anonymous,
             username: self.username.clone(),
@@ -305,6 +366,7 @@ mod stream_role_tests {
                 set_system_time: false,
                 voice_transmit: false,
                 camera_publish: false,
+                sign_checklists: false,
             },
             expires_at_ms: None,
             anonymous,
@@ -331,6 +393,212 @@ mod stream_role_tests {
         p.command_access.allowed_commands = vec!["StreamControl".into()];
         assert!(!p.can_manage_stream());
         assert_eq!(p.command_access.allowed_commands, vec!["StreamControl"]);
+    }
+}
+
+#[cfg(test)]
+mod admin_authority_tests {
+    use super::*;
+
+    fn user(name: &str, roles: Vec<StreamRole>, permissions: Permissions) -> UserRecord {
+        UserRecord {
+            roles,
+            username: name.into(),
+            password: PasswordHashRecord {
+                algorithm: default_password_algorithm(),
+                iterations: 1,
+                salt_b64: String::new(),
+                hash_b64: String::new(),
+            },
+            permissions,
+            command_access: CommandAccess {
+                allowed_commands: vec!["Pilot".into()],
+            },
+            calibration_access: CalibrationAccess::default(),
+            disabled: false,
+        }
+    }
+
+    /// Every stored flag combination an admin record might carry, including
+    /// none at all and each single flag on its own.
+    fn stored_variants() -> Vec<Permissions> {
+        let mut variants = vec![Permissions::default(), Permissions::all()];
+        for permission in Permission::ALL {
+            let mut only: serde_json::Value = serde_json::to_value(Permissions::default()).unwrap();
+            only[permission.field_name()] = true.into();
+            variants.push(serde_json::from_value(only).unwrap());
+        }
+        variants
+    }
+
+    fn assert_holds_everything(permissions: Permissions, context: &str) {
+        assert_eq!(permissions, Permissions::all(), "{context}");
+        for permission in Permission::ALL {
+            assert!(permissions.flag(*permission), "{context}: {permission:?} flag");
+            assert!(permissions.allows(*permission), "{context}: {permission:?} allowed");
+        }
+    }
+
+    #[test]
+    fn permission_list_covers_every_serialized_flag() {
+        // Fails if a flag is ever added to `Permissions` without also being
+        // part of `Permission::ALL` (and therefore `Permissions::all()`).
+        let default = serde_json::to_value(Permissions::default()).unwrap();
+        let mut stored: Vec<_> = default.as_object().unwrap().keys().cloned().collect();
+        let mut listed: Vec<_> = Permission::ALL.iter().map(|p| p.field_name().to_string()).collect();
+        stored.sort();
+        listed.sort();
+        assert_eq!(stored, listed);
+        let all = serde_json::to_value(Permissions::all()).unwrap();
+        assert!(all.as_object().unwrap().values().all(|v| v == &serde_json::Value::Bool(true)));
+        assert_eq!(all.as_object().unwrap().len(), Permission::ALL.len());
+    }
+
+    #[test]
+    fn admin_role_grants_every_permission_whatever_is_stored() {
+        for stored in stored_variants() {
+            for roles in [
+                vec![StreamRole::Admin],
+                vec![StreamRole::Admin, StreamRole::StreamViewer],
+                vec![StreamRole::StreamViewer, StreamRole::Admin, StreamRole::StreamMaster],
+            ] {
+                assert_holds_everything(stored.for_roles(&roles), &format!("{stored:?} {roles:?}"));
+            }
+        }
+    }
+
+    #[test]
+    fn non_admin_roles_keep_exactly_their_stored_flags() {
+        for stored in stored_variants() {
+            for roles in [
+                vec![],
+                vec![StreamRole::StreamAdmin],
+                vec![StreamRole::StreamMaster],
+                vec![StreamRole::StreamViewer],
+            ] {
+                assert_eq!(stored.for_roles(&roles), stored.normalized(), "{roles:?}");
+            }
+        }
+        let viewer = Permissions { view_data: true, ..Default::default() };
+        assert!(!viewer.for_roles(&[StreamRole::StreamAdmin]).allows(Permission::VoiceTransmit));
+    }
+
+    fn assert_admin_principal(principal: &AuthPrincipal, context: &str) {
+        assert_holds_everything(principal.permissions, context);
+        assert!(principal.command_access.allowed_commands.is_empty(), "{context}");
+        for command in ["FirmwareUpdate", "StreamControl", "RetractPlumbing", "Abort", "ValveSelfTest"] {
+            assert!(principal.allows_command_name(command), "{context}: {command}");
+        }
+        assert!(principal.calibration_access.view && principal.calibration_access.edit, "{context}");
+        assert!(principal.can_manage_stream() && principal.can_publish_camera(), "{context}");
+        assert!(!principal.roles.contains(&StreamRole::StreamViewer), "{context}");
+        let status = principal.session_status();
+        assert_holds_everything(status.permissions, context);
+        assert!(status.can_view_calibration && status.can_edit_calibration, "{context}");
+    }
+
+    fn claims(roles: Vec<StreamRole>, permissions: Permissions, issuer: &str) -> crate::station_pairing::Claims {
+        crate::station_pairing::Claims {
+            installation_id: "test".into(),
+            issuer: issuer.into(),
+            username: "Chief".into(),
+            issued_at_ms: now_ms(),
+            expires_at_ms: now_ms() + 60_000,
+            nonce: "n".into(),
+            roles,
+            permissions,
+            command_access: CommandAccess { allowed_commands: vec!["Pilot".into()] },
+            calibration_access: CalibrationAccess::default(),
+            remembered: false,
+        }
+    }
+
+    #[test]
+    fn paired_admin_holds_every_permission_even_with_stale_claims() {
+        for stored in stored_variants() {
+            let config = UsersFile {
+                users: vec![user("chief", vec![StreamRole::Admin, StreamRole::StreamViewer], stored)],
+                ..Default::default()
+            };
+            for claimed in stored_variants() {
+                for permission in Permission::ALL {
+                    // Peer-issued portable session: both stations say admin.
+                    let principal = paired_principal(
+                        &config,
+                        &claims(vec![StreamRole::Admin], claimed, "primary"),
+                        "rrls",
+                        *permission,
+                        now_ms(),
+                    )
+                    .unwrap();
+                    assert_admin_principal(&principal, "peer-issued");
+                    // A token this station issued follows the current local role.
+                    let principal = paired_principal(
+                        &config,
+                        &claims(vec![], claimed, "rrls"),
+                        "rrls",
+                        *permission,
+                        now_ms(),
+                    )
+                    .unwrap();
+                    assert_admin_principal(&principal, "self-issued");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn paired_non_admin_and_unconfirmed_admin_stay_intersected() {
+        let operator = Permissions { view_data: true, send_commands: true, ..Default::default() };
+        let config = UsersFile {
+            users: vec![user("chief", vec![StreamRole::Admin], operator)],
+            ..Default::default()
+        };
+        // The peer did not vouch for administrator: no admin authority here.
+        let principal = paired_principal(
+            &config,
+            &claims(vec![], operator, "primary"),
+            "rrls",
+            Permission::ViewData,
+            now_ms(),
+        )
+        .unwrap();
+        assert!(!principal.is_admin());
+        assert!(!principal.permissions.voice_transmit);
+        assert!(paired_principal(&config, &claims(vec![], operator, "primary"), "rrls", Permission::VoiceTransmit, now_ms()).is_err());
+        // Plain operators keep the claim/local intersection and command list.
+        let config = UsersFile {
+            users: vec![user("chief", vec![], operator)],
+            ..Default::default()
+        };
+        let principal = paired_principal(
+            &config,
+            &claims(vec![StreamRole::Admin], Permissions::all(), "primary"),
+            "rrls",
+            Permission::SendCommands,
+            now_ms(),
+        )
+        .unwrap();
+        assert_eq!(principal.permissions, operator);
+        assert!(principal.allows_command_name("Pilot"));
+        assert!(!principal.allows_command_name("FirmwareUpdate"));
+    }
+
+    #[test]
+    fn primary_proxy_actor_admin_holds_every_permission() {
+        let root = crate::recording_export::tests::TestDirectory::new();
+        let manager = AuthManager::new(root.0.join("auth.json"));
+        for stored in stored_variants() {
+            let config = UsersFile {
+                users: vec![user("chief", vec![StreamRole::Admin, StreamRole::StreamViewer], stored)],
+                ..Default::default()
+            };
+            std::fs::write(manager.path(), serde_json::to_vec(&config).unwrap()).unwrap();
+            for permission in Permission::ALL {
+                let principal = manager.paired_proxy_actor("CHIEF", *permission).unwrap();
+                assert_admin_principal(&principal, "proxy actor");
+            }
+        }
     }
 }
 
@@ -606,70 +874,49 @@ impl AuthManager {
         let config = self
             .load_users_file()
             .map_err(|_| AuthFailure::Internal("could not load accounts".into()))?;
+        paired_principal(
+            &config,
+            &claims,
+            &pairing.public.station_id,
+            required,
+            now_ms(),
+        )
+    }
+
+    /// Resolve the primary's CURRENT local grant for one authenticated paired
+    /// proxy assertion. The caller must already verify the narrowly signed
+    /// actor/operation envelope; this method creates no login or session.
+    pub(crate) fn paired_proxy_actor(
+        &self,
+        username: &str,
+        required: Permission,
+    ) -> Result<AuthPrincipal, AuthFailure> {
+        let config = self
+            .load_users_file()
+            .map_err(|_| AuthFailure::Internal("could not load accounts".into()))?;
         let user = config
             .users
             .iter()
-            .find(|u| u.username.eq_ignore_ascii_case(&claims.username) && !u.disabled)
-            .ok_or_else(unauthorized)?;
-        let local = user.permissions.for_roles(&user.roles);
-        let roles: Vec<_> = user
-            .roles
-            .iter()
-            .copied()
-            .filter(|r| claims.roles.contains(r))
-            .collect();
-        let permissions = Permissions {
-            view_data: claims.permissions.view_data && local.view_data,
-            send_commands: claims.permissions.send_commands && local.send_commands,
-            set_system_time: claims.permissions.set_system_time && local.set_system_time,
-            voice_transmit: claims.permissions.voice_transmit && local.voice_transmit,
-            camera_publish: claims.permissions.camera_publish && local.camera_publish,
-        };
+            .find(|user| !user.disabled && user.username.eq_ignore_ascii_case(username))
+            .ok_or_else(|| AuthFailure::Forbidden("paired actor is unavailable".into()))?;
+        let permissions = user.permissions.for_roles(&user.roles);
         if !permissions.allows(required) {
             return Err(AuthFailure::Forbidden(
-                "paired account lacks permission".into(),
+                "paired actor lacks local permission".into(),
             ));
         }
-        let (local_commands, local_calibration) = configured_user_access(&config, &user.username);
-        let mut allowed_commands = intersect_commands(
-            &claims.command_access.allowed_commands,
-            &local_commands.allowed_commands,
-        );
-        // An empty list means unrestricted, so an empty intersection must use a
-        // non-command sentinel rather than accidentally expanding permissions.
-        if !claims.command_access.allowed_commands.is_empty()
-            && !local_commands.allowed_commands.is_empty()
-            && allowed_commands.is_empty()
-        {
-            allowed_commands.push("__no_paired_commands__".into());
-        }
-        let local_expiry = claims.issued_at_ms.saturating_add(
-            (config.session_ttl_seconds.min(i64::MAX as u64 / 1000) as i64).saturating_mul(1000),
-        );
-        let expires = claims.expires_at_ms.min(local_expiry);
-        if expires <= now_ms() {
-            return Err(unauthorized());
-        }
+        let (command_access, calibration_access) = configured_user_access(&config, &user.username);
         Ok(AuthPrincipal {
-            roles,
+            roles: user.roles.clone(),
             username: Some(user.username.clone()),
             permissions,
-            expires_at_ms: Some(expires),
+            expires_at_ms: None,
             anonymous: false,
-            session_type: Some(
-                if claims.remembered {
-                    "remembered"
-                } else {
-                    "session"
-                }
-                .into(),
-            ),
-            command_access: CommandAccess { allowed_commands },
-            calibration_access: CalibrationAccess {
-                view: claims.calibration_access.view && local_calibration.view,
-                edit: claims.calibration_access.edit && local_calibration.edit,
-            },
-        })
+            session_type: Some("paired_command_assertion".into()),
+            command_access,
+            calibration_access,
+        }
+        .with_role_authority())
     }
 
     pub async fn authorize_token(
@@ -722,6 +969,7 @@ impl AuthManager {
                 set_system_time: false,
                 voice_transmit: false,
                 camera_publish: false,
+                sign_checklists: false,
             }
             .normalized();
 
@@ -734,26 +982,18 @@ impl AuthManager {
                 .iter()
                 .find(|u| u.username.eq_ignore_ascii_case(&username) && !u.disabled)
                 .ok_or_else(|| AuthFailure::Unauthorized("Account disabled or removed".into()))?;
-            // Application admins inherit full application access. Removing that
-            // role or disabling the account is checked against the current file.
+            // Application admins inherit full application access through
+            // `with_role_authority`. Removing that role or disabling the
+            // account is checked against the current file.
             let current = user.permissions.for_roles(&user.roles);
-            if user.roles.contains(&StreamRole::Admin) {
-                permissions = current;
-            } else {
-                permissions.view_data &= current.view_data;
-                permissions.send_commands &= current.send_commands;
-                permissions.set_system_time = current.set_system_time;
-                permissions.voice_transmit = current.voice_transmit && current.view_data;
-                permissions.camera_publish = current.camera_publish && current.view_data;
-            }
-            if !permissions.allows(required) {
-                return Err(AuthFailure::Forbidden(
-                    "session does not have the required permission".into(),
-                ));
-            }
+            permissions.view_data &= current.view_data;
+            permissions.send_commands &= current.send_commands;
+            permissions.set_system_time = current.set_system_time;
+            permissions.voice_transmit = current.voice_transmit && current.view_data;
+            permissions.camera_publish = current.camera_publish && current.view_data;
+            permissions.sign_checklists = current.sign_checklists && current.view_data;
             let (command_access, calibration_access) = configured_user_access(&config, &username);
-
-            return Ok(AuthPrincipal {
+            let principal = AuthPrincipal {
                 roles: user.roles.clone(),
                 username: Some(username),
                 permissions,
@@ -762,7 +1002,14 @@ impl AuthManager {
                 session_type: Some(row.get::<String, _>("session_type")),
                 command_access,
                 calibration_access,
-            });
+            }
+            .with_role_authority();
+            if !principal.permissions.allows(required) {
+                return Err(AuthFailure::Forbidden(
+                    "session does not have the required permission".into(),
+                ));
+            }
+            return Ok(principal);
         }
 
         let config = self
@@ -772,6 +1019,7 @@ impl AuthManager {
         permissions.set_system_time = false;
         permissions.voice_transmit = false;
         permissions.camera_publish = false;
+        permissions.sign_checklists = false;
         if !permissions.allows(required) {
             return Err(AuthFailure::Unauthorized(
                 "authentication required".to_string(),
@@ -795,8 +1043,15 @@ impl AuthManager {
         db: &SqlitePool,
         token: Option<&str>,
     ) -> Result<SessionStatus, AuthFailure> {
+        // A token that was sent but no longer resolves must be reported as 401,
+        // exactly as every data endpoint does, so clients drop it and sign in
+        // again instead of looking "anonymous" here while all other requests fail.
+        let presented = token.is_some_and(|token| !token.trim().is_empty());
         match self.authorize_token(db, token, Permission::ViewData).await {
             Ok(principal) => Ok(principal.session_status()),
+            Err(AuthFailure::Unauthorized(message)) if presented => {
+                Err(AuthFailure::Unauthorized(message))
+            }
             Err(AuthFailure::Unauthorized(_)) => {
                 let config = self.load_users_file().map_err(|e| {
                     AuthFailure::Internal(format!("failed to load users.json: {e}"))
@@ -806,7 +1061,8 @@ impl AuthManager {
                     username: None,
                     permissions: Permissions {
                         voice_transmit: false,
-                camera_publish: false,
+                        camera_publish: false,
+                        sign_checklists: false,
                         ..config.anonymous.normalized()
                     },
                     expires_at_ms: None,
@@ -831,6 +1087,90 @@ impl AuthManager {
     }
 }
 
+/// Resolve a verified paired (portable) session against the CURRENT local
+/// accounts. Non-admin grants are the intersection of the signed claims and
+/// the local account. An administrator holds every permission here; command
+/// admission through the primary's proxy is still enforced separately.
+fn paired_principal(
+    config: &UsersFile,
+    claims: &crate::station_pairing::Claims,
+    own_station_id: &str,
+    required: Permission,
+    now: i64,
+) -> Result<AuthPrincipal, AuthFailure> {
+    let unauthorized = || AuthFailure::Unauthorized("invalid or revoked paired session".into());
+    let user = config
+        .users
+        .iter()
+        .find(|u| u.username.eq_ignore_ascii_case(&claims.username) && !u.disabled)
+        .ok_or_else(unauthorized)?;
+    let local = user.permissions.for_roles(&user.roles);
+    let mut roles: Vec<_> = user
+        .roles
+        .iter()
+        .copied()
+        .filter(|r| claims.roles.contains(r))
+        .collect();
+    // A token this station issued is backed by a local session row, so it
+    // follows the CURRENT local account exactly like an unpaired session:
+    // granting administrator takes effect without signing in again. A
+    // peer-issued token still needs both stations to agree on the role.
+    if claims.issuer == own_station_id
+        && user.roles.contains(&StreamRole::Admin)
+        && !roles.contains(&StreamRole::Admin)
+    {
+        roles.push(StreamRole::Admin);
+    }
+    let permissions = claims.permissions.intersect(local);
+    let (local_commands, local_calibration) = configured_user_access(config, &user.username);
+    let mut allowed_commands = intersect_commands(
+        &claims.command_access.allowed_commands,
+        &local_commands.allowed_commands,
+    );
+    // An empty list means unrestricted, so an empty intersection must use a
+    // non-command sentinel rather than accidentally expanding permissions.
+    if !claims.command_access.allowed_commands.is_empty()
+        && !local_commands.allowed_commands.is_empty()
+        && allowed_commands.is_empty()
+    {
+        allowed_commands.push("__no_paired_commands__".into());
+    }
+    let local_expiry = claims.issued_at_ms.saturating_add(
+        (config.session_ttl_seconds.min(i64::MAX as u64 / 1000) as i64).saturating_mul(1000),
+    );
+    let expires = claims.expires_at_ms.min(local_expiry);
+    if expires <= now {
+        return Err(unauthorized());
+    }
+    let principal = AuthPrincipal {
+        roles,
+        username: Some(user.username.clone()),
+        permissions,
+        expires_at_ms: Some(expires),
+        anonymous: false,
+        session_type: Some(
+            if claims.remembered {
+                "remembered"
+            } else {
+                "session"
+            }
+            .into(),
+        ),
+        command_access: CommandAccess { allowed_commands },
+        calibration_access: CalibrationAccess {
+            view: claims.calibration_access.view && local_calibration.view,
+            edit: claims.calibration_access.edit && local_calibration.edit,
+        },
+    }
+    .with_role_authority();
+    if !principal.permissions.allows(required) {
+        return Err(AuthFailure::Forbidden(
+            "paired account lacks permission".into(),
+        ));
+    }
+    Ok(principal)
+}
+
 async fn create_session_for_user(
     db: &SqlitePool,
     config: &UsersFile,
@@ -843,9 +1183,8 @@ async fn create_session_for_user(
     let permissions = user.permissions.for_roles(&user.roles);
     let (command_access, calibration_access) = configured_user_access(config, &user.username);
     let session_type = if remember_me { "remembered" } else { "session" };
-    let token = match crate::station_pairing::Pairing::load()
-        .map_err(|_| AuthFailure::Internal("station pairing configuration invalid".into()))?
-    {
+    // A broken pairing falls back to an ordinary local session; login must not fail.
+    let token = match crate::station_pairing::Pairing::load_or_unpaired("login") {
         Some(pairing) => pairing
             .token(&crate::station_pairing::Claims {
                 installation_id: pairing.public.installation_id.clone(),
@@ -898,6 +1237,7 @@ async fn create_session_for_user(
             command_access,
             calibration_access,
         }
+        .with_role_authority()
         .session_status(),
     })
 }

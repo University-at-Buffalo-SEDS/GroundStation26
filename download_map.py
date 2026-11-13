@@ -11,10 +11,109 @@ def run(cmd: list[str], cwd: Path, env: dict[str, str] | None = None) -> None:
     subprocess.run(cmd, cwd=cwd, check=True, env=env)
 
 
+# High-detail regions the downloader can add (map_downloader/src/profile.rs
+# SELECTABLE_REGIONS). Rough storage for zoom 9-17 satellite JPEG tiles at
+# about 25-40 KB each; actual size depends on the imagery.
+REGIONS = [
+    ("urrg", "URRG launch field (Potter, NY)", 12_474, (300, 490)),
+    ("ub", "UB campus (Buffalo, NY)", 7_246, (180, 280)),
+    ("midland", "Midland, TX (city and airport)", 18_668, (460, 730)),
+]
+
+
+def parse_regions(value: str) -> list[str]:
+    known = {name for name, *_ in REGIONS}
+    picked = []
+    for name in (part.strip().lower() for part in value.split(",")):
+        if not name:
+            continue
+        if name not in known:
+            raise ValueError(f"unknown region {name!r}; choose from {', '.join(sorted(known))}")
+        if name not in picked:
+            picked.append(name)
+    if not picked:
+        raise ValueError("choose at least one region")
+    return picked
+
+
+def describe(names: list[str]) -> str:
+    low = sum(size[0] for name, _, _, size in REGIONS if name in names)
+    high = sum(size[1] for name, _, _, size in REGIONS if name in names)
+    return f"~{low}-{high} MB"
+
+
+def pick_regions_tui() -> list[str]:
+    """Checkbox picker: arrows/j/k move, space toggles, a toggles all, enter confirms."""
+    import curses
+
+    def run_picker(screen) -> list[str]:
+        curses.curs_set(0)
+        chosen = [False] * len(REGIONS)
+        at = 0
+        message = ""
+        while True:
+            screen.erase()
+            screen.addstr(0, 0, "High-detail map regions (zoom 9-17). Select one or more:")
+            for index, (name, label, tiles, (low, high)) in enumerate(REGIONS):
+                mark = "[x]" if chosen[index] else "[ ]"
+                line = f" {mark} {label:<34} {tiles:>6} tiles  ~{low}-{high} MB"
+                screen.addstr(2 + index, 0, line, curses.A_REVERSE if index == at else curses.A_NORMAL)
+            selected = [REGIONS[i][0] for i, on in enumerate(chosen) if on]
+            total = describe(selected) if selected else "nothing selected"
+            screen.addstr(3 + len(REGIONS), 0, f"Total: {total}")
+            screen.addstr(5 + len(REGIONS), 0, "space: toggle  a: all  enter: download  q: cancel")
+            if message:
+                screen.addstr(7 + len(REGIONS), 0, message)
+            key = screen.getch()
+            if key in (curses.KEY_UP, ord("k")):
+                at = (at - 1) % len(REGIONS)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                at = (at + 1) % len(REGIONS)
+            elif key == ord(" "):
+                chosen[at] = not chosen[at]
+            elif key == ord("a"):
+                chosen = [not all(chosen)] * len(REGIONS)
+            elif key in (curses.KEY_ENTER, 10, 13):
+                if selected:
+                    return selected
+                message = "Select at least one region (space)."
+            elif key in (ord("q"), 27):
+                raise KeyboardInterrupt
+
+    return curses.wrapper(run_picker)
+
+
+def pick_regions_text() -> list[str]:
+    print("High-detail map regions (zoom 9-17):")
+    for name, label, tiles, (low, high) in REGIONS:
+        print(f"  {name:<8} {label:<34} {tiles:>6} tiles  ~{low}-{high} MB")
+    while True:
+        try:
+            return parse_regions(input("Regions to download (comma separated, e.g. urrg,ub): "))
+        except ValueError as error:
+            print(f"  {error}")
+
+
+def choose_regions(args: argparse.Namespace) -> list[str] | None:
+    """--regions wins; otherwise ask on a terminal. None keeps the defaults."""
+    if args.regions is not None:
+        return parse_regions(args.regions)
+    if args.test or args.repair_tile or not sys.stdin.isatty():
+        return None
+    try:
+        return pick_regions_tui()
+    except Exception:
+        # No curses (or a terminal too small to draw): ask in plain text.
+        return pick_regions_text()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Download offline map tiles.")
     parser.add_argument("--profile", choices=["groundstation", "rrls"], default=None,
                         help="Coverage preset: rrls downloads only UB, URRG and Midland into its own bounded dataset; default keeps normal GroundStation coverage.")
+    parser.add_argument("--regions", default=None, metavar="urrg,ub,midland",
+                        help="High-detail regions to download, one or more of urrg, ub, midland. "
+                             "Without it an interactive picker asks (on a terminal).")
     parser.add_argument("--repair-tile", action="append", default=[], metavar="Z/X/Y",
                         help="Refetch only selected cached coordinates (repeat up to32); preserves each old tile until a valid replacement commits. Cannot combine with --test.")
     parser.add_argument("--test",action="store_true",help="Test a few configured map tiles without creating or writing map data; reports direct and fallback routing.")
@@ -82,6 +181,14 @@ def main() -> None:
     env = os.environ.copy()
     if args.profile is not None:
         env["MAP_PROFILE"] = args.profile
+    try:
+        regions = choose_regions(args)
+    except ValueError as error:
+        print(f"Error: --regions: {error}", file=sys.stderr)
+        sys.exit(2)
+    if regions is not None:
+        env["MAP_REGIONS"] = ",".join(regions)
+        print(f"High-detail regions: {', '.join(regions)} ({describe(regions)})")
     if args.direct_to_db and args.via_tiles:
         print("Error: --direct-to-db and --via-tiles are mutually exclusive.", file=sys.stderr)
         sys.exit(2)

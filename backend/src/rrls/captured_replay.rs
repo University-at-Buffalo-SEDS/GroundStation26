@@ -4,8 +4,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use std::collections::{BTreeMap, VecDeque};
 
-#[path = "../comms/virtual_uart.rs"]
-mod virtual_uart;
+use crate::comms::virtual_uart;
 
 #[derive(Deserialize)]
 struct Fixture {

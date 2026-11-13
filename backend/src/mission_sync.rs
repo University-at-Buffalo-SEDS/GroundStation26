@@ -12,7 +12,7 @@ use paired_settings::{Document, coordinator::Coordinator, radio::RadioSync};
 use ring::signature::KeyPair;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-#[cfg(all(test, not(feature = "hitl_mode")))]
+#[cfg(test)]
 use std::time::Instant;
 use std::{
     collections::BTreeMap,
@@ -66,6 +66,11 @@ impl Catalog {
     }
 }
 static RUNTIME: OnceLock<Arc<Mutex<Runtime>>> = OnceLock::new();
+
+/// True once the paired settings worker owns the general SETTINGS inbox.
+pub(crate) fn running() -> bool {
+    RUNTIME.get().is_some()
+}
 struct Runtime {
     installation: String,
     actors: Vec<String>,
@@ -174,8 +179,7 @@ impl Runtime {
             "Review a current conflict before resolving it"
         );
         let mut next = self.coordinator.clone();
-        let document =
-            next.resolve(&request.key, &request.expected, request.value, &self.actors)?;
+        let document = next.resolve(&request.key, &request.expected, request.value, &self.actors)?;
         Self::validate(cfg, &request.key, &document)?;
         // A failed API save cannot leave a queued resolution that applies later.
         next.save(&self.path)?;
@@ -218,8 +222,9 @@ fn step(
     };
     let mut reception_error = None;
     for wire in frames {
-        #[cfg(not(feature = "hitl_mode"))]
-        if paired_settings::journal_replication::JournalRadio::recognizes(&wire) {
+        if !crate::runtime_mode::is_hitl()
+            && paired_settings::journal_replication::JournalRadio::recognizes(&wire)
+        {
             if !crate::checklists::paired::receive_wire(wire) {
                 reception_error = Some(anyhow::anyhow!("Shared checklist inbox is busy"));
             }
@@ -351,10 +356,17 @@ fn step(
 }
 
 /// HITL retains its existing configuration and sequencing behavior.
+fn run_settings_step(state: &AppState, generation: u64, work: impl FnOnce()) -> bool {
+    let Some(_claim) = crate::gse::claim_operator_dispatch(state, generation) else {
+        return false;
+    };
+    work();
+    true
+}
+
 pub fn start(state: Arc<AppState>) -> Option<tokio::task::JoinHandle<()>> {
-    if cfg!(feature = "hitl_mode") {
-        return None;
-    }
+    // HITL stations sync too: a paired HITL primary and RRLS must share
+    // mission state. Command proxy already requires both to run the same mode.
     let pairing = match crate::station_pairing::Pairing::load() {
         Ok(Some(pairing)) => Arc::new(pairing),
         Ok(None) => return None,
@@ -399,9 +411,25 @@ pub fn start(state: Arc<AppState>) -> Option<tokio::task::JoinHandle<()>> {
     if RUNTIME.set(runtime.clone()).is_err() {
         return None;
     }
-    #[cfg(not(feature = "hitl_mode"))]
-    let _checklists =
-        crate::checklists::paired::start(state.clone(), pairing.clone(), mesh.clone());
+    // Shared checklists never run in HITL. A HITL start brings them up the
+    // first time the station leaves HITL (they pause again in HITL).
+    let _checklists = if !crate::runtime_mode::is_hitl() {
+        crate::checklists::paired::start(state.clone(), pairing.clone(), mesh.clone())
+    } else {
+        let mut modes = crate::runtime_mode::subscribe();
+        let mut shutdown = state.shutdown_subscribe();
+        let (state, pairing, mesh) = (state.clone(), pairing.clone(), mesh.clone());
+        tokio::spawn(async move {
+            while crate::runtime_mode::is_hitl() {
+                tokio::select! {
+                    _ = shutdown.recv() => return,
+                    changed = modes.changed() => if changed.is_err() { return },
+                }
+            }
+            crate::checklists::paired::preflight();
+            let _ = crate::checklists::paired::start(state, pairing, mesh).await;
+        })
+    };
     let mut shutdown = state.shutdown_subscribe();
     Some(tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
@@ -411,10 +439,12 @@ pub fn start(state: Arc<AppState>) -> Option<tokio::task::JoinHandle<()>> {
                 _ = shutdown.recv() => break,
                 _ = interval.tick() => {
                     let runtime = runtime.clone(); let state = state.clone();
+                    let generation = crate::gse::capture_operator_origin(&state).unwrap_or(0);
                     let mesh = mesh.clone(); let pairing = pairing.clone();
                     // File synchronization, serialization and signatures never
                     // block a Tokio network worker or run under the radio lock.
                     if let Err(error) = tokio::task::spawn_blocking(move || {
+                        run_settings_step(&state, generation, || {
                         let mut runtime = runtime.lock().unwrap();
                         let result = step(&mut runtime, &state, &mesh, pairing.mission_signing_key());
                         let message = result.as_ref().err().map(|_| "Shared mission settings could not be synchronized".to_owned());
@@ -422,6 +452,7 @@ pub fn start(state: Arc<AppState>) -> Option<tokio::task::JoinHandle<()>> {
                             if let Err(error) = &result { log::warn!("Paired mission settings synchronization deferred: {error}"); }
                             runtime.last_error = message;
                         }
+                        });
                     }).await { log::error!("Paired settings worker failed: {error}"); }
                 }
             }
@@ -505,6 +536,7 @@ async fn resolve(
     headers: HeaderMap,
     Json(request): Json<Resolve>,
 ) -> Response {
+    let admission_generation = crate::gse::capture_operator_origin(&state).unwrap_or(0);
     let principal =
         match crate::web::authorize_headers(&state, &headers, crate::auth::Permission::ViewData)
             .await
@@ -525,6 +557,9 @@ async fn resolve(
         )
             .into_response();
     }
+    let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
+        return (StatusCode::CONFLICT, "Recovery admission is closed or request is stale").into_response();
+    };
     let Some(runtime) = RUNTIME.get() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -816,10 +851,10 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
     /// Explicitly isolated process: fake config paths supplied by qualification runner.
-    #[cfg(not(feature = "hitl_mode"))]
     #[tokio::test]
     #[ignore = "requires isolated fake settings directory; never use operator configuration"]
     async fn inert_worker_persists_saved_settings_without_outputs_or_qualification_changes() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let dir = PathBuf::from(
             std::env::var("GS_MISSION_ADAPTER_TEST_DIR")
                 .expect("isolated fake settings directory required"),
@@ -945,10 +980,181 @@ mod tests {
         assert!(gse.calibration_import_allowed());
         assert_eq!(serde_json::to_value(&gse.engine.status).unwrap(), before);
     }
-    #[cfg(feature = "hitl_mode")]
     #[tokio::test]
     async fn hitl_start_remains_disabled_before_any_pairing_or_settings_worker() {
+        crate::mode_suite!(Hitl);
         let state = crate::state::tests::test_app_state().await;
         assert!(start(state).is_none());
+    }
+}
+
+#[cfg(test)]
+mod recovery_worker_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+    #[tokio::test]
+    async fn actual_settings_step_keeps_original_origin_and_progresses_after_reopen() {
+        if crate::operator_queue::isolated_case(
+            module_path!(),
+            "actual_settings_step_keeps_original_origin_and_progresses_after_reopen",
+        ) {
+            return;
+        }
+        let state = crate::state::tests::test_app_state().await;
+        let network = Arc::new(sedsnet::router::Router::new(
+            sedsnet::router::RouterConfig::new([]).with_sender("GS"),
+        ));
+        state.topology_router.set(network.clone()).unwrap();
+        let current = Catalog::capture(&state).unwrap();
+        let directory =
+            std::env::temp_dir().join(format!("mission-claim-{}", rand::random::<u128>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut runtime = Runtime::new(
+            "recovery-test".into(),
+            "gs".into(),
+            vec!["rrls".into()],
+            current.snapshot().unwrap(),
+            true,
+            directory.join("history.json"),
+        )
+        .unwrap();
+        runtime.needs_publication = true;
+        let mesh = Arc::new(Mutex::new(crate::rrls::Mesh::new(
+            crate::rrls::Role::Primary,
+            7,
+        )));
+        let key = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[88; 32]).unwrap();
+        let old = crate::gse::capture_operator_origin(&state).unwrap();
+        state
+            .operator_admission_barrier
+            .store(77, Ordering::Release);
+        let closed = run_settings_step(&state, old, || {
+            step(&mut runtime, &state, &mesh, &key).unwrap();
+        });
+        let ty = crate::telemetry_schema::data_type("DAQ_LOADCELL_CALIBRATION");
+        let after_closed = network.get_cached_network_variable(ty).unwrap().is_some();
+        state.automatic_generation.store(old + 1, Ordering::Release);
+        state.operator_admission_barrier.store(0, Ordering::Release);
+        let stale = run_settings_step(&state, old, || {
+            step(&mut runtime, &state, &mesh, &key).unwrap();
+        });
+        let mut during = 0;
+        let fresh = run_settings_step(&state, old + 1, || {
+            during = state.operator_dispatch_inflight.load(Ordering::Acquire);
+            step(&mut runtime, &state, &mesh, &key).unwrap();
+        });
+        let after_fresh = network.get_cached_network_variable(ty).unwrap().is_some();
+        let _ = std::fs::remove_dir_all(directory);
+        assert!(
+            !after_closed,
+            "old actual settings worker published SDK calibration whileclosed"
+        );
+        assert!(!closed && !stale);
+        assert!(
+            fresh && after_fresh,
+            "pending calibration publication must converge naturally afterreopen"
+        );
+        assert_eq!(during, 1);
+        assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 0);
+    }
+}
+
+#[cfg(test)]
+mod recovery_resolution_tests {
+    use super::*;
+    use futures::FutureExt;
+    use std::sync::atomic::Ordering;
+    #[tokio::test]
+    async fn actual_auth_delayed_resolution_cannot_replace_new_run_pending_settings() {
+        if crate::operator_queue::isolated_case(
+            module_path!(),
+            "actual_auth_delayed_resolution_cannot_replace_new_run_pending_settings",
+        ) {
+            return;
+        }
+        let (root, state, _commands, headers) =
+            crate::web::command_dispatch_tests::preauth_fixture().await;
+        let path = root.0.join("auth.json");
+        let mut users: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        users["users"][0]["calibration_access"] = serde_json::json!({"view":true,"edit":true});
+        std::fs::write(path, users.to_string()).unwrap();
+        let current = Catalog::capture(&state).unwrap();
+        let path = PathBuf::from(std::env::var_os("GS_RECOVERY_ISOLATED_ROOT").unwrap())
+            .join("mission-resolution.json");
+        let mut runtime = Runtime::new(
+            "resolution-test".into(),
+            "gs".into(),
+            vec!["rrls".into()],
+            current.snapshot().unwrap(),
+            true,
+            path.clone(),
+        )
+        .unwrap();
+        let key = "calibration/full_mass_kg";
+        let remote = Document {
+            heads: vec![paired_settings::Revision {
+                clock: BTreeMap::from([("rrls".into(), 1)]),
+                value: serde_json::json!(21.0),
+            }],
+        };
+        let actors = runtime.actors.clone();
+        runtime
+            .coordinator
+            .merge("resolution-test", key, &remote, &actors)
+            .unwrap();
+        let reviewed = runtime.coordinator.store().document(key).unwrap().clone();
+        assert_eq!(reviewed.heads.len(), 2);
+        runtime.checkpoint().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(RUNTIME.set(Arc::new(Mutex::new(runtime))).is_ok());
+        let held = state.auth_db.acquire().await.unwrap();
+        let request = resolve(
+            State(state.clone()),
+            headers.clone(),
+            Json(Resolve {
+                key: key.into(),
+                expected: reviewed.clone(),
+                value: serde_json::json!(22.0),
+            }),
+        );
+        tokio::pin!(request);
+        assert!(request.as_mut().now_or_never().is_none());
+        state
+            .operator_admission_barrier
+            .store(77, Ordering::Release);
+        state.automatic_generation.fetch_add(1, Ordering::AcqRel);
+        state.operator_admission_barrier.store(0, Ordering::Release);
+        drop(held);
+        let stale = request.await.status();
+        let after_stale = RUNTIME
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .coordinator
+            .store()
+            .document(key)
+            .unwrap()
+            .clone();
+        let file_after_stale = std::fs::read(&path).unwrap();
+        let fresh = resolve(
+            State(state.clone()),
+            headers,
+            Json(Resolve {
+                key: key.into(),
+                expected: reviewed.clone(),
+                value: serde_json::json!(22.0),
+            }),
+        )
+        .await
+        .status();
+        assert_eq!(
+            after_stale, reviewed,
+            "old actual resolution replaced the current pending document"
+        );
+        assert_eq!(file_after_stale, before);
+        assert_eq!(stale, StatusCode::CONFLICT);
+        assert_eq!(fresh, StatusCode::OK);
+        assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 0);
     }
 }

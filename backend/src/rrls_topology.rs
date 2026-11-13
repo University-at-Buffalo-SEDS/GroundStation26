@@ -22,13 +22,12 @@ pub(crate) fn project(
         .find(|n| n.sender_id.as_deref() == Some("RF"))
         .map(|n| n.id.clone());
     // A logical SDK connection is not evidence of a working direct radio path.
-    if observed.relaying || !observed.direct_age_ms.is_some_and(|age| age < 3_000) {
-        if let Some(rf) = &rf {
+    if (observed.relaying || !observed.direct_age_ms.is_some_and(|age| age < 3_000))
+        && let Some(rf) = &rf {
             links.retain(|l| {
                 !((l.source == gs && l.target == *rf) || (l.target == gs && l.source == *rf))
             });
         }
-    }
     let Some(age) = observed.peer_age_ms else {
         return;
     };
@@ -45,10 +44,17 @@ pub(crate) fn project(
     } else {
         "Standby"
     };
+    // Standby is silent: presence is only the last verified exchange, so the
+    // label states its age instead of claiming the radio is live now.
+    let seen = format!("seen {} s ago", age / 1000);
     let id = "board_rrls".to_string();
     let node = NetworkTopologyNode {
         id: id.clone(),
-        label: format!("RRLS · {mode}"),
+        label: if observed.relaying && online {
+            format!("RRLS · {mode}")
+        } else {
+            format!("RRLS · {mode} · {seen}")
+        },
         kind: NetworkTopologyNodeKind::Board,
         status,
         group: "recovery".into(),
@@ -57,10 +63,13 @@ pub(crate) fn project(
         age_ms: Some(age),
         endpoints: Vec::new(),
         show_in_details: true,
-        detail: Some(if observed.relaying && !observed.command_ready {
-            "Relayed telemetry received; command readiness unconfirmed".into()
-        } else {
-            format!("Recovery radio: {}", mode.to_lowercase())
+        detail: Some({
+            let base = if observed.relaying && !observed.command_ready {
+                "Relayed telemetry received; command readiness unconfirmed".to_string()
+            } else {
+                format!("Recovery radio: {}, last verified exchange {seen}", mode.to_lowercase())
+            };
+            relay_detail(&base, &observed)
         }),
         stats: None,
     };
@@ -73,8 +82,8 @@ pub(crate) fn project(
         label: Some(mode.to_lowercase()),
         status,
     });
-    if online && observed.relaying {
-        if let Some(rf) = rf {
+    if online && observed.relaying
+        && let Some(rf) = rf {
             links.push(NetworkTopologyLink {
                 source: id,
                 target: rf,
@@ -82,6 +91,18 @@ pub(crate) fn project(
                 status,
             });
         }
+}
+
+/// Append the primary's relay request state and the reason it last changed.
+fn relay_detail(base: &str, observed: &TopologyObservation) -> String {
+    let state = match (observed.relay_requested, observed.relaying) {
+        (true, true) => "relay requested and active",
+        (true, false) => "relay requested; RRLS not relaying (no readiness, or it cannot hear the AV bay either)",
+        (false, _) => "direct path in use",
+    };
+    match &observed.relay_change {
+        Some(change) => format!("{base} | {state} | changed {change}"),
+        None => format!("{base} | {state}"),
     }
 }
 
@@ -134,14 +155,16 @@ mod tests {
             direct_age_ms: Some(0),
             relaying: false,
             command_ready: false,
+            relay_requested: false,
+            relay_change: None,
         };
-        let (nodes, links) = snapshot(o);
+        let (nodes, links) = snapshot(o.clone());
         assert!(edge(&links, "gs", "rf"));
         assert!(!nodes.iter().any(|n| n.id == "board_rrls"));
         o.peer_age_ms = Some(0);
         o.direct_age_ms = None;
         o.relaying = true;
-        let (nodes, links) = snapshot(o);
+        let (nodes, links) = snapshot(o.clone());
         assert!(!edge(&links, "gs", "rf"));
         assert!(edge(&links, "gs", "rrls"));
         assert!(edge(&links, "rrls", "rf"));
@@ -153,13 +176,25 @@ mod tests {
         }));
         o.direct_age_ms = Some(0);
         o.relaying = false;
-        let (nodes, links) = snapshot(o);
+        let (nodes, links) = snapshot(o.clone());
         assert!(edge(&links, "gs", "rf"));
         assert!(!edge(&links, "rrls", "rf"));
-        assert!(nodes.iter().any(|n| n.label == "RRLS · Standby"));
+        assert!(nodes.iter().any(|n| n.label == "RRLS · Standby · seen 0 s ago"));
+        o.peer_age_ms = Some(4_999);
+        let (nodes, _) = snapshot(o.clone());
+        assert!(nodes.iter().any(|n| n.label == "RRLS · Standby · seen 4 s ago"
+            && n.detail.as_deref().is_some_and(|d| d.contains("last verified exchange seen 4 s ago"))));
+        o.relay_requested = true;
+        o.relay_change = Some("12 s ago: no direct AV-bay frame for 3.0 s".into());
+        let (nodes, _) = snapshot(o.clone());
+        assert!(nodes.iter().any(|n| n.detail.as_deref().is_some_and(|d| d
+            .contains("relay requested; RRLS not relaying")
+            && d.contains("changed 12 s ago: no direct AV-bay frame for 3.0 s"))));
+        o.relay_requested = false;
+        o.relay_change = None;
         o.peer_age_ms = Some(15_000);
         o.direct_age_ms = None;
-        let (nodes, links) = snapshot(o);
+        let (nodes, links) = snapshot(o.clone());
         assert!(!edge(&links, "gs", "rf"));
         assert!(!edge(&links, "rrls", "rf"));
         assert!(

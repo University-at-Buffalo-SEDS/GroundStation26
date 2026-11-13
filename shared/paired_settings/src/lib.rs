@@ -502,3 +502,6 @@ pub mod journal;
 
 #[cfg(feature = "sqlite-journal")]
 pub mod journal_replication;
+
+#[cfg(test)]
+mod test_directory;

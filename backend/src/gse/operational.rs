@@ -19,6 +19,10 @@ pub struct Saved {
     pub baseline: Option<Baseline>,
     pub fill_target_kg: Option<f32>,
     #[serde(default)]
+    pub turbocharge: Option<gse_sequence::turbocharge::Evidence>,
+    #[serde(default)]
+    pub turbocharge_binding: Option<serde_json::Value>,
+    #[serde(default)]
     pub pending_checklists: Vec<crate::checklists::CompletionEvent>,
     #[serde(default)]
     pub checklist_digest: Option<String>,
@@ -68,24 +72,26 @@ impl Saved {
                 return Err("Invalid pending sequence completion event".into());
             }
         }
-        if let Some(b) = &self.baseline {
-            if b.samples < 3
+        if self.turbocharge.as_ref().is_some_and(|e| !e.valid()) {
+            return Err("Invalid saved Turbocharge evidence".into());
+        }
+        if let Some(b) = &self.baseline
+            && (b.samples < 3
                 || ![b.average_psi, b.min_psi, b.max_psi, b.noise_psi]
                     .into_iter()
                     .all(f32::is_finite)
                 || b.min_psi > b.average_psi
                 || b.average_psi > b.max_psi
-                || b.noise_psi < 0.0
+                || b.noise_psi < 0.0)
             {
                 return Err("Invalid saved pressure baseline".into());
             }
-        }
         if self.qualification.nitrogen_satisfied() && self.baseline.is_none() {
             return Err("Saved nitrogen test has no pressure baseline".into());
         }
         if self
             .fill_target_kg
-            .is_some_and(|v| !v.is_finite() || v <= 0.0)
+            .is_some_and(|v| !v.is_finite() || v == 0.0)
             || (self.qualification.completed(Milestone::FillTarget)
                 && self.fill_target_kg.is_none())
         {
@@ -113,12 +119,18 @@ impl Saved {
     }
     pub fn save(&self, path: &Path) -> Result<(), String> {
         self.validate()?;
+        let bytes = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
+        if bytes.len() > 16384 {
+            return Err("Qualification record exceeds its existing16KiB bound".into());
+        }
         let parent = path.parent().ok_or("Missing qualification directory")?;
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         let temporary = path.with_extension("upload");
         let result = (|| -> std::io::Result<()> {
             let mut file = std::fs::File::create(&temporary)?;
-            file.write_all(&serde_json::to_vec_pretty(self)?)?;
+            file.write_all(&bytes)?;
+            #[cfg(test)]
+            persist_diagnostic::before_sync(path)?;
             file.sync_all()?;
             std::fs::rename(&temporary, path)?;
             std::fs::File::open(parent)?.sync_all()
@@ -144,6 +156,7 @@ pub struct Operational {
     pub startup_configured: bool,
     pub qd: QdWait,
     pub qd_dispatch_utc_ms: Option<u64>,
+    pub(super) qd_launch_admission: Option<super::LaunchAdmission>,
     pub persist_error: Option<String>,
 }
 impl Operational {
@@ -179,7 +192,9 @@ impl Operational {
         }
         let mut next = self.saved.clone();
         next.automatic_abort_claimed = false;
-        let result = self.path.as_ref()
+        let result = self
+            .path
+            .as_ref()
             .ok_or_else(|| "Qualification storage is not initialized".to_string())
             .and_then(|path| next.save(path));
         if let Err(error) = result {
@@ -346,6 +361,7 @@ mod tests {
     use super::*;
     #[test]
     fn saved_template_binding_and_local_reset_receipts_survive_restart() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let path = std::env::temp_dir().join(format!(
             "gse-paired-binding-{}.json",
             rand::random::<u128>()
@@ -396,6 +412,7 @@ mod tests {
     }
     #[test]
     fn restart_retains_ordered_tests_but_never_resumes_outputs_or_queued_launch() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let path = std::env::temp_dir().join(format!(
             "gse-qualification-{}-{}.json",
             std::process::id(),
@@ -432,12 +449,14 @@ mod tests {
     }
     #[test]
     fn corrupt_or_missing_baseline_cannot_restore_fill_permission() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let invalid = r#"{"qualification":{"version":1,"generation":0,"self_test":true,"nitrogen_test":true,"fill_target":false,"fault":null},"baseline":null,"fill_target_kg":null}"#;
         let record: Saved = serde_json::from_str(invalid).unwrap();
         assert!(record.validate().is_err());
     }
     #[test]
     fn topology_must_settle_again_after_loss_or_route_change() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let mut op = Operational::default();
         op.topology(0, true, "a".into());
         op.topology(1999, true, "a".into());
@@ -459,6 +478,7 @@ mod checklist_outbox_tests {
     use super::*;
     #[test]
     fn restart_retries_the_same_saved_event_and_storage_failure_never_acks_it() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let path = std::env::temp_dir().join(format!("gse-outbox-{}.json", rand::random::<u128>()));
         let mut op = Operational {
             path: Some(path.clone()),
@@ -493,8 +513,8 @@ mod checklist_outbox_tests {
     }
     #[test]
     fn unfinished_or_stale_runs_cannot_enqueue_a_success() {
-        let mut op = Operational::default();
-        op.run_generation = 1;
+        crate::mode_suite!(Normal, TestFire, Testing);
+        let mut op = Operational { run_generation: 1, ..Operational::default() };
         assert!(op.complete(Milestone::SelfTest).is_err());
         assert!(op.saved.pending_checklists.is_empty());
         assert!(!op.saved.qualification.completed(Milestone::SelfTest));
@@ -506,6 +526,7 @@ mod fire_persistence_tests {
     use super::*;
     #[test]
     fn failed_fire_save_never_consumes_the_armed_evidence_in_memory() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let path =
             std::env::temp_dir().join(format!("gse-fire-blocked-{}", rand::random::<u128>()));
         std::fs::create_dir(&path).unwrap();
@@ -542,5 +563,53 @@ mod fire_persistence_tests {
             Some(Fault::MissingTelemetry)
         );
         std::fs::remove_dir(path).unwrap();
+    }
+}
+
+// Private diagnostic successor only: exact-path, one-shot, bounded test gate.
+#[cfg(test)]
+pub(super) mod persist_diagnostic {
+    use std::{
+        io,
+        path::{Path, PathBuf},
+        sync::{Mutex, mpsc},
+        time::{Duration, Instant},
+    };
+    struct Gate {
+        path: PathBuf,
+        entered: mpsc::Sender<Instant>,
+        release: mpsc::Receiver<()>,
+    }
+    static GATE: Mutex<Option<Gate>> = Mutex::new(None);
+    pub fn arm(path: PathBuf) -> (mpsc::Receiver<Instant>, mpsc::Sender<()>) {
+        let (entry_tx, entry_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut gate = GATE.lock().unwrap();
+        assert!(gate.is_none(), "diagnostic already armed");
+        *gate = Some(Gate {
+            path,
+            entered: entry_tx,
+            release: release_rx,
+        });
+        (entry_rx, release_tx)
+    }
+    pub(super) fn before_sync(path: &Path) -> io::Result<()> {
+        let gate = {
+            let mut slot = GATE.lock().unwrap();
+            if slot.as_ref().is_some_and(|g| g.path == path) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(gate) = gate {
+            gate.entered
+                .send(Instant::now())
+                .map_err(|_| io::Error::other("diagnostic observer disappeared"))?;
+            gate.release
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(|_| io::Error::other("diagnostic bounded persist barrier expired"))?;
+        }
+        Ok(())
     }
 }

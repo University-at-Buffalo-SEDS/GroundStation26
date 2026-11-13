@@ -39,6 +39,7 @@ def main():
     try:provision(a.output,a.primary_url,a.rrls_url)
     except (ValueError,OSError) as e:p.error(str(e))
     print('Created primary/ and rrls/ pairing bundles. Install each only on its corresponding trusted station.')
-    print('Set GS_STATION_PAIRING_FILE to the installed pairing.json path and restart each service.')
+    print('Set GS_STATION_PAIRING_FILE (or pass --pairing to run_groundstation.py/run_rrls.py) to the installed pairing.json path and restart each service.')
+    print('Alternatively pair the two stations from Settings > Station pairing in the UI; no files need copying.')
     print('Provision the same username on both stations; local permissions remain authoritative. Sign in again once to issue a paired session.')
 if __name__=='__main__':main()

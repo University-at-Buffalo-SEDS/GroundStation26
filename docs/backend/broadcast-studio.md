@@ -166,12 +166,15 @@ docker run --rm --name gs-delay-test \
 
 In separate terminals, publish two synthetic cameras using the command below, once
 with `front` and once with `side` as the final path (optionally replace `testsrc2`
-with `smptebars` for the second angle):
+with `smptebars` for the second angle). The cameras carry an AAC tone:
+`concurrent-broadcast-browser.mjs` checks that camera audio decodes, and fails
+with "Timed out waiting for live playback" against video-only cameras.
 
 ```sh
 ffmpeg -hide_banner -loglevel error -re -f lavfi -i testsrc2=size=640x360:rate=15 \
-  -an -c:v libx264 -preset ultrafast -tune zerolatency -profile:v baseline \
-  -g 15 -bf 0 -f rtsp -rtsp_transport tcp \
+  -re -f lavfi -i sine=frequency=440:sample_rate=48000 \
+  -c:v libx264 -preset ultrafast -tune zerolatency -profile:v baseline -pix_fmt yuv420p \
+  -g 15 -bf 0 -c:a aac -b:a 64k -f rtsp -rtsp_transport tcp \
   rtsp://camera:test-only@127.0.0.1:18554/front
 ```
 
@@ -189,7 +192,11 @@ the media router; it does not start hardware/GSE tasks. Start a separate Chromiu
 profile with `--headless --remote-debugging-port=19101
 --user-data-dir=<test-directory>/chrome --autoplay-policy=no-user-gesture-required`.
 Enable working WebGL2 for the model test (macOS testing used `--use-angle=metal
---ignore-gpu-blocklist`). Keep the debug port loopback-only. Wait at least 25 seconds
+--ignore-gpu-blocklist`; Linux headless can use `--use-gl=swiftshader
+--enable-unsafe-swiftshader`). The model test loads a `data:` page that pulls the
+renderer from the loopback fixture, which current Chrome blocks as a private
+network request ("Model failed to load"); start this isolated profile with
+`--disable-features=BlockInsecurePrivateNetworkRequests,PrivateNetworkAccessRespectPreflightResults,PrivateNetworkAccessSendPreflights,LocalNetworkAccessChecks`. Keep the debug port loopback-only. Wait at least 25 seconds
 for media retention, then run sequentially:
 
 ```sh

@@ -82,6 +82,7 @@ async fn scan(root: &std::path::Path) -> std::io::Result<Vec<Recording>> {
     Ok(result)
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn list(
     State(state): State<Arc<MediaState>>,
     headers: HeaderMap,
@@ -111,6 +112,7 @@ async fn list(
         .into_response())
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn safe_path(root: &std::path::Path, stream: &str, file: &str) -> ApiResult<PathBuf> {
     check_id(stream)?;
     if !valid_file(file) {
@@ -138,6 +140,7 @@ async fn safe_path(root: &std::path::Path, stream: &str, file: &str) -> ApiResul
     Ok(resolved)
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn asset(
     State(state): State<Arc<MediaState>>,
     Path((stream, file)): Path<(String, String)>,

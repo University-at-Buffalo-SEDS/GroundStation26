@@ -1,4 +1,4 @@
-//! Bounded local WebSocket crew voice, with an opt-in RRLS Opus bridge.
+//! Bounded local WebSocket crew voice, with an opt-in RRLS Codec2 radio bridge.
 //! Camera/video and voice recording are outside the radio voice path.
 use crate::{auth::Permission, state::AppState};
 #[path = "voice/program.rs"]
@@ -164,7 +164,13 @@ pub fn routes(app: Arc<AppState>, hub: Arc<VoiceHub>) -> Router<Arc<AppState>> {
                 let Some(state) = weak.upgrade() else {
                     break;
                 };
-                for pcm in frame.pcm.chunks_exact(320) {
+                // A radio packet holds 320 ms. Browsers keep under 200 ms
+                // queued per speaker, so release it at real time after a
+                // 60 ms head start instead of in one burst.
+                for (index, pcm) in frame.pcm.as_chunks::<320>().0.iter().enumerate() {
+                    if index >= 3 {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
                     let mut packet = Vec::with_capacity(4 + FRAME_BYTES);
                     packet.extend_from_slice(&0xffff_fffeu32.to_le_bytes());
                     for sample in pcm {

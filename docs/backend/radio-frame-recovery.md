@@ -79,3 +79,44 @@ reproduces 5.11 seconds. Startup logs show the active host burst/gap values.
 the baud rate comes from the selected serial link. RF needs the matching firmware
 build. Hardware confirmation still requires modem readback and physical command
 receipt timing; no active station configuration or firmware was changed here.
+
+
+## Persistent application profile
+
+Raw-UART GS and RRLS starts load the checked-in `backend/comms/rfd-profile.json`
+by default, including rebuilt binaries. The compatible profile retains a 55ms
+UART idle gap for the existing 50ms modem serial-break setting, while budgeting
+32kbit/s usable capacity rather than assuming all 64kbit/s is available. Hardware
+flow control remains disabled unless explicitly enabled on a verified wired link.
+This profile loads application settings; it never writes modem registers.
+
+A serial link can persist a `rfd_profile` path in its communications configuration.
+Relative paths resolve beside that communications JSON. `GS_RADIO_PROFILE` can
+select another file for a particular launch; conflicting per-setting environment
+overrides are rejected. RF firmware uses its checked-in `config/rfd-profile.json`
+on default builds and CMake rebuilds, preventing stale shorter-gap cache values.
+
+The optional `config/radio/rfd-async-64k-low-latency.json` profile requires matched
+modem changes on GS, RF and RRLS before selection. Its 15ms application gap is
+incompatible with an unchanged 50ms modem serial-break setting. Collect public
+settings and forwarding-table readbacks from all three radios before using it;
+no automatic modem retuning is performed. CTS on RRLS alone cannot protect
+unwired GS/RF modem ingress or shared airtime capacity.
+
+### Broadcast retry settings
+
+The [RFDesign ASYNC manual](https://files.rfdesign.com.au/Files/documents/RFD900x%20Asynchronous%20User%20Manual%20V1.1.pdf)
+defines S4 as the maximum retry count and S5 as the maximum broadcast retry
+count. DESTID 32768 selects broadcast on newer ASYNC firmware. A high broadcast
+retry limit can consume airtime in addition to application-level reliable
+retries. The manual does not specify a deterministic number or timing of copies
+for every packet; do not infer an exact airtime multiplier from these settings.
+
+Read back all three modems before changing a profile. Verify unique node IDs,
+the same network/air/framing settings, and the forwarding table (`AT+F?`): fixed
+modem forwarding and application RRLS forwarding are separate mechanisms.
+The RF repository's `scripts/rfd_profile.py --profile <profile.json>
+--readback gs=<public.json> --readback rf=<public.json>
+--readback rrls=<public.json>` checks saved public readbacks without opening a
+serial port or writing settings. Selecting an application profile does not
+configure its corresponding modem retry or serial-break settings.

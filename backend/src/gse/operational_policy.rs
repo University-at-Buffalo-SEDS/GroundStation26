@@ -12,10 +12,12 @@ pub(super) fn operational_action_allowed(rt: &Runtime, action: Action) -> bool {
         Action::StartFill => Milestone::FillTarget,
         _ => unreachable!(),
     };
-    !rt.operational.saved.automatic_abort_claimed && crate::checklists::paired::qualification_allowed(
-        rt.operational.saved.checklist_digest.as_deref(),
-        rt.operational.has_checklist_evidence(),
-    ) && rt.operational.saved.pending_checklists.is_empty()
+    !rt.operational.saved.automatic_abort_claimed
+        && crate::checklists::paired::qualification_allowed(
+            rt.operational.saved.checklist_digest.as_deref(),
+            rt.operational.has_checklist_evidence(),
+        )
+        && rt.operational.saved.pending_checklists.is_empty()
         && rt.operational.topology_stable
         && rt.operational.startup_configured
         && rt.operational.persist_error.is_none()
@@ -31,39 +33,55 @@ fn flight_routes(state: &AppState) -> bool {
             })
         })
 }
+// Safety catalog (About safety): launch-failure-pause, launch-signoff. Keep backend/src/safety_catalog_rules.rs in step.
 pub(super) fn operational_launch_allowed(state: &AppState, rt: &Runtime) -> bool {
     let now = rt.now();
     let target = state.fill_targets_snapshot().nitrous.target_mass_kg;
-    !rt.operational.saved.automatic_abort_claimed && crate::checklists::paired::qualification_allowed(
-        rt.operational.saved.checklist_digest.as_deref(),
-        rt.operational.has_checklist_evidence(),
-    ) && rt.operational.saved.pending_checklists.is_empty()
+    !rt.operational.saved.automatic_abort_claimed
+        && crate::checklists::paired::qualification_allowed(
+            rt.operational.saved.checklist_digest.as_deref(),
+            rt.operational.has_checklist_evidence(),
+        )
+        && rt.operational.saved.pending_checklists.is_empty()
         && rt.operational.saved.qualification.launch_qualified()
         && rt.operational.persist_error.is_none()
         && rt.operational.topology_stable
         && rt.operational.saved.fill_target_kg == Some(target)
-        && rt
-            .fresh_mass(now)
-            .is_some_and(|mass| rt.fill_cutoff.target_met(mass.value, target))
+        && (!rt.turbo_inventory_pending || rt.turbo_evidence.is_some())
+        && rt.fresh_mass(now).is_some_and(|mass| {
+            (!rt.turbo_inventory_pending
+                && rt.turbo_evidence.is_none()
+                && gse_sequence::fill_resume::inventory_ready(
+                    mass.value, target, rt.engine.config.fill_tolerance_kg,
+                ))
+                || turbocharge::accepts_mass(state, rt, mass)
+        })
         && matches!(
             rt.engine.status.phase,
             Phase::Passed | Phase::Paused | Phase::Idle
         )
-        && rt.pressure.is_some_and(|p| {
-            p.value.is_finite()
-                && p.at_ms <= now
-                && now - p.at_ms <= 2_000
-                && rt
-                    .engine
-                    .config
-                    .pressure_limit(rt.engine.nitrous_target_psi, 50.0)
-                    .is_ok_and(|limit| p.value < limit)
-        })
+        // A failure pause holds for explicit operator review first.
+        && rt.engine.failure().is_none()
+        && !rt.overpressure.latched()
+        && rt
+            .turbo_evidence
+            .as_ref()
+            .map_or(rt.pressure, |_| rt.valve_pressure)
+            .is_some_and(|p| {
+                p.value.is_finite()
+                    && p.at_ms <= now
+                    && now - p.at_ms <= 2_000
+                    && rt
+                        .engine
+                        .config
+                        .pressure_limit(rt.engine.nitrous_target_psi, 50.0)
+                        .is_ok_and(|limit| p.value < limit)
+            })
         && rt
             .valves
             .iter()
             .all(|v| v.is_some_and(|v| !v.open && v.at_ms <= now && now - v.at_ms <= 2_000))
-        && (cfg!(feature = "test_fire_mode")
+        && (crate::runtime_mode::is_test_fire()
             || (flight_routes(state) && crate::antenna::rocket_launch_fix_locked()))
 }
 fn topology(state: &AppState) -> (bool, String) {
@@ -109,17 +127,66 @@ fn topology(state: &AppState) -> (bool, String) {
     keys.sort();
     (fresh && routes, keys.join("|"))
 }
+/// Fresh tank pressure (the engine's own source) at or above the session limit.
+fn pressure_hazard(rt: &Runtime) -> bool {
+    let input = rt.input(true, true);
+    input
+        .pressure
+        .filter(|p| p.value.is_finite() && p.at_ms <= input.now_ms && input.now_ms - p.at_ms <= 2_000)
+        .zip(rt.engine.session_pressure_limit().ok())
+        .is_some_and(|(p, limit)| p.value >= limit)
+}
+/// An unexpected supply report alone is not a hazard: close both supplies and
+/// pause. Only a fresh pressure at or above the limit keeps the relief policy.
+// Safety catalog (About safety): failure-pause, failure-dump. Keep backend/src/safety_catalog_rules.rs in step.
+fn pause_or_relieve_unexpected_supply(rt: &mut Runtime, message: &str) -> Effects {
+    // Without an active sequence (manual control, Passed, Cancelled) there
+    // is no pause to return to; keep the established crossflow relief.
+    let sequence_owned = rt.engine.active() || rt.fill_trim.is_some() || rt.turbocharge.is_some();
+    if !sequence_owned || pressure_hazard(rt) {
+        return fault(rt, Fault::UnsafeSupplyFlow, message);
+    }
+    let input = rt.input(true, true);
+    super::pause_for_failure(rt, input, message)
+}
 fn fault(rt: &mut Runtime, reason: Fault, message: &str) -> Effects {
     rt.operational.saved.qualification.latch(reason);
     rt.operational.running = false;
     rt.operational.qd = QdWait::default();
+    rt.operational.qd_launch_admission = None;
     let _ = rt.operational.persist();
+    rt.fill_trim = None;
+    rt.turbocharge = None;
+    rt.turbo_evidence = None;
     rt.engine.fault(rt.now(), message)
 }
-pub(super) fn complete_operational_milestones(rt: &mut Runtime, previous: Phase) {
+pub(super) fn complete_operational_milestones(rt: &mut Runtime, previous: Phase, progress_input:Inputs) {
     let phase = rt.engine.status.phase;
     if previous == phase || !rt.operational.running {
         return;
+    }
+    // Copy the actual completed engine transition before qualification restoration
+    // can replace Cancelled with a previously retained Passed display state.
+    rt.progress_observe(progress_input,crate::sequence_progress_projection::Cause::Tick);
+    // A failed nitrogen-test run never retains an older pass, whether it
+    // relieves (leak) or pauses closed for the operator (timeout, stale data).
+    let failed_test = phase == Phase::PauseSetup && rt.engine.failure().is_some();
+    if (phase == Phase::CancelSetup || failed_test)
+        && matches!(
+            previous,
+            Phase::Baseline | Phase::Raising | Phase::Settling | Phase::Holding
+        )
+    {
+        // A cancelled/inconclusive nitrogen test cannot retain an older pass.
+        if let Err(error) = rt.operational.saved.qualification.invalidate_nitrogen() {
+            rt.operational
+                .saved
+                .qualification
+                .latch(Fault::MissingTelemetry);
+            rt.engine.status.message = error.into();
+        }
+        rt.operational.run_generation = rt.operational.saved.qualification.generation();
+        let _ = rt.operational.persist();
     }
     let milestone = if previous == Phase::SelfFinish && phase == Phase::Idle {
         rt.operational.saved.baseline = rt.engine.status.baseline.clone();
@@ -129,9 +196,10 @@ pub(super) fn complete_operational_milestones(rt: &mut Runtime, previous: Phase)
         Some(Milestone::NitrogenTest)
     } else if previous == Phase::PauseSetup
         && phase == Phase::Paused
+        && rt.engine.failure().is_none()
         && rt.operational.target_reached.is_some_and(|target| {
             rt.fresh_mass(rt.now())
-                .is_some_and(|mass| rt.fill_cutoff.target_met(mass.value, target))
+                .is_some_and(|mass| fill_mass_in_band(&rt.engine.config, mass.value, target))
         })
     {
         rt.operational.saved.fill_target_kg = rt.operational.target_reached;
@@ -161,9 +229,15 @@ pub(super) fn complete_operational_milestones(rt: &mut Runtime, previous: Phase)
         if let Err(error) = rt.operational.complete(milestone) {
             rt.engine.status.message =
                 format!("Qualification could not be saved: {error}. Manual reset required.");
+            rt.progress_failed_current();
         } else if let Err(error) = rt.operational.flush_checklists() {
             rt.engine.status.message =
                 format!("Test passed, but checklist progress could not be saved: {error}");
+            rt.progress_failed_current();
+        } else {
+            let kind=match milestone {Milestone::SelfTest=>crate::sequence_progress::Kind::ValveSelfTest,Milestone::NitrogenTest=>crate::sequence_progress::Kind::NitrogenTest,Milestone::FillTarget=>crate::sequence_progress::Kind::Fill};
+            let event=format!("qualification:{}:{milestone:?}",rt.operational.run_generation);
+            rt.progress_pass(kind,event);
         }
         rt.operational.running = false;
     }
@@ -175,30 +249,41 @@ pub(super) fn complete_operational_milestones(rt: &mut Runtime, previous: Phase)
         let _ = rt.operational.persist();
         rt.operational.running = false;
         rt.operational.qd = QdWait::default();
+        rt.operational.qd_launch_admission = None;
     }
 }
 /// Publish the durable mission stage through the existing real FC state path.
 /// G_Armed asks FC to perform Postinit; it never bypasses FC readiness checks.
+#[cfg(test)]
 pub(super) fn publish_qualified_flight_armed(state: &Arc<AppState>) {
-    if cfg!(feature = "test_fire_mode") || !prelaunch(state) {
-        return;
-    }
-    let qualified = {
-        let rt = state.gse.lock().unwrap();
-        rt.operational.saved.qualification.stage()
-            == gse_sequence::qualification::MissionStage::Armed
-            && rt.operational.persist_error.is_none()
-            && rt.operational.saved.pending_checklists.is_empty()
-            && matches!(
-                rt.engine.status.phase,
-                Phase::Paused | Phase::Passed | Phase::Idle
-            )
-    };
-    if qualified {
-        state.set_local_flight_state(FlightState::Armed);
+    // Existing direct test entry, outside Dispatch. Production carries the
+    // original tick's observation across its guard instead of recapturing.
+    let _ = crate::network_variables::flight_state();
+    if let Some(observation) = crate::automatic_flight_state::Observation::begin(state) {
+        publish_qualified_flight_armed_with_observation(state, &observation);
     }
 }
+pub(super) fn publish_qualified_flight_armed_with_observation(
+    state: &Arc<AppState>, observation: &crate::automatic_flight_state::Observation,
+) {
+    if crate::runtime_mode::is_test_fire() || !prelaunch(state) { return; }
+    let qualification_generation = {
+        let rt = state.gse.lock().unwrap();
+        if rt.operational.saved.qualification.stage() != gse_sequence::qualification::MissionStage::Armed
+            || rt.operational.persist_error.is_some()
+            || !rt.operational.saved.pending_checklists.is_empty()
+            || !matches!(rt.engine.status.phase, Phase::Paused | Phase::Passed | Phase::Idle) { return; }
+        rt.operational.saved.qualification.generation()
+    };
+    if let Some(original) = observation.captured()
+        && let Some(proposal) = original.proposal(FlightState::Armed,
+            crate::automatic_flight_state::Cause::QualifiedArmed { qualification_generation }) {
+        crate::automatic_flight_state::publish(state, proposal);
+    }
+}
+
 /// Returns true when automation must not advance this tick.
+// Safety catalog (About safety): connectivity-loss, qd-settle. Keep backend/src/safety_catalog_rules.rs in step.
 pub(super) fn operational_tick(state: &Arc<AppState>, interlock: bool) -> bool {
     let blocked = {
         let rt = state.gse.lock().unwrap();
@@ -206,7 +291,9 @@ pub(super) fn operational_tick(state: &Arc<AppState>, interlock: bool) -> bool {
             == gse_sequence::qualification::MissionStage::Fire
             || rt.operational.saved.automatic_abort_claimed
     };
-    if blocked { return true; }
+    if blocked {
+        return true;
+    }
     let stage = *state.state.lock().unwrap();
     // No GroundStation-generated abort or valve correction from Launch onward.
     if !matches!(
@@ -223,14 +310,15 @@ pub(super) fn operational_tick(state: &Arc<AppState>, interlock: bool) -> bool {
     }
     let (healthy, key) = topology(state);
     let mut effects = Effects::default();
-    let mut launch = false;
+    let mut launch = None;
     let mut rt = state.gse.lock().unwrap();
     let now = rt.now();
     rt.operational.topology(now, healthy, key);
     if !rt.operational.running {
         rt.engine.nitrous_target_psi = state.fill_targets_snapshot().nitrous.target_pressure_psi;
     }
-    if !rt.operational.startup_configured
+    if !rt.manual_control
+        && !rt.operational.startup_configured
         && rt.operational.topology_stable
         && interlock
         && rt.operational.saved.qualification.fault().is_none()
@@ -264,12 +352,24 @@ pub(super) fn operational_tick(state: &Arc<AppState>, interlock: bool) -> bool {
             || rt.operational.saved.qualification.stage()
                 != gse_sequence::qualification::MissionStage::Idle
             || !matches!(stage, FlightState::Startup | FlightState::Idle);
-        if operating && !healthy {
+        let sequence_owned = rt.engine.active() || rt.fill_trim.is_some() || rt.turbocharge.is_some();
+        if operating && !healthy && sequence_owned {
+            // Missing routes/boards are missing data, not a tank hazard: pause
+            // closed once and hold for the operator (no relief, no latch).
+            if rt.engine.failure().is_none()
+                || !matches!(rt.engine.status.phase, Phase::PauseSetup | Phase::Paused)
+            {
+                let input = rt.input(true, interlock);
+                effects = super::pause_for_failure(&mut rt, input, "Fill-system connectivity lost");
+            }
+        } else if operating && !healthy {
+            // No sequence owns the valves: keep the latch, close supplies only.
             effects = fault(
                 &mut rt,
                 Fault::TopologyLost,
                 "Fill-system connectivity lost",
             );
+            effects.valves.retain(|(index, _)| *index >= 3);
         } else if rt.operational.running && !interlock {
             effects = fault(&mut rt, Fault::ValveMismatch, "Interlock lost");
         }
@@ -277,14 +377,28 @@ pub(super) fn operational_tick(state: &Arc<AppState>, interlock: bool) -> bool {
     if rt.operational.qd.queued() && matches!(rt.operational.qd.status(now), QdStatus::AckTimedOut)
     {
         rt.operational.qd = QdWait::default();
+        rt.operational.qd_launch_admission = None;
         state.add_temporary_notification("QD acknowledgement timed out; queued launch cancelled");
     }
+    if rt.operational.qd.queued()
+        && rt
+            .operational
+            .qd_launch_admission
+            .is_none_or(|ticket| !ticket.remains_current(state))
+    {
+        rt.operational.qd.cancel_launch();
+        rt.operational.qd_launch_admission = None;
+        state.add_temporary_notification("Queued launch cancelled: its original admission was superseded. Check readiness and make a new explicit request.");
+    }
     if rt.operational.qd.queued() && matches!(rt.operational.qd.status(now), QdStatus::Ready) {
-        // Timer is never authority to launch: every prerequisite is rechecked.
+        // Timer never creates a new intent or replaces original ownership.
         if interlock && operational_launch_allowed(state, &rt) {
-            launch = rt.operational.qd.take_ready_launch(now);
+            if rt.operational.qd.take_ready_launch(now) {
+                launch = rt.operational.qd_launch_admission.take();
+            }
         } else {
             rt.operational.qd = QdWait::default();
+            rt.operational.qd_launch_admission = None;
             state.add_temporary_notification(
                 "Queued launch cancelled: live launch prerequisites changed",
             );
@@ -293,17 +407,38 @@ pub(super) fn operational_tick(state: &Arc<AppState>, interlock: bool) -> bool {
     let skip = !rt.operational.running || !effects.valves.is_empty();
     drop(rt);
     apply(state, effects);
-    if launch && state.cmd_tx.try_send(TelemetryCommand::Launch).is_err() {
-        state.add_notification("Queued launch was not dispatched: command queue unavailable");
-    }
+    if let Some(ticket) = launch
+        && state
+            .cmd_tx
+            .try_send(TelemetryCommand::QueuedOperator {
+            launch_hold: None,
+            recovery_origin: None,
+                launch_revision: Some(ticket.board_abort_revision),
+                plumbing_origin: None,
+                generation: ticket.generation,
+                command: Box::new(TelemetryCommand::Launch),
+            })
+            .is_err()
+        {
+            state.add_notification("Queued launch was not dispatched: command queue unavailable");
+        }
     skip
 }
 fn qd_dispatch_timestamp_ms() -> u64 {
     crate::telemetry_task::procedure_clock::now().utc_ms()
 }
-pub(super) fn handle_operational_command(state: &Arc<AppState>, cmd: &TelemetryCommand) -> bool {
+pub(super) fn handle_operational_command(
+    state: &Arc<AppState>,
+    cmd: &TelemetryCommand,
+    plumbing_origin: Option<crate::actuator_plumbing::MotionOrigin>,
+    launch_revision: Option<u64>,
+) -> bool {
     let name = crate::sequences::command_name(cmd);
-    if name == "RetractPlumbing" && !cfg!(feature = "test_fire_mode") {
+    if name == "RetractPlumbing" && !crate::runtime_mode::is_test_fire() {
+        if let Err(message) = crate::actuator_plumbing::motion_ready(state) {
+            state.add_notification(message);
+            return true;
+        }
         let Some(router) = state.topology_router.get() else {
             return true;
         };
@@ -317,20 +452,26 @@ pub(super) fn handle_operational_command(state: &Arc<AppState>, cmd: &TelemetryC
         ) {
             return true;
         }
-        match router.log_queue(
-            crate::telemetry_schema::data_type("ACTUATOR_COMMAND"),
-            &[crate::rocket_commands::ActuatorBoardCommands::RetractPlumbing as u8],
+        match crate::gse::queue_plumbing_under_dispatch_with_stop_fence(
+            state,
+            router,
+            plumbing_origin,
+            true,
         ) {
             Ok(()) => {
+                rt.effects_queued = true;
                 let now = rt.now();
-                rt.operational.qd.dispatched(now);
+                rt.operational.qd_launch_admission = None;
+                rt.operational.qd.dispatched_with_timeout(
+                    now,
+                    crate::actuator_plumbing::completion_timeout_ms(state),
+                );
                 rt.operational.qd_dispatch_utc_ms = Some(qd_dispatch_timestamp_ms());
                 drop(rt);
                 state.set_pending_umbilical_valve_state(
                     crate::rocket_commands::ActuatorBoardCommands::RetractPlumbing as u8,
                     true,
                 );
-                crate::telemetry_task::flush_command_tx(router, "QD retract");
             }
             Err(error) => {
                 drop(rt);
@@ -339,12 +480,31 @@ pub(super) fn handle_operational_command(state: &Arc<AppState>, cmd: &TelemetryC
         }
         return true;
     }
-    if matches!(name, "Launch" | "GroundStationLaunch") && !cfg!(feature = "test_fire_mode") {
+    if matches!(name, "Launch" | "GroundStationLaunch") && !crate::runtime_mode::is_test_fire() {
         let mut rt = state.gse.lock().unwrap();
         let now = rt.now();
         if !matches!(rt.operational.qd.status(now), QdStatus::Ready) {
+            let ticket = match super::LaunchAdmission::capture_for_launch(state, launch_revision) {
+                Ok(ticket) => ticket,
+                Err(error) => {
+                    drop(rt);
+                    state.add_temporary_notification(error);
+                    return true;
+                }
+            };
+            if rt.operational.qd.queued()
+                && rt
+                    .operational
+                    .qd_launch_admission
+                    .is_none_or(|old| !old.remains_current(state))
+            {
+                rt.operational.qd.cancel_launch();
+                rt.operational.qd_launch_admission = None;
+            }
             match rt.operational.qd.queue_launch(now) {
                 Ok(()) => {
+                    // Repeated requests do not renew an already accepted intent.
+                    rt.operational.qd_launch_admission.get_or_insert(ticket);
                     let message=match rt.operational.qd.status(now) {
                         QdStatus::Settling{remaining_ms}=>format!("Launch queued: QD settling, {:.1} seconds remaining",remaining_ms as f64/1000.0),
                         _=>"Launch queued: waiting for QD acknowledgement, then five seconds settling".into(),
@@ -364,7 +524,24 @@ pub(super) fn handle_operational_command(state: &Arc<AppState>, cmd: &TelemetryC
 }
 
 pub(super) fn check_report_safety(state: &Arc<AppState>) {
-    if state.gse.lock().unwrap().operational.saved.automatic_abort_claimed { return; }
+    if state
+        .launch_history
+        .lock()
+        .unwrap()
+        .automatic_actions_inhibited()
+    {
+        return;
+    }
+    if state
+        .gse
+        .lock()
+        .unwrap()
+        .operational
+        .saved
+        .automatic_abort_claimed
+    {
+        return;
+    }
     if state
         .gse
         .lock()
@@ -391,27 +568,63 @@ pub(super) fn check_report_safety(state: &Arc<AppState>) {
         return;
     }
     let mut rt = state.gse.lock().unwrap();
-    if rt.operational.saved.qualification.fault().is_some() {
+    if rt.operational.saved.qualification.fault().is_some() || rt.overpressure.owns_valves() {
         return;
     }
     let phase = rt.engine.status.phase;
-    let nitrous_session = matches!(
-        phase,
-        Phase::FillSetup | Phase::Filling | Phase::PauseSetup | Phase::Paused
-    );
+    if let Some(controller) = rt.turbocharge.as_ref() {
+        use gse_sequence::turbocharge::Phase as TurboPhase;
+        let nitrogen_transition = matches!(
+            controller.phase(),
+            TurboPhase::Closing
+                | TurboPhase::OpeningNitrogen
+                | TurboPhase::Raising
+                | TurboPhase::ClosingNitrogen
+        );
+        let unsafe_supply = if rt.valves[4].is_some_and(|v| v.open) {
+            Some("Nitrous opened during Turbocharge")
+        } else if !nitrogen_transition && rt.valves[3].is_some_and(|v| v.open) {
+            Some("Nitrogen opened outside its Turbocharge ACK phase")
+        } else {
+            None
+        };
+        if let Some(message) = unsafe_supply {
+            let effects = pause_or_relieve_unexpected_supply(&mut rt, message);
+            drop(rt);
+            apply(state, effects);
+        }
+        // The typed controller owns fresh ACKs and all five CLOSED contracts;
+        // resting nitrous-fill policy must not reject its intentional N2 step.
+        return;
+    }
+    // While a pause or cancel is closing the supplies, a supply report that
+    // is still (or just became) open is the in-flight state being closed,
+    // e.g. the Nitrogen-open report of a command sent just before a
+    // Turbocharge cancel. The engine's ACK-gated closure, its stuck-supply
+    // check and the pressure ceiling own that window.
+    if matches!(phase, Phase::PauseSetup | Phase::CancelSetup) && rt.fill_trim.is_none() {
+        return;
+    }
+    // A paused nitrogen test is not a nitrous session: nitrogen may still be
+    // closing while its pause is confirmed. Once paused, nitrogen must be closed.
+    let test_pause = rt.engine.paused_test().is_some();
+    let nitrous_session = rt.engine.nitrous_session()
+        || matches!(phase, Phase::FillSetup | Phase::Filling)
+        || (matches!(phase, Phase::PauseSetup | Phase::Paused) && !test_pause);
     let unexpected_supply = if nitrous_session && rt.valves[3].is_some_and(|v| v.open) {
         Some("Nitrogen opened during nitrous fill")
-    } else if matches!(
-        phase,
-        Phase::Raising | Phase::Settling | Phase::Holding | Phase::Paused
-    ) && rt.valves[4].is_some_and(|v| v.open)
+    } else if test_pause && phase == Phase::Paused && rt.valves[3].is_some_and(|v| v.open) {
+        Some("Nitrogen opened while the test is paused")
+    } else if (!nitrous_session && rt.valves[3].is_some_and(|v| v.open)
+        || matches!(phase, Phase::Raising | Phase::Settling | Phase::Holding))
+        && rt.valves[4].is_some_and(|v| v.open)
     {
         Some("Nitrous opened outside nitrous fill")
     } else {
         None
     };
     if let Some(message) = unexpected_supply {
-        let effects = fault(&mut rt, Fault::UnsafeSupplyFlow, message);
+        let effects = pause_or_relieve_unexpected_supply(&mut rt, message);
         drop(rt);
         apply(state, effects);
         return;
@@ -450,7 +663,6 @@ pub(super) fn check_report_safety(state: &Arc<AppState>) {
                 Effects {
                     valves,
                     notification: Some("Restoring sequence valve configuration".into()),
-                    ..Effects::default()
                 },
             );
         }
@@ -517,13 +729,368 @@ mod tests {
         state.set_action_policy(policy);
         state
     }
+    // Scenario-only factory: retain every modeled QD/operational prerequisite,
+    // but install the real status ingress before the final independent SDK proof.
+    async fn fixture_with_status_sender(commands:tokio::sync::mpsc::Sender<TelemetryCommand>)->(Arc<AppState>,usize) {
+        let mut state = crate::state::tests::test_app_state().await;
+        // Must precede the status handler's Weak binding: Arc::get_mut then
+        // remains legal and the command channel is identical to the old case.
+        Arc::get_mut(&mut state).unwrap().cmd_tx=commands;
+        state.set_local_flight_state(FlightState::Idle);
+        let router = Arc::new(sedsnet::router::Router::new(
+            sedsnet::router::RouterConfig::new([crate::ignition_pair::fixture::handler(&state, |_|Ok(()))]).with_sender("GS"),
+        ));
+        let side = router.add_side_packed("simulated_fill", |_| Ok(()));
+        let announce = sedsnet::discovery::build_discovery_announce(
+            "GB",
+            123,
+            &[
+                crate::telemetry_schema::endpoint("VALVE_BOARD"),
+                crate::telemetry_schema::endpoint("ACTUATOR_BOARD"),
+            ],
+        )
+        .unwrap();
+        router
+            .rx_packed_from_side(&sedsnet::wire_format::pack_packet(&announce), side)
+            .unwrap();
+        router.process_all_queues_with_timeout(0).unwrap();
+        state.topology_router.set(router).unwrap();
+        for board in [
+            Board::GatewayBoard,
+            Board::ValveBoard,
+            Board::ActuatorBoard,
+            Board::DaqBoard,
+        ] {
+            state.mark_board_seen(
+                board.sender_id(),
+                crate::telemetry_task::get_current_timestamp_ms(),
+            );
+        }
+        let (_, key) = topology(&state);
+        let mut rt = state.gse.lock().unwrap();
+        rt.clock = Instant::now() - std::time::Duration::from_secs(3);
+        rt.operational.topology(0, true, key.clone());
+        rt.operational.topology(3000, true, key);
+        rt.operational.startup_configured = true;
+        rt.operational.path = Some(std::env::temp_dir().join(format!(
+            "gse-runtime-{}-{}.json",
+            std::process::id(),
+            rand::random::<u128>()
+        )));
+        rt.engine.config.maximum_zero_offset_psi = Some(5.0);
+        rt.engine.config.dry_self_test_confirmed = true;
+        rt.observe_pressure(Some(0.0));
+        rt.observe_mass(Some(0.0));
+        for (key, open) in KEYS.into_iter().zip(gse_sequence::CLOSED) {
+            rt.observe_valve(key, open);
+        }
+        drop(rt);
+        let mut policy = state.action_policy_snapshot();
+        policy.key_enabled = true;
+        policy.software_buttons_enabled = true;
+        state.set_action_policy(policy);
+        (state,side)
+    }
+    #[tokio::test]
+    async fn cancelled_leak_test_invalidates_old_pass_without_aborting_vehicle() {
+        crate::mode_suite!(Normal, TestFire, Testing);
+        let state = fixture().await;
+        {
+            let mut rt = state.gse.lock().unwrap();
+            let generation = rt.operational.saved.qualification.generation();
+            for milestone in [
+                Milestone::SelfTest,
+                Milestone::NitrogenTest,
+                Milestone::FillTarget,
+            ] {
+                rt.operational
+                    .saved
+                    .qualification
+                    .complete(milestone, generation)
+                    .unwrap();
+            }
+            rt.operational.running = true;
+            rt.engine.status.phase = Phase::Holding;
+            let now = rt.now();
+            let _ = rt.engine.cancel_failed_test(now, "small hold leak");
+            let reporting_input=rt.input(true,true);
+            complete_operational_milestones(&mut rt, Phase::Holding, reporting_input);
+            assert!(rt.operational.saved.qualification.generation() > generation);
+            assert!(rt.operational.saved.qualification.fault().is_none());
+            assert!(
+                rt.operational
+                    .saved
+                    .qualification
+                    .completed(Milestone::SelfTest)
+            );
+            assert!(!rt.operational.saved.qualification.nitrogen_satisfied());
+            assert!(
+                !rt.operational
+                    .saved
+                    .qualification
+                    .completed(Milestone::FillTarget)
+            );
+            assert!(
+                rt.operational
+                    .saved
+                    .qualification
+                    .complete(Milestone::NitrogenTest, generation)
+                    .is_err(),
+                "a delayed completion from the cancelled test cannot restore its pass"
+            );
+            rt.engine.status.phase = Phase::Cancelled;
+            let reporting_input=rt.input(true,true);
+            complete_operational_milestones(&mut rt, Phase::CancelSetup, reporting_input);
+            assert_eq!(
+                rt.engine.status.phase,
+                Phase::Cancelled,
+                "old pass must not restore Passed"
+            );
+        }
+        assert!(!state.abort_indicator_latched());
+        cleanup(&state);
+    }
     fn cleanup(state: &AppState) {
         if let Some(path) = &state.gse.lock().unwrap().operational.path {
             let _ = std::fs::remove_file(path);
         }
     }
     #[tokio::test]
+    async fn trim_data_failure_pauses_closed_without_relief_or_latch() {
+        crate::mode_suite!(Normal, TestFire, Testing);
+        let state = fixture().await;
+        {
+            let mut rt = state.gse.lock().unwrap();
+            let (controller, _) =
+                gse_sequence::fill_trim::Controller::start(rt.now(), 5., 200., &rt.engine.config)
+                    .unwrap();
+            rt.fill_trim = Some(controller);
+            rt.engine.status.phase = Phase::PauseSetup;
+            rt.operational.running = true;
+            rt.observe_mass(None);
+        }
+        tick(&state, true);
+        {
+            let rt = state.gse.lock().unwrap();
+            assert_eq!(rt.engine.status.phase, Phase::PauseSetup);
+            assert_eq!(rt.engine.failure(), Some("Fill mass is missing, invalid or stale"));
+            assert_eq!(rt.operational.saved.qualification.fault(), None);
+            assert!(rt.fill_trim.is_none());
+        }
+        assert_eq!(state.get_pending_umbilical_valve_state(9), Some(false));
+        assert_eq!(state.get_pending_umbilical_valve_state(10), Some(false));
+        for key in [1, 2] {
+            assert_ne!(state.get_pending_umbilical_valve_state(key), Some(true));
+        }
+        // Fresh closed reports complete the hold: Paused, everything closed.
+        for _ in 0..12 {
+            {
+                let mut rt = state.gse.lock().unwrap();
+                let now = rt.now() + 10;
+                rt.test_now_ms = Some(now);
+                for key in KEYS {
+                    rt.observe_valve(key, false);
+                }
+                rt.observe_pressure(Some(0.0));
+            }
+            tick(&state, true);
+        }
+        assert_eq!(state.gse.lock().unwrap().engine.status.phase, Phase::Paused);
+        cleanup(&state);
+    }
+    fn assert_paused_closed_without_relief(state: &AppState, reason: &str) {
+        {
+            let rt = state.gse.lock().unwrap();
+            assert_eq!(rt.engine.status.phase, Phase::PauseSetup, "{}", rt.engine.status.message);
+            assert_eq!(rt.engine.failure(), Some(reason));
+            assert_eq!(rt.operational.saved.qualification.fault(), None);
+            assert!(!operational_launch_allowed(state, &rt));
+        }
+        assert_eq!(state.get_pending_umbilical_valve_state(9), Some(false));
+        assert_eq!(state.get_pending_umbilical_valve_state(10), Some(false));
+        for key in [1, 2] {
+            assert_ne!(state.get_pending_umbilical_valve_state(key), Some(true));
+        }
+    }
+    #[tokio::test]
+    async fn stale_fill_mass_during_fill_pauses_closed_without_relief() {
+        crate::mode_suite!(Normal, TestFire, Testing);
+        let state = fixture().await;
+        {
+            let mut rt = state.gse.lock().unwrap();
+            rt.engine.status.phase = Phase::Filling;
+            rt.engine.claimed = true;
+            rt.operational.running = true;
+            rt.observe_mass(None);
+        }
+        tick(&state, true);
+        assert_paused_closed_without_relief(
+            &state,
+            "Automatic fill stopped: fresh calibrated fill weight is required",
+        );
+        cleanup(&state);
+    }
+    #[tokio::test]
+    async fn unclassified_board_error_pauses_an_active_fill_instead_of_dumping() {
+        crate::mode_suite!(Normal, TestFire, Testing);
+        let state = fixture().await;
+        {
+            let mut rt = state.gse.lock().unwrap();
+            rt.engine.status.phase = Phase::Filling;
+            rt.engine.claimed = true;
+            rt.operational.running = true;
+        }
+        super::super::pause_fill_for_recoverable_fault(&state, "board reported an unclassified error");
+        assert_paused_closed_without_relief(&state, "board reported an unclassified error");
+        cleanup(&state);
+    }
+    #[tokio::test]
+    async fn trim_pressure_limit_uses_existing_emergency_relief_without_waiting_for_ack() {
+        crate::mode_suite!(Normal, TestFire, Testing);
+        let state = fixture().await;
+        {
+            let mut rt = state.gse.lock().unwrap();
+            let (controller, _) =
+                gse_sequence::fill_trim::Controller::start(rt.now(), 5., 200., &rt.engine.config)
+                    .unwrap();
+            rt.fill_trim = Some(controller);
+            rt.engine.status.phase = Phase::PauseSetup;
+            rt.operational.running = true;
+            rt.observe_mass(Some(5.0));
+            rt.observe_pressure(Some(200.0));
+        }
+        tick(&state, true);
+        assert_eq!(state.gse.lock().unwrap().engine.status.phase, Phase::Fault);
+        for (key, requested) in KEYS.into_iter().zip(gse_sequence::RELIEVED) {
+            assert_eq!(
+                state.get_pending_umbilical_valve_state(key),
+                Some(requested)
+            );
+        }
+        assert!(state.gse.lock().unwrap().fill_trim.is_none());
+        cleanup(&state);
+    }
+    #[tokio::test]
+    async fn changed_plans_revoke_only_affected_qualification_without_outputs() {
+        crate::mode_suite!(Normal, TestFire, Testing);
+        let state = fixture().await;
+        let path = armed_fixture_for_test(&state, state.topology_router.get().unwrap());
+        let mut rt = state.gse.lock().unwrap();
+        // A representation-only editor round trip preserves the proven plan.
+        let mut config = rt.engine.config.clone();
+        config.nitrogen_steps = config.nitrogen_plan().unwrap();
+        assert!(!nitrogen_configuration_changed(&rt.engine.config, &config));
+        config.fill_settle_ms += 1000;
+        invalidate_changed_configuration(&mut rt, &config).unwrap();
+        let saved = operational::Saved::load(&path).unwrap();
+        assert!(saved.qualification.completed(Milestone::SelfTest));
+        assert!(saved.qualification.nitrogen_satisfied());
+        assert!(!saved.qualification.completed(Milestone::FillTarget));
+        rt.engine.config = config.clone();
+        config.nitrogen_steps[0].hold_ms += 1000;
+        invalidate_changed_configuration(&mut rt, &config).unwrap();
+        let saved = operational::Saved::load(&path).unwrap();
+        assert!(saved.qualification.completed(Milestone::SelfTest));
+        assert!(!saved.qualification.nitrogen_satisfied());
+        assert!(!saved.qualification.completed(Milestone::FillTarget));
+        assert!(
+            state
+                .pending_umbilical_valve_states
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        drop(rt);
+        cleanup(&state);
+    }
+    #[tokio::test]
+    async fn manual_handoff_preserves_reports_and_nitrous_crossflow_guard() {
+        crate::mode_suite!(Normal, TestFire, Testing);
+        let state = fixture().await;
+        apply_cold_flow_test_prerequisites(&state);
+        {
+            let mut rt = state.gse.lock().unwrap();
+            let input = rt.input(true, true);
+            rt.engine.request(Action::StartFill, input).unwrap();
+            rt.engine.status.phase = Phase::Filling;
+            rt.observe_valve(10, true);
+            rt.operational.running = true;
+        }
+        state.set_umbilical_valve_state(0, false);
+        let mut policy = state.action_policy_snapshot();
+        policy.controls.retain(|control| control.cmd != "Pilot");
+        policy.controls.push(ActionControl { disabled_reason: None, requested: None, network_note: None,
+            cmd: "Pilot".into(),
+            enabled: true,
+            blink: BlinkMode::None,
+            actuated: Some(false),
+        });
+        state.set_action_policy(policy);
+        assert!(
+            state.is_command_allowed(&TelemetryCommand::Pilot),
+            "manual override must be reachable during fill: gate={:?} policy={:?}",
+            command_allowed(&state, &TelemetryCommand::Pilot),
+            state.action_policy_snapshot()
+        );
+        let before = state.gse.lock().unwrap().valves;
+        assert!(!handle_command(&state, &TelemetryCommand::Pilot));
+        {
+            let rt = state.gse.lock().unwrap();
+            assert_eq!(rt.engine.status.phase, Phase::Idle);
+            assert!(!rt.engine.claimed);
+            assert!(rt.manual_control);
+            assert!(!rt.operational.running);
+            assert_eq!(
+                rt.valves.map(|v| v.map(|v| (v.open, v.at_ms))),
+                before.map(|v| v.map(|v| (v.open, v.at_ms)))
+            );
+            assert!(rt.engine.nitrous_session());
+            assert!(rt.engine.status.nitrogen_passed);
+            assert!(rt.engine.status.self_test_locked);
+        }
+        assert!(
+            state
+                .pending_umbilical_valve_states
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "handoff must not issue CLOSED/RELIEVED"
+        );
+        assert_eq!(
+            command_allowed(&state, &TelemetryCommand::Nitrogen),
+            Some(false)
+        );
+        tick(&state, true);
+        assert_eq!(
+            state.gse.lock().unwrap().engine.status.phase,
+            Phase::Idle,
+            "no startup or legacy takeover"
+        );
+        state.gse.lock().unwrap().observe_valve(9, true);
+        report_safety(&state);
+        assert_eq!(
+            state.gse.lock().unwrap().engine.status.phase,
+            Phase::Fault,
+            "manual mode must retain crossflow protection"
+        );
+        cleanup(&state);
+    }
+    fn apply_cold_flow_test_prerequisites(state: &AppState) {
+        let mut rt = state.gse.lock().unwrap();
+        rt.engine.status.nitrogen_passed = true;
+        rt.engine.status.self_test_locked = true;
+        rt.engine.status.phase = Phase::Passed;
+        rt.engine.status.baseline = Some(gse_sequence::Baseline {
+            average_psi: 0.,
+            min_psi: 0.,
+            max_psi: 0.,
+            noise_psi: 0.1,
+            samples: 50,
+        });
+    }
+    #[tokio::test]
     async fn operator_procedure_completes_over_routed_commands_and_persists_each_check() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         use crate::gse::tests::{button_test_state, confirm_test_valves, pump_test_link};
         let (state, sent, peer) = button_test_state().await;
         let path =
@@ -542,7 +1109,9 @@ mod tests {
         let (_, key) = topology(&state);
         {
             let mut rt = state.gse.lock().unwrap();
-            rt.clock = Instant::now() - std::time::Duration::from_secs(3);
+            // This routed plant advances explicit modeled 100ms steps below.
+            // Persistence wall time must not advance that modeled sensor clock.
+            rt.test_now_ms = Some(3000);
             rt.operational.path = Some(path.clone());
             rt.operational.topology(0, true, key.clone());
             rt.operational.topology(3000, true, key);
@@ -587,7 +1156,14 @@ mod tests {
             policy.key_enabled = true;
             policy.software_buttons_enabled = true;
             state.set_action_policy(policy);
-            assert_eq!(command_allowed(&state, &cmd), Some(true), "{command}");
+            assert_eq!(command_allowed(&state, &cmd), Some(true), "{command}: {}", {
+                let rt = state.gse.lock().unwrap();
+                format!("phase={:?} pressure={:?} baseline={:?} nitrogen_passed={} prelaunch={} operational={} engine={}",
+                    rt.engine.status.phase, rt.pressure, rt.engine.status.baseline,
+                    rt.engine.status.nitrogen_passed, prelaunch(&state),
+                    operational_action_allowed(&rt, action(&cmd).unwrap()),
+                    rt.engine.allows(action(&cmd).unwrap(), rt.input(prelaunch(&state), true)))
+            });
             assert!(handle_command(&state, &cmd));
             for _ in 0..1200 {
                 pump_test_link(&state, &peer);
@@ -596,19 +1172,25 @@ mod tests {
                     let commands = sent.lock().unwrap();
                     for (kind, bytes) in &commands[consumed..] {
                         assert_eq!(bytes.len(), 1);
+                        assert_ne!(
+                            bytes[0] & 0x80,
+                            0,
+                            "routed automatic valves retain their origin"
+                        );
+                        let command = bytes[0] & 0x7f;
                         let candidates = if kind == "VALVE_COMMAND" { 0..3 } else { 3..5 };
                         let index = candidates
                             .into_iter()
-                            .find(|&i| bytes[0] == OPEN[i] || bytes[0] == CLOSE[i])
+                            .find(|&i| command == OPEN[i] || command == CLOSE[i])
                             .expect("only GSE valves are actuated");
-                        valves[index] = bytes[0] == OPEN[index];
+                        valves[index] = command == OPEN[index];
                     }
                     consumed = commands.len();
                 }
                 elapsed += 100;
                 {
                     let mut rt = state.gse.lock().unwrap();
-                    rt.clock = Instant::now() - std::time::Duration::from_millis(elapsed);
+                    rt.test_now_ms = Some(elapsed);
                 }
                 confirm_test_valves(&state, valves);
                 {
@@ -621,16 +1203,16 @@ mod tests {
                             0.0
                         };
                     rt.observe_pressure(Some(pressure));
-                    let mass = if phase == Phase::Filling
-                        || phase == Phase::PauseSetup
-                        || phase == Phase::Paused
-                    {
-                        state.fill_targets_snapshot().nitrous.target_mass_kg
+                    let target = state.fill_targets_snapshot().nitrous.target_mass_kg;
+                    let mass = if phase == Phase::Filling {
+                        target + target.signum() * rt.engine.config.fill_overfill_kg
+                    } else if matches!(phase, Phase::PauseSetup | Phase::Paused) {
+                        target
                     } else {
                         0.0
                     };
                     rt.observe_mass(Some(mass));
-                    if phase == Phase::Raising {
+                    if phase == Phase::Raising && valves[3] {
                         assert_eq!(valves, [false, false, false, true, false]);
                     }
                     if phase == Phase::Holding {
@@ -647,6 +1229,14 @@ mod tests {
                 );
                 if !rt.operational.running && rt.engine.status.phase == done {
                     break;
+                }
+                // The operator's Dump choice at the passed nitrogen-test hold.
+                let hold = rt.engine.status.phase == Phase::Paused
+                    && rt.engine.test_hold() == Some(&gse_sequence::TestHold::Passed);
+                drop(rt);
+                if hold {
+                    let _dispatch = dispatch_gate();
+                    super::super::dump_test_hold_under_dispatch(&state).unwrap();
                 }
             }
             let saved = operational::Saved::load(&path).unwrap();
@@ -669,7 +1259,43 @@ mod tests {
         cleanup(&state);
     }
     #[tokio::test]
+    async fn nitrogen_admission_rejects_real_elapsed_stale_pressure_until_new_sample() {
+        crate::mode_suite!(Normal, TestFire, Testing);
+        let state = fixture().await;
+        let original_pressure = {
+            let mut rt = state.gse.lock().unwrap();
+            assert!(rt.test_now_ms.is_none(), "negative must use real monotonic time");
+            rt.operational.running = true;
+            rt.engine.status.phase = Phase::Idle;
+            let input = rt.input(true, true);
+            complete_operational_milestones(&mut rt, Phase::SelfFinish, input);
+            assert!(rt.operational.saved.qualification.completed(Milestone::SelfTest));
+            rt.observe_pressure(Some(0.0));
+            rt.pressure.unwrap()
+        };
+        assert_eq!(command_allowed(&state, &TelemetryCommand::NitrogenTest), Some(true));
+        tokio::time::sleep(std::time::Duration::from_millis(2001)).await;
+        {
+            let rt = state.gse.lock().unwrap();
+            assert!(rt.test_now_ms.is_none());
+            assert_eq!(rt.pressure.unwrap().at_ms, original_pressure.at_ms);
+            let input = rt.input(true, true);
+            let age_ms = input.now_ms.checked_sub(original_pressure.at_ms).unwrap();
+            assert!(age_ms >= 2001, "actual elapsed age={age_ms}");
+            assert!(rt.engine.config.validate().is_ok());
+            assert!(operational_action_allowed(&rt, Action::NitrogenTest));
+            assert!(!rt.engine.allows(Action::NitrogenTest, input));
+            assert_eq!(rt.engine.status.phase, Phase::Idle);
+        }
+        assert_eq!(command_allowed(&state, &TelemetryCommand::NitrogenTest), Some(false));
+        state.gse.lock().unwrap().observe_pressure(Some(0.0));
+        assert_eq!(command_allowed(&state, &TelemetryCommand::NitrogenTest), Some(true));
+        cleanup(&state);
+    }
+
+    #[tokio::test]
     async fn runtime_requires_self_test_before_nitrogen_and_saves_completion() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let state = fixture().await;
         assert_eq!(
             command_allowed(&state, &TelemetryCommand::NitrogenTest),
@@ -679,7 +1305,8 @@ mod tests {
             let mut rt = state.gse.lock().unwrap();
             rt.operational.running = true;
             rt.engine.status.phase = Phase::Idle;
-            complete_operational_milestones(&mut rt, Phase::SelfFinish);
+            let reporting_input=rt.input(true,true);
+            complete_operational_milestones(&mut rt, Phase::SelfFinish, reporting_input);
             let saved = operational::Saved::load(rt.operational.path.as_ref().unwrap()).unwrap();
             assert!(saved.qualification.completed(Milestone::SelfTest));
         }
@@ -695,7 +1322,8 @@ mod tests {
         cleanup(&state);
     }
     #[tokio::test]
-    async fn incompatible_nitrogen_report_faults_immediately_but_never_after_launch() {
+    async fn incompatible_nitrogen_report_pauses_closed_immediately_but_never_after_launch() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let state = fixture().await;
         {
             let mut rt = state.gse.lock().unwrap();
@@ -705,15 +1333,19 @@ mod tests {
         }
         check_report_safety(&state);
         {
+            // An unexpected report alone, below the pressure limit: close both
+            // supplies and pause for the operator, without relief or a latch.
             let rt = state.gse.lock().unwrap();
-            assert_eq!(rt.engine.status.phase, Phase::Fault);
-            assert_eq!(
-                rt.operational.saved.qualification.fault(),
-                Some(Fault::UnsafeSupplyFlow)
-            );
+            assert_eq!(rt.engine.status.phase, Phase::PauseSetup);
+            assert_eq!(rt.engine.failure(), Some("Nitrogen opened during nitrous fill"));
+            assert_eq!(rt.operational.saved.qualification.fault(), None);
+            assert!(!operational_launch_allowed(&state, &rt));
         }
         assert_eq!(state.get_pending_umbilical_valve_state(9), Some(false));
-        state.set_local_flight_state(FlightState::Launch);
+        assert_eq!(state.get_pending_umbilical_valve_state(10), Some(false));
+        assert_ne!(state.get_pending_umbilical_valve_state(1), Some(true));
+        assert_ne!(state.get_pending_umbilical_valve_state(2), Some(true));
+        state.set_preexisting_flight_state_for_test(FlightState::Launch);
         {
             let mut rt = state.gse.lock().unwrap();
             rt.operational.saved = Default::default();
@@ -741,6 +1373,7 @@ mod tests {
     }
     #[tokio::test]
     async fn resting_valve_mismatch_is_corrected_without_reopening_supplies_or_after_launch() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let state = fixture().await;
         {
             let mut rt = state.gse.lock().unwrap();
@@ -751,14 +1384,15 @@ mod tests {
         assert_eq!(state.get_pending_umbilical_valve_state(1), Some(false));
         assert_eq!(state.get_pending_umbilical_valve_state(9), None);
         assert_eq!(state.get_pending_umbilical_valve_state(10), None);
-        state.set_local_flight_state(FlightState::Launch);
+        state.set_preexisting_flight_state_for_test(FlightState::Launch);
         state.set_pending_umbilical_valve_state(1, true);
         check_report_safety(&state);
         assert_eq!(state.get_pending_umbilical_valve_state(1), Some(true));
         cleanup(&state);
     }
     #[tokio::test]
-    async fn nitrous_opening_during_nitrogen_test_latches_immediate_crossflow_fault() {
+    async fn nitrous_opening_during_nitrogen_test_closes_both_supplies_and_pauses() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let state = fixture().await;
         {
             let mut rt = state.gse.lock().unwrap();
@@ -768,23 +1402,50 @@ mod tests {
             rt.observe_valve(10, true);
         }
         check_report_safety(&state);
-        assert_eq!(
-            state
-                .gse
-                .lock()
-                .unwrap()
-                .operational
-                .saved
-                .qualification
-                .fault(),
-            Some(Fault::UnsafeSupplyFlow)
-        );
+        {
+            let rt = state.gse.lock().unwrap();
+            assert_eq!(rt.operational.saved.qualification.fault(), None);
+            assert_eq!(rt.engine.status.phase, Phase::PauseSetup);
+            assert_eq!(rt.engine.failure(), Some("Nitrous opened outside nitrous fill"));
+        }
         assert_eq!(state.get_pending_umbilical_valve_state(9), Some(false));
         assert_eq!(state.get_pending_umbilical_valve_state(10), Some(false));
+        assert_ne!(state.get_pending_umbilical_valve_state(1), Some(true));
+        assert_ne!(state.get_pending_umbilical_valve_state(2), Some(true));
         cleanup(&state);
     }
     #[tokio::test]
+    async fn unexpected_supply_at_the_pressure_limit_keeps_crossflow_relief() {
+        crate::mode_suite!(Normal, TestFire, Testing);
+        for phase in [Phase::Filling, Phase::Raising, Phase::Paused] {
+            let state = fixture().await;
+            {
+                let mut rt = state.gse.lock().unwrap();
+                rt.engine.status.phase = phase;
+                rt.operational.running = true;
+                // At or above the 500 + 100 psi session limit.
+                rt.observe_pressure(Some(600.0));
+                rt.observe_valve(9, true);
+                if phase == Phase::Raising {
+                    rt.observe_valve(10, true);
+                }
+            }
+            check_report_safety(&state);
+            let rt = state.gse.lock().unwrap();
+            assert_eq!(rt.engine.status.phase, Phase::Fault, "{phase:?}");
+            assert_eq!(
+                rt.operational.saved.qualification.fault(),
+                Some(Fault::UnsafeSupplyFlow)
+            );
+            drop(rt);
+            assert_eq!(state.get_pending_umbilical_valve_state(1), Some(true));
+            assert_eq!(state.get_pending_umbilical_valve_state(2), Some(true));
+            cleanup(&state);
+        }
+    }
+    #[tokio::test]
     async fn stale_cached_qd_status_and_wrong_sender_never_start_settling() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let state = fixture().await;
         let key = crate::rocket_commands::ActuatorBoardCommands::RetractPlumbing as u8;
         {
@@ -809,7 +1470,16 @@ mod tests {
     }
     #[tokio::test]
     async fn durable_armed_publication_is_mode_sensitive_and_once_only() {
+        crate::mode_suite!(Normal, TestFire, Testing);
+        if crate::operator_queue::isolated_case(module_path!(), "durable_armed_publication_is_mode_sensitive_and_once_only") { return; }
         let state = fixture().await;
+        // The final phase now requires actual SDK admission, not just the old
+        // RAM mutation before a failed unknown-clock submission. Match main's
+        // initialized managed registry and this fixture's known native UTC.
+        let _ = crate::network_variables::flight_state();
+        let router = state.topology_router.get().unwrap();
+        router.try_set_local_network_time(sedsnet::timesync::PartialNetworkTime::from_unix_ms(1_793_000_000_000)).unwrap();
+        crate::network_variables::initialize_for_state(&state, router).unwrap();
         let mut updates = state.state_tx.subscribe();
         publish_qualified_flight_armed(&state);
         assert!(
@@ -839,7 +1509,7 @@ mod tests {
         );
         state.gse.lock().unwrap().operational.persist_error = None;
         publish_qualified_flight_armed(&state);
-        if cfg!(feature = "test_fire_mode") {
+        if crate::runtime_mode::is_test_fire() {
             assert!(updates.try_recv().is_err());
             assert_eq!(state.local_flight_state_snapshot(), FlightState::Idle);
         } else {
@@ -855,6 +1525,7 @@ mod tests {
     #[cfg(feature = "firmware_sim")]
     #[test]
     fn qd_dispatch_uses_the_explicit_model_source_epoch_without_changing_wall_mode() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         const NAME: &str = "gse::operational_policy::tests::qd_dispatch_uses_the_explicit_model_source_epoch_without_changing_wall_mode";
         if let Ok(mode) = std::env::var("GS_QD_CLOCK_CHILD") {
             if mode == "model" {
@@ -896,9 +1567,9 @@ mod tests {
         }
         std::fs::remove_dir_all(dir).unwrap();
     }
-    #[cfg(not(feature = "test_fire_mode"))]
     #[tokio::test]
     async fn flight_launch_waits_five_seconds_from_qd_ack_and_rechecks_live_gates() {
+        crate::mode_suite!(Normal, Testing);
         const NAME: &str = "gse::operational_policy::tests::flight_launch_waits_five_seconds_from_qd_ack_and_rechecks_live_gates";
         if std::env::var_os("GS_QD_GATES_CHILD").is_none() {
             let clock =
@@ -906,7 +1577,8 @@ mod tests {
             let mut child = std::process::Command::new(std::env::current_exe().unwrap());
             child
                 .args(["--exact", NAME, "--test-threads=1"])
-                .env("GS_QD_GATES_CHILD", "1");
+                .env("GS_QD_GATES_CHILD", "1")
+                .env("GS_SIM_MODE", "0");
             if cfg!(feature = "firmware_sim") {
                 std::fs::write(&clock, "0").unwrap();
                 child
@@ -933,15 +1605,15 @@ mod tests {
             "five-second-valves",
             "ten-second-valves",
             "one-second-valves",
+            "board-abort-clear",
+            "host-stop-clear",
         ] {
             queued_flight_launch_scenario(revoke).await;
         }
     }
-    #[cfg(not(feature = "test_fire_mode"))]
     async fn queued_flight_launch_scenario(revoke: &str) {
-        let mut state = fixture().await;
         let (commands, mut received) = tokio::sync::mpsc::channel(8);
-        Arc::get_mut(&mut state).unwrap().cmd_tx = commands;
+        let (state,modeled_fill_side) = fixture_with_status_sender(commands).await;
         let mut notices = state.notifications_tx.subscribe();
         let target = state.fill_targets_snapshot().nitrous.target_mass_kg;
         {
@@ -988,13 +1660,24 @@ mod tests {
             &state,
             &state.gse.lock().unwrap()
         ));
+        crate::gse::qualified_launch_proofs_for_test(&state);
+        // Isolate the inherited ACK+five-second settle policy with a modeled
+        // already-accepted legacy dispatch. Actual public/GSE retraction now
+        // owns durable MotionV2 provenance and the independent45s gate; its
+        // real SDK path is exercised by actuator_plumbing::http_tests.
+        {
+            let mut rt=state.gse.lock().unwrap();
+            let now=rt.now();
+            rt.operational.qd.dispatched(now);
+            rt.operational.qd_dispatch_utc_ms=Some(qd_dispatch_timestamp_ms());
+            rt.operational.qd_launch_admission=None;
+            assert_eq!(rt.operational.qd.status(now),QdStatus::AwaitingAck);
+        }
         assert!(handle_operational_command(
             &state,
-            &TelemetryCommand::RetractPlumbing
-        ));
-        assert!(handle_operational_command(
-            &state,
-            &TelemetryCommand::Launch
+            &TelemetryCommand::Launch,
+            None,
+            crate::board_abort::capture_launch_revision_named(&state, "Launch"),
         ));
         assert!(
             received.try_recv().is_err(),
@@ -1025,7 +1708,9 @@ mod tests {
         let acknowledged_at = state.gse.lock().unwrap().now();
         assert!(handle_operational_command(
             &state,
-            &TelemetryCommand::Launch
+            &TelemetryCommand::Launch,
+            None,
+            crate::board_abort::capture_launch_revision_named(&state, "Launch"),
         ));
         let mut seen = Vec::new();
         while let Ok(messages) = notices.try_recv() {
@@ -1036,6 +1721,13 @@ mod tests {
                 .any(|notice| notice.message.contains("QD settling")
                     && notice.message.contains("seconds remaining"))
         );
+        let original = state
+            .gse
+            .lock()
+            .unwrap()
+            .operational
+            .qd_launch_admission
+            .unwrap();
         let exact_model = crate::simulation_clock_ms().is_some();
         let before = if exact_model { 4999 } else { 4900 };
         let ready = if exact_model { 5000 } else { 5100 };
@@ -1068,6 +1760,33 @@ mod tests {
                     "fc-route" => {
                         router.remove_side(radio).unwrap();
                     }
+                    "board-abort-clear" => {
+                        let board = Board::ActuatorBoard;
+                        state
+                            .board_abort
+                            .observe_abort(board, Instant::now(), 10_000);
+                        let at = Instant::now();
+                        state.board_abort.observe_status(
+                            board,
+                            42,
+                            8,
+                            1,
+                            Some(1),
+                            false,
+                            true,
+                            at,
+                            state.board_abort.query_revision(board),
+                            at,
+                            10_001,
+                        );
+                        assert_eq!(state.board_abort.masks().0, 0);
+                    }
+                    "host-stop-clear" => {
+                        state.manual_abort_intent.request_untimed();
+                        state.manual_abort_intent.try_claim().unwrap().accepted();
+                        crate::board_abort::synchronize_stop_revision(&state);
+                        assert_eq!(state.board_abort.masks().0, 0);
+                    }
                     _ => (),
                 }
             }
@@ -1098,7 +1817,10 @@ mod tests {
             drop(rt);
             operational_tick(&state, true);
             if should_launch {
-                assert!(matches!(received.try_recv(), Ok(TelemetryCommand::Launch)));
+                assert!(matches!(received.try_recv(),
+                    Ok(TelemetryCommand::QueuedOperator { generation, command , .. })
+                        if generation == crate::gse::automatic_generation(&state)
+                            && matches!(*command, TelemetryCommand::Launch)));
             } else {
                 assert!(received.try_recv().is_err());
             }
@@ -1125,10 +1847,64 @@ mod tests {
             received.try_recv().is_err(),
             "the queued launch is dispatched once"
         );
+        if matches!(revoke, "board-abort-clear" | "host-stop-clear") {
+            assert!(!original.remains_current(&state));
+            // Independent final-admission proof: every real SDK launch queue
+            // call rejects the original revision even though Abort is cleared.
+            assert!(
+                !crate::gse::queue_controller_with_launch_revision(
+                    &state,
+                    router,
+                    crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
+                    &[1],
+                    Some(original.board_abort_revision)
+                )
+                .unwrap()
+            );
+            // Only the independent fresh SDK-positive premise changes. All
+            // earlier QD/GPS/route/revision/Abort/Stop negatives above remain
+            // modeled with their original clocks and assertions.
+            router.remove_side(modeled_fill_side).unwrap();
+            for board in crate::board_abort::BOARDS {
+                if matches!(board,Board::ActuatorBoard|Board::ValveBoard){continue;}
+                let at = Instant::now();
+                state.board_abort.observe_status(
+                    board,
+                    42,
+                    8,
+                    2,
+                    Some(1),
+                    false,
+                    true,
+                    at,
+                    state.board_abort.query_revision(board),
+                    at,
+                    10_002,
+                );
+            }
+            // Other five board prerequisites remain explicitly MODELED. The
+            // ignition pair alone is now genuine queried SDK evidence on the
+            // exact enqueue Router, with no competing fake GB controller route.
+            let _actual_pair=crate::ignition_pair::fixture::Peers::warm_pair_only(&state,router.clone()).await;
+            assert!(state.board_abort.ignition_pair_current());
+            let fresh = crate::board_abort::capture_launch_revision_named(&state, "Launch");
+            assert!(
+                crate::gse::queue_controller_with_launch_revision(
+                    &state,
+                    router,
+                    crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
+                    &[1],
+                    fresh
+                )
+                .unwrap(),
+                "a distinct explicit intent still reaches the actual SDK owner"
+            );
+        }
         cleanup(&state);
     }
     #[tokio::test]
     async fn stabilized_below_target_does_not_qualify_launch() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let state = fixture().await;
         let mut rt = state.gse.lock().unwrap();
         rt.operational
@@ -1150,13 +1926,15 @@ mod tests {
             .unwrap();
         rt.operational.running = true;
         rt.engine.status.phase = Phase::Paused;
-        complete_operational_milestones(&mut rt, Phase::PauseSetup);
+        let reporting_input=rt.input(true,true);
+        complete_operational_milestones(&mut rt, Phase::PauseSetup, reporting_input);
         assert!(!rt.operational.saved.qualification.launch_qualified());
         drop(rt);
         cleanup(&state);
     }
     #[tokio::test]
     async fn lost_fill_board_latches_fault_and_cancels_pending_launch() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let state = fixture().await;
         state.gse.lock().unwrap().operational.running = true;
         state
@@ -1180,8 +1958,198 @@ mod tests {
         );
         cleanup(&state);
     }
+    mod inherited_freshness_diagnostic {
+        use super::*;
+        use std::time::{Duration, Instant};
+        async fn ready() -> Arc<AppState> {
+            let state = fixture().await;
+            let mut rt = state.gse.lock().unwrap();
+            assert!(
+                rt.test_now_ms.is_none(),
+                "must exercise real monotonic clock"
+            );
+            rt.operational
+                .saved
+                .qualification
+                .complete(Milestone::SelfTest, 0)
+                .unwrap();
+            rt.operational.saved.baseline = Some(gse_sequence::Baseline {
+                average_psi: 0.,
+                min_psi: 0.,
+                max_psi: 0.,
+                noise_psi: 0.1,
+                samples: 50,
+            });
+            rt.observe_pressure(Some(0.));
+            for key in KEYS {
+                rt.observe_valve(key, false);
+            }
+            drop(rt);
+            state
+        }
+        fn facts(rt: &Runtime, input: Inputs) -> serde_json::Value {
+            let fresh = input.pressure.filter(|p| {
+                p.value.is_finite() && p.at_ms <= input.now_ms && input.now_ms - p.at_ms <= 2000
+            });
+            let config_valid = rt.engine.config.validate().is_ok();
+            let limit = rt
+                .engine
+                .config
+                .pressure_limit(rt.engine.nitrous_target_psi, 50.)
+                .is_ok_and(|limit| limit > rt.engine.nitrous_target_psi);
+            let nitrogen = rt.engine.status.nitrogen_passed || rt.engine.status.nitrogen_overridden;
+            let phase = matches!(rt.engine.status.phase, Phase::Passed | Phase::Paused);
+            let zero = fresh.is_some_and(|p| {
+                rt.engine
+                    .status
+                    .baseline
+                    .as_ref()
+                    .is_some_and(|b| b.is_zero(p.value))
+            });
+            let actual = rt.engine.allows(Action::StartFill, input);
+            assert_eq!(
+                actual,
+                input.prelaunch
+                    && input.interlock
+                    && config_valid
+                    && fresh.is_some()
+                    && limit
+                    && nitrogen
+                    && phase
+                    && zero
+            );
+            serde_json::json!({"now_ms":input.now_ms,"pressure_at_ms":input.pressure.map(|p|p.at_ms),"pressure_age_ms":input.pressure.map(|p|input.now_ms.saturating_sub(p.at_ms)),"prelaunch":input.prelaunch,"interlock":input.interlock,"config_valid":config_valid,"fresh_pressure":fresh.is_some(),"pressure_limit":limit,"nitrogen_evidence":nitrogen,"phase":phase,"zero_baseline_with_fresh_pressure":zero,"allows":actual})
+        }
+        #[tokio::test]
+        async fn real_persist_hold_expires_old_input_then_new_reports_restore_current_context() {
+            crate::mode_suite!(Normal, TestFire, Testing);
+            let state = ready().await;
+            let (path, original) = {
+                let rt = state.gse.lock().unwrap();
+                (rt.operational.path.clone().unwrap(), rt.pressure.unwrap())
+            };
+            let (entered, release) = operational::persist_diagnostic::arm(path);
+            let helper = std::thread::spawn(move || {
+                let at = entered.recv_timeout(Duration::from_secs(10)).unwrap();
+                std::thread::sleep(Duration::from_millis(2200));
+                let held = at.elapsed();
+                release.send(()).unwrap();
+                held
+            });
+            let wall = Instant::now();
+            apply_cold_flow_override(&state, "alice", "Diagnostic real persistence hold").unwrap();
+            let held = helper.join().unwrap();
+            assert!(held >= Duration::from_millis(2200));
+            let mut rt = state.gse.lock().unwrap();
+            assert_eq!(rt.pressure.unwrap().at_ms, original.at_ms);
+            let old_input = rt.input(true, true);
+            let old = facts(&rt, old_input);
+            assert_eq!(old["allows"], false);
+            assert_eq!(old["fresh_pressure"], false);
+            for field in [
+                "prelaunch",
+                "interlock",
+                "config_valid",
+                "pressure_limit",
+                "nitrogen_evidence",
+                "phase",
+            ] {
+                assert_eq!(old[field], true, "{field}");
+            }
+            println!(
+                "PERSIST_FRESHNESS old={old} actual_barrier_ms={} total_wall_ms={}",
+                held.as_millis(),
+                wall.elapsed().as_millis()
+            );
+            // A new receipt through the actual observer, not a mutation of old Sample.at_ms.
+            rt.observe_pressure(Some(0.));
+            for key in KEYS {
+                rt.observe_valve(key, false);
+            }
+            let new_sample = rt.pressure.unwrap();
+            assert!(new_sample.at_ms > original.at_ms);
+            assert_eq!(original.at_ms, old_input.pressure.unwrap().at_ms);
+            let new_input = rt.input(true, true);
+            let new = facts(&rt, new_input);
+            assert_eq!(new["allows"], true);
+            println!(
+                "PERSIST_FRESHNESS genuine_new_reports={new} original_stamp_retained={}",
+                original.at_ms
+            );
+            drop(rt);
+            cleanup(&state);
+        }
+        #[tokio::test]
+        async fn fresh_reports_do_not_repair_changed_prelaunch_or_interlock() {
+            crate::mode_suite!(Normal, TestFire, Testing);
+            let state = ready().await;
+            apply_cold_flow_override(&state, "alice", "Context negative control").unwrap();
+            let mut rt = state.gse.lock().unwrap();
+            rt.observe_pressure(Some(0.));
+            for key in KEYS {
+                rt.observe_valve(key, false);
+            }
+            let input = rt.input(true, true);
+            assert_eq!(facts(&rt, input)["allows"], true);
+            drop(rt);
+            state.set_local_flight_state(FlightState::Ascent);
+            {
+                let mut rt = state.gse.lock().unwrap();
+                rt.observe_pressure(Some(0.));
+                let changed_state = rt.input(
+                    prelaunch(&state),
+                    interlock(&state, &state.action_policy_snapshot()),
+                );
+                let denied = facts(&rt, changed_state);
+                assert_eq!(denied["allows"], false);
+                assert_eq!(denied["fresh_pressure"], true);
+                assert_eq!(denied["prelaunch"], false);
+                println!("PERSIST_FRESHNESS actual_state_Ascent={denied}");
+            }
+            state.set_local_flight_state(FlightState::Idle);
+            // Production policy decoration acquires GSE; never call it while
+            // the test already holds that mutex.
+            let mut policy = state.action_policy_snapshot();
+            policy.key_enabled = false;
+            state.set_action_policy(policy);
+            {
+                let mut rt = state.gse.lock().unwrap();
+                rt.observe_pressure(Some(0.));
+                let changed_interlock = rt.input(
+                    prelaunch(&state),
+                    interlock(&state, &state.action_policy_snapshot()),
+                );
+                let denied = facts(&rt, changed_interlock);
+                assert_eq!(denied["allows"], false);
+                assert_eq!(denied["fresh_pressure"], true);
+                assert_eq!(denied["interlock"], false);
+                println!("PERSIST_FRESHNESS actual_key_interlock_disabled={denied}");
+            }
+            cleanup(&state);
+        }
+        #[tokio::test]
+        async fn fresh_reports_do_not_repair_unsafe_changed_ceiling() {
+            crate::mode_suite!(Normal, TestFire, Testing);
+            let state = ready().await;
+            apply_cold_flow_override(&state, "alice", "Configuration negative control").unwrap();
+            let mut rt = state.gse.lock().unwrap();
+            rt.engine.config.pressure_ceiling_psi = Some(1.);
+            rt.observe_pressure(Some(0.));
+            for key in KEYS {
+                rt.observe_valve(key, false);
+            }
+            let input = rt.input(true, true);
+            let denied = facts(&rt, input);
+            assert_eq!(denied["allows"], false);
+            assert_eq!(denied["fresh_pressure"], true);
+            println!("PERSIST_FRESHNESS changed_ceiling={denied}");
+            drop(rt);
+            cleanup(&state);
+        }
+    }
     #[tokio::test]
     async fn cold_flow_override_requires_real_self_test_and_live_safe_inputs() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let state = fixture().await;
         assert!(apply_cold_flow_override(&state, "alice", "External cold flow reviewed").is_err());
         {
@@ -1209,6 +2177,15 @@ mod tests {
         assert!(apply_cold_flow_override(&state, "alice", "External cold flow reviewed").is_err());
         state.gse.lock().unwrap().observe_pressure(Some(0.0));
         apply_cold_flow_override(&state, "alice", "External cold flow reviewed").unwrap();
+        // The positive assertion models continuing telemetry after durable I/O.
+        // Emit new observations; never renew the timestamp of the old sample.
+        {
+            let mut rt = state.gse.lock().unwrap();
+            rt.observe_pressure(Some(0.0));
+            for key in KEYS {
+                rt.observe_valve(key, false);
+            }
+        }
         let rt = state.gse.lock().unwrap();
         assert!(!rt.engine.status.nitrogen_passed);
         assert!(rt.engine.status.nitrogen_overridden);
@@ -1224,6 +2201,7 @@ mod tests {
     }
     #[tokio::test]
     async fn durable_fire_intent_is_once_only_and_prevents_restart_abort_or_valve_setup() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let state = fixture().await;
         let path = armed_fixture_for_test(&state, state.topology_router.get().unwrap());
         commit_fire_intent(&state).unwrap();
@@ -1239,8 +2217,13 @@ mod tests {
         state.set_local_flight_state(FlightState::Idle);
         assert!(!automatic_abort_allowed(&state));
         assert!(
-            crate::telemetry_task::command_at_dispatch(&state, TelemetryCommand::AutomaticAbort)
-                .is_none(),
+            crate::telemetry_task::command_at_dispatch(
+                &state,
+                TelemetryCommand::AutomaticAbort {
+                    generation: crate::gse::automatic_generation(&state)
+                }
+            )
+            .is_none(),
             "Delayed automatic abort must stay blocked after durable Fire even if local state restarted Idle"
         );
         assert!(
@@ -1269,6 +2252,7 @@ mod tests {
     }
     #[tokio::test]
     async fn paused_fill_and_armed_mission_keep_connectivity_protection_while_fc_state_is_idle() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         for armed in [false, true] {
             let state = fixture().await;
             {
@@ -1307,22 +2291,29 @@ mod tests {
                 .unwrap()
                 .last_seen_instant = Some(Instant::now() - std::time::Duration::from_secs(4));
             assert!(operational_tick(&state, true));
-            assert_eq!(
-                state
-                    .gse
-                    .lock()
-                    .unwrap()
-                    .operational
-                    .saved
-                    .qualification
-                    .fault(),
-                Some(Fault::TopologyLost)
-            );
+            {
+                // Lost routes are missing data: the filled hold re-closes and
+                // waits for the operator; no relief and no qualification latch.
+                let rt = state.gse.lock().unwrap();
+                assert_eq!(rt.operational.saved.qualification.fault(), None);
+                assert_eq!(rt.engine.status.phase, Phase::PauseSetup);
+                assert_eq!(rt.engine.failure(), Some("Fill-system connectivity lost"));
+                assert!(!operational_launch_allowed(&state, &rt));
+            }
+            assert_eq!(state.get_pending_umbilical_valve_state(9), Some(false));
+            assert_eq!(state.get_pending_umbilical_valve_state(10), Some(false));
+            assert_ne!(state.get_pending_umbilical_valve_state(1), Some(true));
+            assert_ne!(state.get_pending_umbilical_valve_state(2), Some(true));
+            // Repeated unhealthy ticks do not re-issue the pause.
+            state.pending_umbilical_valve_states.lock().unwrap().clear();
+            operational_tick(&state, true);
+            assert!(state.pending_umbilical_valve_states.lock().unwrap().is_empty());
             cleanup(&state);
         }
     }
     #[tokio::test]
     async fn accepted_mass_cutoff_can_arm_without_requiring_an_unreachable_exact_float_target() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let state = fixture().await;
         let target = state.fill_targets_snapshot().nitrous.target_mass_kg;
         let mut rt = state.gse.lock().unwrap();
@@ -1345,7 +2336,8 @@ mod tests {
         rt.operational.target_reached = Some(target);
         rt.engine.status.phase = Phase::Paused;
         rt.observe_mass(Some(target * 0.996));
-        complete_operational_milestones(&mut rt, Phase::PauseSetup);
+        let reporting_input=rt.input(true,true);
+        complete_operational_milestones(&mut rt, Phase::PauseSetup, reporting_input);
         assert_eq!(
             rt.operational.saved.qualification.stage(),
             gse_sequence::qualification::MissionStage::Armed
@@ -1358,3 +2350,6 @@ mod tests {
         cleanup(&state);
     }
 }
+
+#[cfg(test)]
+mod automatic_phase_tests;
