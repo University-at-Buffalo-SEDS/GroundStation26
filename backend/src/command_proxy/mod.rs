@@ -1535,7 +1535,11 @@ pub(crate) fn status() -> Status {
         status.takeover = true;
         status.takeover_commands = crate::sequences::all_command_names().into_iter()
             .filter(|name| takeover_operation(name)).map(String::from).collect();
-        status.reason = "RRLS takeover: the primary GroundStation is out of range, so this RRLS commands the AV bay directly. Authority returns to the primary automatically once it is heard again.".into();
+        status.reason = if crate::rrls::handback_waiting() {
+            "RRLS takeover: GS heard, but it has no route to the AV bay yet, so this RRLS keeps commanding the AV bay directly. Authority returns to the primary once it reaches the AV bay.".into()
+        } else {
+            "RRLS takeover: the primary GroundStation is out of range, so this RRLS commands the AV bay directly. Authority returns to the primary automatically once it is heard again and reaches the AV bay.".into()
+        };
     }
     status
 }

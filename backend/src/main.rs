@@ -2370,6 +2370,11 @@ async fn main() -> anyhow::Result<()> {
             let mut egress = false;
             let mut writable = false;
             loop {
+                // This RRLS's own route to RF/FC/PB: with one, it keeps a
+                // takeover until the primary reports one too.
+                if let Some(mesh) = rrls::settings_transport() {
+                    mesh.lock().unwrap().set_av_bay_routed(crate::manual_abort_resend::av_bay_abort_route(&router));
+                }
                 let takeover = rrls::takeover_active();
                 // An operator Abort on a listening RRLS opens the radio side too;
                 // Mesh::local_tx then lets only ABORT frames out.

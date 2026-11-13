@@ -57,9 +57,9 @@ const TAKEOVER_MS: u64 = PROXY_LEASE_MS;
 /// discovery route from the primary to RF/FC/PB (what its Abort is sent on).
 const HEALTH_DIRECT: u8 = 1;
 const HEALTH_AV_BAY_ROUTED: u8 = 2;
-/// A heard primary that has not reported an AV-bay route gets authority back
-/// after this long anyway (the discovery route lifetime): an older primary,
-/// or one the AV bay never answers, must not leave the RRLS in charge.
+/// A heard primary that reports no AV-bay route gets authority back after
+/// this long (the discovery route lifetime) only if this RRLS has none
+/// either; while the RRLS reaches the AV bay it keeps command.
 const HANDBACK_ROUTE_WAIT_MS: u64 = 30_000;
 /// Upper bound on the primary's HEALTH period (500 ms plus loop latency),
 /// used to extrapolate its sequence without ever running ahead of it.
@@ -128,6 +128,12 @@ fn is_abort_frame(payload: &[u8]) -> bool {
         .is_ok_and(|info| info.envelope.ty == crate::telemetry_schema::data_type("ABORT"))
 }
 /// RRLS: it owns the AV bay because the primary is out of range.
+static RRLS_HANDBACK_WAITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// RRLS in takeover: the primary is heard again but has no route to the AV
+/// bay yet, so this RRLS keeps command.
+pub(crate) fn handback_waiting() -> bool {
+    RRLS_HANDBACK_WAITING.load(std::sync::atomic::Ordering::Acquire)
+}
 pub(crate) fn takeover_active() -> bool {
     RRLS_TAKEOVER.load(std::sync::atomic::Ordering::Acquire)
 }
@@ -2543,19 +2549,20 @@ impl Mesh {
             // has rediscovered RF/FC/PB, and an Abort it sent then went nowhere.
             let waiting = *self.handback_waiting_since.get_or_insert(now);
             let waited = now.saturating_sub(waiting);
-            if self.primary_av_bay_routed || waited >= HANDBACK_ROUTE_WAIT_MS {
+            if self.primary_av_bay_routed || (waited >= HANDBACK_ROUTE_WAIT_MS && !self.av_bay_routed) {
                 self.takeover = false;
                 self.handback_waiting_since = None;
                 if self.primary_av_bay_routed {
                     log::info!("RRLS takeover ended: the primary's HEALTH has been continuous for {RESTORE_MS} ms and it has a fresh AV-bay route; authority handed back");
                 } else {
-                    log::warn!("RRLS takeover ended: the primary has been heard for {waited} ms past {RESTORE_MS} ms but reports no AV-bay route; authority handed back anyway");
+                    log::warn!("RRLS takeover ended: the primary has been heard for {waited} ms past {RESTORE_MS} ms and reports no AV-bay route, but this RRLS has none either; authority handed back");
                 }
             }
         }
         if !self.takeover || !restored {
             self.handback_waiting_since = None;
         }
+        RRLS_HANDBACK_WAITING.store(self.handback_waiting(), std::sync::atomic::Ordering::Release);
         RRLS_TAKEOVER.store(self.takeover, std::sync::atomic::Ordering::Release);
         if self.abort_egress_until.is_some_and(|until| now >= until) {
             self.abort_egress_until = None;
@@ -2565,8 +2572,14 @@ impl Mesh {
     /// RRLS operator Abort: ABORT is the one command never refused for lack of
     /// authority. For ABORT_EGRESS_MS a listening RRLS puts its own ABORT frames
     /// (nothing else) on the radio, besides sending the Abort to the primary.
-    /// Primary: whether its router has a fresh discovery route to RF/FC/PB,
-    /// reported to the RRLS in HEALTH (its hand-back condition).
+    /// RRLS in takeover: the primary is heard again but reports no AV-bay
+    /// route, so this RRLS keeps command (shown to its operator).
+    pub(crate) fn handback_waiting(&self) -> bool {
+        self.takeover && self.handback_waiting_since.is_some() && !self.primary_av_bay_routed
+    }
+    /// Whether this station's router has a fresh discovery route to
+    /// RF/FC/PB. The primary reports it to the RRLS in HEALTH (the hand-back
+    /// condition); an RRLS that has one keeps command until the primary does.
     pub fn set_av_bay_routed(&mut self, routed: bool) {
         self.av_bay_routed = routed;
     }
@@ -3439,9 +3452,12 @@ mod tests {
         rr.tick(now);
         assert!(!rr.takeover(), "the primary has a fresh AV-bay route: authority back");
     }
+    /// Neither station can reach the AV bay: the RRLS holds no advantage, so
+    /// authority returns to the heard primary after the route lifetime.
     #[test]
     fn a_primary_that_never_reports_an_av_bay_route_gets_authority_back_after_the_route_lifetime() {
         let (mut rr, mut now, mut seq) = rrls_in_takeover_after_a_long_cut();
+        rr.set_av_bay_routed(false);
         let heard = now;
         while now < heard + RESTORE_MS + HANDBACK_ROUTE_WAIT_MS - 500 {
             rr.incoming(true, &health_route(7, seq, true, false), now);
@@ -3455,6 +3471,27 @@ mod tests {
         rr.incoming(true, &health_route(7, seq, true, false), now + 1_000);
         rr.tick(now + 1_000);
         assert!(!rr.takeover(), "bounded: an older primary or one the AV bay never answers");
+    }
+    /// The RRLS still reaches the AV bay and the primary does not: handing
+    /// control over would leave nobody able to command the AV bay, so the
+    /// RRLS keeps it, past the route lifetime, and says why.
+    #[test]
+    fn an_rrls_that_reaches_the_av_bay_keeps_command_until_the_primary_does() {
+        let (mut rr, mut now, mut seq) = rrls_in_takeover_after_a_long_cut();
+        rr.set_av_bay_routed(true);
+        let heard = now;
+        while now < heard + RESTORE_MS + HANDBACK_ROUTE_WAIT_MS + 10_000 {
+            rr.incoming(true, &health_route(7, seq, true, false), now);
+            rr.tick(now);
+            seq += 1;
+            now += 500;
+        }
+        assert!(rr.takeover(), "the primary still has no AV-bay route");
+        assert!(rr.handback_waiting(), "the RRLS shows that it keeps command for that reason");
+        rr.incoming(true, &health_route(7, seq, true, true), now);
+        rr.tick(now);
+        assert!(!rr.takeover());
+        assert!(!rr.handback_waiting());
     }
     #[test]
     fn the_primary_reports_its_av_bay_route_in_health() {
