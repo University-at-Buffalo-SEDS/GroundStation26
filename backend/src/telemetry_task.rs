@@ -252,6 +252,12 @@ pub(crate) fn set_absolute_time_data_dir(dir: &std::path::Path) {
 
 /// Station host UTC in ns: the model clock in simulation (ms resolution, the
 /// simulator's truth), else CLOCK_REALTIME at full resolution.
+/// The station's host UTC in milliseconds: the clock network time is built
+/// on (the simulator clock under simulation).
+pub(crate) fn station_host_utc_ms() -> u64 {
+    host_utc_ns().max(0).div_euclid(1_000_000) as u64
+}
+
 fn host_utc_ns() -> i64 {
     if crate::simulation_clock_ms().is_some() {
         return (procedure_clock::now().utc_ms() as i64).saturating_mul(1_000_000);
