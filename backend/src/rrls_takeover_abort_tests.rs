@@ -46,6 +46,9 @@ struct Bay {
     hold: Arc<AtomicU8>,
     held: Arc<Mutex<Vec<Vec<u8>>>>,
     peers: Vec<Arc<Router>>,
+    names: Vec<&'static str>,
+    /// While holding: the boards the radio still reaches (see `release_to`).
+    open: Arc<Mutex<Vec<&'static str>>>,
 }
 impl Bay {
     fn pump(&self) {
@@ -65,6 +68,21 @@ impl Bay {
         }
         self.pump();
     }
+    /// Deliver what is on the air to the named boards only (the rest still owe).
+    /// From now on the radio reaches the named boards again (the rest still
+    /// owe); they also receive what was held.
+    fn release_to(&self, boards: &[&'static str]) {
+        self.open.lock().unwrap().extend_from_slice(boards);
+        let held = self.held.lock().unwrap().clone();
+        for (peer, name) in self.peers.iter().zip(&self.names) {
+            if boards.contains(name) {
+                for bytes in &held {
+                    peer.rx_packed_from_side(bytes, 0).unwrap();
+                }
+            }
+        }
+        self.pump();
+    }
     fn pending(&self, name: &str) -> Vec<u64> {
         let ty = crate::telemetry_schema::data_type(name);
         let mut owners: Vec<u64> = self.rrls.export_reliable_pending_stats().into_iter()
@@ -79,6 +97,12 @@ impl Bay {
 
 /// An RRLS whose radio reaches RF, FC and PB (discovered), as in a takeover.
 async fn bay(takeover: bool) -> Bay {
+    bay_with(takeover, false).await
+}
+
+/// `primary`: the primary was discovered too, then cut (its route outlives
+/// the cut, so it is still listed), and it is not yet forgotten.
+async fn bay_with(takeover: bool, primary: bool) -> Bay {
     crate::telemetry_schema::initialize().unwrap();
     let now = Arc::new(AtomicU64::new(1_000));
     let state = crate::state::tests::test_app_state().await;
@@ -111,23 +135,49 @@ async fn bay(takeover: bool) -> Bay {
     }
     let hold = Arc::new(AtomicU8::new(0));
     let held = Arc::new(Mutex::new(Vec::new()));
-    let (phase, store, targets) = (hold.clone(), held.clone(), peers.clone());
+    let open = Arc::new(Mutex::new(Vec::new()));
+    let (phase, store, targets, reach) = (hold.clone(), held.clone(), peers.clone(), open.clone());
     rrls.add_side_packed("rocket_comms", move |bytes| {
-        if phase.load(Ordering::Relaxed) == 1 {
+        let holding = phase.load(Ordering::Relaxed) == 1;
+        if holding {
             store.lock().unwrap().push(bytes.to_vec());
-            return Ok(());
         }
-        for peer in &targets {
-            peer.rx_packed_from_side(bytes, 0)?;
+        for (peer, name) in targets.iter().zip(AV_BAY) {
+            if !holding || reach.lock().unwrap().contains(&name) {
+                peer.rx_packed_from_side(bytes, 0)?;
+            }
         }
         Ok(())
     });
-    let bay = Bay { state, rrls, hold, held, peers };
+    // The primary's link is side 1: the boards answer on side 0, the radio.
+    let gs_up = Arc::new(std::sync::atomic::AtomicBool::new(primary));
+    if primary {
+        let clock = now.clone();
+        let gs = Arc::new(Router::new_with_clock(
+            RouterConfig::new([EndpointHandler::new_packet_handler(crate::telemetry_schema::endpoint("ABORT"), |_| Ok(()))])
+                .with_sender("GS"),
+            Box::new(move || clock.load(Ordering::Relaxed)),
+        ));
+        gs.enable_network_variable(crate::telemetry_schema::data_type("FLIGHT_STATE"), NetworkVariablePermissions::READ_ONLY).unwrap();
+        let (back, up) = (rrls.clone(), gs_up.clone());
+        gs.add_side_packed("RRLS", move |bytes| if up.load(Ordering::Relaxed) { back.rx_packed_from_side(bytes, 0) } else { Ok(()) });
+        let (to_gs, up) = (gs.clone(), gs_up.clone());
+        rrls.add_side_packed("primary_link", move |bytes| if up.load(Ordering::Relaxed) { to_gs.rx_packed_from_side(bytes, 0) } else { Ok(()) });
+        gs.announce_discovery().unwrap();
+        for _ in 0..10 {
+            gs.process_all_queues().unwrap();
+            rrls.process_all_queues().unwrap();
+        }
+        std::mem::forget(gs);
+    }
+    let bay = Bay { state, rrls, hold, held, peers, names: AV_BAY.to_vec(), open };
     for peer in &bay.peers {
         peer.announce_discovery().unwrap();
     }
     bay.rrls.announce_discovery().unwrap();
     bay.pump();
+    // The cut: from here the primary neither hears nor is heard.
+    gs_up.store(false, Ordering::Relaxed);
     crate::rrls::set_takeover_for_test(takeover);
     // main.rs applies this on every takeover change.
     crate::network_variables::set_takeover_outputs_writable(&bay.rrls, takeover).unwrap();
@@ -187,4 +237,62 @@ async fn a_listening_rrls_abort_sends_only_the_abort() {
         .get_cached_network_variable(crate::telemetry_schema::data_type("FLIGHT_STATE"))
         .unwrap()
         .is_none_or(|latest| crate::types::canonical_sender_id(latest.sender()) != "RRLS"));
+}
+
+fn hash(name: &str) -> u64 {
+    sedsnet::packet::hash_bytes_u64(0x517C_C1B7_2722_0A95, name.as_bytes())
+}
+
+/// The AV-bay boards an Abort service sees owing `name`'s pending frames,
+/// and whether any remaining owner is not a board (manual_abort_resend and
+/// abort_retirement map owners the same way).
+fn owed_boards(bay: &Bay, name: &str) -> (u8, bool) {
+    let ty = crate::telemetry_schema::data_type(name);
+    let (mut mask, mut unnamed) = (0u8, false);
+    for row in bay.rrls.export_reliable_pending_stats().into_iter().filter(|row| row.data_type == ty) {
+        for owner in row.pending_destinations {
+            match crate::board_recovery::coordinator::pending_destination_board(&bay.rrls, owner)
+                .and_then(|board| crate::board_abort::BOARDS.iter().position(|b| *b == board))
+            {
+                Some(i) => mask |= 1 << i,
+                None => unnamed = true,
+            }
+        }
+    }
+    (mask, unnamed)
+}
+
+/// Forgetting the out-of-range primary (an RRLS taking over) only removes
+/// the primary from the owners of a pending ABORT and Aborted FLIGHT_STATE:
+/// neither completes while any AV-bay board still owes its acknowledgement,
+/// and both Abort services then see exactly the boards that still owe it.
+#[tokio::test]
+async fn forgetting_the_primary_never_completes_an_abort_an_av_bay_board_still_owes() {
+    if rrls_child("forgetting_the_primary_never_completes_an_abort_an_av_bay_board_still_owes") {
+        return;
+    }
+    let bay = bay_with(true, true).await;
+    press_abort(&bay);
+    let gs = hash("GS");
+    let mut boards: Vec<u64> = AV_BAY.iter().map(|name| hash(name)).collect();
+    boards.sort_unstable();
+    let mut with_gs = boards.clone();
+    with_gs.push(gs);
+    with_gs.sort_unstable();
+    assert_eq!(bay.pending("ABORT"), with_gs, "owed to the still-listed primary as well");
+    assert_eq!(bay.pending("FLIGHT_STATE"), with_gs);
+    assert_eq!(owed_boards(&bay, "ABORT"), (0b111, true), "the primary is an owner no service can name");
+
+    crate::network_variables::takeover_changed(&bay.rrls, true).unwrap();
+    for name in ["ABORT", "FLIGHT_STATE"] {
+        assert_eq!(bay.pending(name), boards, "{name}: only the primary is retired");
+        assert_eq!(owed_boards(&bay, name), (0b111, false), "{name}: every board still owes it");
+    }
+    bay.release_to(&["RF", "FC"]);
+    for name in ["ABORT", "FLIGHT_STATE"] {
+        assert_eq!(bay.pending(name), vec![hash("PB")], "{name}: pending until PB acknowledges");
+        assert_eq!(owed_boards(&bay, name), (1 << 2, false));
+    }
+    bay.release_to(&["PB"]);
+    assert!(bay.pending("ABORT").is_empty() && bay.pending("FLIGHT_STATE").is_empty());
 }
