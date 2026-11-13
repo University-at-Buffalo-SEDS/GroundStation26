@@ -382,6 +382,9 @@ pub struct AppState {
     /// Administrator "launch sequence only" setting.
     pub sequence_access: Arc<crate::sequence_access::SequenceAccess>,
 
+    /// Administrator choice of valve or sequence control for the panel buttons.
+    pub panel_control: Arc<crate::panel_control::PanelControl>,
+
     /// In-memory recent telemetry cache used to bridge DB write lag during reseed.
     pub recent_telemetry_cache: Arc<Mutex<VecDeque<TelemetryRow>>>,
 
@@ -4521,6 +4524,7 @@ pub(crate) mod tests {
             last_command_ms: Arc::new(Mutex::new(HashMap::new())),
             fill_sequence_continue_requests: Arc::new(AtomicU64::new(0)),
             sequence_access: Default::default(),
+            panel_control: Default::default(),
             recent_telemetry_cache: Arc::new(Mutex::new(VecDeque::new())),
             latest_gps_fix_by_sender: Arc::new(Mutex::new(HashMap::new())),
             latest_gps_satellites_by_sender: Arc::new(Mutex::new(HashMap::new())),

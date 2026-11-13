@@ -498,7 +498,31 @@ where
         }
         if !can_press(&allowed.lock().unwrap()) {
             let policy = state.action_policy_snapshot();
-            if !policy.key_enabled {
+            // A sequence switched off by "Launch sequence only" is refused
+            // with that setting's reason; the button never falls back to
+            // its valve.
+            let panel_cmd = crate::gse::panel_name(&state, crate::sequences::command_name(&cmd));
+            let launch_only_reason = policy
+                .controls
+                .iter()
+                .find(|c| c.cmd == panel_cmd)
+                .and_then(|c| c.disabled_reason.as_deref())
+                .filter(|reason| *reason == crate::sequence_access::DISABLED_REASON)
+                .map(str::to_owned);
+            if let Some(reason) = launch_only_reason {
+                let now_ms = crate::telemetry_task::get_current_timestamp_ms();
+                let warn_map = LAST_WARN_MS_BY_CMD.get_or_init(|| Mutex::new(HashMap::new()));
+                let mut guard = warn_map.lock().unwrap();
+                let last = guard.get(&panel_cmd).copied().unwrap_or(0);
+                if now_ms.saturating_sub(last) >= WARN_INTERVAL_MS.load(Ordering::Relaxed) {
+                    guard.insert(panel_cmd.clone(), now_ms);
+                    drop(guard);
+                    emit_notification_warning(
+                        &state,
+                        format!("Ignored {panel_cmd} button press: {reason}"),
+                    );
+                }
+            } else if !policy.key_enabled {
                 let now_ms = crate::telemetry_task::get_current_timestamp_ms();
                 let warn_map = LAST_WARN_MS_BY_CMD.get_or_init(|| Mutex::new(HashMap::new()));
                 let mut guard = warn_map.lock().unwrap();
@@ -1107,5 +1131,128 @@ mod fill_recording_tests {
         assert!(!crate::fill_recording::dispatch_queued(&f.state, &manual));
         assert_eq!(f.state.recording_status_snapshot().db_path, path);
         assert_eq!(f.files().len(), 1);
+    }
+}
+
+#[cfg(all(test, not(feature = "raspberry_pi")))]
+mod panel_control_tests {
+    use super::*;
+    use crate::panel_control::{PanelMode, set};
+    use crate::types::FlightState;
+
+    fn sent(rx: &mut mpsc::Receiver<TelemetryCommand>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(TelemetryCommand::QueuedOperator { command, .. }) = rx.try_recv() {
+            out.push(crate::sequences::command_name(&command).to_string());
+        }
+        out
+    }
+
+    fn install(
+        state: &Arc<AppState>,
+        gpio: &Arc<crate::gpio::GpioPins>,
+        allowed: &Arc<Mutex<AllowedActions>>,
+        tx: &mpsc::Sender<TelemetryCommand>,
+    ) {
+        type Gate = fn(&AllowedActions) -> bool;
+        let buttons: [(u8, Gate, TelemetryCommand); 4] = [
+            (PILOT_VALVE_PIN, |a| a.pilot, TelemetryCommand::Pilot),
+            (DUMP_PIN, |a| a.dump, TelemetryCommand::Dump),
+            (NORMALLY_OPEN_PIN, |a| a.normally_open, TelemetryCommand::NormallyOpen),
+            (IGNITER_PIN, |a| a.igniter, TelemetryCommand::Igniter),
+        ];
+        for (pin, gate, cmd) in buttons {
+            gpio.setup_input_pin(pin).unwrap();
+            setup_button_callback(
+                state.clone(),
+                gpio.clone(),
+                allowed.clone(),
+                tx.clone(),
+                pin,
+                gate,
+                cmd,
+                Duration::from_millis(50),
+            )
+            .unwrap();
+        }
+    }
+
+    fn press_all(gpio: &crate::gpio::GpioPins) {
+        for pin in [PILOT_VALVE_PIN, DUMP_PIN, NORMALLY_OPEN_PIN, IGNITER_PIN] {
+            gpio.trigger_input_for_test(pin, true);
+        }
+    }
+
+    #[tokio::test]
+    async fn presses_follow_the_admin_choice_through_the_same_gates() {
+        let state = crate::state::tests::test_app_state().await;
+        *state.state.lock().unwrap() = FlightState::Idle;
+        state.gse.lock().unwrap().engine.config.grouped_panel = true;
+        let gpio = crate::gpio::GpioPins::new_isolated();
+        let allowed = Arc::new(Mutex::new(AllowedActions {
+            pilot: true,
+            dump: true,
+            normally_open: true,
+            igniter: true,
+            ..Default::default()
+        }));
+        let (tx, mut rx) = mpsc::channel(16);
+        install(&state, &gpio, &allowed, &tx);
+
+        // Station default (grouped): sequences.
+        press_all(&gpio);
+        assert_eq!(sent(&mut rx), ["ValveSelfTest", "CancelFill", "PauseFill", "Igniter"]);
+        set(&state, Some(PanelMode::Valves), None).unwrap();
+        press_all(&gpio);
+        assert_eq!(sent(&mut rx), ["Pilot", "Dump", "NormallyOpen", "Igniter"]);
+        state.gse.lock().unwrap().engine.config.grouped_panel = false;
+        set(&state, Some(PanelMode::Sequences), None).unwrap();
+        press_all(&gpio);
+        assert_eq!(sent(&mut rx), ["ValveSelfTest", "CancelFill", "PauseFill", "Igniter"]);
+
+        // The action-policy gate still decides: a closed gate sends nothing.
+        *allowed.lock().unwrap() = AllowedActions::default();
+        press_all(&gpio);
+        assert!(sent(&mut rx).is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_gate_and_led_follow_the_mapped_command() {
+        for (mode, launch_only) in [
+            (crate::station_mode::Mode::Hitl, true),
+            (crate::station_mode::Mode::Hitl, false),
+            (crate::station_mode::Mode::Normal, true),
+        ] {
+            let _mode = crate::runtime_mode::test_support::thread_mode(mode);
+            let state = crate::state::tests::test_app_state().await;
+            *state.state.lock().unwrap() = FlightState::Idle;
+            state.gse.lock().unwrap().engine.config.grouped_panel = false;
+            state.set_action_policy(crate::sequences::default_action_policy());
+            crate::sequence_access::set(&state, launch_only, None).unwrap();
+            set(&state, Some(PanelMode::Sequences), None).unwrap();
+            crate::sequences::refresh_action_policy_projection(&state);
+            let policy = state.action_policy_snapshot();
+            let control = |cmd: &str| policy.controls.iter().find(|c| c.cmd == cmd).cloned();
+            let allowed = allowed_from_policy(&state, &policy);
+            let self_test = control("ValveSelfTest");
+            // The Pilot button's gate is exactly the ValveSelfTest control.
+            assert_eq!(allowed.pilot, self_test.as_ref().is_some_and(|c| c.enabled), "{mode:?}");
+            if mode == crate::station_mode::Mode::Hitl && launch_only {
+                let self_test = self_test.expect("ValveSelfTest control is published");
+                assert!(!self_test.enabled);
+                assert_eq!(
+                    self_test.disabled_reason.as_deref(),
+                    Some(crate::sequence_access::DISABLED_REASON)
+                );
+                assert!(!allowed.pilot && !allowed.nitrogen && !allowed.nitrous);
+                assert_eq!(led_for(&state, &policy, "Pilot", 0), LED_DISABLED_BRIGHTNESS);
+                // A press is refused; it does not fall back to the Pilot valve.
+                let gpio = crate::gpio::GpioPins::new_isolated();
+                let (tx, mut rx) = mpsc::channel(4);
+                install(&state, &gpio, &Arc::new(Mutex::new(allowed)), &tx);
+                gpio.trigger_input_for_test(PILOT_VALVE_PIN, true);
+                assert!(sent(&mut rx).is_empty());
+            }
+        }
     }
 }

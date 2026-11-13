@@ -2,6 +2,7 @@ mod abort_input;
 mod abort_retirement;
 mod admin;
 mod sequence_access;
+mod panel_control;
 mod daq_launch_log;
 mod daq_sd;
 mod radio_voice;
@@ -1697,6 +1698,7 @@ async fn main() -> anyhow::Result<()> {
         last_command_ms: Arc::new(Mutex::new(HashMap::new())),
         fill_sequence_continue_requests: Arc::new(AtomicU64::new(0)),
         sequence_access: Default::default(),
+        panel_control: Default::default(),
         recent_telemetry_cache: Arc::new(Mutex::new(std::collections::VecDeque::new())),
         latest_gps_fix_by_sender: Arc::new(Mutex::new(HashMap::new())),
         latest_gps_satellites_by_sender: Arc::new(Mutex::new(HashMap::new())),
@@ -1711,6 +1713,7 @@ async fn main() -> anyhow::Result<()> {
     // with no launch or sequence running. Seed it from the restored state
     // before the radio opens, then keep it current.
     crate::sequence_access::restore(&state);
+    crate::panel_control::restore(&state);
     comms::rfd_modem::set_gate(comms::rfd_modem::station_block_reason(&state));
     {
         let state = state.clone();

@@ -2156,19 +2156,12 @@ fn tick_inner(state: &Arc<AppState>, interlock: bool) {
 }
 
 /// The existing five-valve hardware cluster can be switched as one group.
+/// The command a physical panel button sends: its valve, or its sequence when
+/// the panel is in sequence control (GSE `grouped_panel`, or the
+/// administrator's choice in `panel_control`).
 pub fn panel_name(state: &AppState, name: &str) -> String {
-    if !state.gse.lock().unwrap().engine.config.grouped_panel {
-        return name.into();
-    }
-    match name {
-        "Dump" => "CancelFill",
-        "NormallyOpen" => "PauseFill",
-        "Pilot" => "ValveSelfTest",
-        "Nitrogen" => "NitrogenTest",
-        "Nitrous" => "StartFill",
-        other => other,
-    }
-    .into()
+    let grouped = state.gse.lock().unwrap().engine.config.grouped_panel;
+    crate::panel_control::translate(crate::panel_control::effective(state, grouped), name).into()
 }
 pub fn panel_command(state: &AppState, cmd: TelemetryCommand) -> TelemetryCommand {
     let name = panel_name(state, crate::sequences::command_name(&cmd));
