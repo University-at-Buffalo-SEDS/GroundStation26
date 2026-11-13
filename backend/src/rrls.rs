@@ -53,6 +53,14 @@ const PROXY_LEASE_MS: u64 = 6_000;
 /// back once the primary's HEALTH has been continuous for RESTORE_MS, so a
 /// primary at the edge of range does not flap authority.
 const TAKEOVER_MS: u64 = PROXY_LEASE_MS;
+/// HEALTH byte 8: bit 0 the primary's direct AV-bay link, bit 1 a fresh
+/// discovery route from the primary to RF/FC/PB (what its Abort is sent on).
+const HEALTH_DIRECT: u8 = 1;
+const HEALTH_AV_BAY_ROUTED: u8 = 2;
+/// A heard primary that has not reported an AV-bay route gets authority back
+/// after this long anyway (the discovery route lifetime): an older primary,
+/// or one the AV bay never answers, must not leave the RRLS in charge.
+const HANDBACK_ROUTE_WAIT_MS: u64 = 30_000;
 /// Upper bound on the primary's HEALTH period (500 ms plus loop latency),
 /// used to extrapolate its sequence without ever running ahead of it.
 const PROXY_HEALTH_PERIOD_BOUND_MS: u64 = 650;
@@ -548,6 +556,13 @@ pub struct Mesh {
     /// never heard the AV bay counts its relay loss gap from here.
     first_tick: Option<u64>,
     primary_direct: bool,
+    /// RRLS: the primary's latest HEALTH reported a fresh AV-bay route.
+    primary_av_bay_routed: bool,
+    /// RRLS in takeover: since when the primary has been heard back
+    /// continuously (RESTORE_MS) while it reports no AV-bay route.
+    handback_waiting_since: Option<u64>,
+    /// Primary: a fresh discovery route to RF/FC/PB (set by its router owner).
+    av_bay_routed: bool,
     last_direct: Option<u64>,
     direct_since: Option<u64>,
     fallback: bool,
@@ -626,6 +641,9 @@ impl Mesh {
             abort_egress_until: None,
             first_tick: None,
             primary_direct: true,
+            primary_av_bay_routed: false,
+            handback_waiting_since: None,
+            av_bay_routed: false,
             last_direct: None,
             direct_since: None,
             fallback: false,
@@ -845,7 +863,7 @@ impl Mesh {
             {
                 let mut payload = self.session.to_le_bytes().to_vec();
                 payload.extend_from_slice(&self.sequence.to_le_bytes());
-                payload.push(u8::from(!self.fallback));
+                payload.push(if self.fallback { 0 } else { HEALTH_DIRECT } | if self.av_bay_routed { HEALTH_AV_BAY_ROUTED } else { 0 });
                 if let Some(budget) = self.budget.as_mut() {
                     budget.health(self.session, self.sequence, !self.fallback, now);
                 }
@@ -1063,14 +1081,14 @@ impl Mesh {
         if sent
             && let Some((HEALTH, payload)) = decode(&frame.bytes)
             && payload.len() == 9
-            && payload[8] <= 1
+            && payload[8] <= HEALTH_DIRECT | HEALTH_AV_BAY_ROUTED
         {
             let now = self.now();
             if let Some(state) = self.budget.as_mut() {
                 state.full_health_written(
                     u32::from_le_bytes(payload[..4].try_into().unwrap()),
                     u32::from_le_bytes(payload[4..8].try_into().unwrap()),
-                    payload[8] != 0,
+                    payload[8] & HEALTH_DIRECT != 0,
                     now,
                 );
             }
@@ -2520,8 +2538,23 @@ impl Mesh {
             self.takeover = true;
             log::warn!("RRLS takeover: the primary has been unheard for {TAKEOVER_MS} ms while the AV bay is heard; this RRLS now commands the AV bay directly");
         } else if self.takeover && restored {
-            self.takeover = false;
-            log::info!("RRLS takeover ended: the primary's HEALTH has been continuous for {RESTORE_MS} ms; authority handed back");
+            // Hand back only once the primary can reach the AV bay: after a
+            // cut longer than the route lifetime it is heard again before it
+            // has rediscovered RF/FC/PB, and an Abort it sent then went nowhere.
+            let waiting = *self.handback_waiting_since.get_or_insert(now);
+            let waited = now.saturating_sub(waiting);
+            if self.primary_av_bay_routed || waited >= HANDBACK_ROUTE_WAIT_MS {
+                self.takeover = false;
+                self.handback_waiting_since = None;
+                if self.primary_av_bay_routed {
+                    log::info!("RRLS takeover ended: the primary's HEALTH has been continuous for {RESTORE_MS} ms and it has a fresh AV-bay route; authority handed back");
+                } else {
+                    log::warn!("RRLS takeover ended: the primary has been heard for {waited} ms past {RESTORE_MS} ms but reports no AV-bay route; authority handed back anyway");
+                }
+            }
+        }
+        if !self.takeover || !restored {
+            self.handback_waiting_since = None;
         }
         RRLS_TAKEOVER.store(self.takeover, std::sync::atomic::Ordering::Release);
         if self.abort_egress_until.is_some_and(|until| now >= until) {
@@ -2532,6 +2565,11 @@ impl Mesh {
     /// RRLS operator Abort: ABORT is the one command never refused for lack of
     /// authority. For ABORT_EGRESS_MS a listening RRLS puts its own ABORT frames
     /// (nothing else) on the radio, besides sending the Abort to the primary.
+    /// Primary: whether its router has a fresh discovery route to RF/FC/PB,
+    /// reported to the RRLS in HEALTH (its hand-back condition).
+    pub fn set_av_bay_routed(&mut self, routed: bool) {
+        self.av_bay_routed = routed;
+    }
     pub fn open_abort_egress(&mut self, now: u64) {
         if self.role == Role::Rrls {
             self.abort_egress_until = Some(now.saturating_add(ABORT_EGRESS_MS));
@@ -2663,7 +2701,7 @@ impl Mesh {
                     self.relay_seen = Some(now);
                     None
                 }
-                (Role::Rrls, HEALTH) if data.len() == 9 && data[8] <= 1 => {
+                (Role::Rrls, HEALTH) if data.len() == 9 && data[8] <= HEALTH_DIRECT | HEALTH_AV_BAY_ROUTED => {
                     let session = u32::from_le_bytes(data[..4].try_into().ok()?);
                     let seq = u32::from_le_bytes(data[4..8].try_into().ok()?);
                     if self.primary_session == Some(session) {
@@ -2679,13 +2717,14 @@ impl Mesh {
                     }
                     self.primary_session = Some(session);
                     self.primary_sequence = seq;
-                    self.primary_direct = data[8] != 0;
+                    self.primary_direct = data[8] & HEALTH_DIRECT != 0;
+                    self.primary_av_bay_routed = data[8] & HEALTH_AV_BAY_ROUTED != 0;
                     if self.health_received.is_none_or(|v| now.saturating_sub(v) >= LEASE_MS) {
                         self.health_streak_since = Some(now);
                     }
                     self.health_received = Some(now);
                     if let Some(budget) = self.budget.as_mut() {
-                        budget.health(session, seq, data[8] != 0, now);
+                        budget.health(session, seq, data[8] & HEALTH_DIRECT != 0, now);
                     }
                     // A takeover keeps its own queued AV-bay commands until it
                     // hands back.
@@ -3358,11 +3397,76 @@ mod tests {
         assert!(!mesh.active(251));
     }
 
+    /// HEALTH from a primary that has a fresh discovery route to the AV bay.
     fn health(session: u32, seq: u32, direct: bool) -> Vec<u8> {
+        health_route(session, seq, direct, true)
+    }
+    fn health_route(session: u32, seq: u32, direct: bool, av_bay_routed: bool) -> Vec<u8> {
         let mut p = session.to_le_bytes().to_vec();
         p.extend_from_slice(&seq.to_le_bytes());
-        p.push(direct as u8);
+        p.push(u8::from(direct) | if av_bay_routed { HEALTH_AV_BAY_ROUTED } else { 0 });
         encode(HEALTH, &p)
+    }
+    /// An RRLS in takeover, the primary then cut for longer than the 30 s
+    /// discovery route lifetime and heard again from `now`.
+    fn rrls_in_takeover_after_a_long_cut() -> (Mesh, u64, u32) {
+        let mut rr = Mesh::new(Role::Rrls, 2);
+        rr.assume_av_bay_heard_for_test();
+        rr.incoming(true, &health(7, 1, true), 0);
+        rr.tick(1);
+        rr.tick(TAKEOVER_MS);
+        assert!(rr.takeover());
+        (rr, TAKEOVER_MS + 40_000, 2)
+    }
+    /// fullnet C-fix: the RRLS handed back 5.4 s after a 45 s cut ended, when
+    /// the primary heard it again but had not yet rediscovered the AV bay, and
+    /// the primary's Abort pressed then was "NOT sent to the AV bay: no fresh
+    /// discovery route" (re-sent 0.6 s and 1.6 s later; every board Aborted at
+    /// 4.5 s). The RRLS keeps authority until the primary's HEALTH reports a
+    /// fresh AV-bay route, the condition that Abort is sent under.
+    #[test]
+    fn the_rrls_hands_back_only_once_the_primary_has_a_fresh_av_bay_route() {
+        let (mut rr, mut now, mut seq) = rrls_in_takeover_after_a_long_cut();
+        let heard = now;
+        while now < heard + RESTORE_MS + 5_000 {
+            rr.incoming(true, &health_route(7, seq, true, false), now);
+            rr.tick(now);
+            seq += 1;
+            now += 500;
+        }
+        assert!(rr.takeover(), "the primary is heard but cannot reach the AV bay yet");
+        rr.incoming(true, &health_route(7, seq, true, true), now);
+        rr.tick(now);
+        assert!(!rr.takeover(), "the primary has a fresh AV-bay route: authority back");
+    }
+    #[test]
+    fn a_primary_that_never_reports_an_av_bay_route_gets_authority_back_after_the_route_lifetime() {
+        let (mut rr, mut now, mut seq) = rrls_in_takeover_after_a_long_cut();
+        let heard = now;
+        while now < heard + RESTORE_MS + HANDBACK_ROUTE_WAIT_MS - 500 {
+            rr.incoming(true, &health_route(7, seq, true, false), now);
+            rr.tick(now);
+            seq += 1;
+            now += 500;
+            if now < heard + RESTORE_MS + HANDBACK_ROUTE_WAIT_MS - 500 {
+                assert!(rr.takeover());
+            }
+        }
+        rr.incoming(true, &health_route(7, seq, true, false), now + 1_000);
+        rr.tick(now + 1_000);
+        assert!(!rr.takeover(), "bounded: an older primary or one the AV bay never answers");
+    }
+    #[test]
+    fn the_primary_reports_its_av_bay_route_in_health() {
+        for routed in [false, true] {
+            let mut primary = Mesh::new(Role::Primary, 1);
+            primary.set_av_bay_routed(routed);
+            primary.tick(0);
+            let frame = primary.pop(0).unwrap();
+            let (ty, body) = decode(&frame.bytes).unwrap();
+            assert_eq!(ty, HEALTH);
+            assert_eq!(body[8] & HEALTH_AV_BAY_ROUTED != 0, routed);
+        }
     }
     #[test]
     fn rrls_takes_over_the_av_bay_when_the_primary_is_out_of_range_and_hands_back() {

@@ -2387,12 +2387,18 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if !rrls::is_rrls() {
-        // An RRLS gone Offline (unheard for 15 s) is no longer owed reliable
-        // frames; it returns with its next discovery announcement.
+        // The primary reports in HEALTH whether it has a fresh discovery route
+        // to RF/FC/PB (the RRLS hands a takeover back only then). An RRLS gone
+        // Offline (unheard for 15 s) is no longer owed reliable frames; it
+        // returns with its next discovery announcement.
         let router = router.clone();
         tokio::spawn(async move {
             let mut offline = false;
             loop {
+                let routed = crate::manual_abort_resend::av_bay_abort_route(&router);
+                if let Some(mesh) = rrls::settings_transport() {
+                    mesh.lock().unwrap().set_av_bay_routed(routed);
+                }
                 let now = rrls::topology_observation()
                     .and_then(|observed| observed.peer_age_ms)
                     .is_some_and(|age| age >= crate::rrls_topology::OFFLINE_AFTER_MS);
@@ -2401,7 +2407,7 @@ async fn main() -> anyhow::Result<()> {
                 } else if !now {
                     offline = false;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
         });
     }
