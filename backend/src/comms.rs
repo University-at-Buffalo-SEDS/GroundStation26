@@ -1362,6 +1362,14 @@ impl UartComms {
                     transmission.follower_frame().map(|follower| &follower.bytes[..]),
                     control_may_bypass,
                 ));
+                // Mesh control alone does not spend the station's turn: an
+                // Abort re-send waiting for the gap (range6: HEALTH took the
+                // gaps and the ABORT re-send left 1.3 s after the press) or the
+                // turn's ordinary write still gets it.
+                cap.set_turn_control_only(
+                    is_mesh_control_frame(&transmission.frame().bytes)
+                        && transmission.follower_frame().is_none_or(|follower| is_mesh_control_frame(&follower.bytes)),
+                );
                 // A standby RRLS's own control (observe refresh, discovery,
                 // settings/pairing, position) waits, bounded, for quiet air;
                 // relayed data keeps the RRLS pacing.
@@ -6677,6 +6685,7 @@ mod raw_uart_tests {
         );
         let mut writes = Vec::new();
         let mut ordinary_open = 0;
+        let mut ordinary_ready = Vec::new();
         let mut buf = [0u8; 512];
         for now in (30_000u64..36_000).step_by(5) {
             std::fs::write(&clock, now.to_string()).unwrap();
@@ -6689,6 +6698,7 @@ mod raw_uart_tests {
             }
             if uart.transmit_ready_for(16, &ordinary) {
                 ordinary_open += 1;
+                ordinary_ready.push(now);
             }
             uart.service_transmit().unwrap();
             if matches!(peer.read(&mut buf), Ok(n) if n > 0) {
@@ -6704,6 +6714,14 @@ mod raw_uart_tests {
             // time; HEALTH never meets RF's air (or its last 10 ms).
             let in_air: Vec<_> = writes.iter().filter(|at| *at % 200 < 100).collect();
             assert!(in_air.is_empty(), "HEALTH written during RF's turn at {in_air:?}: {writes:?}");
+            // HEALTH does not spend the gap: the turn's own write (an Abort
+            // re-send, ordinary frames) still has it once HEALTH's own air
+            // packet is over, not only by joining that packet.
+            let spent: Vec<_> = writes
+                .iter()
+                .filter(|at| !ordinary_ready.iter().any(|t| *t >= *at + 40 && *t < *at - *at % 200 + 200))
+                .collect();
+            assert!(spent.is_empty(), "HEALTH at {spent:?} took the station's gap: ordinary ready at {ordinary_ready:?}");
         }
         // Silent: the 500 ms cadence. Turns: plus at most one turn period.
         // Chatty: plus at most the hold bound.

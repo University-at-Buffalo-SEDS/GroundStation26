@@ -92,6 +92,10 @@ pub(crate) struct TurnGate {
     /// The current packet was started by a bypassing frame (ABORT, mesh
     /// control): it did not use the turn, and ordinary frames may not join it.
     out_of_turn: bool,
+    /// The frame being admitted is RR mesh control alone (HEALTH, READY,
+    /// budget/RF-profile control). Written in the gap it does not spend the
+    /// station's turn: the gap stays open for the turn's own write.
+    control_only: bool,
 }
 /// A standby RRLS sends its own frames after the gate's quiet time of no air
 /// (no AV-bay or station bytes heard): sent blind, most met GS or RF air and
@@ -150,9 +154,9 @@ impl TurnGate {
         // frames that must wait for the gap). Started in the station's own
         // gap, it is the turn's write: ordinary frames may join it, so
         // HEALTH does not cost an extra air packet.
-        self.out_of_turn = self.bypass
+        self.out_of_turn = (self.bypass || self.control_only)
             && !self.standby
-            && !TurnGate { bypass: false, ..*self }.open(wall, virtual_ms);
+            && (self.control_only || !TurnGate { bypass: false, ..*self }.open(wall, virtual_ms));
         if self.out_of_turn {
             return;
         }
@@ -303,6 +307,14 @@ impl Capacity {
     pub(crate) fn set_turn_bypass(&mut self, bypass: bool) {
         if let Some(turn) = self.gate_mut() {
             turn.bypass = bypass;
+            // Every admission decides this anew; only the mesh-control writer sets it.
+            turn.control_only = false;
+        }
+    }
+    /// The frame being admitted is RR mesh control alone (see TurnGate::control_only).
+    pub(crate) fn set_turn_control_only(&mut self, control_only: bool) {
+        if let Some(turn) = self.gate_mut() {
+            turn.control_only = control_only;
         }
     }
     /// The primary relies on an RRLS relay: free-run (see TurnGate::relaying).
