@@ -51,6 +51,23 @@ pub(super) enum Outcome {
     Rejected(u8),
 }
 
+/// A new SDK envelope whose packet ID is not `taken`. The ID hashes a 16-bit
+/// per-packet nonce, so a poll can draw the ID of the original or of an
+/// earlier poll (pair-reset: PB failed "envelope identity repeated" once).
+/// A repeat is drawn again, a bounded number of times.
+fn fresh_envelope(
+    mut make: impl FnMut() -> Result<Packet, &'static str>,
+    taken: impl Fn(u64) -> bool,
+) -> Result<Packet, &'static str> {
+    for _ in 0..8 {
+        let packet = make()?;
+        if !taken(packet.packet_id()) {
+            return Ok(packet);
+        }
+    }
+    Err("Recovery SDK envelope identity repeated")
+}
+
 pub(super) struct Exchange {
     board: Board,
     router: Arc<sedsnet::router::Router>,
@@ -259,19 +276,19 @@ impl Exchange {
         if self.poll_ids.len() >= POLL_BUDGET {
             return Err("Recovery application poll budget exhausted");
         }
-        let packet = Packet::new(
-            self.packet.data_type(),
-            self.packet.endpoints(),
-            self.packet.sender(),
-            self.packet.timestamp(),
-            Arc::from(self.packet.payload()),
-        )
-        .map_err(|_| "Recovery poll packet preparation failed")?;
-        let id = packet.packet_id();
-        if id == self.packet.packet_id() || self.poll_ids.contains(&id) {
-            return Err("Recovery SDK envelope identity repeated");
-        }
-        self.poll_ids.push(id);
+        let original = self.packet.packet_id();
+        let taken = |id: u64| id == original || self.poll_ids.contains(&id);
+        let packet = fresh_envelope(
+            || Packet::new(
+                self.packet.data_type(),
+                self.packet.endpoints(),
+                self.packet.sender(),
+                self.packet.timestamp(),
+                Arc::from(self.packet.payload()),
+            ).map_err(|_| "Recovery poll packet preparation failed"),
+            taken,
+        )?;
+        self.poll_ids.push(packet.packet_id());
         Ok(packet)
     }
 
@@ -460,6 +477,21 @@ mod tests {
         assert!(terminal(2, 0xbe, 2).is_err(), "outputs must be the unchanged safe mask");
         assert!(terminal(2, 0xbf, 6).is_err(), "Abort must be cleared");
         assert_eq!(terminal(2, 0xbe, 6), Ok(Outcome::Applied));
+    }
+
+    /// A poll envelope that draws a packet ID already used (the 16-bit nonce
+    /// repeats) is drawn again instead of failing the board's recovery.
+    #[test]
+    fn a_repeated_poll_envelope_identity_is_drawn_again() {
+        let make = |nonce: u16| Packet::new(
+            crate::telemetry_schema::data_type("BOARD_RECOVERY_REQUEST"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")], "GS", 1_793_000_000_000, Arc::from([1u8; 32])).unwrap().with_nonce(nonce);
+        crate::telemetry_schema::initialize().unwrap();
+        let used = make(7).packet_id();
+        let mut draws = [7u16, 7, 9].into_iter();
+        let got = fresh_envelope(|| Ok(make(draws.next().unwrap())), |id| id == used).unwrap();
+        assert_eq!(got.packet_id(), make(9).packet_id(), "two repeats drawn again, the third draw taken");
+        assert!(fresh_envelope(|| Ok(make(7)), |id| id == used).is_err(), "bounded: always the same identity fails");
     }
 
     #[test]

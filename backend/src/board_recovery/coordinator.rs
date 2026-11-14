@@ -1019,12 +1019,14 @@ async fn refresh_prepare_queries(
         query_one(*board).await?;
     }
     // The radio queries ran one after another: re-ask, once, any whose
-    // readback aged out while the later ones were answered.
+    // readback is past half its freshness by now, so none expires before
+    // prepare_inner reads it ("Explicit fresh dedicated QUERY is required",
+    // pair-reset cycle 3: re-asks made the radio queries longer).
     for board in &av_bay {
-        let stale = state.board_recovery.inner.lock().unwrap().values[index(*board).unwrap()]
+        let aging = state.board_recovery.inner.lock().unwrap().values[index(*board).unwrap()]
             .as_ref()
-            .is_none_or(|row| !row.fresh(Stamp::now()));
-        if stale {
+            .is_none_or(|row| row.age(Stamp::now()) > readback_ttl() / 2);
+        if aging {
             query_one(*board).await?;
         }
     }
