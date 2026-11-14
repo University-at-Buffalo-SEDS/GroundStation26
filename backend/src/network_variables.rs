@@ -379,15 +379,17 @@ const STATION_VARIABLES: [&str; 9] = [
 pub(crate) fn station_serves(ty: sedsnet::config::DataType) -> bool {
     !crate::rrls::is_rrls() && STATION_VARIABLES.iter().any(|name| crate::telemetry_schema::data_type(name) == ty)
 }
-/// RRLS takeover: the cosmetic outputs (underglow, buzzer) and FLIGHT_STATE
-/// become writable while it owns the AV bay and read-only again when it hands
-/// back. FLIGHT_STATE carries only its operator's Abort (see
-/// AppState::observe_local_manual_stop_admission).
+/// RRLS takeover: the cosmetic outputs (underglow, buzzer) become writable
+/// while it owns the AV bay and read-only again when it hands back.
+/// FLIGHT_STATE stays read-only: a writable variable answers the boards'
+/// requests from the station's cache, and an RRLS serving a cached
+/// FLIGHT_STATE (the flight computer's own report, or its own earlier Abort)
+/// is how a stale value could come back after an Abort or a Reset. Its
+/// operator's Abort write is the one exception (`with_rrls_flight_state_write`).
 pub(crate) fn set_takeover_outputs_writable(router: &Router, writable: bool) -> Result<()> {
-    let types = NetworkOutput::ALL.map(|output| output.data_type());
-    for data_type in types.into_iter().chain([FLIGHT_STATE_TYPE]) {
+    for output in NetworkOutput::ALL {
         router.enable_network_variable(
-            crate::telemetry_schema::data_type(data_type),
+            crate::telemetry_schema::data_type(output.data_type()),
             if writable {
                 NetworkVariablePermissions::READ_WRITE
             } else {
@@ -953,7 +955,26 @@ pub fn set_flight_state(router: &Router, state: u8) -> Result<()> {
 /// every other control (system_clock::control_packet_timestamp_ms), network UTC
 /// when present and the station's wall clock otherwise, never the primary's.
 pub(crate) fn set_takeover_flight_state(router: &Router, state: u8) -> Result<()> {
-    set_flight_state_at(router, state, crate::system_clock::control_packet_timestamp_ms(router))
+    with_rrls_flight_state_write(router, || {
+        set_flight_state_at(router, state, crate::system_clock::control_packet_timestamp_ms(router))
+    })
+}
+
+/// An RRLS writes FLIGHT_STATE only for its operator's takeover Abort (and that
+/// write's re-send): the variable is writable for exactly that write and
+/// read-only again at once, so the RRLS never answers a FLIGHT_STATE request.
+/// The primary's variable is always writable; this is a pass-through there.
+fn with_rrls_flight_state_write<T>(router: &Router, write: impl FnOnce() -> Result<T>) -> Result<T> {
+    if !crate::rrls::is_rrls() {
+        return write();
+    }
+    let ty = crate::telemetry_schema::data_type(FLIGHT_STATE_TYPE);
+    router.enable_network_variable(ty, NetworkVariablePermissions::READ_WRITE)?;
+    let result = write();
+    let restored = router.enable_network_variable(ty, NetworkVariablePermissions::READ_ONLY);
+    let value = result?;
+    restored?;
+    Ok(value)
 }
 
 fn set_flight_state_at(router: &Router, state: u8, timestamp: u64) -> Result<()> {
@@ -1048,7 +1069,7 @@ fn resend_latest_flight_state(
         return Ok(false);
     };
     let again = flight_state_wire_packet(value, latest.timestamp())?;
-    router.set_network_variable(again)?;
+    with_rrls_flight_state_write(router, || Ok(router.set_network_variable(again)?))?;
     Ok(true)
 }
 

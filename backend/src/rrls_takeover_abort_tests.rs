@@ -299,3 +299,68 @@ async fn forgetting_the_primary_never_completes_an_abort_an_av_bay_board_still_o
     bay.release_to(&["PB"]);
     assert!(bay.pending("ABORT").is_empty() && bay.pending("FLIGHT_STATE").is_empty());
 }
+
+/// FLIGHT_STATE frames the RRLS put on the air since the last clear:
+/// (sender, value).
+fn rrls_flight_states(bay: &Bay) -> Vec<(String, u8)> {
+    let ty = crate::telemetry_schema::data_type("FLIGHT_STATE");
+    bay.held.lock().unwrap().iter()
+        .filter_map(|bytes| sedsnet::wire_format::unpack_packet(bytes).ok())
+        .filter(|packet| packet.data_type() == ty)
+        .map(|packet| (crate::types::canonical_sender_id(packet.sender()).to_string(), packet.payload().first().copied().unwrap_or(0)))
+        .collect()
+}
+
+/// A board's request for FLIGHT_STATE from the RRLS in takeover.
+fn board_requests_flight_state(bay: &Bay) {
+    bay.held.lock().unwrap().clear();
+    bay.hold.store(1, Ordering::Relaxed);
+    bay.peers[0].request_managed_variable(crate::telemetry_schema::data_type("FLIGHT_STATE")).unwrap();
+    bay.pump();
+}
+
+/// fullnet Cshort-fix11: an RRLS in takeover answered the boards' periodic
+/// FLIGHT_STATE requests from its cache (it held the variable writable for the
+/// whole takeover), replaying the flight computer's own InFlight report 11
+/// times. A station serving a cached FLIGHT_STATE to the AV bay is how a stale
+/// value could come back after an Abort or a Reset. The RRLS never answers
+/// FLIGHT_STATE requests.
+#[tokio::test]
+async fn a_takeover_rrls_never_answers_a_flight_state_request() {
+    if rrls_child("a_takeover_rrls_never_answers_a_flight_state_request") {
+        return;
+    }
+    let bay = bay(true).await;
+    press_abort(&bay);
+    bay.release();
+    board_requests_flight_state(&bay);
+    assert_eq!(rrls_flight_states(&bay), vec![], "no answer from the RRLS's cache");
+}
+
+/// No FLIGHT_STATE frame but the RRLS's own Aborted write leaves it in a
+/// takeover, even while it holds the flight computer's report as the latest.
+#[tokio::test]
+async fn only_the_rrls_own_aborted_flight_state_leaves_it_in_takeover() {
+    if rrls_child("only_the_rrls_own_aborted_flight_state_leaves_it_in_takeover") {
+        return;
+    }
+    let bay = bay(true).await;
+    // The flight computer's report (InFlight) reaches the RRLS.
+    let report = sedsnet::packet::Packet::new(
+        crate::telemetry_schema::data_type("FLIGHT_STATE"),
+        &[crate::telemetry_schema::endpoint("FLIGHT_STATE")],
+        "FC",
+        crate::telemetry_task::get_current_timestamp_ms(),
+        std::sync::Arc::from([crate::types::NetworkFlightState::InFlight as u8]),
+    )
+    .unwrap();
+    let _ = bay.rrls.rx_packed_from_side(&sedsnet::wire_format::pack_packet(&report), 0);
+    bay.pump();
+    board_requests_flight_state(&bay);
+    assert_eq!(rrls_flight_states(&bay), vec![], "the report is never served back");
+    bay.held.lock().unwrap().clear();
+    press_abort(&bay);
+    let sent = rrls_flight_states(&bay);
+    assert!(!sent.is_empty() && sent.iter().all(|f| *f == ("RRLS".to_string(), crate::types::NetworkFlightState::Aborted as u8)),
+        "only its own Aborted write: {sent:?}");
+}
