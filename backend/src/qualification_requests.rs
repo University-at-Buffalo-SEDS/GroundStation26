@@ -159,8 +159,16 @@ impl Request {
         }
     }
     pub(crate) fn submit(&self, router: &Router, packet: Packet) -> anyhow::Result<()> {
+        self.submit_with(router, packet, Router::set_network_variable)
+    }
+    pub(crate) fn submit_with(
+        &self,
+        router: &Router,
+        packet: Packet,
+        send: impl FnOnce(&Router, Packet) -> sedsnet::TelemetryResult<()>,
+    ) -> anyhow::Result<()> {
         if self.token.is_none() {
-            return router.set_network_variable(packet).map_err(Into::into);
+            return send(router, packet).map_err(Into::into);
         }
         let id = packet.packet_id();
         if let Some(token) = self.token {
@@ -169,7 +177,7 @@ impl Request {
             );
             self.submissions.set(self.submissions.get() + 1);
         }
-        let result = router.set_network_variable(packet);
+        let result = send(router, packet);
         if let Some(token) = self.token {
             emit(
                 serde_json::json!({"event":"submit_result","token":token,"packet_id":id,"ok":result.is_ok(),"at_ms":crate::simulation_clock_ms()}),

@@ -364,3 +364,36 @@ async fn only_the_rrls_own_aborted_flight_state_leaves_it_in_takeover() {
     assert!(!sent.is_empty() && sent.iter().all(|f| *f == ("RRLS".to_string(), crate::types::NetworkFlightState::Aborted as u8)),
         "only its own Aborted write: {sent:?}");
 }
+
+/// The RRLS's own Aborted write never opens FLIGHT_STATE to writes, not even
+/// while it is being sent: a board request handled during the write would be
+/// answered from the cache. Probed from RF as the Aborted frame arrives (inside
+/// the RRLS's send): a write attempt there must be refused as read-only.
+#[tokio::test]
+async fn flight_state_stays_read_only_while_the_rrls_abort_is_sent() {
+    if rrls_child("flight_state_stays_read_only_while_the_rrls_abort_is_sent") {
+        return;
+    }
+    let bay = bay(true).await;
+    let ty = crate::telemetry_schema::data_type("FLIGHT_STATE");
+    let probes = Arc::new(Mutex::new(Vec::<bool>::new()));
+    let (seen, weak) = (probes.clone(), Arc::downgrade(&bay.rrls));
+    bay.peers[0].on_network_variable_update(ty, move |packet| {
+        if crate::types::canonical_sender_id(packet.sender()) != "RRLS" {
+            return Ok(());
+        }
+        if let Some(rrls) = weak.upgrade() {
+            let refused = matches!(rrls.set_network_variable(packet.clone()), Err(sedsnet::TelemetryError::PermissionDenied));
+            seen.lock().unwrap().push(refused);
+        }
+        Ok(())
+    }).unwrap();
+    // Delivered as sent, so RF handles the frame inside the RRLS's write.
+    bay.state.manual_abort_intent.request();
+    let mut claim = bay.state.manual_abort_intent.try_claim().unwrap();
+    assert!(publish_local_claim(&bay.state, &bay.rrls, &mut claim).unwrap());
+    claim.accepted();
+    bay.pump();
+    let probes = probes.lock().unwrap().clone();
+    assert!(!probes.is_empty() && probes.iter().all(|refused| *refused), "writable while sending: {probes:?}");
+}
