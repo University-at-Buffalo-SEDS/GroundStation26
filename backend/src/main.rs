@@ -2345,6 +2345,11 @@ async fn main() -> anyhow::Result<()> {
     // after the transmit-complete and read stamps each frame byte still costs
     // 64 kbit/s air (125 us) plus the receiving 115200 baud UART (86.8 us).
     router.set_side_timesync_path(rocket_side, 211_800, 0);
+    // Its physical minimum one-way delay besides the per-byte part: the modem
+    // closes a packet S6 (serial break) after the last byte, then at least the
+    // 4 ms TX setup. A true lower bound: the error bound rests on it.
+    let serial_break_ms = crate::comms::rfd_profile::active().map_or(10, |p| p.modem.serial_break_ms);
+    router.set_side_timesync_min_delay(rocket_side, ((serial_break_ms + 4) * 1_000_000).min(u64::from(u32::MAX)) as u32);
     keep_schema_exchange_off_the_radio(&router, rocket_side, umbilical_side.as_slice())?;
     if rrls::is_rrls() {
         // A listener never re-sends an overheard frame back onto the air. As an
