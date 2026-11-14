@@ -2084,6 +2084,12 @@ impl WireBacklog {
         let index = self.ordered.iter().position(|(_, bytes)| crate::comms::is_abort_flight_state(bytes))?;
         self.ordered.remove(index)
     }
+    /// The Abort's FLIGHT_STATE=15 that joins its ABORT's write, if queued.
+    fn take_abort_flight_state(&mut self) -> Option<(u8, Vec<u8>)> {
+        let packet = self.pop_abort_flight_state()?;
+        self.control_bytes = self.control_bytes.saturating_add(packet.1.len());
+        Some(packet)
+    }
     /// The frame `backlog_pop` would take next from the priority lanes.
     fn next_priority_frame(&self) -> Option<&Vec<u8>> {
         self.priorities.last_key_value().and_then(|(_, queue)| queue.front())
@@ -2483,6 +2489,47 @@ mod priority_tests {
             .unwrap(),
         )
         .to_vec()
+    }
+    /// T30 fullnet, Abort cycle 0: a BOARD_RECOVERY_REQUEST queued before the
+    /// Abort was held at control capacity at the head of the 255 lane, and the
+    /// Abort's FLIGHT_STATE=15 waited behind it for 343 ms. After its ABORT,
+    /// FLIGHT_STATE=15 is next, ahead of every other control.
+    #[test]
+    fn an_aborts_flight_state_goes_right_behind_its_abort() {
+        let query = bundle_test_frame("BOARD_RECOVERY_REQUEST", "GROUND_STATION", 1, &[0u8; 32]);
+        let abort = bundle_test_frame("ABORT", "ABORT", 2, b"SEDS_MANUAL_ABORT_V1:K");
+        let aborted = bundle_test_frame("FLIGHT_STATE", "FLIGHT_STATE", 2, &[15]);
+        let idle = bundle_test_frame("FLIGHT_STATE", "FLIGHT_STATE", 3, &[1]);
+        assert!(crate::comms::is_abort_flight_state(&aborted));
+        assert!(!crate::comms::is_abort_flight_state(&idle));
+        for flight_state_first in [false, true] {
+            for critical in [false, true] {
+                let mut backlog = WireBacklog::new(true);
+                backlog.push(255, query.clone(), false);
+                if flight_state_first {
+                    backlog.push(255, aborted.clone(), false);
+                    backlog.push(255, abort.clone(), false);
+                } else {
+                    backlog.push(255, abort.clone(), false);
+                    backlog.push(255, aborted.clone(), false);
+                }
+                let mut pop = |backlog: &mut WireBacklog| {
+                    if critical { backlog.pop_critical() } else { backlog.pop() }.unwrap().1
+                };
+                assert_eq!(pop(&mut backlog), abort, "ABORT first (critical={critical})");
+                assert_eq!(
+                    pop(&mut backlog),
+                    aborted,
+                    "FLIGHT_STATE=15 right behind its ABORT (critical={critical}, state first={flight_state_first})"
+                );
+                assert_eq!(pop(&mut backlog), query);
+            }
+        }
+        // Another FLIGHT_STATE keeps its place in the operator commands.
+        let mut backlog = WireBacklog::new(true);
+        backlog.push(255, query.clone(), false);
+        backlog.push(255, idle.clone(), false);
+        assert_eq!(backlog.pop_critical().unwrap().1, query);
     }
     /// A bundle takes only what the backlog would send next anyway, in its
     /// own order, and stops at the first frame that may not join: an ABORT
@@ -4371,10 +4418,26 @@ pub(super) fn spawn_comms_worker_threads(
                     // Compact bundle: frames that would be written next anyway,
                     // in the backlog's own priority order, of the first frame's
                     // pacing class. Only while the radio link negotiated bundles.
-                    let bundling = retry_id.is_none()
+                    // An Abort's FLIGHT_STATE=15 leaves in its ABORT's write,
+                    // right behind it, never at the station's next gap.
+                    let abort_pair = if retry_id.is_none()
+                        && is_abort_frame(&payload)
+                        && comms.supports_abort_pair()
+                    {
+                        backlog.refill(&mut comms_handle.tx_rx, &mut drain_remaining);
+                        backlog.take_abort_flight_state().filter(|(p, b)| {
+                            !discard_retired_write(comms_handle.tx_budget.as_deref(), comms_handle.transport_activity.as_deref(), *p, b)
+                        })
+                    } else {
+                        None
+                    };
+                    let bundling = abort_pair.is_none()
+                        && retry_id.is_none()
                         && tx_worker_router.side_compact_bundle_active(side_id)
                         && comms.bundle_frame_len(priority, &payload, None).is_some();
-                    let mut extras: Vec<(u8, Vec<u8>)> = if bundling {
+                    let mut extras: Vec<(u8, Vec<u8>)> = if let Some(pair) = abort_pair {
+                        vec![pair]
+                    } else if bundling {
                         backlog.refill(&mut comms_handle.tx_rx, &mut drain_remaining);
                         backlog
                             .bundle_followers(&**comms, (priority, &payload))
@@ -4384,7 +4447,7 @@ pub(super) fn spawn_comms_worker_threads(
                     } else {
                         Vec::new()
                     };
-                    if !bundling {
+                    if !bundling && extras.is_empty() {
                         let follower = if retry_id.is_none() {
                             backlog.batch_follower(&**comms, (priority, &payload))
                         } else {

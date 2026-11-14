@@ -384,6 +384,11 @@ pub trait CommsDevice: Send {
     fn ordinary_background_state(&self) -> Option<OrdinaryLaneState> {
         None
     }
+    /// Whether `send_tracked_counted` takes an Abort's ABORT and its
+    /// FLIGHT_STATE=15 together, in one write.
+    fn supports_abort_pair(&self) -> bool {
+        false
+    }
 
     fn try_clone_tx(&self) -> std::io::Result<Option<Box<dyn CommsDevice>>> {
         Ok(None)
@@ -2308,9 +2313,17 @@ fn simulated_serial_pty() -> bool {
     *ENABLED.get_or_init(|| std::env::var("GS_SIMULATED_SERIAL_PTY").ok().as_deref() == Some("1"))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Every radio TX check refusal on this thread: (gate, an Abort's
+    /// FLIGHT_STATE=15).
+    static GATE_REFUSALS_FOR_TEST: std::cell::RefCell<Vec<(&'static str, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 /// Sim/trace only (GS_SIM_TRACE_RELIABLE): which radio TX check held a
 /// frame back, at most once per check per 100 ms of simulated (or wall) time.
 fn trace_radio_gate_refusal(gate: &'static str, priority: u8, payload: &[u8], detail: impl FnOnce() -> String) {
+    #[cfg(test)]
+    GATE_REFUSALS_FOR_TEST.with(|seen| seen.borrow_mut().push((gate, is_abort_flight_state(payload))));
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ENABLED.get_or_init(|| std::env::var_os("GS_SIM_TRACE_RELIABLE").is_some()) {
         return;
@@ -4011,10 +4024,42 @@ impl UartComms {
         priority: u8,
         leases: &[sedsnet::router::PackedWriteLease],
     ) -> Result<usize, Box<dyn Error + Send + Sync>> {
+        self.send_sdk_write_with_follower_tracked(payload, sdk_wire, None, priority, leases)
+    }
+    /// An Abort's ABORT and its FLIGHT_STATE=15 in one UART write: two RR
+    /// frames, admitted and paced as the ABORT (never held for a turn or at
+    /// control capacity), so FLIGHT_STATE=15 never waits for the station's
+    /// next gap (T30 fullnet: 343 ms behind the ABORT).
+    fn send_abort_pair_tracked(
+        &mut self,
+        abort: &[u8],
+        flight_state: &[u8],
+        priority: u8,
+        leases: &[sedsnet::router::PackedWriteLease],
+    ) -> Result<usize, Box<dyn Error + Send + Sync>> {
+        if !is_abort_frame(abort) || !is_abort_flight_state(flight_state) {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput).into());
+        }
+        self.send_sdk_write_with_follower_tracked(abort, abort, Some(flight_state), priority, leases)
+    }
+    fn send_sdk_write_with_follower_tracked(
+        &mut self,
+        payload: &[u8],
+        sdk_wire: &[u8],
+        follower: Option<&[u8]>,
+        priority: u8,
+        leases: &[sedsnet::router::PackedWriteLease],
+    ) -> Result<usize, Box<dyn Error + Send + Sync>> {
+        if follower.is_some() && !matches!(self.protocol, SerialProtocol::RawUart) {
+            return Err(std::io::Error::from(std::io::ErrorKind::Unsupported).into());
+        }
         if !self.poll_hardware_flow_control()? {
             return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into());
         }
-        let close_batch = closes_radio_packet_batch(priority, payload);
+        // An Abort's FLIGHT_STATE=15 is paced as its ABORT: no command
+        // contract, loan or control-capacity hold.
+        let abort_state = is_abort_flight_state(payload);
+        let close_batch = !abort_state && closes_radio_packet_batch(priority, payload);
         let ordinary_owner = is_completed_sdk_ordinary_owner(priority, payload);
         let contract = if close_batch {
             radio_packet_boundary_contract(priority, payload)
@@ -4028,7 +4073,9 @@ impl UartComms {
             .flatten()
             .flatten()
             .map(|(id, _)| id);
-        let canonical_receipt = radio_batch_control_contract(priority, payload)
+        let canonical_receipt = (!abort_state)
+            .then(|| radio_batch_control_contract(priority, payload))
+            .flatten()
             .and_then(|(id, receipt)| receipt.then_some(id));
         // Judged on the SDK frame: below it is wrapped in the RR envelope. An
         // early copy of the Abort's FLIGHT_STATE (AbortStateBurst) takes the
@@ -4053,6 +4100,27 @@ impl UartComms {
             Some(frame)
         } else {
             None
+        };
+        // The follower's own RR frame, wrapped in the same routing snapshot.
+        let follower_framed = match follower {
+            Some(next) => {
+                let routed_next = if let Some(shared) = &self.recovery {
+                    let mesh = shared.lock().unwrap();
+                    let Some(frame) = mesh.local_tx(false, next, mesh.now()) else {
+                        return Ok(0);
+                    };
+                    Some(frame)
+                } else {
+                    None
+                };
+                let body = routed_next.as_ref().map_or(next, |frame| &frame.bytes[..]);
+                Some(if routed_next.as_ref().is_some_and(|frame| frame.command) {
+                    build_raw_uart_command_frame(body)?
+                } else {
+                    build_raw_uart_frame(body)?
+                })
+            }
+            None => None,
         };
         let recovery_command = routed.as_ref().is_some_and(|frame| frame.command);
         let payload = routed.as_ref().map_or(sdk_wire, |frame| &frame.bytes[..]);
@@ -4166,11 +4234,14 @@ impl UartComms {
             SerialProtocol::RawUart => {
                 #[cfg(target_os = "linux")]
                 {
-                    let framed = if recovery_command {
+                    let mut framed = if recovery_command {
                         build_raw_uart_command_frame(payload)?
                     } else {
                         build_raw_uart_frame(payload)?
                     };
+                    if let Some(next) = &follower_framed {
+                        framed.extend_from_slice(next);
+                    }
                     maybe_log_raw_uart_tx(&framed, &self.protocol);
                     start_write_leases(leases)?;
                     let result = write_all_fd_with_poll_counted(
@@ -4194,11 +4265,14 @@ impl UartComms {
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
-                    let framed = if recovery_command {
+                    let mut framed = if recovery_command {
                         build_raw_uart_command_frame(payload)?
                     } else {
                         build_raw_uart_frame(payload)?
                     };
+                    if let Some(next) = &follower_framed {
+                        framed.extend_from_slice(next);
+                    }
                     maybe_log_raw_uart_tx(&framed, &self.protocol);
                     start_write_leases(leases)?;
                     write_all_std_counted(&mut self.inner, &framed, &mut accepted)
@@ -4301,19 +4375,21 @@ impl UartComms {
         if io_result.is_ok() && matches!(self.protocol, SerialProtocol::RawUart) {
             report_write_leases_drained(leases);
             if self.recovery.is_some() {
-                // An Abort's FLIGHT_STATE=15 write: schedule its early copies.
-                ABORT_STATE_BURST
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .get_or_insert_with(Default::default)
-                    .note_written(abort_state_now_ms(), sdk_payload);
-                // Its later copies (re-sends) take the station's gap.
-                if let Some(id) = abort_critical_id(sdk_payload) {
-                    ABORT_COPIES
+                for written in core::iter::once(sdk_payload).chain(follower) {
+                    // An Abort's FLIGHT_STATE=15 write: schedule its early copies.
+                    ABORT_STATE_BURST
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .get_or_insert_with(Default::default)
-                        .note_written(id);
+                        .note_written(abort_state_now_ms(), written);
+                    // Its later copies (re-sends) take the station's gap.
+                    if let Some(id) = abort_critical_id(written) {
+                        ABORT_COPIES
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .get_or_insert_with(Default::default)
+                            .note_written(id);
+                    }
                 }
                 if is_abort_frame(sdk_payload)
                     && !SENDING_ABORT_GAP_COPY.load(std::sync::atomic::Ordering::Acquire)
@@ -4377,6 +4453,13 @@ impl CommsDevice for UartComms {
         frames: &[(u8, &[u8])],
         leases: &[sedsnet::router::PackedWriteLease],
     ) -> Result<Option<usize>, Box<dyn Error + Send + Sync>> {
+        if self.supports_abort_pair()
+            && let [(priority, abort), (_, flight_state)] = frames
+            && is_abort_frame(abort)
+            && is_abort_flight_state(flight_state)
+        {
+            return self.send_abort_pair_tracked(abort, flight_state, *priority, leases).map(Some);
+        }
         if (frames.len() == 1 || is_radio_bundle(frames))
             && matches!(self.protocol, SerialProtocol::RawUart)
             && rfd_profile::active().is_some()
@@ -4394,6 +4477,9 @@ impl CommsDevice for UartComms {
         }
         self.send_tracked(frames, leases)?;
         Ok(None)
+    }
+    fn supports_abort_pair(&self) -> bool {
+        matches!(self.protocol, SerialProtocol::RawUart)
     }
     fn ordinary_background_state(&self) -> Option<OrdinaryLaneState> {
         if !matches!(self.protocol, SerialProtocol::RawUart) || rfd_profile::active().is_none() {
@@ -4659,7 +4745,9 @@ impl CommsDevice for UartComms {
     fn transmit_ready_for(&self, priority: u8, payload: &[u8]) -> bool {
         // Advisory worker precheck uses the fully wrapped wire cost. The
         // writer rechecks the actual routed bytes under this same lock below.
-        let control = if matches!(self.protocol, SerialProtocol::RawUart) {
+        // An Abort's FLIGHT_STATE=15 is admitted as its ABORT is: never held
+        // at control capacity (its loans and replay rules are for commands).
+        let control = if matches!(self.protocol, SerialProtocol::RawUart) && !is_abort_flight_state(payload) {
             radio_batch_control_contract(priority, payload).and_then(|(id, receipt)| {
                 let bytes = if let Some(shared) = &self.recovery {
                     let mesh = shared.lock().unwrap();
@@ -4713,7 +4801,8 @@ impl CommsDevice for UartComms {
             && !state.ordinary_ready(
                 wall,
                 clock,
-                closes_radio_packet_batch(priority, payload) || radio_liveness_frame(priority, payload),
+                (control.is_none() && !is_abort_flight_state(payload) && closes_radio_packet_batch(priority, payload))
+                    || radio_liveness_frame(priority, payload),
             )
         {
             trace_radio_gate_refusal("ordinary_capacity", priority, payload, || {
@@ -7370,6 +7459,122 @@ mod raw_uart_tests {
         }
         assert!(sent, "the Abort's FLIGHT_STATE=15 waited for the gap behind HEALTH");
         assert!(drain(&mut peer) > 0, "FLIGHT_STATE=15 on the wire within 5 ms");
+    }
+
+    /// T30 fullnet: an Abort's FLIGHT_STATE=15 left 343 ms after its ABORT
+    /// (behind a held BOARD_RECOVERY_REQUEST, then the next gap), and its
+    /// copies were held at control capacity. With RF on air (the gate closed)
+    /// an out-of-turn ABORT takes its FLIGHT_STATE=15 in the same write, and
+    /// while the Abort is active no copy or re-send of FLIGHT_STATE=15 is held
+    /// at control capacity: it is paced as the ABORT is.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn abort_takes_its_flight_state_in_the_same_write_with_the_gate_closed() {
+        if !cfg!(feature = "firmware_sim") {
+            crate::mode_suite!(Hitl);
+        }
+        const CHILD: &str = "GS_ABORT_PAIR_CHILD";
+        const NAME: &str = "comms::raw_uart_tests::abort_takes_its_flight_state_in_the_same_write_with_the_gate_closed";
+        if std::env::var_os(CHILD).is_none() {
+            let clock = std::env::temp_dir().join(format!("gs-abort-pair-{}.clock", std::process::id()));
+            std::fs::write(&clock, "30000").unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("GS_SIM_CLOCK_FILE", &clock)
+                .env("GS_SIMULATED_SERIAL_PTY", "1")
+                .env_remove("GS_RADIO_TURN_TAKING")
+                .output()
+                .unwrap();
+            let _ = std::fs::remove_file(clock);
+            assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        let in_burst = |now: u64| now % 200 < 90;
+        crate::telemetry_schema::initialize().unwrap();
+        let clock = std::path::PathBuf::from(std::env::var_os("GS_SIM_CLOCK_FILE").unwrap());
+        let pack = |name: &str, endpoint: &str, stamp: u64, payload: &[u8]| {
+            serialize::pack_packet(
+                &Packet::new(
+                    crate::telemetry_schema::data_type(name),
+                    &[crate::telemetry_schema::endpoint(endpoint)],
+                    "GS",
+                    stamp,
+                    std::sync::Arc::from(payload),
+                )
+                .unwrap(),
+            )
+            .to_vec()
+        };
+        let abort = pack("ABORT", "ABORT", 9, b"SEDS_MANUAL_ABORT_V1:K");
+        let state = pack("FLIGHT_STATE", "FLIGHT_STATE", 9, &[15]);
+        let (mut peer, port) = serialport::TTYPort::pair().unwrap();
+        peer.set_timeout(Duration::from_millis(1)).unwrap();
+        let (mut uart, mesh, _) = recovery_uart_fixture(port);
+        {
+            let mut capacity = rfd_capacity::Capacity::new(64000, 15, 16).with_turn_period(200);
+            capacity.enable_turn_gate();
+            uart.write_lock.lock().unwrap().radio_capacity = Some(capacity);
+        }
+        uart.enable_radio_capacity_control();
+        let mut buf = [0u8; 4096];
+        let mut drain = |peer: &mut serialport::TTYPort| {
+            let mut out = Vec::new();
+            while let Ok(n) = peer.read(&mut buf) {
+                if n == 0 { break; }
+                out.extend_from_slice(&buf[..n]);
+            }
+            out
+        };
+        let contains = |bytes: &[u8], frame: &[u8]| bytes.windows(frame.len()).any(|w| w == frame);
+        // Turns with RF until the Abort lands inside RF's burst (gate closed).
+        let mut now = 30_000u64;
+        loop {
+            std::fs::write(&clock, now.to_string()).unwrap();
+            if in_burst(now) {
+                note_air_rx_now();
+                mesh.lock().unwrap().incoming(true, b"RS\x01\x00\x00\x00\x00\x00\x00", now);
+            }
+            uart.service_transmit().unwrap();
+            drain(&mut peer);
+            if now > 30_600 && in_burst(now) && now % 200 >= 30 {
+                break;
+            }
+            now += 5;
+        }
+        assert!(!uart.write_lock.lock().unwrap().radio_capacity.as_ref().unwrap().turn_gap_open(Instant::now(), Some(now)));
+        assert!(uart.supports_abort_pair());
+        uart.send_tracked_counted(&[(255, &abort[..]), (255, &state[..])], &[])
+            .expect("the Abort's pair goes at once, out of turn");
+        let written = drain(&mut peer);
+        assert!(contains(&written, &abort), "ABORT on the wire");
+        assert!(contains(&written, &state), "FLIGHT_STATE=15 in the ABORT's write");
+        // The Abort stays active: copies and the SDK's 400 ms re-sends of
+        // FLIGHT_STATE=15 are never held at control capacity.
+        GATE_REFUSALS_FOR_TEST.with(|seen| seen.borrow_mut().clear());
+        let start = now;
+        let mut state_writes = 0;
+        while now < start + 2_000 {
+            now += 5;
+            std::fs::write(&clock, now.to_string()).unwrap();
+            if in_burst(now) {
+                note_air_rx_now();
+                mesh.lock().unwrap().incoming(true, b"RS\x01\x00\x00\x00\x00\x00\x00", now);
+            }
+            uart.service_transmit().unwrap();
+            if (now - start) % 400 == 0 {
+                let _ = uart.send_data_with_priority(&state, 255);
+            }
+            if contains(&drain(&mut peer), &state) {
+                state_writes += 1;
+            }
+        }
+        assert!(state_writes >= 2, "FLIGHT_STATE=15 copies and re-sends went out: {state_writes}");
+        let held: Vec<_> = GATE_REFUSALS_FOR_TEST.with(|seen| seen.borrow().clone());
+        assert!(
+            !held.iter().any(|(gate, flight_state)| *flight_state && *gate == "control_capacity"),
+            "FLIGHT_STATE=15 held at control capacity: {held:?}"
+        );
     }
 
     /// ABORT is never held for a turn, also when the radio writer pairs it
