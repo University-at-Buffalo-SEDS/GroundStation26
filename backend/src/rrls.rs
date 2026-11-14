@@ -133,14 +133,15 @@ static RRLS_HANDBACK_GRACE: std::sync::atomic::AtomicBool = std::sync::atomic::A
 pub(crate) fn handback_grace_open() -> bool {
     RRLS_HANDBACK_GRACE.load(std::sync::atomic::Ordering::Acquire)
 }
-fn is_ack_or_leave_frame(payload: &[u8]) -> bool {
-    sedsnet::wire_format::peek_frame_info_unchecked(payload).is_ok_and(|info| {
-        matches!(info.envelope.ty, sedsnet::config::DataType::ReliableAck | sedsnet::config::DataType::DiscoveryLeave)
-    })
+/// A local frame's type, whatever its rocket-side framing. On that side the
+/// router sends side-transport full, compact and chunked frames as well as
+/// canonical ones (fullnet C-fix3: the hand-back leave is a side-transport
+/// frame, and a canonical-only check filtered it out).
+fn is_ack_or_leave(ty: Option<sedsnet::config::DataType>) -> bool {
+    matches!(ty, Some(sedsnet::config::DataType::ReliableAck | sedsnet::config::DataType::DiscoveryLeave))
 }
-fn is_abort_frame(payload: &[u8]) -> bool {
-    sedsnet::wire_format::peek_frame_info_unchecked(payload)
-        .is_ok_and(|info| info.envelope.ty == crate::telemetry_schema::data_type("ABORT"))
+fn is_abort(ty: Option<sedsnet::config::DataType>) -> bool {
+    ty == Some(crate::telemetry_schema::data_type("ABORT"))
 }
 /// RRLS: it owns the AV bay because the primary is out of range.
 static RRLS_HANDBACK_WAITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -543,6 +544,10 @@ impl Transmission {
 
 pub struct Mesh {
     pub role: Role,
+    /// Classifies the local router's rocket-side frames (canonical,
+    /// side-transport full and compact, chunks) for the RRLS egress filters.
+    /// It sees every frame in transmit order, including those filtered out.
+    side_frames: std::sync::Mutex<sedsnet::side_peek::SideFramePeeker>,
     voice_enabled: bool,
     settings_peer_seen: Option<u64>,
     /// A station-pairing frame from the peer arrived over the radio. Link
@@ -635,6 +640,8 @@ impl Mesh {
     pub fn new(role: Role, session: u32) -> Self {
         Self {
             role,
+            // The rocket side uses header templates (with_small_packet_transport).
+            side_frames: std::sync::Mutex::new(sedsnet::side_peek::SideFramePeeker::new(true)),
             settings_framing: None,
             budget: None,
             budget_requested: false,
@@ -2622,10 +2629,15 @@ impl Mesh {
     /// Local router traffic is disabled on RRLS (it observes and relays) except
     /// during a takeover, when it owns the AV bay and transmits directly.
     pub fn local_tx(&self, command: bool, payload: &[u8], now: u64) -> Option<Outgoing> {
+        let ty = if self.role == Role::Rrls {
+            self.side_frames.lock().unwrap_or_else(|p| p.into_inner()).peek(payload).map(|info| info.ty)
+        } else {
+            None
+        };
         if self.role == Role::Rrls
             && !self.takeover
-            && !(self.abort_egress_until.is_some_and(|until| now < until) && is_abort_frame(payload))
-            && !(self.handback_grace_open(now) && is_ack_or_leave_frame(payload))
+            && !(self.abort_egress_until.is_some_and(|until| now < until) && is_abort(ty))
+            && !(self.handback_grace_open(now) && is_ack_or_leave(ty))
         {
             return None;
         }
@@ -3554,6 +3566,139 @@ mod tests {
     /// "fresh query got no reply within 15 s". For HANDBACK_GRACE_MS after a
     /// hand-back the RRLS still sends acknowledgements and its discovery
     /// leave, and nothing else.
+    /// Every frame the RRLS router emits on its real rocket side (header
+    /// templates and chunking: canonical, full, compact and chunked frames),
+    /// in transmit order, labelled by what produced it.
+    fn rocket_side_frames() -> Vec<(&'static str, Vec<u8>)> {
+        crate::telemetry_schema::initialize().unwrap();
+        let link: crate::comms_config::CommsLinkConfig = serde_json::from_value(serde_json::json!({"interface": "serial", "port": "/dev/test-radio", "protocol": "raw_uart"})).unwrap();
+        let label = std::sync::Arc::new(std::sync::Mutex::new("setup"));
+        let frames = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(&'static str, Vec<u8>)>::new()));
+        let clock = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1_000));
+        let at = |c: &std::sync::Arc<std::sync::atomic::AtomicU64>| { let c = c.clone(); Box::new(move || c.load(std::sync::atomic::Ordering::Relaxed)) as Box<dyn sedsnet::router::Clock + Send + Sync> };
+        let rrls = std::sync::Arc::new(sedsnet::router::Router::new_with_clock(sedsnet::router::RouterConfig::new([
+            sedsnet::router::EndpointHandler::new_packet_handler(crate::telemetry_schema::endpoint("ABORT"), |_| Ok(())),
+        ]).with_sender("RRLS"), at(&clock)));
+        let rf = std::sync::Arc::new(sedsnet::router::Router::new_with_clock(sedsnet::router::RouterConfig::new([
+            sedsnet::router::EndpointHandler::new_packet_handler(crate::telemetry_schema::endpoint("ABORT"), |_| Ok(())),
+        ]).with_sender("RF"), at(&clock)));
+        let (out, now_label, to_rf) = (frames.clone(), label.clone(), rf.clone());
+        rrls.add_side_packed_with_options("rocket_comms", move |bytes| {
+            out.lock().unwrap().push((*now_label.lock().unwrap(), bytes.to_vec()));
+            let _ = to_rf.rx_packed_from_side(bytes, 0);
+            Ok(())
+        }, crate::rocket_router_side_options(&link, false));
+        let back = rrls.clone();
+        rf.add_side_packed_with_options("radio", move |bytes| back.rx_packed_from_side(bytes, 0), crate::rocket_router_side_options(&link, false));
+        rrls.announce_discovery().unwrap();
+        rf.announce_discovery().unwrap();
+        for _ in 0..5 { rrls.process_all_queues().unwrap(); rf.process_all_queues().unwrap(); }
+        if false { eprintln!("TOPO rrls routes={:?} rf routes={:?}", rrls.export_topology().routes.iter().map(|r| (r.side_name.clone(), r.announcers.iter().map(|a| a.sender_id.clone()).collect::<Vec<_>>(), r.reachable_endpoints.len())).collect::<Vec<_>>(), rf.export_topology().routes.iter().map(|r| (r.side_name.clone(), r.announcers.iter().map(|a| a.sender_id.clone()).collect::<Vec<_>>())).collect::<Vec<_>>()); }
+        let step = |what: &'static str, act: &dyn Fn()| {
+            *label.lock().unwrap() = what;
+            act();
+            for _ in 0..20 { clock.fetch_add(100, std::sync::atomic::Ordering::Relaxed); let _ = rrls.process_all_queues(); let _ = rf.process_all_queues(); }
+        };
+        for i in 0..4u8 {
+            step("ack", &|| {
+                // RF's reliable ABORT to the RRLS: the RRLS acknowledges it.
+                let packet = sedsnet::packet::Packet::new(crate::telemetry_schema::data_type("ABORT"),
+                    &[crate::telemetry_schema::endpoint("ABORT")], "RF", 10_000 + u64::from(i), std::sync::Arc::from(&b"rf abort"[..])).unwrap();
+                // Straight off the radio, as RF's frame arrives.
+                rrls.rx_packed_from_side(&sedsnet::wire_format::pack_packet(&packet), 0).unwrap();
+            });
+            step("leave", &|| rrls.announce_leave().unwrap());
+            step("other", &|| {
+                rrls.tx(sedsnet::packet::Packet::new(crate::telemetry_schema::data_type("HEARTBEAT"),
+                    &sedsnet::endpoints_from_datatype(crate::telemetry_schema::data_type("HEARTBEAT")), "RRLS", 20_000 + u64::from(i), std::sync::Arc::from([])).unwrap()).unwrap();
+                rrls.announce_discovery().unwrap();
+            });
+        }
+        let frames: Vec<_> = frames.lock().unwrap().clone().into_iter().filter(|(what, _)| *what != "setup").collect();
+        let mut frames = frames;
+        frames.extend(rocket_side_abort_frames());
+        frames
+    }
+
+    /// The RRLS's operator ABORTs as its router frames them on the real rocket side.
+    fn rocket_side_abort_frames() -> Vec<(&'static str, Vec<u8>)> {
+        let link: crate::comms_config::CommsLinkConfig = serde_json::from_value(serde_json::json!({"interface": "serial", "port": "/dev/test-radio", "protocol": "raw_uart"})).unwrap();
+        let clock = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1_000));
+        let c = clock.clone();
+        let rrls = sedsnet::router::Router::new_with_clock(sedsnet::router::RouterConfig::new([]).with_sender("RRLS"), Box::new(move || c.load(std::sync::atomic::Ordering::Relaxed)));
+        let frames = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let out = frames.clone();
+        rrls.add_side_packed_with_options("rocket_comms", move |bytes| { out.lock().unwrap().push(("abort", bytes.to_vec())); Ok(()) }, crate::rocket_router_side_options(&link, false));
+        for _ in 0..4 {
+            crate::telemetry_task::queue_manual_abort_wire_receipted(&rrls, crate::manual_abort_intent::WirePolicy::Untimed).unwrap();
+            for _ in 0..5 { clock.fetch_add(100, std::sync::atomic::Ordering::Relaxed); let _ = rrls.process_all_queues(); }
+        }
+        let frames = frames.lock().unwrap().clone();
+        assert!(!frames.is_empty(), "ABORT frames on the rocket side");
+        frames
+    }
+
+    fn handed_back_rrls() -> (Mesh, u64) {
+        let (mut rr, mut now, mut seq) = rrls_in_takeover_after_a_long_cut();
+        while rr.takeover() {
+            rr.incoming(true, &health(7, seq, true), now);
+            rr.tick(now);
+            seq += 1;
+            now += 500;
+        }
+        (rr, now)
+    }
+
+    /// fullnet C-fix3: the hand-back discovery leave never reached the air.
+    /// On the real rocket side it is a side-transport frame, and the grace
+    /// filter read only canonical frames. In the grace window every leave and
+    /// acknowledgement passes, whatever its framing, and nothing else does.
+    #[test]
+    fn in_the_hand_back_grace_only_acks_and_the_leave_leave_the_rrls_on_the_real_rocket_side() {
+        let frames = rocket_side_frames();
+        for what in ["ack", "leave", "abort", "other"] {
+            assert!(frames.iter().any(|(w, _)| *w == what), "{what} frames produced");
+        }
+        let (rr, now) = handed_back_rrls();
+        assert!(rr.handback_grace_open(now));
+
+        let wrapped = frames.iter().filter(|(w, b)| (*w == "leave" || *w == "ack") && b.starts_with(b"SDT")).count();
+        let outcomes: Vec<(&str, bool, usize, u8)> = frames.iter()
+            .map(|(what, bytes)| (*what, rr.local_tx(false, bytes, now).is_some(), bytes.len(), bytes.get(3).copied().unwrap_or(0)))
+            .collect();
+        for (what, passed, len, kind) in &outcomes {
+            let want = matches!(*what, "ack" | "leave");
+            // A frame the router emitted for an ACK/leave step may include
+            // discovery side frames; only ACK/leave typed frames must pass.
+            if !want {
+                assert!(!passed, "{what} frame (len {len}, kind {kind}) blocked in grace: {outcomes:?}");
+            }
+        }
+        assert!(outcomes.iter().any(|(w, p, _, _)| *w == "leave" && *p), "a leave passes: {outcomes:?}");
+        assert!(outcomes.iter().any(|(w, p, _, _)| *w == "ack" && *p), "an ack passes: {outcomes:?}");
+        let _ = wrapped;
+    }
+
+    /// A listening RRLS's operator Abort: every ABORT frame passes in its
+    /// egress window, whatever its framing; nothing else does.
+    #[test]
+    fn a_listening_rrls_abort_passes_on_the_real_rocket_side_and_nothing_else() {
+        let frames = rocket_side_frames();
+        let mut rr = Mesh::new(Role::Rrls, 7);
+        rr.tick(0);
+        rr.open_abort_egress(0);
+        let outcomes: Vec<(&str, bool, usize)> = frames.iter()
+            .map(|(what, bytes)| (*what, rr.local_tx(false, bytes, 1).is_some(), bytes.len()))
+            .collect();
+        for (what, passed, len) in &outcomes {
+            if *what != "abort" {
+                assert!(!passed, "{what} frame (len {len}) blocked while listening: {outcomes:?}");
+            }
+        }
+        let aborts: Vec<_> = outcomes.iter().filter(|(w, _, _)| *w == "abort").collect();
+        assert!(!aborts.is_empty() && aborts.iter().any(|(_, p, _)| *p), "the ABORT passes: {outcomes:?}");
+    }
+
     #[test]
     fn after_a_hand_back_the_rrls_still_acknowledges_and_leaves_for_a_while() {
         let (mut rr, mut now, mut seq) = rrls_in_takeover_after_a_long_cut();
