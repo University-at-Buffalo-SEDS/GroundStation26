@@ -5435,6 +5435,7 @@ impl OrderedExhaustion {
         let flight_state = crate::telemetry_schema::data_type("FLIGHT_STATE");
         let flight_command = crate::telemetry_schema::data_type("FLIGHT_COMMAND");
         let command_heads: Vec<u64>;
+        let mut flight_state_gone: Vec<(u64, Vec<u64>)> = Vec::new();
         let heads = {
             let mut guard = self.state.lock().unwrap();
             let (sampled, counts) = &mut *guard;
@@ -5457,8 +5458,12 @@ impl OrderedExhaustion {
             if gone.is_empty() || gone.iter().any(|(_, ty, _)| *ty == recovery_request) {
                 crate::board_recovery::abort_confirm::note_query_stream_retired();
             }
+            flight_state_gone = gone.iter().filter(|(_, ty, _)| *ty == flight_state).map(|(id, _, owners)| (*id, owners.clone())).collect();
             gone.iter().filter(|(_, ty, _)| *ty == flight_state).map(|(id, _, _)| *id).collect::<Vec<_>>()
         };
+        // An owed AV-bay board that never acknowledged the station's own
+        // Aborted FLIGHT_STATE: the Abort re-send sends it again.
+        crate::manual_abort_resend::note_flight_state_exhausted(router, &flight_state_gone);
         // An operator flight command queued behind a retired one was dropped
         // with it; the telemetry task decides whether to send it again.
         crate::operator_command_resend::note_retired(router, &command_heads);

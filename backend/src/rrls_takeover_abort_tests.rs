@@ -4,7 +4,7 @@
 // takeover Abort reached RF in 37 ms but only the FC latched it: the RRLS
 // never wrote FLIGHT_STATE. A listening RRLS still never writes it.
 use super::*;
-use crate::types::FlightState;
+use crate::types::{Board, FlightState};
 use sedsnet::router::{EndpointHandler, NetworkVariablePermissions, RouterConfig};
 use std::sync::atomic::AtomicU8;
 
@@ -517,4 +517,150 @@ async fn a_primary_answers_a_flight_state_request_with_its_own_write_after_an_fc
     fc_reports_in_flight(&bay);
     board_requests_flight_state(&bay);
     assert_eq!(rrls_flight_states(&bay), vec![("GS".to_string(), crate::types::NetworkFlightState::Aborted as u8)]);
+}
+
+/// The operator Abort as main.rs publishes it: sent, then armed for re-send.
+fn press_abort_armed(bay: &Bay) {
+    bay.hold.store(1, Ordering::Relaxed);
+    bay.state.manual_abort_intent.request();
+    let mut claim = bay.state.manual_abort_intent.try_claim().unwrap();
+    let mark = crate::manual_abort_resend::send_mark(&bay.rrls);
+    assert!(mark.av_bay_routed(), "the AV bay is routed when the Abort is sent");
+    assert!(publish_local_claim(&bay.state, &bay.rrls, &mut claim).unwrap());
+    let wire = claim.wire().expect("an operator Abort carries its wire");
+    let recovery = crate::board_recovery::coordinator::recovery_activity(&bay.state).flatten();
+    bay.state.abort_resend.arm(claim.epoch(), wire, recovery, mark);
+    claim.accepted();
+    bay.pump();
+}
+
+fn mark_present(bay: &Bay, boards: &[Board]) {
+    let mut status = bay.state.board_status.lock().unwrap();
+    for board in boards {
+        status.get_mut(board).unwrap().last_seen_instant = Some(std::time::Instant::now());
+    }
+}
+
+/// The station's production services on the shared clock: its router worker
+/// (crate::telemetry_task::radio_io), the boards, and the Abort re-send
+/// service's pass (manual_abort_resend::service), until `done` or `ms` of
+/// station time. The worker samples retrying writes on wall time, so each
+/// 200 ms of station time takes 100 ms.
+fn run_services(bay: &Bay, worker: &mut crate::telemetry_task::RouterServiceForTest, ms: u64, mut done: impl FnMut(&Bay) -> bool) -> bool {
+    for _ in 0..ms / 200 {
+        bay.now.fetch_add(200, Ordering::Relaxed);
+        worker.pump(&bay.rrls);
+        for peer in &bay.peers {
+            let _ = peer.process_all_queues();
+        }
+        worker.pump(&bay.rrls);
+        if done(bay) {
+            return true;
+        }
+        if crate::manual_abort_resend::service_runs() && bay.state.abort_resend.active_resends().is_some()
+            && let Some(seen) = crate::manual_abort_resend::observe(&bay.state, bay.now.load(Ordering::Relaxed))
+        {
+            bay.state.abort_resend.step(&bay.rrls, seen);
+        }
+        if done(bay) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    false
+}
+
+/// PB's FLIGHT_STATE, as it holds it: (sender, value).
+fn pb_flight_state(bay: &Bay) -> Option<(String, u8)> {
+    bay.peers[2]
+        .get_cached_network_variable(crate::telemetry_schema::data_type("FLIGHT_STATE"))
+        .unwrap()
+        .map(|p| (crate::types::canonical_sender_id(p.sender()).to_string(), p.payload()[0]))
+}
+
+const PB_BIT: u8 = 1 << 2;
+
+/// The station's Aborted FLIGHT_STATE reached RF and FC; PB was out of reach
+/// until it ran out of retries. Returns the router worker for the rest.
+fn aborted_flight_state_exhausts_on_pb(bay: &Bay) -> crate::telemetry_task::RouterServiceForTest {
+    mark_present(bay, &[Board::RFBoard, Board::FlightComputer, Board::PowerBoard]);
+    press_abort_armed(bay);
+    assert_eq!(bay.pending("FLIGHT_STATE").len(), 3, "the Aborted write is owed by RF, FC and PB");
+    bay.release_to(&["RF", "FC"]);
+    let mut worker = crate::telemetry_task::RouterServiceForTest::default();
+    let ty = crate::telemetry_schema::data_type("FLIGHT_STATE");
+    let written = bay.rrls.own_network_variable(ty).unwrap().packet_id();
+    // Done as PB's copy runs out of retries: once the worker has recorded it
+    // (before the re-send service's next pass), or once it is no longer pending.
+    assert!(run_services(bay, &mut worker, 20_000, |bay| !bay.pending("FLIGHT_STATE").contains(&hash("PB"))
+            || crate::manual_abort_resend::flight_state_unacked_for_test() & PB_BIT != 0),
+        "PB's copy runs out of retries");
+    assert_eq!(bay.rrls.own_network_variable(ty).unwrap().packet_id(), written, "not re-sent yet");
+    assert_eq!(pb_flight_state(bay), None, "PB never got it");
+    worker
+}
+
+/// PB comes back in reach (nothing held is replayed to it).
+fn pb_comes_back(bay: &Bay) {
+    bay.open.lock().unwrap().push("PB");
+}
+
+/// 1. Production path, no direct call: the Aborted FLIGHT_STATE exhausts on
+/// PB; when PB is back it receives the station's own Aborted value without
+/// any operator action. Exhausting once never ends its delivery.
+#[tokio::test]
+async fn a_primary_keeps_delivering_its_aborted_flight_state_to_pb_after_it_exhausts() {
+    if primary_child("a_primary_keeps_delivering_its_aborted_flight_state_to_pb_after_it_exhausts") {
+        return;
+    }
+    let bay = bay(false).await;
+    let mut worker = aborted_flight_state_exhausts_on_pb(&bay);
+    pb_comes_back(&bay);
+    assert!(run_services(&bay, &mut worker, 20_000, |bay| pb_flight_state(bay).is_some()), "PB is sent it again");
+    assert_eq!(pb_flight_state(&bay), Some(("GS".to_string(), crate::types::NetworkFlightState::Aborted as u8)));
+}
+
+/// 4. The same for an RRLS in takeover.
+#[tokio::test]
+async fn a_takeover_rrls_keeps_delivering_its_aborted_flight_state_to_pb_after_it_exhausts() {
+    if rrls_child("a_takeover_rrls_keeps_delivering_its_aborted_flight_state_to_pb_after_it_exhausts") {
+        return;
+    }
+    let bay = bay(true).await;
+    let mut worker = aborted_flight_state_exhausts_on_pb(&bay);
+    pb_comes_back(&bay);
+    assert!(run_services(&bay, &mut worker, 20_000, |bay| pb_flight_state(bay).is_some()), "PB is sent it again");
+    assert_eq!(pb_flight_state(&bay), Some(("RRLS".to_string(), crate::types::NetworkFlightState::Aborted as u8)));
+}
+
+/// 2. Not after a Reset: the station has left Aborted.
+#[tokio::test]
+async fn no_aborted_flight_state_resend_after_a_reset() {
+    if primary_child("no_aborted_flight_state_resend_after_a_reset") {
+        return;
+    }
+    let bay = bay(false).await;
+    let mut worker = aborted_flight_state_exhausts_on_pb(&bay);
+    // Reset: the station leaves Aborted and writes the new state.
+    bay.state.set_preexisting_flight_state_for_test(FlightState::Idle);
+    crate::network_variables::set_flight_state(&bay.rrls, FlightState::Idle as u8).unwrap();
+    pb_comes_back(&bay);
+    run_services(&bay, &mut worker, 15_000, |_| false);
+    let aborted = crate::types::NetworkFlightState::Aborted as u8;
+    assert!(pb_flight_state(&bay).is_some_and(|(sender, value)| sender == "GS" && value != aborted),
+        "PB gets the Reset's state, never the Aborted one again: {:?}", pb_flight_state(&bay));
+}
+
+/// 3. Not once PB's readback shows Aborted.
+#[tokio::test]
+async fn no_aborted_flight_state_resend_once_pb_reads_aborted() {
+    if primary_child("no_aborted_flight_state_resend_once_pb_reads_aborted") {
+        return;
+    }
+    let bay = bay(false).await;
+    let mut worker = aborted_flight_state_exhausts_on_pb(&bay);
+    bay.state.board_abort.observe_abort(Board::PowerBoard, std::time::Instant::now(), bay.now.load(Ordering::Relaxed));
+    pb_comes_back(&bay);
+    run_services(&bay, &mut worker, 15_000, |_| false);
+    assert_eq!(pb_flight_state(&bay), None, "PB reads Aborted: not owed it again");
 }

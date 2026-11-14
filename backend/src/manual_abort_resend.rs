@@ -28,6 +28,61 @@
 use crate::manual_abort_intent::WirePolicy;
 use sedsnet::router::Router;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+/// AV-bay boards (BOARDS mask) whose copy of this station's own Aborted
+/// FLIGHT_STATE ran out of retries before they acknowledged it. Exhausting
+/// once never ends its delivery: the re-send below sends the station's own
+/// Aborted value again until each such board acknowledges it or reads
+/// Aborted, the station leaves Aborted (Reset), or a newer own write
+/// supersedes it. PB takes an Abort only from FLIGHT_STATE.
+static FLIGHT_STATE_UNACKED: AtomicU8 = AtomicU8::new(0);
+
+fn board_mask(router: &Router, owners: &[u64]) -> u8 {
+    owners.iter().fold(0u8, |mask, owner| {
+        crate::board_recovery::coordinator::pending_destination_board(router, *owner)
+            .and_then(|board| crate::board_abort::BOARDS.iter().position(|b| *b == board))
+            .map_or(mask, |i| mask | (1 << i))
+    })
+}
+
+/// Ordered FLIGHT_STATE writes that ran out of retries (packet ID, owners
+/// still pending), from the router worker. Records the AV-bay boards that
+/// never acknowledged this station's own Aborted value.
+pub(crate) fn note_flight_state_exhausted(router: &Router, gone: &[(u64, Vec<u64>)]) {
+    let ty = crate::telemetry_schema::data_type("FLIGHT_STATE");
+    let Some(own) = router.own_network_variable(ty) else { return };
+    if own.payload() != [crate::types::NetworkFlightState::Aborted as u8] {
+        return;
+    }
+    let boards = gone
+        .iter()
+        .filter(|(id, _)| *id == own.packet_id())
+        .fold(0u8, |mask, (_, owners)| mask | board_mask(router, owners))
+        & AV_BAY_MASK;
+    if boards != 0 {
+        FLIGHT_STATE_UNACKED.fetch_or(boards, Ordering::AcqRel);
+        log::warn!(
+            "Aborted FLIGHT_STATE ran out of retries before {} acknowledged it; it will be sent again",
+            board_names(boards)
+        );
+    }
+}
+
+fn board_names(mask: u8) -> String {
+    crate::board_abort::BOARDS
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| mask & (1 << i) != 0)
+        .map(|(_, board)| board.sender_id())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[cfg(test)]
+pub(crate) fn flight_state_unacked_for_test() -> u8 {
+    FLIGHT_STATE_UNACKED.load(Ordering::Acquire)
+}
 
 /// RF, FC and PB in `board_abort::BOARDS` order.
 const AV_BAY_MASK: u8 = 0b111;
@@ -230,21 +285,43 @@ impl AbortResend {
                 );
             }
             *guard = None;
+            FLIGHT_STATE_UNACKED.store(0, Ordering::Release);
             return None;
         }
+        let sent = Self::step_abort(armed, router, &seen, owed, unheard);
+        // After any ABORT copy of this pass, so the FLIGHT_STATE queues behind
+        // it: the Aborted FLIGHT_STATE an owed board never acknowledged (it
+        // ran out of retries; also the case when the exhausted ABORT was just
+        // re-sent), or the one held while the Abort had no AV-bay route. A
+        // board that acknowledged it is not owed it again.
+        let unacked = FLIGHT_STATE_UNACKED.load(Ordering::Acquire) & AV_BAY_MASK;
+        let lost = unacked & (owed | unheard);
+        if (armed.flight_state_owed || lost != 0) && !armed.unrouted {
+            match crate::network_variables::resend_aborted_flight_state(router) {
+                Ok(true) => {
+                    armed.flight_state_owed = false;
+                    FLIGHT_STATE_UNACKED.fetch_and(!unacked, Ordering::AcqRel);
+                    if lost != 0 {
+                        log::warn!("Aborted FLIGHT_STATE re-sent: {} never acknowledged it", board_names(lost));
+                    } else {
+                        log::warn!("Aborted FLIGHT_STATE re-sent: the AV bay is routed again after the operator Abort was held");
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => log::warn!("Aborted FLIGHT_STATE re-send refused: {error}"),
+            }
+        }
+        sent
+    }
+
+    /// The ABORT part of `step`.
+    fn step_abort(armed: &mut Armed, router: &Router, seen: &Observation, owed: u8, unheard: u8) -> Option<u8> {
         let abort = crate::telemetry_schema::data_type("ABORT");
         let rows = router.export_reliable_pending_stats();
         let abort_rows: Vec<(u8, u32)> = rows
             .iter()
             .filter(|row| row.data_type == abort)
-            .map(|row| {
-                let boards = row.pending_destinations.iter().fold(0u8, |mask, owner| {
-                    crate::board_recovery::coordinator::pending_destination_board(router, *owner)
-                        .and_then(|board| crate::board_abort::BOARDS.iter().position(|b| *b == board))
-                        .map_or(mask, |i| mask | (1 << i))
-                });
-                (boards & AV_BAY_MASK, row.retries)
-            })
+            .map(|row| (board_mask(router, &row.pending_destinations) & AV_BAY_MASK, row.retries))
             .collect();
         let pending = abort_rows.iter().copied().max_by_key(|(_, retries)| *retries);
         // Did the last send go toward the AV bay? The SDK sends ABORT only
@@ -267,19 +344,9 @@ impl AbortResend {
                 Some(_) => {}
             }
         }
-        if armed.flight_state_owed && !armed.unrouted {
-            match crate::network_variables::resend_aborted_flight_state(router) {
-                Ok(true) => {
-                    armed.flight_state_owed = false;
-                    log::warn!("Aborted FLIGHT_STATE re-sent: the AV bay is routed again after the operator Abort was held");
-                }
-                Ok(false) => {}
-                Err(error) => log::warn!("Aborted FLIGHT_STATE re-send refused: {error}"),
-            }
-        }
         if armed.unrouted && pending.is_none_or(|(boards, _)| boards == 0) {
             // Covers an unheard AV bay too: its route comes back first.
-            if let Some(sent) = Self::send_when_routed(armed, router, &seen, owed | unheard) {
+            if let Some(sent) = Self::send_when_routed(armed, router, seen, owed | unheard) {
                 return sent;
             }
         }
@@ -313,13 +380,7 @@ impl AbortResend {
                 log::warn!(
                     "operator Abort re-sent ({}): the last ABORT ran out of retries before {} acknowledged it",
                     armed.resends,
-                    crate::board_abort::BOARDS
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| owed & (1 << i) != 0)
-                        .map(|(_, board)| board.sender_id())
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    board_names(owed)
                 );
                 Some(owed)
             }
@@ -392,6 +453,12 @@ pub(crate) fn observe(state: &crate::state::AppState, now_ms: u64) -> Option<Obs
     })
 }
 
+/// The primary re-sends its operator Abort; an RRLS only while its takeover
+/// owns the AV bay (a listening RRLS's Abort is the primary's to deliver).
+pub(crate) fn service_runs() -> bool {
+    !crate::rrls::is_rrls() || crate::rrls::takeover_active()
+}
+
 pub(crate) async fn service(
     state: std::sync::Arc<crate::state::AppState>,
     router: std::sync::Arc<Router>,
@@ -404,7 +471,7 @@ pub(crate) async fn service(
             _ = shutdown.recv() => return,
             _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
         }
-        if crate::rrls::is_rrls() || state.abort_resend.active_resends().is_none() {
+        if !service_runs() || state.abort_resend.active_resends().is_none() {
             continue;
         }
         let now_ms = crate::simulation_clock_ms().unwrap_or_else(|| start.elapsed().as_millis() as u64);
