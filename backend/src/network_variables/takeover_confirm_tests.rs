@@ -189,3 +189,35 @@ fn a_buzzer_receipt_without_a_readback_stays_unconfirmed() {
     observe_fc_health_outputs(&words);
     assert_eq!(network_output_view(NetworkOutput::FlightBuzzer).confirmed, Some(true));
 }
+
+/// Handing back, the RRLS leaves the network as a station at once: the AV
+/// bay stops addressing it (it no longer acknowledges anything) instead of
+/// for the 30 s route lifetime.
+#[test]
+fn handing_back_sends_a_discovery_leave_the_av_bay_acts_on() {
+    if rrls_child("handing_back_sends_a_discovery_leave_the_av_bay_acts_on") {
+        return;
+    }
+    let bay = takeover();
+    let rf = bay.bay[0].clone();
+    let knows_rrls = |rf: &Router| rf.export_topology().routes.iter()
+        .any(|route| route.announcers.iter().any(|a| a.sender_id == "RRLS"));
+    assert!(knows_rrls(&rf), "the RRLS is a known station during the takeover");
+    crate::rrls::set_takeover_for_test(false);
+    bay.in_air.lock().unwrap().clear();
+    takeover_changed(&bay.rrls, false).unwrap();
+    bay.rrls.process_all_queues().unwrap();
+    // What the hand-back grace lets on the air (rrls::Mesh::local_tx):
+    // acknowledgements and the discovery leave, nothing else.
+    let on_air: Vec<Vec<u8>> = bay.in_air.lock().unwrap().drain(..)
+        .filter(|bytes| sedsnet::wire_format::peek_frame_info_unchecked(bytes).is_ok_and(|info| {
+            matches!(info.envelope.ty, sedsnet::config::DataType::ReliableAck | sedsnet::config::DataType::DiscoveryLeave)
+        }))
+        .collect();
+    assert!(!on_air.is_empty(), "the hand-back put a discovery leave on the air");
+    for bytes in on_air {
+        rf.rx_packed_from_side(&bytes, 0).unwrap();
+    }
+    rf.process_all_queues().unwrap();
+    assert!(!knows_rrls(&rf), "the AV bay no longer routes to the RRLS");
+}

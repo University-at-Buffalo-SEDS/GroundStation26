@@ -2378,7 +2378,7 @@ async fn main() -> anyhow::Result<()> {
                 let takeover = rrls::takeover_active();
                 // An operator Abort on a listening RRLS opens the radio side too;
                 // Mesh::local_tx then lets only ABORT frames out.
-                let wanted = takeover || rrls::abort_egress_open();
+                let wanted = takeover || rrls::abort_egress_open() || rrls::handback_grace_open();
                 if wanted != egress && router.set_side_egress_enabled(rocket_side, wanted).is_ok() {
                     egress = wanted;
                     log::info!("RRLS radio egress {}", if takeover { "enabled for takeover" } else if wanted { "enabled for an operator Abort (ABORT frames only)" } else { "disabled (observer)" });

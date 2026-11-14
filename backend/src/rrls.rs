@@ -123,6 +123,21 @@ const ABORT_EGRESS_MS: u64 = 10_000;
 pub(crate) fn abort_egress_open() -> bool {
     RRLS_ABORT_EGRESS.load(std::sync::atomic::Ordering::Acquire)
 }
+/// After a hand-back the AV bay still addresses this RRLS for its route
+/// lifetime. For this long the listening RRLS still acknowledges what it is
+/// sent and puts its discovery leave on the air (nothing else), so the boards
+/// stop addressing it at once and no frame stalls waiting for it.
+const HANDBACK_GRACE_MS: u64 = 5_000;
+static RRLS_HANDBACK_GRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// RRLS: the router's radio side must stay enabled for the hand-back grace.
+pub(crate) fn handback_grace_open() -> bool {
+    RRLS_HANDBACK_GRACE.load(std::sync::atomic::Ordering::Acquire)
+}
+fn is_ack_or_leave_frame(payload: &[u8]) -> bool {
+    sedsnet::wire_format::peek_frame_info_unchecked(payload).is_ok_and(|info| {
+        matches!(info.envelope.ty, sedsnet::config::DataType::ReliableAck | sedsnet::config::DataType::DiscoveryLeave)
+    })
+}
 fn is_abort_frame(payload: &[u8]) -> bool {
     sedsnet::wire_format::peek_frame_info_unchecked(payload)
         .is_ok_and(|info| info.envelope.ty == crate::telemetry_schema::data_type("ABORT"))
@@ -569,6 +584,8 @@ pub struct Mesh {
     handback_waiting_since: Option<u64>,
     /// Primary: a fresh discovery route to RF/FC/PB (set by its router owner).
     av_bay_routed: bool,
+    /// RRLS: until when, after a hand-back, it still acknowledges and leaves.
+    handback_grace_until: Option<u64>,
     last_direct: Option<u64>,
     direct_since: Option<u64>,
     fallback: bool,
@@ -650,6 +667,7 @@ impl Mesh {
             primary_av_bay_routed: false,
             handback_waiting_since: None,
             av_bay_routed: false,
+            handback_grace_until: None,
             last_direct: None,
             direct_since: None,
             fallback: false,
@@ -2552,6 +2570,7 @@ impl Mesh {
             if self.primary_av_bay_routed || (waited >= HANDBACK_ROUTE_WAIT_MS && !self.av_bay_routed) {
                 self.takeover = false;
                 self.handback_waiting_since = None;
+                self.handback_grace_until = Some(now.saturating_add(HANDBACK_GRACE_MS));
                 if self.primary_av_bay_routed {
                     log::info!("RRLS takeover ended: the primary's HEALTH has been continuous for {RESTORE_MS} ms and it has a fresh AV-bay route; authority handed back");
                 } else {
@@ -2563,6 +2582,10 @@ impl Mesh {
             self.handback_waiting_since = None;
         }
         RRLS_HANDBACK_WAITING.store(self.handback_waiting(), std::sync::atomic::Ordering::Release);
+        if self.takeover || self.handback_grace_until.is_some_and(|until| now >= until) {
+            self.handback_grace_until = None;
+        }
+        RRLS_HANDBACK_GRACE.store(self.handback_grace_until.is_some(), std::sync::atomic::Ordering::Release);
         RRLS_TAKEOVER.store(self.takeover, std::sync::atomic::Ordering::Release);
         if self.abort_egress_until.is_some_and(|until| now >= until) {
             self.abort_egress_until = None;
@@ -2574,6 +2597,9 @@ impl Mesh {
     /// (nothing else) on the radio, besides sending the Abort to the primary.
     /// RRLS in takeover: the primary is heard again but reports no AV-bay
     /// route, so this RRLS keeps command (shown to its operator).
+    pub(crate) fn handback_grace_open(&self, now: u64) -> bool {
+        self.handback_grace_until.is_some_and(|until| now < until)
+    }
     pub(crate) fn handback_waiting(&self) -> bool {
         self.takeover && self.handback_waiting_since.is_some() && !self.primary_av_bay_routed
     }
@@ -2599,6 +2625,7 @@ impl Mesh {
         if self.role == Role::Rrls
             && !self.takeover
             && !(self.abort_egress_until.is_some_and(|until| now < until) && is_abort_frame(payload))
+            && !(self.handback_grace_open(now) && is_ack_or_leave_frame(payload))
         {
             return None;
         }
@@ -3492,6 +3519,62 @@ mod tests {
         rr.tick(now);
         assert!(!rr.takeover());
         assert!(!rr.handback_waiting());
+    }
+    fn packed(ty: sedsnet::config::DataType, payload: &[u8]) -> Vec<u8> {
+        crate::telemetry_schema::initialize().unwrap();
+        let p = sedsnet::packet::Packet::new(
+            ty,
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+            "RRLS",
+            1,
+            payload.to_vec().into(),
+        )
+        .unwrap();
+        sedsnet::wire_format::pack_packet(&p).to_vec()
+    }
+    /// The discovery leave a router actually puts on its side.
+    fn leave_frame() -> Vec<u8> {
+        crate::telemetry_schema::initialize().unwrap();
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = sedsnet::router::Router::new(sedsnet::router::RouterConfig::new([]).with_sender("RRLS"));
+        let out = sent.clone();
+        router.add_side_packed("radio", move |bytes| { out.lock().unwrap().push(bytes.to_vec()); Ok(()) });
+        router.announce_leave().unwrap();
+        router.process_all_queues().unwrap();
+        let frames = sent.lock().unwrap().clone();
+        frames.into_iter()
+            .find(|bytes| sedsnet::wire_format::peek_frame_info_unchecked(bytes)
+                .is_ok_and(|info| info.envelope.ty == sedsnet::config::DataType::DiscoveryLeave))
+            .expect("a discovery leave on the side")
+    }
+    /// fullnet C-dev2: for the 30 s after a hand-back, RF still addressed its
+    /// board status (its replies to the primary's fresh queries included) to
+    /// the RRLS only, which was listening again and never acknowledged them;
+    /// RF's ordered status stream stalled and the primary's Reset all failed
+    /// "fresh query got no reply within 15 s". For HANDBACK_GRACE_MS after a
+    /// hand-back the RRLS still sends acknowledgements and its discovery
+    /// leave, and nothing else.
+    #[test]
+    fn after_a_hand_back_the_rrls_still_acknowledges_and_leaves_for_a_while() {
+        let (mut rr, mut now, mut seq) = rrls_in_takeover_after_a_long_cut();
+        while rr.takeover() {
+            rr.incoming(true, &health(7, seq, true), now);
+            rr.tick(now);
+            seq += 1;
+            now += 500;
+        }
+        let handed_back = now - 500;
+        let ack = packed(sedsnet::config::DataType::ReliableAck, &42u64.to_le_bytes());
+        let leave = leave_frame();
+        let data = packed(crate::telemetry_schema::data_type("AV_BAY_UNDERGLOW"), &[1]);
+        assert!(rr.local_tx(false, &ack, now).is_some(), "acknowledge what the AV bay still owes this RRLS");
+        assert!(rr.local_tx(false, &leave, now).is_some(), "tell the AV bay this RRLS is no longer a station");
+        assert!(rr.local_tx(true, &data, now).is_none(), "listening again: nothing else");
+        assert!(rr.handback_grace_open(now));
+        let after = handed_back + HANDBACK_GRACE_MS + 1;
+        rr.tick(after);
+        assert!(rr.local_tx(false, &ack, after).is_none());
+        assert!(!rr.handback_grace_open(after));
     }
     #[test]
     fn the_primary_reports_its_av_bay_route_in_health() {

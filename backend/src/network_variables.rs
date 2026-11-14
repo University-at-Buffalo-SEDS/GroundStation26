@@ -405,6 +405,12 @@ pub(crate) fn set_takeover_outputs_writable(router: &Router, writable: bool) -> 
 /// discovery announcement.
 pub(crate) fn takeover_changed(router: &Router, takeover: bool) -> Result<()> {
     set_takeover_outputs_writable(router, takeover)?;
+    if !takeover {
+        // Handing back: leave as a station now (sent in the hand-back grace,
+        // rrls::HANDBACK_GRACE_MS), so the AV bay stops addressing a
+        // listening RRLS that no longer acknowledges anything.
+        router.announce_leave()?;
+    }
     if takeover {
         let retired = router.forget_peer(Board::GroundStation.sender_id())?;
         log::info!("RRLS takeover: the primary is no longer a destination ({retired} pending frame(s) released)");
