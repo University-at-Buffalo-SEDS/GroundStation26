@@ -2517,6 +2517,11 @@ async fn handle_packet_at_ingress(
     let automatic_origin = original_entry.filter(|_| {
         matches!(state.board_from_network_sender(pkt.sender()), Some(board) if board != Board::GroundStation)
     });
+    // RRLS: track the station clock as the AV bay holds it, from the primary's
+    // and the boards' frames (system_clock::control_packet_timestamp_ms).
+    if !primary_role && state.board_from_network_sender(pkt.sender()).is_some() {
+        crate::system_clock::observe_station_timestamp(pkt.timestamp());
+    }
     let source = i64::try_from(pkt.timestamp()).ok().and_then(|source| {
         crate::telemetry_provenance::canonical_source(source, procedure_clock::timestamp_ms())
     });
