@@ -453,6 +453,7 @@ fn radio_tx_budget(out: &mut Fixtures) {
     // exhaustions through the router worker's queue service; the fixture
     // shows a station that has seen none.
     diagnostics["ordered_exhausted_by_type"] = json!({});
+    diagnostics["unordered_exhausted_by_type"] = json!({});
     out.add("network-diagnostics/radio-tx-budget", diagnostics);
 }
 

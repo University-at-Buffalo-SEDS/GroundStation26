@@ -709,6 +709,7 @@ impl TxQueueBudget {
             "owed_settings_turns": self.owed_settings_turns.load(Ordering::Relaxed),
             "coalesced_receipts": self.coalesced_receipts.load(Ordering::Relaxed),
             "ordered_exhausted_by_type": ORDERED_EXHAUSTION.counts(),
+            "unordered_exhausted_by_type": unordered_exhausted_counts(),
             "coalesced_frames": self.coalesced_frames.load(Ordering::Relaxed),
             "control_limit_bytes": self.limit,
             "ordinary_limit_bytes": self.ordinary_limit,
@@ -5480,6 +5481,31 @@ impl OrderedExhaustion {
     }
 }
 
+/// Unordered reliable deliveries the SDK gave up after their last retry, by
+/// type. It drops such a delivery alone and returns no error, so without
+/// this nothing showed it (an Ordered one surfaces as the TX pass's error).
+static UNORDERED_EXHAUSTED: Mutex<std::collections::BTreeMap<String, u64>> =
+    Mutex::new(std::collections::BTreeMap::new());
+fn unordered_exhausted_counts() -> serde_json::Value {
+    serde_json::json!(*UNORDERED_EXHAUSTED.lock().unwrap())
+}
+/// Log and count the Unordered deliveries `router` gave up since the last
+/// call. Ordered ones are logged and counted by ORDERED_EXHAUSTION.
+pub(super) fn note_unordered_exhausted(router: &Router) {
+    for exhausted in router.take_exhausted_reliable() {
+        if exhausted.ordered {
+            continue;
+        }
+        let ty = exhausted.data_type.map_or_else(|| "unknown".to_owned(), |ty| format!("{ty:?}"));
+        log::warn!(
+            "unordered {} delivery exhausted: type={ty} packet={}",
+            if exhausted.end_to_end { "end-to-end" } else { "hop" },
+            exhausted.packet_id
+        );
+        *UNORDERED_EXHAUSTED.lock().unwrap().entry(ty).or_default() += 1;
+    }
+}
+
 /// The router worker's queue service: TX (unless the radio backoff holds
 /// it), then RX, which is never held back. A TX error (one frame's delivery
 /// expiring or exhausting its retries) ends only this TX pass; RX still
@@ -5500,6 +5526,7 @@ pub(super) fn process_router_queues_with_backoff(
                 }
                 log_telemetry_error("router tx queue processing failed", err);
             }
+            note_unordered_exhausted(router);
         });
     }
     if super::ROUTER_RX_BUDGET_MS > 0
@@ -7118,3 +7145,63 @@ mod abort_retirement_tests;
 #[cfg(test)]
 #[path = "radio_station_variable_tests.rs"]
 mod station_variable_tests;
+#[cfg(test)]
+mod unordered_exhaustion_tests {
+    use super::*;
+    use sedsnet::router::RouterConfig;
+
+    /// A board's Unordered status report whose receipts are all lost runs out
+    /// of retries: the SDK drops it alone, with no error. The queue service
+    /// logs it and counts it by type for the network diagnostics.
+    #[test]
+    fn an_unordered_delivery_that_runs_out_of_retries_is_counted_by_type() {
+        let _tuning = crate::network_delivery_tuning_for_test();
+        crate::telemetry_schema::initialize().unwrap();
+        let ty = crate::telemetry_schema::data_type("BOARD_STATE_STATUS");
+        let station = Router::new(RouterConfig::new([sedsnet::router::EndpointHandler::new_packet_handler(
+            crate::telemetry_schema::endpoint("GROUND_STATION"),
+            |_| Ok(()),
+        )]).with_sender("GS"));
+        let board = Router::new(RouterConfig::new([]).with_sender("PB"));
+        let down: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+        let up: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+        let (d, u) = (down.clone(), up.clone());
+        board.add_side_packed("radio", move |bytes: &[u8]| { d.lock().unwrap().push(bytes.to_vec()); Ok(()) });
+        station.add_side_packed("radio", move |bytes: &[u8]| { u.lock().unwrap().push(bytes.to_vec()); Ok(()) });
+        let mut service = RouterServiceForTest::default();
+        let lossy = std::sync::atomic::AtomicBool::new(false);
+        let mut pump = |service: &mut RouterServiceForTest| {
+            service.pump(&board);
+            let _ = station.process_all_queues_with_timeout(0);
+            for frame in std::mem::take(&mut *down.lock().unwrap()) { let _ = station.rx_packed_from_side(&frame, 0); }
+            for frame in std::mem::take(&mut *up.lock().unwrap()) {
+                if !lossy.load(Ordering::SeqCst) { let _ = board.rx_packed_from_side(&frame, 0); }
+            }
+        };
+        board.announce_discovery().unwrap();
+        station.announce_discovery().unwrap();
+        for _ in 0..50 { pump(&mut service); std::thread::sleep(Duration::from_millis(1)); }
+        let before = UNORDERED_EXHAUSTED.lock().unwrap().get("BOARD_STATE_STATUS").copied().unwrap_or(0);
+        lossy.store(true, Ordering::SeqCst);
+        let packet = sedsnet::packet::Packet::new(
+            ty,
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+            &board.sender(),
+            crate::get_current_timestamp_ms(),
+            Arc::from(vec![0u8; 40]),
+        ).unwrap();
+        board.tx_queue(packet).unwrap();
+        let tuning = sedsnet::config::runtime_tuning_config();
+        let span = Duration::from_millis(u64::from(tuning.reliable_retransmit_ms) * u64::from(tuning.reliable_max_retries + 3));
+        let start = std::time::Instant::now();
+        let mut counted = before;
+        while start.elapsed() < span && counted == before {
+            pump(&mut service);
+            counted = UNORDERED_EXHAUSTED.lock().unwrap().get("BOARD_STATE_STATUS").copied().unwrap_or(0);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        eprintln!("UNORDERED_EXHAUSTED counts={} after={:?}", unordered_exhausted_counts(), start.elapsed());
+        assert_eq!(counted, before + 1, "counted once by type");
+        assert_eq!(board.export_runtime_stats().reliable.exhausted.end_to_end_unordered, 1);
+    }
+}

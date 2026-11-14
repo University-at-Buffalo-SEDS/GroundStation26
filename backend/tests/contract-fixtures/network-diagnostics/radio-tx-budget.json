@@ -23,5 +23,6 @@
     "transport_busy": 0
   },
   "shed_frames": 0,
-  "station_answered_requests": 0
+  "station_answered_requests": 0,
+  "unordered_exhausted_by_type": {}
 }
