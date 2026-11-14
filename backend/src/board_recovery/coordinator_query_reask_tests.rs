@@ -127,3 +127,68 @@ fn a_query_is_dropped_only_after_it_leaves_the_sdk_and_its_reply_grace() {
     assert!(!query_dropped(&mut u, false, late));
     assert!(query_dropped(&mut u, false, late + network_wait(QUERY_REPLY_GRACE)));
 }
+
+/// A RECOVER poll queued behind a copy still pending in the one Ordered
+/// stream cannot overtake it, and every copy left in the SDK goes on air even
+/// after an Abort ends the exchange (the SDK cannot cancel one packet). The
+/// exchange polls only while none of its copies is pending: at most one.
+#[tokio::test]
+async fn an_exchange_keeps_at_most_one_recover_copy_in_the_sdk() {
+    use super::super::exchange::{ConfirmBoundary, Exchange};
+    use std::sync::atomic::AtomicUsize;
+    let _tuning = crate::network_delivery_tuning_for_test();
+    crate::telemetry_schema::initialize().unwrap();
+    let run = |gated: bool| -> (usize, usize) {
+        let host = Arc::new(Router::new(RouterConfig::new([]).with_sender("GS")));
+        host.try_set_local_network_time(sedsnet::timesync::PartialNetworkTime::from_unix_ms(1_793_000_000_000)).unwrap();
+        let got = Arc::new(AtomicUsize::new(0));
+        let vb = board_router(Board::ValveBoard, got.clone());
+        let out: Arc<std::sync::Mutex<Vec<Vec<u8>>>> = Arc::default();
+        let back: Arc<std::sync::Mutex<Vec<Vec<u8>>>> = Arc::default();
+        { let o = out.clone(); host.add_side_packed("umbilical", move |b: &[u8]| { o.lock().unwrap().push(b.to_vec()); Ok(()) }); }
+        { let k = back.clone(); vb.add_side_packed("umbilical", move |b: &[u8]| { k.lock().unwrap().push(b.to_vec()); Ok(()) }); }
+        let lossy = std::cell::Cell::new(false);
+        let pump = || {
+            let _ = host.process_all_queues_with_timeout(0);
+            for b in std::mem::take(&mut *out.lock().unwrap()) { let _ = vb.rx_packed_from_side(&b, 0); }
+            let _ = vb.process_all_queues_with_timeout(0);
+            for b in std::mem::take(&mut *back.lock().unwrap()) { if !lossy.get() { let _ = host.rx_packed_from_side(&b, 0); } }
+        };
+        vb.announce_discovery().unwrap();
+        host.announce_discovery().unwrap();
+        for _ in 0..50 { pump(); std::thread::sleep(Duration::from_millis(1)); }
+        lossy.set(true); // every receipt and reply from the board is lost
+        let boundary = ConfirmBoundary::capture(&host).unwrap();
+        let now = Stamp::now();
+        let query = Observation {
+            value: Readback { result: 0, state: Some(15), flags: 0x3f | RESYNC_IMPLEMENTATION, nonce: 1, boot: 42, epoch: 8, uptime: 10, outputs: 6, issuer: 99 },
+            received: now,
+            observed_after: now,
+        };
+        let mut exchange = Exchange::prepare_operation_at(Board::ValveBoard, &query, 2, OP_RESYNC, 2, now, host.clone(), boundary).unwrap();
+        host.tx_queue(exchange.packet(now).unwrap().clone()).unwrap();
+        let (mut most, mut polls) = (0usize, 0usize);
+        let start = WallInstant::now();
+        let mut next_poll = start + Duration::from_millis(500);
+        while start.elapsed() < Duration::from_secs(6) {
+            pump();
+            let held = host.export_reliable_pending_stats().iter().filter(|row| exchange.owns(row.packet_id)).count();
+            most = most.max(held);
+            if WallInstant::now() >= next_poll {
+                if !gated || !recover_copy_pending(&host, &exchange) {
+                    host.tx_queue(exchange.poll_packet(Stamp::now()).unwrap()).unwrap();
+                    polls += 1;
+                }
+                next_poll = WallInstant::now() + Duration::from_millis(500);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        (most, polls)
+    };
+    let (piled, _) = run(false);
+    let (most, polls) = run(true);
+    eprintln!("RECOVER_COPIES ungated_most={piled} gated_most={most} gated_polls={polls}");
+    assert!(piled > 1, "without the check, polls pile up behind the pending copy ({piled})");
+    assert_eq!(most, 1, "at most one RECOVER copy is ever held in the SDK");
+    assert!(polls >= 1, "a poll still goes out once the earlier copy left the SDK");
+}

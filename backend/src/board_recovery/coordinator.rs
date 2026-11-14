@@ -2084,13 +2084,24 @@ async fn exchange(
         }
         exchange.packet(Stamp::now())?;
         if WallInstant::now() >= next_poll {
-            authorize(state, headers, ticket).await?;
-            let packet=exchange.poll_packet(Stamp::now())?;
-            send(state,headers,ticket,&router,token,packet,||exchange.packet(Stamp::now()).map(|_|())).await?;
+            // One RECOVER copy in the SDK at a time: a poll queued behind a
+            // copy still pending in the one Ordered stream cannot overtake it,
+            // and every copy left there keeps going on air after an Abort ends
+            // this loop (the SDK cannot cancel one packet).
+            if !recover_copy_pending(&router, &exchange) {
+                authorize(state, headers, ticket).await?;
+                let packet=exchange.poll_packet(Stamp::now())?;
+                send(state,headers,ticket,&router,token,packet,||exchange.packet(Stamp::now()).map(|_|())).await?;
+            }
             next_poll = WallInstant::now() + network_wait(POLL);
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+/// True while the SDK still holds one of this exchange's RECOVER copies (the
+/// original or a poll) awaiting its receipt.
+fn recover_copy_pending(router: &sedsnet::router::Router, exchange: &super::exchange::Exchange) -> bool {
+    router.export_reliable_pending_stats().iter().any(|row| exchange.owns(row.packet_id))
 }
 /// "Reset RF, FC; refused by VB (reason)" when some boards were reset and
 /// others were not, from the operation's `board_results`.

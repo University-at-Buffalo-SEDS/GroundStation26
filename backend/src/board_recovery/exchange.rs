@@ -244,6 +244,12 @@ impl Exchange {
         Ok(&self.packet)
     }
 
+    /// True for this exchange's own SDK packets: the original request or one
+    /// of its polls.
+    pub(super) fn owns(&self, packet_id: u64) -> bool {
+        packet_id == self.packet.packet_id() || self.poll_ids.contains(&packet_id)
+    }
+
     /// A bounded application poll has a new SDK envelope, the original
     /// application nonce/body and the ORIGINAL canonical command timestamp.
     /// No new authorization or freshness is created by polling. Admission and
