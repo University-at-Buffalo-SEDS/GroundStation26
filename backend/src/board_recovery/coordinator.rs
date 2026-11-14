@@ -13,6 +13,9 @@ use tokio::task::JoinHandle;
 const CONFIRM_TTL: Duration = Duration::from_secs(30);
 const QUIESCE_TTL: Duration = Duration::from_secs(12);
 const POLL: Duration = Duration::from_millis(500);
+/// A prepare's fresh queries, first asks and re-asks of readbacks past half
+/// their freshness together, end within this (wall-scaled in simulation).
+const PREPARE_QUERY_BUDGET: Duration = Duration::from_secs(30);
 const _: () = assert!(POLL.as_millis() * super::exchange::POLL_BUDGET as u128 > QUERY_TTL.as_millis());
 /// Wall-clock waits on a board's network reply (fresh query, SDK delivery
 /// drain, poll cadence). A firmware_sim bay runs many times slower than real
@@ -934,13 +937,16 @@ async fn refresh_prepare_queries(
             log::info!("Recovery PREPARE waited {} ms for an Abort to be delivered before its fresh queries", start.elapsed().as_millis());
         }
     }
-    // BOARD_RECOVERY_REQUEST is one ordered SDK stream: one query in flight at
-    // a time, whatever the board. Ask the umbilical boards first, all at once
-    // (their round trips are short), so none waits behind a radio query; then
-    // the AV-bay boards one at a time, each with the full freshness wait. Sent
-    // together, the three radio queries ran back to back in the one stream
-    // and the last missed the window (deploy-hitl: Reset all failed 3 of 3).
-    let query_one = |board: Board| async move {
+    // BOARD_RECOVERY_REQUEST is Unordered: every board's query goes at once,
+    // the AV-bay boards' included, none waiting behind another. Asked one
+    // after another (when it was one Ordered stream), two AV-bay re-asks at
+    // 50% radio loss outlasted the readback freshness (pair-reset2 cycles 1
+    // and 3: "Explicit fresh dedicated QUERY is required").
+    let deadline = WallInstant::now() + network_wait(PREPARE_QUERY_BUDGET);
+    // `recheck`: a re-ask of a readback past half its freshness. At the
+    // budget it stops waiting and prepare_inner decides on what is fresh;
+    // a first ask that gets no reply refuses.
+    let query_one = |board: Board, recheck: bool| async move {
         // Background status collection may already own this read-only slot.
         // Replace it at once with a DISTINCT nonce instead of waiting for it:
         // on a slow link that wait alone could use most of the window. The
@@ -988,16 +994,18 @@ async fn refresh_prepare_queries(
             if fresh {
                 break;
             }
-            if start.elapsed() > network_wait(QUERY_TTL) {
+            if recheck && WallInstant::now() >= deadline {
+                break;
+            }
+            if start.elapsed() > network_wait(QUERY_TTL) || WallInstant::now() >= deadline {
                 return Err(if AV_BAY_MASK & index(board).map_or(0, |i| 1 << i) != 0 {
                     "An AV-bay board's fresh query got no reply within 15 s over the radio (the radio round trip is the limit); run Reset all again"
                 } else {
                     "Fresh query timed out before challenge"
                 });
             }
-            // Dropped by the SDK without a reply (cancelled behind an exhausted
-            // query in the one Ordered stream, or every copy lost): ask again
-            // within the same window. A query is read-only.
+            // Dropped without a reply (every copy, or the reply, lost): ask
+            // again within the same window. A query is read-only.
             if asks < QUERY_ASKS && watch.dropped(state, board, nonce) {
                 log::warn!("Recovery PREPARE: {} query dropped without a reply; asking again ({} of {QUERY_ASKS})", board.sender_id(), asks + 1);
                 admit().await?;
@@ -1009,39 +1017,28 @@ async fn refresh_prepare_queries(
         }
         Ok::<(), &'static str>(())
     };
-    let is_av_bay = |board: &Board| index(*board).is_some_and(|i| AV_BAY_MASK & (1 << i) != 0);
-    let (av_bay, umbilical): (Vec<Board>, Vec<Board>) = boards.into_iter().partition(is_av_bay);
-    futures::future::join_all(umbilical.iter().copied().map(query_one))
+    futures::future::join_all(boards.iter().map(|board| query_one(*board, false)))
         .await
         .into_iter()
         .collect::<Result<Vec<()>, _>>()?;
-    for board in &av_bay {
-        query_one(*board).await?;
-    }
-    // The radio queries ran one after another: re-ask, once, any whose
-    // readback is past half its freshness by now, so none expires before
-    // prepare_inner reads it ("Explicit fresh dedicated QUERY is required",
-    // pair-reset cycle 3: re-asks made the radio queries longer).
-    for board in &av_bay {
-        let aging = state.board_recovery.inner.lock().unwrap().values[index(*board).unwrap()]
-            .as_ref()
-            .is_none_or(|row| row.age(Stamp::now()) > readback_ttl() / 2);
-        if aging {
-            query_one(*board).await?;
+    // Re-ask, all at once, every readback past half its freshness, until none
+    // is or the budget is spent: one answered early (or a re-ask that took a
+    // while) would otherwise expire before prepare_inner reads it, or before
+    // CONFIRM reaches it ("Original preparation query expired").
+    loop {
+        let aging: Vec<Board> = boards.iter().copied().filter(|board| {
+            state.board_recovery.inner.lock().unwrap().values[index(*board).unwrap()]
+                .as_ref()
+                .is_none_or(|row| row.age(Stamp::now()) > readback_ttl() / 2)
+        }).collect();
+        if aging.is_empty() || WallInstant::now() >= deadline {
+            break;
         }
+        futures::future::join_all(aging.into_iter().map(|board| query_one(board, true)))
+            .await
+            .into_iter()
+            .collect::<Result<Vec<()>, _>>()?;
     }
-    // The umbilical boards were asked first: one whose readback is past half
-    // its freshness by now would expire before CONFIRM reaches it ("Original
-    // preparation query expired"). Their round trip is short; ask again.
-    let aging: Vec<Board> = umbilical.iter().copied().filter(|board| {
-        state.board_recovery.inner.lock().unwrap().values[index(*board).unwrap()]
-            .as_ref()
-            .is_none_or(|row| row.age(Stamp::now()) > readback_ttl() / 2)
-    }).collect();
-    futures::future::join_all(aging.into_iter().map(query_one))
-        .await
-        .into_iter()
-        .collect::<Result<Vec<()>, _>>()?;
     Ok(())
 }
 // Retry only a rejected, never-owned read-only offer, before Confirm seals UTC.
@@ -3110,6 +3107,11 @@ mod tests {
         lose_proof_replies: usize,
         /// Every QUERY reply is lost (a board that never answers).
         silent_queries: bool,
+        /// Link latency for QUERY replies (a radio round trip).
+        query_delay: Duration,
+        /// Every other QUERY reply is lost, the first included (50% loss).
+        lose_alternate_queries: bool,
+        queries_seen: usize,
         /// FC firmware RESET_STARTUP_ANY: advertised as bit 7 on the FC and
         /// applied like RECOVER, refused (UNSAFE) while a pulse runs.
         reset_any: bool,
@@ -3496,6 +3498,9 @@ mod tests {
                             first_receipt: HashMap::new(),
                             lose_proof_replies: 0,
                             silent_queries: false,
+                            query_delay: Duration::ZERO,
+                            lose_alternate_queries: false,
+                            queries_seen: 0,
                             reset_any: false,
                             pulse_active: false,
                         }))
@@ -3648,7 +3653,7 @@ mod tests {
                             let due = (wire[1] != 0 && !m.recover_delay.is_zero()).then(|| {
                                 let delay = m.recover_delay;
                                 *m.first_receipt.entry(nonce).or_insert_with(WallInstant::now) + delay
-                            });
+                            }).or_else(|| (wire[1] == 0 && !m.query_delay.is_zero()).then(|| WallInstant::now() + m.query_delay));
                             if !m.seen.contains_key(&nonce) || wire[1] == 0 {
                                 response[1] = result;
                                 response[2] = m.state;
@@ -3681,6 +3686,12 @@ mod tests {
                             }
                             if wire[1] == 0 && m.silent_queries {
                                 continue;
+                            }
+                            if wire[1] == 0 && m.lose_alternate_queries {
+                                m.queries_seen += 1;
+                                if m.queries_seen % 2 == 1 {
+                                    continue;
+                                }
                             }
                             if wire[1] == 0 && m.applied > 0 && m.lose_proof_replies > 0 {
                                 m.lose_proof_replies -= 1;
@@ -6628,6 +6639,85 @@ mod tests {
         assert!(released < Duration::from_millis(250), "released {released:?} after the Abort");
         let response = prepare.await.unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+    async fn prepare_reset_all_timed(fixture: &Fixture) -> (StatusCode, Value, Duration) {
+        let state = fixture.state();
+        let start = std::time::Instant::now();
+        let response = super::super::tests::http(state.clone(), "POST", "/api/board-recovery/prepare", Some("operator"),
+            json!({"action":"reset_startup","boards":BOARDS.iter().map(|b|b.sender_id()).collect::<Vec<_>>(),"board":null,"mode":null,
+                   "backend_instance":hex(&state.board_recovery.identity.unwrap()),"reset_epoch":format!("{:016x}",crate::gse::automatic_generation(&state))})).await;
+        let status = response.status();
+        (status, body(response).await, start.elapsed())
+    }
+    fn model_of(fixture: &Fixture, board: Board) -> Arc<Mutex<Model>> {
+        fixture.models.iter().find(|(b, _)| *b == board).unwrap().1.clone()
+    }
+    /// pair-reset2 cycles 1 and 3: at 50% radio loss two of the three AV-bay
+    /// queries each needed a re-ask. Asked one after another, the pass took
+    /// longer than the readbacks stay fresh, so RF (refreshed first) had
+    /// expired by the time prepare read it ("Explicit fresh dedicated QUERY
+    /// is required"). Asked together, and re-asked until none is past half
+    /// its freshness, prepare succeeds well within its budget.
+    #[tokio::test]
+    async fn prepare_succeeds_when_half_the_av_bay_query_replies_are_lost() {
+        if isolated("prepare_succeeds_when_half_the_av_bay_query_replies_are_lost") { return; }
+        let fixture = Fixture::new().await;
+        *fixture.http.state.state.lock().unwrap() = crate::types::FlightState::Aborted;
+        for board in BOARDS {
+            fixture.query(board).await;
+        }
+        // A lost reply costs the 1.5 s reply grace and a re-ask; readbacks
+        // stay fresh for 2 s (half: 1 s); the radio round trip is 300 ms.
+        super::super::READBACK_TTL_MS.store(2_000, Ordering::Relaxed);
+        for board in [Board::RFBoard, Board::FlightComputer, Board::PowerBoard] {
+            let model = model_of(&fixture, board);
+            let mut model = model.lock().unwrap();
+            model.query_delay = Duration::from_millis(300);
+            model.lose_alternate_queries = board != Board::FlightComputer;
+        }
+        let (status, value, elapsed) = prepare_reset_all_timed(&fixture).await;
+        eprintln!("AV_BAY_HALF_LOSS status={status} elapsed={elapsed:?} value={value}");
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert!(elapsed < network_wait(PREPARE_QUERY_BUDGET), "prepare took {elapsed:?}");
+        assert!(model_of(&fixture, Board::RFBoard).lock().unwrap().queries_seen >= 2, "RF's first reply was lost and it was asked again");
+        assert!(model_of(&fixture, Board::PowerBoard).lock().unwrap().queries_seen >= 2, "PB's first reply was lost and it was asked again");
+    }
+    /// The three AV-bay queries go out together: with a 1 s radio round trip
+    /// each, prepare takes about one round trip, not three.
+    #[tokio::test]
+    async fn prepare_asks_the_av_bay_boards_together() {
+        if isolated("prepare_asks_the_av_bay_boards_together") { return; }
+        let fixture = Fixture::new().await;
+        *fixture.http.state.state.lock().unwrap() = crate::types::FlightState::Aborted;
+        for board in BOARDS {
+            fixture.query(board).await;
+        }
+        for board in [Board::RFBoard, Board::FlightComputer, Board::PowerBoard] {
+            model_of(&fixture, board).lock().unwrap().query_delay = Duration::from_millis(1_000);
+        }
+        let (status, value, elapsed) = prepare_reset_all_timed(&fixture).await;
+        eprintln!("AV_BAY_TOGETHER status={status} elapsed={elapsed:?}");
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert!(elapsed < Duration::from_millis(2_500), "prepare took {elapsed:?}: the AV-bay queries went one after another");
+    }
+    /// A board that never answers still ends prepare with the radio timeout
+    /// refusal, within the prepare budget.
+    #[tokio::test]
+    async fn a_silent_av_bay_board_still_refuses_prepare_within_its_budget() {
+        if isolated("a_silent_av_bay_board_still_refuses_prepare_within_its_budget") { return; }
+        let fixture = Fixture::new().await;
+        *fixture.http.state.state.lock().unwrap() = crate::types::FlightState::Aborted;
+        for board in BOARDS {
+            fixture.query(board).await;
+        }
+        model_of(&fixture, Board::PowerBoard).lock().unwrap().silent_queries = true;
+        let (status, value, elapsed) = prepare_reset_all_timed(&fixture).await;
+        eprintln!("AV_BAY_SILENT status={status} elapsed={elapsed:?} value={value}");
+        assert_eq!(status, StatusCode::CONFLICT, "{value}");
+        assert_eq!(value["error"], "fresh_query_required", "{value}");
+        assert!(value["message"].as_str().unwrap().starts_with("An AV-bay board's fresh query got no reply within 15 s"), "{value}");
+        assert!(elapsed <= network_wait(PREPARE_QUERY_BUDGET) + Duration::from_secs(2), "refused after {elapsed:?}");
+        assert!(fixture.models.iter().all(|(_, m)| m.lock().unwrap().applied == 0));
     }
     async fn changed_review_identity_is_rejected_without_adopting_fresh_query(change_boot: bool) {
         let fixture = Fixture::new().await;
