@@ -1870,8 +1870,11 @@ impl AppState {
         // Aborted FLIGHT_STATE like the primary's (only RF and PB's way to take
         // it). Its projections of the primary's state still never publish.
         if crate::rrls::is_rrls() {
-            if crate::rrls::takeover_active() {
-                self.publish_router_flight_state(actual);
+            if crate::rrls::takeover_active()
+                && let Some(router) = self.topology_router.get()
+                && let Err(err) = crate::network_variables::set_takeover_flight_state(router, actual as u8)
+            {
+                log::warn!("RRLS takeover: failed to publish the Aborted flight state: {err}");
             }
         } else {
             self.queue_router_flight_state_update(actual);

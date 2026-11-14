@@ -181,7 +181,10 @@ async fn bay_with(takeover: bool, primary: bool) -> Bay {
     crate::rrls::set_takeover_for_test(takeover);
     // main.rs applies this on every takeover change.
     crate::network_variables::set_takeover_outputs_writable(&bay.rrls, takeover).unwrap();
-    crate::telemetry_task::refresh_host_network_time(&bay.rrls, crate::telemetry_task::get_current_timestamp_ms());
+    // An RRLS runs no time sync (telemetry_task::timesync_enabled), so its router
+    // has no network UTC: fullnet C-fix2 failed the takeover FLIGHT_STATE write
+    // on exactly that ("network UTC is not available").
+    assert!(bay.rrls.network_time_ms().is_none());
     bay.state.set_preexisting_flight_state_for_test(FlightState::Idle);
     bay
 }

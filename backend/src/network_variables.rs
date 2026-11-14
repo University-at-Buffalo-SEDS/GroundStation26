@@ -950,8 +950,21 @@ pub fn set_flight_buzzer(router: &Router, enabled: bool) -> Result<()> {
 }
 
 pub fn set_flight_state(router: &Router, state: u8) -> Result<()> {
-    let request = crate::qualification_requests::Request::begin("set_flight_state");
     let timestamp = crate::system_clock::required_control_network_utc_ms(router)?;
+    set_flight_state_at(router, state, timestamp)
+}
+
+/// An RRLS in takeover writing its operator's Abort. An RRLS runs no time sync
+/// (telemetry_task::timesync_enabled), so its router has no network UTC and
+/// set_flight_state refused the write (fullnet C-fix2): it is stamped like
+/// every other control (system_clock::control_packet_timestamp_ms), network UTC
+/// when present and the station's wall clock otherwise, never the primary's.
+pub(crate) fn set_takeover_flight_state(router: &Router, state: u8) -> Result<()> {
+    set_flight_state_at(router, state, crate::system_clock::control_packet_timestamp_ms(router))
+}
+
+fn set_flight_state_at(router: &Router, state: u8, timestamp: u64) -> Result<()> {
+    let request = crate::qualification_requests::Request::begin("set_flight_state");
     let packet = flight_state_wire_packet(network_phase(state)?, timestamp)?;
     {
         let mut guard = store()
