@@ -66,7 +66,7 @@ fn abort_across_rf(resend: bool, deaf_ms: u64, run_ms: u64, readback_never: bool
     deaf_until.store(abort_at + deaf_ms, Ordering::Relaxed);
     let resender = AbortResend::default();
     crate::telemetry_task::queue_manual_abort_wire_receipted(&gs, WirePolicy::Untimed).unwrap();
-    resender.arm(1, WirePolicy::Untimed, None, SendMark { av_bay_routed: av_bay_abort_route(&gs), ..SendMark::default() });
+    resender.arm(1, WirePolicy::Untimed, None, SendMark { av_bay_routed: av_bay_abort_route(&gs), routed_boards: routed_av_bay_boards(&gs), ..SendMark::default() });
     let mut sent = 0u64;
     while now.load(Ordering::Relaxed) < abort_at + run_ms {
         pump(5);
@@ -278,7 +278,7 @@ fn arm_now(resender: &AbortResend, mark: SendMark) {
     resender.arm(1, WirePolicy::Untimed, None, mark);
 }
 fn routed_mark() -> SendMark {
-    SendMark { av_bay_routed: true, ..SendMark::default() }
+    SendMark { av_bay_routed: true, routed_boards: AV_BAY_MASK, ..SendMark::default() }
 }
 fn observation(now_ms: u64, owed: u8, unheard: u8) -> Observation {
     Observation { now_ms, epoch: 1, station_aborted: true, recovery: None, owed, unheard }
