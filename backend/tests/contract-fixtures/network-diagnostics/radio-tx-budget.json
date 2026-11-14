@@ -23,6 +23,12 @@
     "transport_busy": 0
   },
   "shed_frames": 0,
+  "silent_owners_retired": {
+    "completed_ordered": 0,
+    "completed_unordered": 0,
+    "retired_ordered": 0,
+    "retired_unordered": 0
+  },
   "station_answered_requests": 0,
   "unordered_exhausted_by_type": {}
 }

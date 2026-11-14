@@ -710,6 +710,7 @@ impl TxQueueBudget {
             "coalesced_receipts": self.coalesced_receipts.load(Ordering::Relaxed),
             "ordered_exhausted_by_type": ORDERED_EXHAUSTION.counts(),
             "unordered_exhausted_by_type": unordered_exhausted_counts(),
+            "silent_owners_retired": silent_owner_counts(),
             "coalesced_frames": self.coalesced_frames.load(Ordering::Relaxed),
             "control_limit_bytes": self.limit,
             "ordinary_limit_bytes": self.ordinary_limit,
@@ -5503,6 +5504,42 @@ pub(super) fn note_unordered_exhausted(router: &Router) {
             exhausted.packet_id
         );
         *UNORDERED_EXHAUSTED.lock().unwrap().entry(ty).or_default() += 1;
+    }
+    note_silent_owner_retirements(router);
+}
+
+/// The SDK's silent-owner counts as last logged: owners retired after
+/// missing every retry of a frame (Ordered, Unordered) and frames completed
+/// only after such a retirement (Ordered, Unordered).
+static SILENT_OWNERS: Mutex<(Option<std::time::Instant>, [u64; 4])> = Mutex::new((None, [0; 4]));
+fn silent_owner_counts() -> serde_json::Value {
+    let counts = SILENT_OWNERS.lock().unwrap().1;
+    serde_json::json!({
+        "retired_ordered": counts[0], "retired_unordered": counts[1],
+        "completed_ordered": counts[2], "completed_unordered": counts[3],
+    })
+}
+/// Logs, next to the exhaustion lines, when the SDK retired a silent owner (a
+/// station that stopped answering): at most one stats read per second.
+fn note_silent_owner_retirements(router: &Router) {
+    let mut last = SILENT_OWNERS.lock().unwrap();
+    if last.0.is_some_and(|at| at.elapsed() < Duration::from_secs(1)) {
+        return;
+    }
+    last.0 = Some(std::time::Instant::now());
+    let e = router.export_runtime_stats().reliable.exhausted;
+    let now = [
+        e.silent_owner_retired_ordered,
+        e.silent_owner_retired_unordered,
+        e.silent_owner_completed_ordered,
+        e.silent_owner_completed_unordered,
+    ];
+    if now != last.1 {
+        log::warn!(
+            "silent end-to-end owner retired: owners retired ordered={} unordered={}; frames completed after retirement ordered={} unordered={}",
+            now[0], now[1], now[2], now[3]
+        );
+        last.1 = now;
     }
 }
 

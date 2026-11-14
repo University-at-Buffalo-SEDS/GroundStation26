@@ -454,6 +454,10 @@ fn radio_tx_budget(out: &mut Fixtures) {
     // shows a station that has seen none.
     diagnostics["ordered_exhausted_by_type"] = json!({});
     diagnostics["unordered_exhausted_by_type"] = json!({});
+    diagnostics["silent_owners_retired"] = json!({
+        "retired_ordered": 0, "retired_unordered": 0,
+        "completed_ordered": 0, "completed_unordered": 0,
+    });
     out.add("network-diagnostics/radio-tx-budget", diagnostics);
 }
 
