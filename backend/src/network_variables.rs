@@ -292,6 +292,18 @@ fn packet_bytes(data_type: &str, endpoint: &str, payload: Arc<[u8]>) -> Result<P
     packet_bytes_at(data_type, endpoint, payload, get_current_timestamp_ms())
 }
 
+/// A cosmetic output's write, stamped like a control: a board takes a
+/// station's timestamp as station time, and an RRLS host clock can be hours
+/// off (fullnet C-fix3, +1 h).
+pub(crate) fn network_output_packet(router: &Router, output: NetworkOutput, value: bool) -> Result<Packet> {
+    packet_bytes_at(
+        output.data_type(),
+        output.endpoint(),
+        Arc::from([u8::from(value)]),
+        crate::system_clock::control_packet_timestamp_ms(router),
+    )
+}
+
 /// The single FLIGHT_STATE wire funnel. Only set (a) is ever built here; the
 /// store keeps the GS-internal phase, and fill sub-phases leave as Fill.
 fn flight_state_wire_packet(state: NetworkFlightState, timestamp: u64) -> Result<Packet> {
@@ -742,7 +754,7 @@ fn publish_network_output(
         REPUBLISH_BACKOFF.lock().unwrap()[output.index()].reset();
     }
     let value = output.requested();
-    let packet = packet(output.data_type(), output.endpoint(), u8::from(value))?;
+    let packet = network_output_packet(router, output, value)?;
     let id = packet.packet_id();
     let result = request.submit(router, packet);
     let now = network_now();

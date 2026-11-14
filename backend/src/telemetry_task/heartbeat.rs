@@ -22,11 +22,16 @@ fn station_heartbeat_packet(
     Packet::new(ty, &endpoints, &sender, timestamp_ms, Arc::from([]))
 }
 
+/// Stamped like a control (system_clock::control_packet_timestamp_ms): the
+/// boards advance their station clock from a station's heartbeat, and an
+/// RRLS's own host clock (no time sync, maybe hours off) stamped there made
+/// the FC refuse every later station command as stale (fullnet C-fix3, +1 h).
 pub(super) fn queue_station_heartbeat(router: &Router) -> sedsnet::TelemetryResult<()> {
-    let timestamp_ms = router
-        .network_time_ms()
-        .unwrap_or_else(super::get_current_timestamp_ms);
-    router.tx_queue(station_heartbeat_packet(router, timestamp_ms)?)
+    router.tx_queue(station_heartbeat(router)?)
+}
+
+pub(crate) fn station_heartbeat(router: &Router) -> sedsnet::TelemetryResult<Packet> {
+    station_heartbeat_packet(router, crate::system_clock::control_packet_timestamp_ms(router))
 }
 
 #[cfg(test)]

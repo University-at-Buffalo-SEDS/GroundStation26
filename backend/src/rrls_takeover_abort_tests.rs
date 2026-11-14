@@ -682,3 +682,26 @@ async fn a_takeover_rrls_never_sends_a_non_aborted_flight_state() {
     assert_eq!(bay.rrls.own_network_variable(crate::telemetry_schema::data_type("FLIGHT_STATE")).map(|p| p.payload()[0]),
         Some(crate::types::NetworkFlightState::Aborted as u8), "its own latest stays Aborted");
 }
+
+/// fullnet C-fix3 (+1 h RRLS clock): the RRLS stamped its HEARTBEAT and the
+/// cosmetic outputs with its own host clock. The FC advances its station
+/// clock from a station's heartbeat, so it then took station time as an hour
+/// ahead and refused the RRLS's correctly stamped Deploy as stale. Every
+/// station frame an RRLS originates is stamped like a control: the station
+/// time it heard, never its host clock.
+#[tokio::test]
+async fn a_takeover_rrls_stamps_its_heartbeat_and_outputs_with_the_heard_station_clock() {
+    if rrls_child("a_takeover_rrls_stamps_its_heartbeat_and_outputs_with_the_heard_station_clock") {
+        return;
+    }
+    let bay = bay(true).await;
+    // The station time it heard from the AV bay: an hour behind its host clock.
+    let heard = crate::telemetry_task::get_current_timestamp_ms() - 3_600_000;
+    crate::system_clock::observe_station_timestamp(heard);
+    let stamps: Vec<(String, u64)> = vec![
+        ("HEARTBEAT".into(), crate::telemetry_task::station_heartbeat(&bay.rrls).unwrap().timestamp()),
+        ("FLIGHT_BUZZER".into(), crate::network_variables::network_output_packet(&bay.rrls, crate::network_variables::NetworkOutput::FlightBuzzer, true).unwrap().timestamp()),
+    ];
+    assert!(stamps.len() >= 2, "both sent: {stamps:?}");
+    assert!(stamps.iter().all(|(_, t)| t.abs_diff(heard) < 60_000), "stamped with the heard station clock {heard}: {stamps:?}");
+}

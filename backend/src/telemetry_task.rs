@@ -27,6 +27,8 @@ pub(crate) use commands::queue_controller_command;
 #[cfg(test)]
 pub(crate) use commands::{queue_priority_manual_abort_packet, queue_manual_abort_wire};
 mod heartbeat;
+#[cfg(test)]
+pub(crate) use heartbeat::station_heartbeat;
 mod periodic;
 pub(crate) mod procedure_clock;
 mod radio_io;
