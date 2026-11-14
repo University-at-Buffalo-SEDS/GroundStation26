@@ -676,7 +676,11 @@ async fn no_aborted_flight_state_resend_once_pb_reads_aborted() {
     }
     let bay = bay(false).await;
     let mut worker = aborted_flight_state_exhausts_on_pb(&bay);
-    bay.state.board_abort.observe_abort(Board::PowerBoard, std::time::Instant::now(), bay.now.load(Ordering::Relaxed));
+    // Every AV-bay board reads Aborted (PB too): nobody is owed it again. A
+    // re-send for a board still not reading Aborted goes to every owner.
+    for board in [Board::RFBoard, Board::FlightComputer, Board::PowerBoard] {
+        bay.state.board_abort.observe_abort(board, std::time::Instant::now(), bay.now.load(Ordering::Relaxed));
+    }
     pb_comes_back(&bay);
     run_services(&bay, &mut worker, 15_000, |_| false);
     assert_eq!(pb_flight_state(&bay), None, "PB reads Aborted: not owed it again");
