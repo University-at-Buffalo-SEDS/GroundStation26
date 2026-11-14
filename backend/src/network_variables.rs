@@ -1047,13 +1047,14 @@ fn resend_latest_flight_state(
     wanted: impl Fn(NetworkFlightState) -> bool,
 ) -> Result<bool> {
     let ty = crate::telemetry_schema::data_type(FLIGHT_STATE_TYPE);
-    let Some(latest) = router.get_cached_network_variable(ty)? else {
+    // This station's own last write, not the newest cached FLIGHT_STATE: the
+    // flight computer re-publishes its state report through the flight, and
+    // a report cached after the Aborted write made this skip every re-send
+    // (PB, which takes an Abort only from FLIGHT_STATE, never got it again).
+    let Some(latest) = router.own_network_variable(ty) else {
         return Ok(false);
     };
-    let ours = crate::types::canonical_sender_id(latest.sender())
-        == crate::types::canonical_sender_id(router.sender().as_ref());
-    if !ours
-        || latest.payload() == [7]
+    if latest.payload() == [7]
         || exhausted_heads.contains(&latest.packet_id())
         || router.export_reliable_pending_stats().iter().any(|row| row.data_type == ty)
     {
@@ -3101,14 +3102,14 @@ mod persistence_callback_tests {
             peer.process_all_queues_with_timeout(0).unwrap();
             source.process_all_queues_with_timeout(0).unwrap();
         }
-        let refreshed = peer
-            .get_cached_network_variable(ty)
-            .unwrap()
-            .expect("actual managed request/reply must return the retained source packet");
-        assert_eq!(refreshed.sender(), "AB");
-        assert_eq!(refreshed.timestamp(), 9000);
-        assert_eq!(refreshed.packet_id(), original_id);
-        assert_eq!(refreshed.payload(), &[15]);
+        // The station answers FLIGHT_STATE requests only with its own write,
+        // never with a board's report it cached (it has written none here).
+        let refreshed = peer.get_cached_network_variable(ty).unwrap();
+        assert!(
+            refreshed.as_ref().is_none_or(|p| p.packet_id() != original_id && p.sender() == "GS"),
+            "the board's retained report is never served back: {refreshed:?}"
+        );
+        assert!(received.lock().unwrap().iter().all(|p| p.packet_id() != original_id));
         assert_eq!(flight_state(), desired);
         let own = flight_state_packet(store().lock().unwrap().values).unwrap();
         assert_eq!(own.sender(), "GS");

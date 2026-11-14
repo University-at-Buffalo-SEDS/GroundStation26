@@ -13,17 +13,31 @@ const AV_BAY: [&str; 3] = ["RF", "FC", "PB"];
 
 /// Runs `name` in a child process as an RRLS with a private variable cache.
 fn rrls_child(name: &str) -> bool {
+    station_child(name, true)
+}
+
+/// Runs `name` in a child process as the primary with a private variable cache.
+fn primary_child(name: &str) -> bool {
+    station_child(name, false)
+}
+
+fn station_child(name: &str, rrls: bool) -> bool {
     if std::env::var_os(CHILD).is_some() {
-        assert!(crate::rrls::is_rrls());
+        assert_eq!(crate::rrls::is_rrls(), rrls);
         return false;
     }
     let root = std::env::temp_dir().join(format!("gs-rrls-takeover-abort-{}", rand::random::<u128>()));
     std::fs::create_dir_all(&root).unwrap();
     let case = format!("manual_abort_utc::rrls_takeover_abort_tests::{name}");
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    if rrls {
+        command.env("GS_RRLS_ROLE", "rrls");
+    } else {
+        command.env_remove("GS_RRLS_ROLE");
+    }
+    let output = command
         .args(["--exact", &case, "--nocapture", "--test-threads=1"])
         .env(CHILD, "1")
-        .env("GS_RRLS_ROLE", "rrls")
         .env("GS_SIM_MODE", "0")
         .env_remove("GS_SIM_CLOCK_FILE")
         .env("GS_NETWORK_VARIABLE_CACHE", root.join("variables.json"))
@@ -40,6 +54,8 @@ fn rrls_child(name: &str) -> bool {
 }
 
 struct Bay {
+    /// Every router's clock (ms).
+    now: Arc<AtomicU64>,
     state: Arc<AppState>,
     rrls: Arc<Router>,
     /// 0 deliver to the AV bay, 1 hold (no frame and so no ACK gets through).
@@ -107,8 +123,10 @@ async fn bay_with(takeover: bool, primary: bool) -> Bay {
     let now = Arc::new(AtomicU64::new(1_000));
     let state = crate::state::tests::test_app_state().await;
     let clock = now.clone();
+    // The station under test: the RRLS, or the primary in a primary child.
+    let station = if crate::rrls::is_rrls() { "RRLS" } else { "GS" };
     let rrls = Arc::new(Router::new_with_clock(
-        RouterConfig::new([]).with_sender("RRLS"),
+        RouterConfig::new([]).with_sender(station),
         Box::new(move || clock.load(Ordering::Relaxed)),
     ));
     state.topology_router.set(rrls.clone()).unwrap();
@@ -170,7 +188,7 @@ async fn bay_with(takeover: bool, primary: bool) -> Bay {
         }
         std::mem::forget(gs);
     }
-    let bay = Bay { state, rrls, hold, held, peers, names: AV_BAY.to_vec(), open };
+    let bay = Bay { now, state, rrls, hold, held, peers, names: AV_BAY.to_vec(), open };
     for peer in &bay.peers {
         peer.announce_discovery().unwrap();
     }
@@ -184,7 +202,14 @@ async fn bay_with(takeover: bool, primary: bool) -> Bay {
     // An RRLS runs no time sync (telemetry_task::timesync_enabled), so its router
     // has no network UTC: fullnet C-fix2 failed the takeover FLIGHT_STATE write
     // on exactly that ("network UTC is not available").
-    assert!(bay.rrls.network_time_ms().is_none());
+    if crate::rrls::is_rrls() {
+        assert!(bay.rrls.network_time_ms().is_none());
+    } else {
+        // The primary runs time sync: its controls carry network UTC.
+        bay.rrls
+            .try_set_local_network_time(sedsnet::timesync::PartialNetworkTime::from_unix_ms(1_793_945_600_000))
+            .unwrap();
+    }
     bay.state.set_preexisting_flight_state_for_test(FlightState::Idle);
     bay
 }
@@ -396,4 +421,100 @@ async fn flight_state_stays_read_only_while_the_rrls_abort_is_sent() {
     bay.pump();
     let probes = probes.lock().unwrap().clone();
     assert!(!probes.is_empty() && probes.iter().all(|refused| *refused), "writable while sending: {probes:?}");
+}
+
+impl Bay {
+    /// Run the clock until no `name` frame is pending: the owners still
+    /// unreachable exhaust their retries.
+    fn exhaust(&self, name: &str) {
+        for _ in 0..20_000 {
+            if self.pending(name).is_empty() {
+                return;
+            }
+            self.now.fetch_add(100, Ordering::Relaxed);
+            // Exhaustion surfaces as a queue error, as on the router worker.
+            for _ in 0..10 {
+                let _ = self.rrls.process_all_queues();
+                for peer in &self.peers {
+                    let _ = peer.process_all_queues();
+                }
+            }
+        }
+        panic!("{name} still pending: {:?}", self.pending(name));
+    }
+}
+
+/// The flight computer's own state report (InFlight) reaching the station.
+fn fc_reports_in_flight(bay: &Bay) {
+    let report = sedsnet::packet::Packet::new(
+        crate::telemetry_schema::data_type("FLIGHT_STATE"),
+        &[crate::telemetry_schema::endpoint("FLIGHT_STATE")],
+        "FC",
+        bay.rrls.network_time_ms().unwrap_or_else(crate::telemetry_task::get_current_timestamp_ms) + 1_000,
+        std::sync::Arc::from([crate::types::NetworkFlightState::InFlight as u8]),
+    )
+    .unwrap();
+    let _ = bay.rrls.rx_packed_from_side(&sedsnet::wire_format::pack_packet(&report), 0);
+    bay.pump();
+}
+
+/// The station's Aborted FLIGHT_STATE reached RF and FC, but PB's ACK never
+/// came back and the write ran out of retries; the flight computer then
+/// reported InFlight, so its report is the newest FLIGHT_STATE the station
+/// holds. The Aborted re-send must still go to PB (PB takes an Abort only
+/// from FLIGHT_STATE): the station re-sends its own write, never a report.
+fn aborted_resend_after_a_newer_report_reaches_pb(bay: &Bay, station: &str) {
+    let ty = crate::telemetry_schema::data_type("FLIGHT_STATE");
+    assert_eq!(bay.pending("FLIGHT_STATE").len(), 3, "the Aborted write is owed by RF, FC and PB");
+    bay.release_to(&["RF", "FC"]);
+    bay.exhaust("FLIGHT_STATE");
+    fc_reports_in_flight(bay);
+    assert_eq!(bay.rrls.get_cached_network_variable(ty).unwrap().map(|p| p.payload()[0]),
+        Some(crate::types::NetworkFlightState::InFlight as u8), "the report is the newest observation");
+    bay.held.lock().unwrap().clear();
+    assert!(crate::network_variables::resend_aborted_flight_state(&bay.rrls).unwrap(), "the Aborted write is re-sent");
+    bay.pump();
+    assert!(bay.pending("FLIGHT_STATE").contains(&hash("PB")), "PB owes the re-send");
+    let sent = rrls_flight_states(bay);
+    assert!(!sent.is_empty() && sent.iter().all(|f| *f == (station.to_string(), crate::types::NetworkFlightState::Aborted as u8)),
+        "only the station's own Aborted write: {sent:?}");
+}
+
+#[tokio::test]
+async fn a_primary_resends_its_aborted_flight_state_to_pb_after_a_newer_fc_report() {
+    if primary_child("a_primary_resends_its_aborted_flight_state_to_pb_after_a_newer_fc_report") {
+        return;
+    }
+    let bay = bay(false).await;
+    bay.hold.store(1, Ordering::Relaxed);
+    crate::network_variables::set_flight_state(&bay.rrls, FlightState::Aborted as u8).unwrap();
+    bay.pump();
+    aborted_resend_after_a_newer_report_reaches_pb(&bay, "GS");
+}
+
+#[tokio::test]
+async fn a_takeover_rrls_resends_its_aborted_flight_state_to_pb_after_a_newer_fc_report() {
+    if rrls_child("a_takeover_rrls_resends_its_aborted_flight_state_to_pb_after_a_newer_fc_report") {
+        return;
+    }
+    let bay = bay(true).await;
+    press_abort(&bay);
+    aborted_resend_after_a_newer_report_reaches_pb(&bay, "RRLS");
+}
+
+/// A board's FLIGHT_STATE request to the primary is answered with the
+/// primary's own last write, even after the flight computer's newer report
+/// (the report is a state report, which every board ignores as a write).
+#[tokio::test]
+async fn a_primary_answers_a_flight_state_request_with_its_own_write_after_an_fc_report() {
+    if primary_child("a_primary_answers_a_flight_state_request_with_its_own_write_after_an_fc_report") {
+        return;
+    }
+    let bay = bay(false).await;
+    crate::network_variables::set_flight_state(&bay.rrls, FlightState::Aborted as u8).unwrap();
+    bay.pump();
+    assert!(bay.pending("FLIGHT_STATE").is_empty());
+    fc_reports_in_flight(&bay);
+    board_requests_flight_state(&bay);
+    assert_eq!(rrls_flight_states(&bay), vec![("GS".to_string(), crate::types::NetworkFlightState::Aborted as u8)]);
 }
