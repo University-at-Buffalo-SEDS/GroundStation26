@@ -22,11 +22,12 @@ impl Admission {
     }
     pub(super) fn request_allowed(&self, boot: [u8; 16], manual_stop: bool) -> bool {
         let s = self.0.lock().unwrap();
-        s.boot == boot && (!s.closed || manual_stop)
+        // A manual stop is admitted across a renewed boot (see Runtime::receive).
+        (s.boot == boot || manual_stop) && (!s.closed || manual_stop)
     }
     pub(super) fn admit(self: &Arc<Self>, boot: [u8; 16], manual_stop: bool) -> Result<Lease> {
         let mut s = self.0.lock().unwrap();
-        ensure!(s.boot == boot, "Proxy capability was revoked");
+        ensure!(s.boot == boot || manual_stop, "Proxy capability was revoked");
         ensure!(!s.closed || manual_stop, "Proxy recovery barrier is closed");
         // Stop never waits behind ordinary work. Its own short dispatch still
         // counts until intent retention, so reset cannot pass that interval.

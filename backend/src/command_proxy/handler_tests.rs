@@ -1221,3 +1221,48 @@ async fn rrls_operator_abort_is_forwarded_to_the_primary_at_once_and_replaces_a_
     assert_eq!(status().pending.unwrap().request_id, pending.request_id);
     state.request_shutdown();
 }
+
+/// fullnet B-fix: a listening RRLS's operator Abort reached the primary 1.6 s
+/// after a Reset all had renewed the primary's control boot, and the primary
+/// refused it ("Wrong primary boot or mode"). RF and PB, which take an Abort
+/// only from the primary's Aborted FLIGHT_STATE, never aborted. A signed,
+/// fresh Abort from the paired RRLS is now admitted across a boot or mode
+/// change (re-applying a stop is always safe); every other request still
+/// needs the current boot.
+#[tokio::test]
+async fn a_paired_abort_is_admitted_after_the_primary_renewed_its_boot() {
+    if !child(
+        "command_proxy::handler_tests::a_paired_abort_is_admitted_after_the_primary_renewed_its_boot",
+        "primary",
+    ) {
+        return;
+    }
+    let (root, p, r) = super::tests::fixtures();
+    let mesh = configure();
+    let pv = {
+        let m = mesh.lock().unwrap();
+        m.command_proxy_transport(m.now()).unwrap()
+    };
+    let (_old_primary, rr, rv) = clients(&p, &r, pv);
+    // A Reset all renews the primary's control boot; the RRLS still holds the old one.
+    let mut primary = Runtime::new(Role::Primary);
+    primary.connect(Some(pv));
+    assert_ne!(primary.boot, rr.capability.as_ref().unwrap().0, "the RRLS's capability names the old boot");
+    let seal = |id: u8, name: &str| {
+        rr.request(&r, rv, crate::station_mode::local_mode(), [id; 16], "operator".into(), Operation::Command(name.into()))
+            .unwrap()
+    };
+    let toggle = primary.receive(&p, pv, crate::station_mode::local_mode(), &seal(1, "ToggleAvBayUnderglow"));
+    assert!(toggle.is_err(), "an ordinary request still needs the current boot");
+    let Ok(Received::Execute(abort)) = primary.receive(&p, pv, crate::station_mode::local_mode(), &seal(2, "Abort")) else {
+        panic!("a paired Abort is admitted across the boot change")
+    };
+    let mut state = crate::recording_export::tests::export_state(&root.0, false).await;
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    Arc::get_mut(&mut state).unwrap().cmd_tx = tx;
+    user(&state.auth, true, false, false, &["Abort"]);
+    let before = state.manual_abort_intent.epoch();
+    assert_eq!(execute_primary(state.clone(), &abort).await, Outcome::Queued);
+    assert!(state.manual_abort_intent.pending_epoch().is_some() || state.manual_abort_intent.epoch() > before,
+        "the primary retained the manual stop");
+}

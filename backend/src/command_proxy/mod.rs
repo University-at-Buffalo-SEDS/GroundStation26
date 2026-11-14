@@ -533,11 +533,14 @@ impl Runtime {
                 operation,
                 plumbing_origin_utc_ms,
             } => {
+                let manual_stop = matches!(&operation, Operation::Command(name) if name == "Abort");
+                // A signed, fresh Abort from the paired RRLS is never refused for a
+                // renewed boot or a mode change (a Reset all renews the boot while
+                // the RRLS still holds the old one): re-applying a stop is safe.
                 ensure!(
-                    primary && envelope.boot == self.boot && mode == local_mode,
+                    primary && (manual_stop || (envelope.boot == self.boot && mode == local_mode)),
                     "Wrong primary boot or mode"
                 );
-                let manual_stop = matches!(&operation, Operation::Command(name) if name == "Abort");
                 ensure!(
                     self.admission.request_allowed(envelope.boot, manual_stop),
                     "Primary recovery is pending"
@@ -1304,9 +1307,10 @@ async fn execute_primary_inner(
             return false;
         };
         let mesh = mesh.lock().unwrap();
+        let manual_stop = matches!(&request.operation, Operation::Command(name) if name == "Abort");
         mesh.command_proxy_transport(mesh.now())
             .is_some_and(|view| view.accepts(&request.envelope, true))
-            && matches!(request.envelope.message,Message::Request{mode,..} if mode==crate::station_mode::local_mode())
+            && (manual_stop || matches!(request.envelope.message,Message::Request{mode,..} if mode==crate::station_mode::local_mode()))
     }
     let fill_captured =
         matches!(&request.operation, Operation::Command(name) if name == "StartFill")
