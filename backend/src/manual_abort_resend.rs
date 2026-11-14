@@ -115,6 +115,12 @@ struct Armed {
     flight_state_owed: bool,
     last_topology_request_ms: Option<u64>,
     unrouted_reported: bool,
+    /// AV-bay boards (BOARDS mask) without a route of their own when the
+    /// Abort was sent (an umbilical route to FC says nothing about RF or PB).
+    /// Each is sent the ABORT and the Aborted FLIGHT_STATE again once it is
+    /// routed. Owners cannot show it: the SDK tracks at most four ABORT owners
+    /// (the umbilical boards fill them) and PB is behind RF's segment.
+    unaddressed: u8,
 }
 
 #[derive(Default)]
@@ -178,6 +184,8 @@ pub(crate) fn av_bay_abort_route(router: &Router) -> bool {
 pub(crate) struct SendMark {
     av_bay_routed: bool,
     abort_tx: Vec<(String, u64)>,
+    /// AV-bay boards (BOARDS mask) with a route of their own then.
+    routed_boards: u8,
 }
 
 fn abort_tx_by_side(router: &Router) -> Vec<(String, u64)> {
@@ -206,12 +214,32 @@ impl SendMark {
 
 /// Taken just before an operator Abort is sent.
 pub(crate) fn send_mark(router: &Router) -> SendMark {
-    SendMark { av_bay_routed: av_bay_abort_route(router), abort_tx: abort_tx_by_side(router) }
+    SendMark {
+        av_bay_routed: av_bay_abort_route(router),
+        abort_tx: abort_tx_by_side(router),
+        routed_boards: routed_av_bay_boards(router),
+    }
 }
 
 #[cfg(test)]
 pub(crate) fn send_mark_routed_for_test() -> SendMark {
-    SendMark { av_bay_routed: true, ..SendMark::default() }
+    SendMark { av_bay_routed: true, routed_boards: AV_BAY_MASK, ..SendMark::default() }
+}
+
+/// AV-bay boards (BOARDS mask) the router has a fresh discovery route to,
+/// judged per board: the board announces itself on a side, or a fresh
+/// AV-bay announcer lists it behind it. FC reachable over the umbilical does
+/// not make RF or PB reachable (fullnet C-fix3: an Abort at hand-back went
+/// to FC only, and RF and PB never got its Aborted FLIGHT_STATE).
+pub(crate) fn routed_av_bay_boards(router: &Router) -> u8 {
+    let ttl = sedsnet::discovery::DISCOVERY_ROUTE_TTL_MS;
+    let index = |sender: &str| crate::board_abort::BOARDS[..3].iter().position(|board| board.sender_id() == sender);
+    router.export_topology().routes.iter().filter(|route| route.age_ms <= ttl).fold(0u8, |mask, route| {
+        route.announcers.iter().filter(|peer| peer.age_ms <= ttl).fold(mask, |mask, peer| {
+            let Some(own) = index(&peer.sender_id) else { return mask };
+            peer.routers.iter().filter_map(|node| index(&node.sender_id)).fold(mask | (1 << own), |mask, i| mask | (1 << i))
+        })
+    })
 }
 
 /// Whether a side that reaches the AV bay transmitted an ABORT since `mark`.
@@ -229,7 +257,8 @@ impl AbortResend {
     pub(crate) fn arm(&self, epoch: u64, wire: WirePolicy, recovery: Option<String>, mark: SendMark) {
         *self.armed.lock().unwrap() = Some(Armed {
             epoch, wire, recovery, last_sent_ms: None, resends: 0, adopt_recovery: false, in_flight: None,
-            unrouted: !mark.av_bay_routed, verify: Some(None), flight_state_owed: !mark.av_bay_routed, mark,
+            unrouted: !mark.av_bay_routed, verify: Some(None), flight_state_owed: !mark.av_bay_routed,
+            unaddressed: AV_BAY_MASK & !mark.routed_boards, mark,
             last_topology_request_ms: None,
             unrouted_reported: false,
         });
@@ -324,6 +353,9 @@ impl AbortResend {
             .map(|row| (board_mask(router, &row.pending_destinations) & AV_BAY_MASK, row.retries))
             .collect();
         let pending = abort_rows.iter().copied().max_by_key(|(_, retries)| *retries);
+        if let Some(sent) = Self::send_to_unaddressed(armed, router, seen, owed | unheard, &abort_rows) {
+            return Some(sent);
+        }
         // Did the last send go toward the AV bay? The SDK sends ABORT only
         // along fresh discovery routes and, among several candidate sides,
         // may pick just one; a pending ABORT that names an AV-bay board, or an
@@ -390,6 +422,40 @@ impl AbortResend {
             }
         }
     }
+    /// An owed AV-bay board the Abort was never addressed to (no route of its
+    /// own when it was sent): once it is routed, send the ABORT again and the
+    /// Aborted FLIGHT_STATE after it. It ends like every other re-send: the
+    /// board reads Aborted, the station leaves Aborted, or a newer Abort.
+    fn send_to_unaddressed(armed: &mut Armed, router: &Router, seen: &Observation, owed: u8, abort_rows: &[(u8, u32)]) -> Option<u8> {
+        // A board a pending ABORT names was addressed after all.
+        armed.unaddressed &= !abort_rows.iter().fold(0u8, |mask, (boards, _)| mask | boards);
+        let ready = armed.unaddressed & owed & routed_av_bay_boards(router);
+        if ready == 0
+            || armed.last_sent_ms.is_some_and(|last| seen.now_ms.saturating_sub(last) < UNROUTED_RESEND_MS)
+        {
+            return None;
+        }
+        match crate::telemetry_task::queue_manual_abort_wire_receipted(router, armed.wire) {
+            Ok(_) => {
+                armed.unaddressed &= !ready;
+                armed.flight_state_owed = true;
+                armed.in_flight = None;
+                armed.resends = armed.resends.saturating_add(1);
+                armed.last_sent_ms = Some(seen.now_ms);
+                log::warn!(
+                    "operator Abort re-sent ({}): {} had no route when it was sent and is routed now",
+                    armed.resends,
+                    board_names(ready)
+                );
+                Some(ready)
+            }
+            Err(error) => {
+                log::warn!("operator Abort re-send refused: {error}");
+                None
+            }
+        }
+    }
+
     /// No ABORT is on its way to an owed AV-bay board, and none is known to
     /// have been routed there. Send one as soon as the router has an AV-bay
     /// route; until then ask for topology so the route comes back sooner, and

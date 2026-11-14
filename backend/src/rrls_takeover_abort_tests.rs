@@ -65,6 +65,10 @@ struct Bay {
     names: Vec<&'static str>,
     /// While holding: the boards the radio still reaches (see `release_to`).
     open: Arc<Mutex<Vec<&'static str>>>,
+    /// Boards that received an ABORT, in order.
+    abort_rx: Arc<Mutex<Vec<&'static str>>>,
+    /// While holding, a board the radio does not reach is not heard either.
+    both_ways: Arc<std::sync::atomic::AtomicBool>,
 }
 impl Bay {
     fn pump(&self) {
@@ -132,12 +136,22 @@ async fn bay_with(takeover: bool, primary: bool) -> Bay {
     state.topology_router.set(rrls.clone()).unwrap();
     crate::network_variables::initialize(&rrls).unwrap();
     let mut peers = Vec::new();
+    let abort_rx = Arc::new(Mutex::new(Vec::new()));
+    let hold = Arc::new(AtomicU8::new(0));
+    let open = Arc::new(Mutex::new(Vec::new()));
+    let both_ways = Arc::new(std::sync::atomic::AtomicBool::new(false));
     for name in AV_BAY {
         let clock = now.clone();
         let peer = Arc::new(Router::new_with_clock(
             RouterConfig::new([EndpointHandler::new_packet_handler(
                 crate::telemetry_schema::endpoint("ABORT"),
-                |_| Ok(()),
+                {
+                    let abort_rx = abort_rx.clone();
+                    move |_| {
+                        abort_rx.lock().unwrap().push(name);
+                        Ok(())
+                    }
+                },
             )])
             .with_sender(name),
             Box::new(move || clock.load(Ordering::Relaxed)),
@@ -147,13 +161,16 @@ async fn bay_with(takeover: bool, primary: bool) -> Bay {
             NetworkVariablePermissions::READ_ONLY,
         )
         .unwrap();
-        let back = rrls.clone();
-        peer.add_side_packed("RRLS", move |bytes| back.rx_packed_from_side(bytes, 0));
+        let (back, phase, reach, gated) = (rrls.clone(), hold.clone(), open.clone(), both_ways.clone());
+        peer.add_side_packed("RRLS", move |bytes| {
+            if gated.load(Ordering::Relaxed) && phase.load(Ordering::Relaxed) == 1 && !reach.lock().unwrap().contains(&name) {
+                return Ok(());
+            }
+            back.rx_packed_from_side(bytes, 0)
+        });
         peers.push(peer);
     }
-    let hold = Arc::new(AtomicU8::new(0));
     let held = Arc::new(Mutex::new(Vec::new()));
-    let open = Arc::new(Mutex::new(Vec::new()));
     let (phase, store, targets, reach) = (hold.clone(), held.clone(), peers.clone(), open.clone());
     rrls.add_side_packed("rocket_comms", move |bytes| {
         let holding = phase.load(Ordering::Relaxed) == 1;
@@ -188,7 +205,7 @@ async fn bay_with(takeover: bool, primary: bool) -> Bay {
         }
         std::mem::forget(gs);
     }
-    let bay = Bay { now, state, rrls, hold, held, peers, names: AV_BAY.to_vec(), open };
+    let bay = Bay { now, state, rrls, hold, held, peers, names: AV_BAY.to_vec(), open, abort_rx, both_ways };
     for peer in &bay.peers {
         peer.announce_discovery().unwrap();
     }
@@ -704,4 +721,55 @@ async fn a_takeover_rrls_stamps_its_heartbeat_and_outputs_with_the_heard_station
     ];
     assert!(stamps.len() >= 2, "both sent: {stamps:?}");
     assert!(stamps.iter().all(|(_, t)| t.abs_diff(heard) < 60_000), "stamped with the heard station clock {heard}: {stamps:?}");
+}
+
+fn flight_state_of(bay: &Bay, board: usize) -> Option<(String, u8)> {
+    bay.peers[board]
+        .get_cached_network_variable(crate::telemetry_schema::data_type("FLIGHT_STATE"))
+        .unwrap()
+        .map(|p| (crate::types::canonical_sender_id(p.sender()).to_string(), p.payload()[0]))
+}
+
+/// fullnet C-fix3, the GS Abort at hand-back: the routes to RF and PB had
+/// expired during the cut while FC was still reachable (over the umbilical),
+/// so the Abort counted as routed; its Aborted FLIGHT_STATE went to no AV-bay
+/// owner and was never sent again. Routing is judged per board: RF and PB,
+/// unrouted when the Abort was sent, get the ABORT and the station's Aborted
+/// FLIGHT_STATE once they are routed again, without operator action.
+#[tokio::test]
+async fn a_primary_abort_reaches_rf_and_pb_once_they_are_routed_again() {
+    if primary_child("a_primary_abort_reaches_rf_and_pb_once_they_are_routed_again") {
+        return;
+    }
+    let bay = bay(false).await;
+    // RF and PB fall out of reach both ways; FC stays reachable and keeps announcing.
+    bay.both_ways.store(true, Ordering::Relaxed);
+    bay.hold.store(1, Ordering::Relaxed);
+    bay.open.lock().unwrap().push("FC");
+    for _ in 0..40 {
+        bay.now.fetch_add(1_000, Ordering::Relaxed);
+        bay.peers[1].announce_discovery().unwrap();
+        let _ = bay.rrls.process_all_queues();
+        for peer in &bay.peers {
+            let _ = peer.process_all_queues();
+        }
+    }
+    assert_eq!(crate::manual_abort_resend::routed_av_bay_boards(&bay.rrls), 1 << 1, "only FC is routed");
+    mark_present(&bay, &[Board::RFBoard, Board::FlightComputer, Board::PowerBoard]);
+    press_abort_armed(&bay);
+    let mut worker = crate::telemetry_task::RouterServiceForTest::default();
+    run_services(&bay, &mut worker, 3_000, |_| false);
+    assert!(!bay.abort_rx.lock().unwrap().iter().any(|b| *b == "RF" || *b == "PB"), "RF and PB are out of reach");
+    assert_eq!(flight_state_of(&bay, 0), None);
+    assert_eq!(flight_state_of(&bay, 2), None);
+    bay.abort_rx.lock().unwrap().clear();
+    // RF and PB come back and are rediscovered.
+    bay.open.lock().unwrap().extend(["RF", "PB"]);
+    bay.peers[0].announce_discovery().unwrap();
+    bay.peers[2].announce_discovery().unwrap();
+    let aborted = ("GS".to_string(), crate::types::NetworkFlightState::Aborted as u8);
+    assert!(run_services(&bay, &mut worker, 20_000, |bay| {
+        let got = bay.abort_rx.lock().unwrap().clone();
+        got.contains(&"RF") && got.contains(&"PB") && flight_state_of(bay, 0) == Some(aborted.clone()) && flight_state_of(bay, 2) == Some(aborted.clone())
+    }), "RF and PB get the ABORT and (GS, 15): abort_rx={:?} rf={:?} pb={:?}", bay.abort_rx.lock().unwrap(), flight_state_of(&bay, 0), flight_state_of(&bay, 2));
 }
