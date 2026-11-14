@@ -967,6 +967,11 @@ pub(crate) fn set_takeover_flight_state(router: &Router, state: u8) -> Result<()
 /// and is written normally.
 pub(crate) fn publish_flight_state(router: &Router, packet: Packet) -> sedsnet::TelemetryResult<()> {
     if crate::rrls::is_rrls() {
+        // Its Aborted value only: no other FLIGHT_STATE ever leaves an RRLS
+        // (a post-Abort Idle would undo the Abort on the boards).
+        if packet.payload() != [NetworkFlightState::Aborted as u8] {
+            return Err(sedsnet::TelemetryError::PermissionDenied);
+        }
         return router.tx(packet);
     }
     router.set_network_variable(packet)

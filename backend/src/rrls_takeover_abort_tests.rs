@@ -664,3 +664,21 @@ async fn no_aborted_flight_state_resend_once_pb_reads_aborted() {
     run_services(&bay, &mut worker, 15_000, |_| false);
     assert_eq!(pb_flight_state(&bay), None, "PB reads Aborted: not owed it again");
 }
+
+/// No FLIGHT_STATE but Aborted ever leaves an RRLS, even in a takeover: a
+/// later non-Aborted write (a post-Abort Idle) would undo the Abort on the
+/// boards. Its only write is its operator's Abort.
+#[tokio::test]
+async fn a_takeover_rrls_never_sends_a_non_aborted_flight_state() {
+    if rrls_child("a_takeover_rrls_never_sends_a_non_aborted_flight_state") {
+        return;
+    }
+    let bay = bay(true).await;
+    press_abort(&bay);
+    bay.held.lock().unwrap().clear();
+    assert!(crate::network_variables::set_takeover_flight_state(&bay.rrls, FlightState::Idle as u8).is_err());
+    bay.pump();
+    assert_eq!(rrls_flight_states(&bay), vec![], "no Idle on the air");
+    assert_eq!(bay.rrls.own_network_variable(crate::telemetry_schema::data_type("FLIGHT_STATE")).map(|p| p.payload()[0]),
+        Some(crate::types::NetworkFlightState::Aborted as u8), "its own latest stays Aborted");
+}
