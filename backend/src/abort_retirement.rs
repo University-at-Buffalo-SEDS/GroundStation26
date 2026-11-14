@@ -390,6 +390,9 @@ fn refresh_locked(
                 entry.gone_since = None;
                 let (mut mask, mut unnamed) = (0u8, false);
                 for owner in &row.pending_destinations {
+                    if crate::network_variables::is_forgotten_station(*owner) {
+                        continue;
+                    }
                     match crate::board_recovery::coordinator::pending_destination_board(router, *owner)
                         .and_then(|board| crate::board_abort::BOARDS.iter().position(|b| *b == board))
                     {

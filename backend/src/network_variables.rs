@@ -411,6 +411,19 @@ pub(crate) fn set_takeover_outputs_writable(router: &Router, writable: bool) -> 
     }
     Ok(())
 }
+/// Stations this router forgot (an RRLS in takeover forgets the primary),
+/// as SEDSnet end-to-end owner hashes. An ABORT is never completed by the
+/// forgetting, so one every AV-bay board acknowledged can stay owed to the
+/// forgotten station until its retries run out: that owner is no board and
+/// is not reported as an unnamed one.
+static FORGOTTEN_STATIONS: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+fn station_owner_hash(name: &str) -> u64 {
+    sedsnet::packet::hash_bytes_u64(0x517C_C1B7_2722_0A95, name.as_bytes())
+}
+/// `owner` is a station this router has forgotten (see FORGOTTEN_STATIONS).
+pub(crate) fn is_forgotten_station(owner: u64) -> bool {
+    FORGOTTEN_STATIONS.lock().unwrap().contains(&owner)
+}
 /// An RRLS's takeover changed. Starting one, it has decided the primary is
 /// out of range: the primary is forgotten as a destination now, so a write
 /// completes once the AV bay acknowledges it instead of waiting out its
@@ -425,7 +438,14 @@ pub(crate) fn takeover_changed(router: &Router, takeover: bool) -> Result<()> {
         // listening RRLS that no longer acknowledges anything.
         router.announce_leave()?;
     }
+    if !takeover {
+        FORGOTTEN_STATIONS.lock().unwrap().clear();
+    }
     if takeover {
+        FORGOTTEN_STATIONS
+            .lock()
+            .unwrap()
+            .push(station_owner_hash(Board::GroundStation.sender_id()));
         let retired = router.forget_peer(Board::GroundStation.sender_id())?;
         log::info!("RRLS takeover: the primary is no longer a destination ({retired} pending frame(s) released)");
     }

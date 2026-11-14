@@ -296,6 +296,9 @@ fn owed_boards(bay: &Bay, name: &str) -> (u8, bool) {
     let (mut mask, mut unnamed) = (0u8, false);
     for row in bay.rrls.export_reliable_pending_stats().into_iter().filter(|row| row.data_type == ty) {
         for owner in row.pending_destinations {
+            if crate::network_variables::is_forgotten_station(owner) {
+                continue;
+            }
             match crate::board_recovery::coordinator::pending_destination_board(&bay.rrls, owner)
                 .and_then(|board| crate::board_abort::BOARDS.iter().position(|b| *b == board))
             {
@@ -340,6 +343,46 @@ async fn forgetting_the_primary_never_completes_an_abort_an_av_bay_board_still_o
     }
     bay.release_to(&["PB"]);
     assert!(bay.pending("ABORT").is_empty() && bay.pending("FLIGHT_STATE").is_empty());
+}
+
+/// Every AV-bay board acknowledged the takeover RRLS's Abort before the
+/// out-of-range primary was forgotten, so only the forgotten primary still
+/// owes it. SEDSnet never completes an ABORT that way (4035f8a): it stays
+/// pending until its normal retry limit. But it owes no board: the Abort
+/// re-send and Abort retirement see no board owing it and no unnamed owner
+/// (so no "an unnamed board" in the operator text), and the Aborted
+/// FLIGHT_STATE, which every board acknowledged, completes.
+#[tokio::test]
+async fn an_abort_only_the_forgotten_primary_owes_owes_no_board() {
+    if rrls_child("an_abort_only_the_forgotten_primary_owes_owes_no_board") {
+        return;
+    }
+    let bay = bay_with(true, true).await;
+    press_abort(&bay);
+    let gs = hash("GS");
+    bay.release_to(&["RF", "FC", "PB"]);
+    for name in ["ABORT", "FLIGHT_STATE"] {
+        assert_eq!(bay.pending(name), vec![gs], "{name}: every board acknowledged, the listed primary did not");
+    }
+    crate::network_variables::takeover_changed(&bay.rrls, true).unwrap();
+    assert!(bay.pending("FLIGHT_STATE").is_empty(), "the Aborted FLIGHT_STATE completes: every board acknowledged it");
+    assert_eq!(bay.pending("ABORT"), vec![gs], "an ABORT is never completed by forgetting a peer");
+    assert_eq!(owed_boards(&bay, "ABORT"), (0, false), "no board owes it, and the forgotten primary is no unnamed owner");
+    // It stays pending until its normal retry limit, then goes.
+    let tuning = sedsnet::config::runtime_tuning_config();
+    let span = u64::from(tuning.reliable_retransmit_ms) * (u64::from(tuning.reliable_max_retries) + 2);
+    let mut elapsed = 0;
+    while !bay.pending("ABORT").is_empty() && elapsed <= 4 * span {
+        bay.now.fetch_add(50, Ordering::Relaxed);
+        elapsed += 50;
+        bay.pump();
+        if elapsed == 50 {
+            assert_eq!(bay.pending("ABORT"), vec![gs], "still pending right after the forgetting");
+        }
+    }
+    assert!(bay.pending("ABORT").is_empty(), "retired at its retry limit");
+    assert!(elapsed >= u64::from(tuning.reliable_retransmit_ms), "not before its retries ({elapsed} ms)");
+    crate::network_variables::takeover_changed(&bay.rrls, false).unwrap();
 }
 
 /// FLIGHT_STATE frames the RRLS put on the air since the last clear:
