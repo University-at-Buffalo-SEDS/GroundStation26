@@ -773,3 +773,107 @@ async fn a_primary_abort_reaches_rf_and_pb_once_they_are_routed_again() {
         got.contains(&"RF") && got.contains(&"PB") && flight_state_of(bay, 0) == Some(aborted.clone()) && flight_state_of(bay, 2) == Some(aborted.clone())
     }), "RF and PB get the ABORT and (GS, 15): abort_rx={:?} rf={:?} pb={:?}", bay.abort_rx.lock().unwrap(), flight_state_of(&bay, 0), flight_state_of(&bay, 2));
 }
+
+/// With segment proxies acknowledging on acceptance (SEDSnet proxy-ACK), the
+/// station's Aborted FLIGHT_STATE completes once RF has accepted it; RF owns
+/// the delivery to PB behind it. If that runs out, the station sees no
+/// exhaustion: PB still not reading Aborted is the trigger. Station - radio -
+/// RF (segment proxy) - CAN - PB, with the CAN link to PB down until RF's own
+/// delivery has given up; PB then receives the station's Aborted value from a
+/// station re-send, without operator action.
+async fn a_proxied_pb_gets_the_aborted_flight_state_from_a_readback_resend(station: &'static str) {
+    crate::telemetry_schema::initialize().unwrap();
+    let ty = crate::telemetry_schema::data_type("FLIGHT_STATE");
+    let now = Arc::new(AtomicU64::new(1_000));
+    let clk = |n: &Arc<AtomicU64>| { let n = n.clone(); Box::new(move || n.load(Ordering::Relaxed)) as Box<dyn sedsnet::router::Clock + Send + Sync> };
+    let state = crate::state::tests::test_app_state().await;
+    let host = Arc::new(Router::new_with_clock(RouterConfig::new([]).with_sender(station), clk(&now)));
+    state.topology_router.set(host.clone()).unwrap();
+    crate::network_variables::initialize(&host).unwrap();
+    // The ABORT's owner on the radio segment (FC's role on the real bay).
+    let rf = Arc::new(Router::new_with_clock(RouterConfig::new([EndpointHandler::new_packet_handler(
+        crate::telemetry_schema::endpoint("ABORT"), |_| Ok(()))]).with_sender("RF"), clk(&now)));
+    let pb = Arc::new(Router::new_with_clock(RouterConfig::new([]).with_sender("PB"), clk(&now)));
+    for board in [&rf, &pb] {
+        board.enable_network_variable(ty, NetworkVariablePermissions::READ_ONLY).unwrap();
+        board.on_network_variable_update(ty, |_| Ok(())).unwrap();
+    }
+    let can_up = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let to_rf = rf.clone();
+    host.add_side_packed("rocket_comms", move |b| { let _ = to_rf.rx_packed_from_side(b, 0); Ok(()) });
+    let to_host = host.clone();
+    rf.add_side_packed("radio", move |b| { let _ = to_host.rx_packed_from_side(b, 0); Ok(()) });
+    let (to_pb, up) = (pb.clone(), can_up.clone());
+    rf.add_side_packed("can", move |b| { if up.load(Ordering::Relaxed) { let _ = to_pb.rx_packed_from_side(b, 0); } Ok(()) });
+    let (to_rf, up) = (rf.clone(), can_up.clone());
+    pb.add_side_packed("can", move |b| { if up.load(Ordering::Relaxed) { let _ = to_rf.rx_packed_from_side(b, 1); } Ok(()) });
+    let pump = || for _ in 0..10 { let _ = host.process_all_queues(); let _ = rf.process_all_queues(); let _ = pb.process_all_queues(); };
+    for r in [&host, &rf, &pb] { r.announce_discovery().unwrap(); }
+    pump();
+    if crate::rrls::is_rrls() {
+        crate::rrls::set_takeover_for_test(true);
+        crate::network_variables::set_takeover_outputs_writable(&host, true).unwrap();
+    } else {
+        host.try_set_local_network_time(sedsnet::timesync::PartialNetworkTime::from_unix_ms(1_793_945_600_000)).unwrap();
+    }
+    state.set_preexisting_flight_state_for_test(FlightState::Idle);
+    {
+        let mut status = state.board_status.lock().unwrap();
+        for board in [Board::RFBoard, Board::PowerBoard, Board::FlightComputer] {
+            status.get_mut(&board).unwrap().last_seen_instant = Some(std::time::Instant::now());
+        }
+    }
+    // RF and FC read back Aborted; PB, behind RF, is the one still owed.
+    let pb_value = || pb.get_cached_network_variable(ty).unwrap().map(|p| (crate::types::canonical_sender_id(p.sender()).to_string(), p.payload()[0]));
+    can_up.store(false, Ordering::Relaxed);
+    state.manual_abort_intent.request();
+    let mut claim = state.manual_abort_intent.try_claim().unwrap();
+    let mark = crate::manual_abort_resend::send_mark(&host);
+    assert!(publish_local_claim(&state, &host, &mut claim).unwrap());
+    state.abort_resend.arm(claim.epoch(), claim.wire().unwrap(), crate::board_recovery::coordinator::recovery_activity(&state).flatten(), mark);
+    claim.accepted();
+    for board in [Board::RFBoard, Board::FlightComputer] {
+        state.board_abort.observe_abort(board, std::time::Instant::now(), now.load(Ordering::Relaxed));
+    }
+    let mut worker = crate::telemetry_task::RouterServiceForTest::default();
+    let mut run = |ms: u64, done: &dyn Fn() -> bool| -> bool {
+        for _ in 0..ms / 200 {
+            now.fetch_add(200, Ordering::Relaxed);
+            worker.pump(&host);
+            let _ = rf.process_all_queues();
+            let _ = pb.process_all_queues();
+            worker.pump(&host);
+            if let Some(seen) = crate::manual_abort_resend::observe(&state, now.load(Ordering::Relaxed)) {
+                state.abort_resend.step(&host, seen);
+            }
+            if done() { return true; }
+        }
+        false
+    };
+    // With proxy-ACK, RF accepted it: nothing is pending at the station and RF
+    // owns PB's copy (without it, the station's write waits for PB through RF
+    // and the exhaustion path re-sends it instead; both must reach PB).
+    run(1_000, &|| false);
+    // RF's own delivery to PB runs out while the CAN link is down.
+    run(8_000, &|| false);
+    assert_eq!(pb_value(), None, "PB never got it");
+    can_up.store(true, Ordering::Relaxed);
+    let aborted = (station.to_string(), crate::types::NetworkFlightState::Aborted as u8);
+    assert!(run(20_000, &|| pb_value() == Some(aborted.clone())), "PB gets ({station}, 15) from a station re-send: {:?}", pb_value());
+}
+
+#[tokio::test]
+async fn a_primary_resends_its_aborted_flight_state_to_a_proxied_pb_that_does_not_read_aborted() {
+    if primary_child("a_primary_resends_its_aborted_flight_state_to_a_proxied_pb_that_does_not_read_aborted") {
+        return;
+    }
+    a_proxied_pb_gets_the_aborted_flight_state_from_a_readback_resend("GS").await;
+}
+
+#[tokio::test]
+async fn a_takeover_rrls_resends_its_aborted_flight_state_to_a_proxied_pb_that_does_not_read_aborted() {
+    if rrls_child("a_takeover_rrls_resends_its_aborted_flight_state_to_a_proxied_pb_that_does_not_read_aborted") {
+        return;
+    }
+    a_proxied_pb_gets_the_aborted_flight_state_from_a_readback_resend("RRLS").await;
+}

@@ -121,6 +121,9 @@ struct Armed {
     /// routed. Owners cannot show it: the SDK tracks at most four ABORT owners
     /// (the umbilical boards fill them) and PB is behind RF's segment.
     unaddressed: u8,
+    /// When the station's own Aborted FLIGHT_STATE was last sent (the first
+    /// pass after the Abort, then each re-send).
+    flight_state_sent_ms: Option<u64>,
 }
 
 #[derive(Default)]
@@ -140,6 +143,14 @@ pub(crate) struct Observation {
     pub owed: u8,
     /// In-scope boards (BOARDS mask) not heard recently and not reading Aborted.
     pub unheard: u8,
+}
+
+/// A present AV-bay board still not reading Aborted this long after the last
+/// Aborted FLIGHT_STATE was sent is sent it again: one whole delivery span
+/// (a segment proxy's own retries behind its receipt) plus an AV-bay readback
+/// round (abort_confirm asks every 2 s for 20 s after the Abort).
+fn readback_resend_ms() -> u64 {
+    crate::reliable_delivery_span().as_millis() as u64 + 2_000
 }
 
 /// How often a held Abort asks for topology while the AV bay has no route.
@@ -258,7 +269,7 @@ impl AbortResend {
         *self.armed.lock().unwrap() = Some(Armed {
             epoch, wire, recovery, last_sent_ms: None, resends: 0, adopt_recovery: false, in_flight: None,
             unrouted: !mark.av_bay_routed, verify: Some(None), flight_state_owed: !mark.av_bay_routed,
-            unaddressed: AV_BAY_MASK & !mark.routed_boards, mark,
+            unaddressed: AV_BAY_MASK & !mark.routed_boards, flight_state_sent_ms: None, mark,
             last_topology_request_ms: None,
             unrouted_reported: false,
         });
@@ -325,13 +336,23 @@ impl AbortResend {
         // board that acknowledged it is not owed it again.
         let unacked = FLIGHT_STATE_UNACKED.load(Ordering::Acquire) & AV_BAY_MASK;
         let lost = unacked & (owed | unheard);
-        if (armed.flight_state_owed || lost != 0) && !armed.unrouted {
+        // Readback is the end-to-end check. A segment proxy (RF, FC) now
+        // acknowledges the write as soon as it accepts it and owns delivery
+        // behind it, so a board it never reached (PB) shows no exhaustion
+        // here: a present board still not reading Aborted one delivery span
+        // plus a readback round after the last send is sent it again.
+        let sent_at = *armed.flight_state_sent_ms.get_or_insert(seen.now_ms);
+        let unconfirmed = if seen.now_ms.saturating_sub(sent_at) >= readback_resend_ms() { owed } else { 0 };
+        if (armed.flight_state_owed || lost != 0 || unconfirmed != 0) && !armed.unrouted {
             match crate::network_variables::resend_aborted_flight_state(router) {
                 Ok(true) => {
                     armed.flight_state_owed = false;
+                    armed.flight_state_sent_ms = Some(seen.now_ms);
                     FLIGHT_STATE_UNACKED.fetch_and(!unacked, Ordering::AcqRel);
                     if lost != 0 {
                         log::warn!("Aborted FLIGHT_STATE re-sent: {} never acknowledged it", board_names(lost));
+                    } else if unconfirmed != 0 {
+                        log::warn!("Aborted FLIGHT_STATE re-sent: {} still does not read Aborted", board_names(unconfirmed));
                     } else {
                         log::warn!("Aborted FLIGHT_STATE re-sent: the AV bay is routed again after the operator Abort was held");
                     }
