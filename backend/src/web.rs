@@ -2203,8 +2203,10 @@ async fn apply_flight_setup(
     let Some(router) = state.topology_router.get() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "router unavailable").into_response();
     };
-    match router.log_queue(
+    // Stamped like every control: an RRLS host clock can be hours off.
+    match router.log_queue_ts(
         crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
+        crate::system_clock::control_packet_timestamp_ms(router),
         &payload,
     ) {
         Ok(()) => Json(FlightSetupApplyResponse {
