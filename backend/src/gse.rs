@@ -2746,7 +2746,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clear_abort_publishes_idle_without_output_commands() {
+    /// After a station Abort the AV bay stays Aborted until an operator Reset:
+    /// Clear GSE abort clears the ground side only. Round fullnet win2-range:
+    /// the Clear pressed right after every board showed the Abort wrote Idle
+    /// (twice) and PB and RF, which apply a newer station FLIGHT_STATE, left
+    /// Aborted within a second. No FLIGHT_STATE other than Aborted is written.
+    async fn clear_abort_keeps_the_aborted_flight_state_without_output_commands() {
         let (state, sent, peer) = button_test_state().await;
         *state.state.lock().unwrap() = FlightState::Aborted;
         crate::network_variables::set_flight_state(
@@ -2779,9 +2784,9 @@ mod tests {
             .get()
             .unwrap()
             .cached_managed_variable(crate::telemetry_schema::data_type("FLIGHT_STATE"))
-            .expect("reconnecting nodes need a replacement managed value");
-        assert_eq!(cached.payload(), &[FlightState::Idle as u8]);
-        assert_eq!(state.local_flight_state_snapshot(), FlightState::Idle);
+            .expect("reconnecting nodes keep the station's Aborted value");
+        assert_eq!(cached.payload(), &[FlightState::Aborted as u8], "no FLIGHT_STATE other than Aborted until Reset");
+        assert_eq!(state.local_flight_state_snapshot(), FlightState::Aborted);
         // The persisted default store is process-global and other parallel
         // tests legitimately update it through their independent AppStates.
         // The router cache above is this station's reconnection contract.
@@ -2830,7 +2835,9 @@ mod tests {
         let release = held.release_after(std::time::Duration::from_millis(60));
         clear_ground_abort_waiting_out_core(&state).await.unwrap();
         release.join().unwrap();
-        assert_eq!(state.local_flight_state_snapshot(), FlightState::Idle);
+        // Cleared on the ground; the station Abort stays until Reset.
+        assert_eq!(state.gse.lock().unwrap().engine.status.phase, Phase::Idle);
+        assert_eq!(state.local_flight_state_snapshot(), FlightState::Aborted);
         let _ = std::fs::remove_file(path);
     }
     #[tokio::test]
@@ -3769,11 +3776,18 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
         // The next explicit self-test establishes and checks its own baseline.
         rt.operational.startup_configured = true;
     }
-    // Update the persisted managed value as well as the local/UI state, so
-    // discovery and reconnection cannot replay this station's old abort value.
+    // After a station Abort (local state Aborted) the AV bay stays Aborted
+    // until an operator Reset: this clears the ground side only and writes no
+    // FLIGHT_STATE. A board that applies a newer station write (PB, RF) would
+    // otherwise leave Aborted on this Idle. Reset writes Startup and the
+    // readiness transition Idle. A ground-only abort (automatic claim, station
+    // not Aborted) returns the managed value to Idle as before.
+    let keep_aborted = *state.state.lock().unwrap() == FlightState::Aborted;
     drop(rt);
-    crate::network_variables::set_flight_state(router, FlightState::Idle as u8)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !keep_aborted {
+        crate::network_variables::set_flight_state(router, FlightState::Idle as u8)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
     let mut rt = state.gse.lock().unwrap();
     if !hitl {
         rt.operational
@@ -3792,7 +3806,9 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
     rt.engine.config = config;
     rt.engine.config.dry_self_test_confirmed = false;
     drop(rt);
-    state.set_local_flight_state(FlightState::Idle);
+    if !keep_aborted {
+        state.set_local_flight_state(FlightState::Idle);
+    }
     // Cleared: an automatic ABORT still owed to a board must not land later.
     // Manual Aborts are not registered there and keep their delivery.
     let retired = crate::abort_retirement::retire_on_operator_clear(state, router);
