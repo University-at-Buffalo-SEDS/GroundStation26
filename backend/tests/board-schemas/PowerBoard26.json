@@ -261,7 +261,7 @@
     {
       "rust": "ActuatorFlightState",
       "name": "FLIGHT_STATE",
-      "doc": "Flight State: 1 \\u00d7 uint8 element.",
+      "doc": "Flight State: 1 \\u00d7 uint8 element. Network values (contract set a): 0 Startup, 1 Idle, 2 Fill, 6 Armed, 7 Launch, 13 Landed, 15 Aborted, 16 InFlight.",
       "class": "Data",
       "element": {
         "kind": "Static",
@@ -708,7 +708,7 @@
         "count": 32
       },
       "endpoints": [],
-      "reliable": "Ordered",
+      "reliable": "Unordered",
       "priority": 200
     },
     {

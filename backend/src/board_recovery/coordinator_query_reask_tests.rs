@@ -38,7 +38,7 @@ fn board_router(board: Board, got: Arc<std::sync::atomic::AtomicUsize>) -> Arc<R
 }
 
 #[tokio::test]
-async fn a_query_cancelled_behind_an_exhausted_radio_query_is_asked_again() {
+async fn a_query_the_sdk_dropped_without_a_reply_is_asked_again() {
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     let _tuning = crate::network_delivery_tuning_for_test();
     crate::telemetry_schema::initialize().unwrap();
@@ -48,9 +48,12 @@ async fn a_query_cancelled_behind_an_exhausted_radio_query_is_asked_again() {
     let (fc_got, vb_got) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     let fc = board_router(Board::FlightComputer, fc_got.clone());
     let vb = board_router(Board::ValveBoard, vb_got.clone());
-    // The radio carries every frame to the FC; while lossy, none comes back
-    // (its receipts are lost). The umbilical works both ways.
+    // While the Valve Board's link is down nothing reaches it or comes back,
+    // so its query runs out of retries undelivered. BOARD_RECOVERY_REQUEST is
+    // Unordered now, so nothing else is cancelled with it; a query can still
+    // be lost this way.
     let lossy = Arc::new(AtomicBool::new(false));
+    let down = AtomicBool::new(false);
     let wires: Vec<Arc<std::sync::Mutex<Vec<Vec<u8>>>>> = (0..4).map(|_| Arc::default()).collect();
     let tap = |w: &Arc<std::sync::Mutex<Vec<Vec<u8>>>>| { let w = w.clone(); move |b: &[u8]| { w.lock().unwrap().push(b.to_vec()); Ok(()) } };
     host.add_side_packed("radio", tap(&wires[0]));
@@ -60,11 +63,11 @@ async fn a_query_cancelled_behind_an_exhausted_radio_query_is_asked_again() {
     let pump = || {
         let _ = host.process_all_queues_with_timeout(0);
         for b in std::mem::take(&mut *wires[0].lock().unwrap()) { let _ = fc.rx_packed_from_side(&b, 0); }
-        for b in std::mem::take(&mut *wires[2].lock().unwrap()) { let _ = vb.rx_packed_from_side(&b, 0); }
+        for b in std::mem::take(&mut *wires[2].lock().unwrap()) { if !down.load(Ordering::SeqCst) { let _ = vb.rx_packed_from_side(&b, 0); } }
         let _ = fc.process_all_queues_with_timeout(0);
         let _ = vb.process_all_queues_with_timeout(0);
         for b in std::mem::take(&mut *wires[1].lock().unwrap()) { if !lossy.load(Ordering::SeqCst) { let _ = host.rx_packed_from_side(&b, 0); } }
-        for b in std::mem::take(&mut *wires[3].lock().unwrap()) { let _ = host.rx_packed_from_side(&b, 1); }
+        for b in std::mem::take(&mut *wires[3].lock().unwrap()) { if !down.load(Ordering::SeqCst) { let _ = host.rx_packed_from_side(&b, 1); } }
     };
     fc.announce_discovery().unwrap();
     vb.announce_discovery().unwrap();
@@ -72,9 +75,10 @@ async fn a_query_cancelled_behind_an_exhausted_radio_query_is_asked_again() {
     for _ in 0..50 { pump(); std::thread::sleep(Duration::from_millis(1)); }
     assert!(state.topology_router.set(host.clone()).is_ok());
     lossy.store(true, Ordering::SeqCst);
+    down.store(true, Ordering::SeqCst);
 
-    // An AV-bay query at the head of the one Ordered stream, then a PREPARE
-    // query to the umbilical Valve Board behind it.
+    // A query to the FC (receipts lost) and a PREPARE query to the Valve
+    // Board, whose link is down.
     host.tx_queue(query_packet(&host, Board::FlightComputer, 11)).unwrap();
     let vb_query = query_packet(&host, Board::ValveBoard, 22);
     super::super::note_query_packet(&state, Board::ValveBoard, 22, vb_query.packet_id());
@@ -93,14 +97,13 @@ async fn a_query_cancelled_behind_an_exhausted_radio_query_is_asked_again() {
     };
     eprintln!("QUERY_REASK fc_got={} vb_got={} dropped_at={dropped_at:?} span={span:?}",
               fc_got.load(Ordering::SeqCst), vb_got.load(Ordering::SeqCst));
-    // The bug: the FC query ran out of retries and the SDK cancelled the
-    // Valve Board's query behind it; the board never got it.
     assert!(fc_got.load(Ordering::SeqCst) >= 1, "the FC got its query; only its receipts were lost");
-    assert_eq!(vb_got.load(Ordering::SeqCst), 0, "cancelled behind the exhausted FC query");
-    // The fix: the drop is seen soon after, well inside the 15 s window, and
-    // the query asked again reaches the board.
-    let at = dropped_at.expect("the cancelled query is seen dropped");
+    assert_eq!(vb_got.load(Ordering::SeqCst), 0, "the Valve Board's query ran out of retries undelivered");
+    // The drop is seen soon after, well inside the 15 s window, and the query
+    // asked again (the link back) reaches the board.
+    let at = dropped_at.expect("the lost query is seen dropped");
     assert!(at < span + network_wait(QUERY_REPLY_GRACE) + Duration::from_secs(2), "seen dropped after {at:?}");
+    down.store(false, Ordering::SeqCst);
     host.tx_queue(query_packet(&host, Board::ValveBoard, 23)).unwrap();
     for _ in 0..50 { pump(); std::thread::sleep(Duration::from_millis(2)); }
     assert_eq!(vb_got.load(Ordering::SeqCst), 1, "the query asked again reaches the Valve Board");

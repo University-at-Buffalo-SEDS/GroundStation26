@@ -541,14 +541,13 @@ mod tests {
     }
 
     /// deploy-relaycut (GS eadd886): an RF query waiting on the cut radio held
-    /// the ordered stream at the Abort. When it gave up its retries 1.5 s
-    /// later, the SDK dropped the umbilical confirm queries queued behind it;
-    /// they were asked again only 3 s after the first ask, so the umbilical
-    /// readback read 3.1-3.6 s. Had the head given up past the 3 s window,
-    /// they would not have been asked again at all. They must go as soon as
-    /// the head gives up.
+    /// the one ordered BOARD_RECOVERY_REQUEST stream at the Abort, and the
+    /// umbilical confirm queries waited behind it (then were dropped with it
+    /// when it gave up), so the umbilical readback read 3.1-3.6 s. The type is
+    /// Unordered now: the umbilical confirm queries go at once while the RF
+    /// query is still in flight.
     #[tokio::test]
-    async fn umbilical_readback_is_asked_again_as_soon_as_the_av_bay_head_gives_up() {
+    async fn umbilical_readback_goes_at_once_while_an_av_bay_query_is_in_flight() {
         let _tuning = crate::network_delivery_tuning_for_test();
         let fixture = crate::board_recovery::tests::http_fixture().await;
         let state = fixture.state.clone();
@@ -579,36 +578,14 @@ mod tests {
         host.tx_queue(Packet::new(recovery_request,
             &[crate::telemetry_schema::endpoint(endpoint(Board::RFBoard))], "GS", 1, Arc::from(&[0u8; 32][..])).unwrap()).unwrap();
         service.pump(&host);
-        assert!(av_bay_query_in_flight(&host), "the RF query holds the ordered stream");
+        assert!(av_bay_query_in_flight(&host), "the RF query is in flight (nothing comes back)");
         let mut confirm = AbortConfirmRefresh::default();
         confirm.start();
         assert_ne!(confirm.poll(&state), 0, "the umbilical boards are asked at once");
         service.pump(&host);
-        assert!(umbilical_queries.lock().unwrap().is_empty(), "queued behind the RF query");
-        // The query service's turn (250 ms tick, or sooner when woken).
-        let tuning = crate::network_delivery_tuning();
-        let span = Duration::from_millis(u64::from(tuning.reliable_retransmit_ms) * u64::from(tuning.reliable_max_retries + 1));
-        let start = std::time::Instant::now();
-        let mut head_gone = None;
-        let mut last_poll = start;
-        while start.elapsed() < span + Duration::from_millis(1_500) {
-            service.pump(&host);
-            if head_gone.is_none() && !av_bay_query_in_flight(&host) {
-                head_gone = Some(std::time::Instant::now());
-            }
-            if last_poll.elapsed() >= Duration::from_millis(25) {
-                for board in BOARDS {
-                    state.board_status.lock().unwrap().get_mut(&board).unwrap().last_seen_instant = Some(std::time::Instant::now());
-                }
-                let _ = confirm.poll(&state);
-                last_poll = std::time::Instant::now();
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        let head_gone = head_gone.expect("the RF query gives up within its retry span");
-        let first = umbilical_queries.lock().unwrap().iter().copied().find(|at| *at >= head_gone);
-        let after = first.map(|at| at.duration_since(head_gone).as_millis());
-        eprintln!("RETIRED_HEAD head_gone_after_ms={} umbilical_query_after_head_ms={after:?}", head_gone.duration_since(start).as_millis());
-        assert!(after.is_some_and(|ms| ms <= 300), "umbilical confirm query {after:?} ms after the RF query gave up");
+        let sent = umbilical_queries.lock().unwrap().len();
+        eprintln!("UNORDERED_CONFIRM umbilical_queries_sent={sent} rf_in_flight={}", av_bay_query_in_flight(&host));
+        assert!(av_bay_query_in_flight(&host), "the RF query is still in flight");
+        assert_eq!(sent, UMBILICAL.len(), "every umbilical confirm query is on the wire, not behind the RF query");
     }
 }

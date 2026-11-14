@@ -1796,6 +1796,9 @@ pub(crate) fn query_reply_current_for_test(state:&AppState,board:Board,nonce:u64
 }
 
 #[cfg(test)]
+#[path = "board_recovery/brr_unordered_tests.rs"]
+mod brr_unordered_tests;
+#[cfg(test)]
 #[path = "board_recovery/testing_model_tests.rs"]
 mod testing_model_tests;
 #[cfg(test)]
