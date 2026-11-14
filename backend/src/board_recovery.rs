@@ -220,6 +220,9 @@ struct Inner {
     /// epoch, uptime ms). Within one boot a push is new only if it is later by
     /// (epoch, uptime); anything else is a replay.
     pushed: [Option<(u64, u32, u32)>; 7],
+    /// The SDK packet of each board's current recovery query, by its nonce, so
+    /// a query the SDK dropped can be told from one still awaiting a reply.
+    query_packets: [Option<(u64, u64)>; 7],
 }
 pub(crate) struct Runtime {
     identity: Option<[u8; 16]>,
@@ -274,6 +277,7 @@ impl Default for Runtime {
                 rejected_statuses: 0,
                 last_rejection: None,
                 pushed: [None; 7],
+                query_packets: [None; 7],
             }),
             apply_requested_ms: Default::default(),
             av_bay_paused: Mutex::new(None),
@@ -1738,10 +1742,12 @@ fn send_board_query(state: &Arc<AppState>, board: Board, mode: QueryMode) -> Res
         sent: now,
         received: false,
     });
+    let packet_id = packet.packet_id();
     if let Err(reason) = router.try_tx_queue(packet) {
         inner.queries[at] = previous;
         return rejected_query_offer(reason);
     }
+    inner.query_packets[at] = Some((nonce, packet_id));
     // A recovery PREPARE wants its own reply only; a re-query keeps the
     // superseded unanswered one acceptable.
     inner.previous[at] = if mode == QueryMode::Prepare { None } else {
@@ -1763,6 +1769,18 @@ pub(crate) fn shutdown_clean_eligible(state: &AppState) -> bool {
 }
 
 
+
+/// The SDK packet carrying the recovery query `nonce` to `board`, if it is
+/// that board's current query.
+pub(super) fn query_packet(state: &AppState, board: Board, nonce: u64) -> Option<u64> {
+    let inner = state.board_recovery.inner.lock().unwrap();
+    inner.query_packets[index(board)?].filter(|(n, _)| *n == nonce).map(|(_, id)| id)
+}
+pub(super) fn note_query_packet(state: &AppState, board: Board, nonce: u64, packet_id: u64) {
+    if let Some(at) = index(board) {
+        state.board_recovery.inner.lock().unwrap().query_packets[at] = Some((nonce, packet_id));
+    }
+}
 
 /// Read-only test observation of the actual production nonce/correlation owner.
 #[cfg(test)]

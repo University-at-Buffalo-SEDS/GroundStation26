@@ -31,6 +31,9 @@ mod control_drain_tests;
 #[cfg(test)]
 #[path = "coordinator_prepare_admission_tests.rs"]
 mod prepare_admission_tests;
+#[cfg(test)]
+#[path = "coordinator_query_reask_tests.rs"]
+mod query_reask_tests;
 
 #[cfg(test)]
 mod network_wait_tests {
@@ -946,7 +949,7 @@ async fn refresh_prepare_queries(
         if !origin_current(state, token) {
             return Err("Recovery origin changed before query");
         }
-        admit_prepare_query(
+        let admit = || admit_prepare_query(
             || {
                 if !origin_current(state, token) {
                     return Err("Recovery origin changed while admitting query");
@@ -962,12 +965,18 @@ async fn refresh_prepare_queries(
                     Err(response) => response,
                 }
             },
-        ).await?;
-        let nonce = state.board_recovery.inner.lock().unwrap().queries[index(board).unwrap()]
-            .as_ref()
-            .ok_or("Query missing")?
-            .nonce;
+        );
+        let current_nonce = || -> Result<u64, &'static str> {
+            Ok(state.board_recovery.inner.lock().unwrap().queries[index(board).unwrap()]
+                .as_ref()
+                .ok_or("Query missing")?
+                .nonce)
+        };
+        admit().await?;
+        let mut nonce = current_nonce()?;
         let start = WallInstant::now();
+        let mut watch = QueryWatch::new();
+        let mut asks = 1usize;
         loop {
             if !origin_current(state, token) {
                 return Err("Stop/epoch changed before challenge");
@@ -985,6 +994,16 @@ async fn refresh_prepare_queries(
                 } else {
                     "Fresh query timed out before challenge"
                 });
+            }
+            // Dropped by the SDK without a reply (cancelled behind an exhausted
+            // query in the one Ordered stream, or every copy lost): ask again
+            // within the same window. A query is read-only.
+            if asks < QUERY_ASKS && watch.dropped(state, board, nonce) {
+                log::warn!("Recovery PREPARE: {} query dropped without a reply; asking again ({} of {QUERY_ASKS})", board.sender_id(), asks + 1);
+                admit().await?;
+                nonce = current_nonce()?;
+                watch = QueryWatch::new();
+                asks += 1;
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
@@ -1009,6 +1028,18 @@ async fn refresh_prepare_queries(
             query_one(*board).await?;
         }
     }
+    // The umbilical boards were asked first: one whose readback is past half
+    // its freshness by now would expire before CONFIRM reaches it ("Original
+    // preparation query expired"). Their round trip is short; ask again.
+    let aging: Vec<Board> = umbilical.iter().copied().filter(|board| {
+        state.board_recovery.inner.lock().unwrap().values[index(*board).unwrap()]
+            .as_ref()
+            .is_none_or(|row| row.age(Stamp::now()) > readback_ttl() / 2)
+    }).collect();
+    futures::future::join_all(aging.into_iter().map(query_one))
+        .await
+        .into_iter()
+        .collect::<Result<Vec<()>, _>>()?;
     Ok(())
 }
 // Retry only a rejected, never-owned read-only offer, before Confirm seals UTC.
@@ -1716,6 +1747,60 @@ async fn send(
     }
 }
 const DEDICATED_QUERY_TIMEOUT: &str = "Dedicated query timed out; SDK ACK is not readback";
+/// Asks of one read-only recovery query within its window (the first and up
+/// to three more after the SDK dropped one without a reply).
+const QUERY_ASKS: usize = 4;
+/// After the SDK stops holding a query (its receipt came, or it ran out of
+/// retries, or it was cancelled), the reply gets this long before the query
+/// counts as dropped.
+const QUERY_REPLY_GRACE: Duration = Duration::from_millis(1500);
+/// A query never seen in the SDK's pending rows may still wait in its TX
+/// queue for this long.
+const QUERY_UNSEEN: Duration = Duration::from_secs(3);
+/// Whether the SDK dropped a read-only recovery query without a reply.
+/// BOARD_RECOVERY_REQUEST is one Ordered stream: when the query at its head
+/// (often an AV-bay board's, its ACKs lost on the radio) runs out of retries,
+/// the SDK cancels every query queued behind it, the umbilical boards'
+/// included (pair-dev/pair-all: every failed Reset all). Waiting out the
+/// whole window for a reply that cannot come failed the recovery.
+struct QueryWatch {
+    sent: WallInstant,
+    checked: Option<WallInstant>,
+    seen: bool,
+    gone: Option<WallInstant>,
+}
+impl QueryWatch {
+    fn new() -> Self {
+        Self { sent: WallInstant::now(), checked: None, seen: false, gone: None }
+    }
+    fn dropped(&mut self, state: &AppState, board: Board, nonce: u64) -> bool {
+        let now = WallInstant::now();
+        if self.checked.is_some_and(|at| now.duration_since(at) < Duration::from_millis(100)) {
+            return false;
+        }
+        self.checked = Some(now);
+        let (Some(router), Some(id)) = (state.topology_router.get(), super::query_packet(state, board, nonce)) else {
+            return false;
+        };
+        let pending = router.export_reliable_pending_stats().iter().any(|row| row.packet_id == id);
+        query_dropped(self, pending, now)
+    }
+}
+/// The decision, apart from the SDK: pending holds the query; a query never
+/// seen pending gets QUERY_UNSEEN to be dispatched; one no longer pending
+/// gets QUERY_REPLY_GRACE for its reply.
+fn query_dropped(watch: &mut QueryWatch, pending: bool, now: WallInstant) -> bool {
+    if pending {
+        watch.seen = true;
+        watch.gone = None;
+        return false;
+    }
+    if !watch.seen && now.duration_since(watch.sent) < network_wait(QUERY_UNSEEN) {
+        return false;
+    }
+    let gone = *watch.gone.get_or_insert(now);
+    now.duration_since(gone) >= network_wait(QUERY_REPLY_GRACE)
+}
 /// Owners `advance_verified_recovery` only try-locks, refusing before any
 /// change when one is held for a moment (a tare sample, a journal write).
 const ADVANCE_BUSY: [&str; 2] = ["Tare capture/commit is busy", "Clock journal busy"];
@@ -1814,6 +1899,10 @@ async fn fresh_query(
     if !endpoint_verified(state, board, &router.export_topology()) {
         return Err("Dedicated hardened endpoint disappeared");
     }
+    let start = WallInstant::now();
+    let mut asks = 0usize;
+    'ask: loop {
+    asks += 1;
     let nonce = random()?;
     let now = Stamp::now();
     let mut wire = [0u8; 32];
@@ -1829,6 +1918,7 @@ async fn fresh_query(
         Arc::from(wire),
     )
     .map_err(|_| "Query packet rejected")?;
+    let packet_id = packet.packet_id();
     state.board_recovery.coordinator.expected(board, nonce);
     {
         let mut inner = state.board_recovery.inner.lock().unwrap();
@@ -1845,7 +1935,8 @@ async fn fresh_query(
         Stamp::now().checked_duration_since(now).filter(|age|*age<=QUERY_TTL)
             .map(|_|()).ok_or("Original dedicated query expired before SDK ownership")
     }).await?;
-    let start = WallInstant::now();
+    super::note_query_packet(state, board, nonce, packet_id);
+    let mut watch = QueryWatch::new();
     loop {
         if crate::gse::with_closed_operator_queue(state, token, || ()).is_none() {
             return Err("Stop superseded dedicated query");
@@ -1868,7 +1959,14 @@ async fn fresh_query(
         if start.elapsed() > dedicated_query_wait() {
             return Err(DEDICATED_QUERY_TIMEOUT);
         }
+        // Dropped by the SDK without a reply: ask again (read-only) within
+        // the same wait instead of waiting it out.
+        if asks < QUERY_ASKS && watch.dropped(state, board, nonce) {
+            log::warn!("{} dedicated query dropped without a reply; asking again ({} of {QUERY_ASKS})", board.sender_id(), asks + 1);
+            continue 'ask;
+        }
         tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     }
 }
 enum BoardResult {
