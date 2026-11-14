@@ -59,9 +59,11 @@ fn radio_transport_priority(priority: u8, payload: &[u8]) -> u8 {
 /// never reached the AV bay. On the radio it is written first and uses the
 /// command reserve, like a board command. Umbilical ordering is unchanged.
 fn is_abort_frame(payload: &[u8]) -> bool {
-    !payload.starts_with(b"SDT")
-        && serialize::peek_frame_info_unchecked(payload)
-            .is_ok_and(|info| info.envelope.ty == crate::telemetry_schema::data_type("ABORT"))
+    crate::comms::is_sdk_abort_frame(payload)
+}
+#[cfg(test)]
+pub(crate) fn radio_abort_frame_for_test(payload: &[u8]) -> bool {
+    is_abort_frame(payload)
 }
 
 /// Discovery state the peer needs on a bounded schedule: route announcements,

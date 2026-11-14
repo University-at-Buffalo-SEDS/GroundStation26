@@ -29,6 +29,8 @@ pub(crate) use commands::{queue_priority_manual_abort_packet, queue_manual_abort
 mod heartbeat;
 #[cfg(test)]
 pub(crate) use heartbeat::station_heartbeat;
+#[cfg(test)]
+pub(crate) use radio_io::radio_abort_frame_for_test;
 mod periodic;
 pub(crate) mod procedure_clock;
 mod radio_io;

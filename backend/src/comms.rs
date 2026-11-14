@@ -3070,11 +3070,28 @@ impl UartWriteState {
 fn command_pair_bypasses_turn(frames: &[(u8, &[u8])]) -> bool {
     frames.iter().any(|(_, payload)| is_abort_frame(payload))
 }
-/// An SDK ABORT frame (manual or automatic); its payload starts with the
-/// SDK envelope on the station's direct link.
+/// An SDK ABORT frame (manual or automatic), whatever its framing.
 fn is_abort_frame(payload: &[u8]) -> bool {
-    serialize::peek_frame_info_unchecked(payload)
-        .is_ok_and(|info| info.envelope.ty == crate::telemetry_schema::data_type("ABORT"))
+    is_sdk_abort_frame(payload)
+}
+
+/// The SDK type of a frame a router put on a side: canonical, side-transport
+/// full or compact, or a chunk. One peeker learns the header templates and
+/// chunk transfers from the frames it is shown (sedsnet::side_peek).
+pub(crate) fn sdk_frame_type(payload: &[u8]) -> Option<sedsnet::config::DataType> {
+    static PEEKER: std::sync::Mutex<Option<sedsnet::side_peek::SideFramePeeker>> = std::sync::Mutex::new(None);
+    PEEKER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_or_insert_with(|| sedsnet::side_peek::SideFramePeeker::new(true))
+        .peek(payload)
+        .map(|info| info.ty)
+}
+
+/// An SDK ABORT, whatever its framing: an ABORT wrapped as a side-transport
+/// frame must never lose its priority if the framing changes.
+pub(crate) fn is_sdk_abort_frame(payload: &[u8]) -> bool {
+    sdk_frame_type(payload) == Some(crate::telemetry_schema::data_type("ABORT"))
 }
 
 fn raw_uart_requires_inner_crc(kind: RawUartFrameKind, body: &[u8]) -> bool {
@@ -7605,6 +7622,30 @@ mod raw_uart_tests {
         // The single-frame SDK writer and its precheck: the frame itself.
         assert!(is_abort_frame(&abort));
         assert!(!is_abort_frame(&command));
+        // The same ABORT as a side-transport FULL frame (templated: template
+        // ID first) and then as a compact frame naming that template: both
+        // are ABORT for every classifier (writer turn, radio priority).
+        let sdt = |kind: u8, body: &[u8]| {
+            let mut frame = b"SDT".to_vec();
+            frame.push(kind);
+            frame.extend_from_slice(body);
+            let crc = crc32fast::hash(&frame);
+            frame.extend_from_slice(&crc.to_le_bytes());
+            frame
+        };
+        let template_id = 0x1234_5678u32;
+        let mut full = Vec::new();
+        let mut id = template_id as u64;
+        loop { let b = (id & 0x7f) as u8; id >>= 7; if id == 0 { full.push(b); break } full.push(b | 0x80); }
+        let compact_body = { let mut b = vec![0u8]; b.extend_from_slice(&full); b.extend_from_slice(&[1, 2, 3]); b };
+        full.extend_from_slice(&abort);
+        let full = sdt(1, &full);
+        let compact = sdt(2, &compact_body);
+        assert!(is_abort_frame(&full), "a FULL-framed ABORT is an ABORT");
+        assert!(is_abort_frame(&compact), "a compact ABORT naming its template is an ABORT");
+        assert!(crate::telemetry_task::radio_abort_frame_for_test(&full) && crate::telemetry_task::radio_abort_frame_for_test(&compact),
+            "the radio writer's priority sees the same ABORTs");
+        assert!(!is_abort_frame(&sdt(1, &{ let mut b = vec![0x55]; b.extend_from_slice(&command); b })));
         // The mesh writer: an ABORT wrapped as AV-bay data, alone or coalesced
         // with HEALTH, goes at once; ordinary data with HEALTH waits.
         let wrap = |kind: u8, inner: &[u8]| {
