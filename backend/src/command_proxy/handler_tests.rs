@@ -1266,3 +1266,36 @@ async fn a_paired_abort_is_admitted_after_the_primary_renewed_its_boot() {
     assert!(state.manual_abort_intent.pending_epoch().is_some() || state.manual_abort_intent.epoch() > before,
         "the primary retained the manual stop");
 }
+
+/// Each copy of an RRLS request is sealed afresh with its current HEALTH
+/// sequence (request_copy_sequence). The primary runs the request once: a
+/// fresher copy of the same request returns the cached result, and the same
+/// request ID with different contents is still refused.
+#[test]
+fn a_resealed_copy_is_the_same_request_and_runs_once() {
+    if !child("command_proxy::handler_tests::a_resealed_copy_is_the_same_request_and_runs_once", "primary") {
+        return;
+    }
+    let (_root, p, r) = super::tests::fixtures();
+    let mesh = configure();
+    let pv = {
+        let m = mesh.lock().unwrap();
+        m.command_proxy_transport(m.now()).unwrap()
+    };
+    let (mut primary, rr, rv) = clients(&p, &r, pv);
+    let seal = |sequence_back: u32, name: &str| {
+        let view = Transport { sequence: rv.sequence.wrapping_sub(sequence_back), ..rv };
+        rr.request(&r, view, crate::station_mode::local_mode(), [9; 16], "operator".into(), Operation::Command(name.into()))
+            .unwrap()
+    };
+    let mode = crate::station_mode::local_mode();
+    assert!(matches!(primary.receive(&p, pv, mode, &seal(2, "ToggleAvBayUnderglow")), Ok(Received::Execute(_))));
+    assert!(
+        matches!(primary.receive(&p, pv, mode, &seal(0, "ToggleAvBayUnderglow")), Ok(Received::Pending | Received::Reply(_))),
+        "a fresher copy of the same request is not executed again"
+    );
+    assert!(
+        primary.receive(&p, pv, mode, &seal(0, "ToggleFlightBuzzer")).is_err(),
+        "the same request ID with different contents is refused"
+    );
+}

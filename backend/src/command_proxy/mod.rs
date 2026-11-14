@@ -102,6 +102,29 @@ fn refresh_retry_due(now: u64, copies: u8, sent: Option<(u64, u64)>, link_idle_d
 const CACHED_CAPABILITY_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 const REQUEST_RESEND_MS: u64 = 400;
 const REQUEST_COPIES: u8 = 5;
+/// What makes two copies one request: everything the RRLS signed except the
+/// HEALTH sequence it sealed that copy with.
+fn request_content(envelope: &wire::Envelope) -> [u8; 16] {
+    wire::contract_digest(
+        format!("{}|{}|{:?}|{:?}", envelope.issuer, envelope.session, envelope.boot, envelope.message).as_bytes(),
+    )
+}
+/// Whether the RRLS sends another copy of a pending request first sealed at
+/// HEALTH sequence `first`, given its current view `view`, and the sequence
+/// that copy is sealed with.
+///
+/// Every copy is sealed afresh with the current view, so each one is as fresh
+/// as the RRLS can make it when it leaves. Copies used to repeat the first
+/// seal: queueing, air time and missed HEALTH aged the later copies past the
+/// primary's SEQUENCE_WINDOW and the primary refused them as stale (fullnet
+/// B-fix: 7 of 12 RRLS commands). The primary recognises a copy by its request
+/// ID and contents (`request_content`), so a request still runs once, and each
+/// copy must still be within SEQUENCE_WINDOW when it arrives: replay
+/// protection is unchanged. Copies continue while a result can still arrive.
+fn request_copy_sequence(first: u32, view: u32, attempts: u8) -> Option<u32> {
+    let age = view.wrapping_sub(first);
+    (attempts < REQUEST_COPIES && age <= LATE_REPLY_WINDOW).then_some(view)
+}
 fn request_resend_delay(id: &[u8; 16], attempts: u8) -> u64 {
     REQUEST_RESEND_MS + u64::from(id[usize::from(attempts) % id.len()]) % 151
 }
@@ -136,6 +159,8 @@ fn note_rejected_frame(role: Role, reason: &str) {
 struct Cached {
     request: [u8; 16],
     digest: [u8; 16],
+    /// `request_content`: the same request in every copy, whatever its seal.
+    content: [u8; 16],
     sequence: u32,
     reply: Option<Vec<u8>>,
 }
@@ -458,9 +483,22 @@ impl Runtime {
         {
             return Ok(Received::Pending);
         }
+        // On-air diagnosis of request freshness: the sealed HEALTH sequence
+        // against this station's current one (age 1..=SEQUENCE_WINDOW accepted).
+        log::debug!(
+            "paired control frame ({}) session {} sequence {} vs current {} age {}",
+            if primary { "primary" } else { "rrls" },
+            envelope.session,
+            envelope.sequence,
+            transport.sequence,
+            transport.sequence.wrapping_sub(envelope.sequence)
+        );
         ensure!(
             transport.accepts(&envelope, primary) || own_late_reply,
-            "Stale primary connection contract"
+            "Stale primary connection contract (sequence {} vs current {}, session {})",
+            envelope.sequence,
+            transport.sequence,
+            envelope.session == transport.session
         );
         match envelope.message.clone() {
             Message::Query | Message::QueryObserve | Message::QueryReadiness => {
@@ -546,13 +584,16 @@ impl Runtime {
                     "Primary recovery is pending"
                 );
                 let digest = wire::contract_digest(bytes);
+                let content = request_content(&envelope);
                 if let Some(previous) = self
                     .results
                     .iter()
                     .find(|item| item.request == envelope.request)
                 {
+                    // A copy sealed afresh (request_copy_sequence) is the same
+                    // request: the cached result, never a second execution.
                     ensure!(
-                        previous.digest == digest,
+                        previous.content == content,
                         "Request ID reused with different contents"
                     );
                     return Ok(previous
@@ -570,6 +611,7 @@ impl Runtime {
                 self.results.push_back(Cached {
                     request: envelope.request,
                     digest,
+                    content,
                     sequence: envelope.sequence,
                     reply: None,
                 });
@@ -621,8 +663,9 @@ impl Runtime {
             "Only primary completes a request"
         );
         self.synchronize_recovery();
+        let manual_stop = matches!(&request.operation, Operation::Command(name) if name == "Abort");
         ensure!(
-            request.envelope.boot == self.boot,
+            request.envelope.boot == self.boot || manual_stop,
             "Proxy capability was revoked"
         );
         let reply = Envelope {
@@ -1495,6 +1538,8 @@ struct Pending {
     session: u32,
     sequence: u32,
     wire: Option<Vec<u8>>,
+    /// Contract digests of every copy sent (each copy is sealed afresh).
+    copy_digests: Vec<[u8; 16]>,
     last_sent: Option<u64>,
     attempts: u8,
     created_at: u64,
@@ -1792,6 +1837,7 @@ async fn submit_with_origins_inner(
                         session: view.session,
                         sequence: view.sequence,
                         wire: None,
+                        copy_digests: Vec::new(),
                         last_sent: None,
                         attempts: 0,
                         created_at,
@@ -1909,6 +1955,7 @@ async fn submit_with_origins_inner(
         session: view.session,
         sequence: view.sequence,
         wire: None,
+        copy_digests: Vec::new(),
         last_sent: None,
         attempts: 0,
         created_at,
@@ -2029,7 +2076,7 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
         let mut next_discovery = None::<u64>;
         // RRLS: the last request that timed out unconfirmed (id, contract
         // digest), so a signed result that arrives late still updates it.
-        let mut unconfirmed = None::<([u8; 16], [u8; 16])>;
+        let mut unconfirmed = None::<([u8; 16], Vec<[u8; 16]>)>;
 
         loop {
             tokio::select! {_=shutdown.recv()=>break,_=tick.tick()=>{}}
@@ -2206,7 +2253,7 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                         observation,
                     }) => {
                         last_exchange = Some(now);
-                        if unconfirmed == Some((request, digest)) {
+                        if unconfirmed.as_ref().is_some_and(|(id, digests)| *id == request && digests.contains(&digest)) {
                             unconfirmed = None;
                             note_late_result(request, &outcome);
                         }
@@ -2430,13 +2477,12 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                             // signed result, and a changed boot or mode arrives in
                             // its next Capability. Re-verify now, and let a late
                             // signed result still report this request's outcome.
-                            unconfirmed = pending.wire.as_deref().map(|wire| (pending.id, wire::contract_digest(wire)));
+                            unconfirmed = (!pending.copy_digests.is_empty()).then(|| (pending.id, pending.copy_digests.clone()));
                             last_observe_refresh = None;
                             refresh_copies = 0;
                             refresh_sent = None;
                         }
-                    } else if pending.attempts < REQUEST_COPIES
-                        && sequence_age <= SEQUENCE_WINDOW
+                    } else if let Some(copy_sequence) = request_copy_sequence(pending.sequence, view.sequence, pending.attempts)
                         && pending.last_sent.is_none_or(|last| {
                             now >= last
                                 && now - last >= request_resend_delay(&pending.id, pending.attempts)
@@ -2469,7 +2515,7 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                             finish_revoked(&pending);
                             continue;
                         }
-                        if pending.wire.is_none() {
+                        {
                             let Some(mode) = mode.effective_mode else {
                                 continue;
                             };
@@ -2478,7 +2524,7 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                                     &pairing,
                                     Transport {
                                         session: pending.session,
-                                        sequence: pending.sequence,
+                                        sequence: copy_sequence,
                                     },
                                     mode,
                                     pending.id,
@@ -2492,7 +2538,7 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                                     &pairing,
                                     Transport {
                                         session: pending.session,
-                                        sequence: pending.sequence,
+                                        sequence: copy_sequence,
                                     },
                                     mode,
                                     pending.id,
@@ -2501,7 +2547,12 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                                 )
                             };
                             match encoded {
-                                Ok(bytes) => pending.wire = Some(bytes),
+                                Ok(bytes) => {
+                                    if pending.copy_digests.len() < usize::from(REQUEST_COPIES) {
+                                        pending.copy_digests.push(wire::contract_digest(&bytes));
+                                    }
+                                    pending.wire = Some(bytes);
+                                }
                                 Err(_) => {
                                     finish_pending(
                                         pending.id,
@@ -2670,6 +2721,8 @@ fn supported_commands_mask_for_peer(launch_origin_supported: bool) -> u64 {
 
 #[cfg(test)]
 mod handler_tests;
+#[cfg(test)]
+mod proxy_freshness_tests;
 
 #[cfg(test)]
 mod recovery_wire_tests {
