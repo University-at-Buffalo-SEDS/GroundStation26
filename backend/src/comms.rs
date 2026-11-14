@@ -1402,7 +1402,16 @@ impl UartComms {
                 && write_state.radio_capacity.as_ref().is_some_and(|cap| {
                     cap.turn_gated() && !cap.turn_gap_fresh(capacity_wall, capacity_clock, MESH_CONTROL_GAP_WINDOW_MS)
                 });
+            let readback = transmission
+                .frame()
+                .bytes
+                .get(4..transmission.frame().bytes.len().saturating_sub(4))
+                .is_some_and(abort_readback_query)
+                && transmission.follower_frame().is_none();
             let refused = stale_gap || write_state.radio_capacity.as_ref().is_some_and(|cap| {
+                if readback {
+                    return !cap.ready_for(capacity_wall, capacity_clock, true);
+                }
                 if let Some((id, receipt)) = transmission.single_control_contract() {
                     if receipt {
                         return !cap.ready_for_receipt(
@@ -2611,6 +2620,27 @@ pub(crate) enum AbortWrite {
     InGap,
     /// Refuse for now (the writer retries on its next pass).
     Hold,
+}
+/// After an operator Abort, the station's AV-bay readback queries
+/// (board_recovery/abort_confirm.rs poll_av_bay) are Abort-critical: a
+/// BOARD_RECOVERY_REQUEST then takes the turn gap with the critical airtime
+/// loan instead of the command lane's control-capacity hold. In the T30
+/// fullnet that hold kept them back while the AV-bay boards' own Abort status
+/// pushes had all been lost, and FC was shown Aborted 11.7 s late. They still
+/// wait for the gap, and the ABORT gap copies go first (service_transmit).
+static ABORT_READBACK_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) fn set_abort_readback_active(active: bool) {
+    ABORT_READBACK_ACTIVE.store(active, std::sync::atomic::Ordering::Release);
+}
+pub(crate) fn abort_readback_active() -> bool {
+    ABORT_READBACK_ACTIVE.load(std::sync::atomic::Ordering::Acquire)
+}
+/// An SDK BOARD_RECOVERY_REQUEST while the Abort readback runs.
+fn abort_readback_query(sdk_payload: &[u8]) -> bool {
+    abort_readback_active()
+        && serialize::peek_frame_info_unchecked(sdk_payload).is_ok_and(|info| {
+            info.envelope.ty == crate::telemetry_schema::data_type("BOARD_RECOVERY_REQUEST")
+        })
 }
 /// When the station last heard any air, and air that carried an AV-bay frame
 /// (station clock ms; the latter is the same stamp the turn gate uses).
@@ -3861,7 +3891,11 @@ impl UartComms {
             )
             .into());
         }
+        let readback = abort_readback_query(sdk_payload);
         if write_state.radio_capacity.as_ref().is_some_and(|cap| {
+            if readback {
+                return !cap.ready_for(capacity_wall, capacity_clock, true);
+            }
             if let Some(id) = command_id {
                 return !cap.ready_for_command(
                     capacity_wall,
@@ -4419,7 +4453,11 @@ impl CommsDevice for UartComms {
             trace_radio_gate_refusal("recovery_capacity", priority, payload, String::new);
             return false;
         }
+        let readback = abort_readback_query(payload);
         if state.radio_capacity.as_ref().is_some_and(|cap| {
+            if readback {
+                return !cap.ready_for(wall, clock, true);
+            }
             if let Some((id, receipt, len)) = control {
                 return if receipt {
                     !cap.ready_for_receipt(wall, clock, id, len)
@@ -7125,6 +7163,64 @@ mod raw_uart_tests {
         bursts.note_any(1_135); // the RRLS writes
         assert!(!bursts.young_heard_gap(1_150, 30), "quiet time restarts on any air");
         assert!(!bursts.young_heard_gap(1_170, 30), "but the gap is 70 ms old: too late for a copy");
+    }
+
+    /// While the Abort readback runs, a BOARD_RECOVERY_REQUEST is Abort-critical:
+    /// a re-send the command lane holds (a replayed contract waits for full
+    /// airtime and the modem's quiet boundary; T30: gate=control_capacity) is
+    /// admitted with the critical loan, but never outside the turn gap. Other
+    /// types, and the same type outside the readback, keep the command lane.
+    #[test]
+    fn an_abort_readback_query_takes_the_critical_loan_but_waits_for_the_gap() {
+        crate::telemetry_schema::initialize().unwrap();
+        let pack = |name: &str| {
+            serialize::pack_packet(
+                &Packet::new(
+                    crate::telemetry_schema::data_type(name),
+                    &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")],
+                    "GS",
+                    1,
+                    std::sync::Arc::from([0u8; 32]),
+                )
+                .unwrap(),
+            )
+            .to_vec()
+        };
+        let query = pack("BOARD_RECOVERY_REQUEST");
+        set_abort_readback_active(false);
+        assert!(!abort_readback_query(&query), "outside the Abort readback: the command lane");
+        set_abort_readback_active(true);
+        assert!(abort_readback_query(&query));
+        let other = serialize::pack_packet(
+            &Packet::new(
+                crate::telemetry_schema::data_type("FLIGHT_STATE"),
+                &[crate::telemetry_schema::endpoint("FLIGHT_STATE")],
+                "GS",
+                1,
+                std::sync::Arc::from([1u8]),
+            )
+            .unwrap(),
+        )
+        .to_vec();
+        assert!(!abort_readback_query(&other), "only BOARD_RECOVERY_REQUEST");
+        set_abort_readback_active(false);
+        // The command lane's hold on a replayed contract, which the readback query skips.
+        let wall = Instant::now();
+        let mut cap = rfd_capacity::Capacity::new(64000, 35, 16);
+        cap.committed_command_batch(wall, Some(35088), [55, 61], 116);
+        assert!(cap.close_command_batch(wall, Some(35088), [11, 12]));
+        cap.committed(wall, Some(35210), 47);
+        cap.committed(wall, Some(35233), 59);
+        cap.committed(wall, Some(35294), 150);
+        cap.drained_virtual(35307021);
+        assert!(!cap.ready_for_command(wall, Some(35344), 11, 84, true), "an ordinary re-send is held");
+        assert!(cap.ready_for(wall, Some(35344), true), "the Abort readback query goes");
+        // Taking turns: the gap still decides.
+        let mut gated = rfd_capacity::Capacity::new(64000, 35, 16).with_turn_period(200);
+        gated.enable_turn_gate();
+        gated.note_air_rx((wall, Some(40_000)));
+        assert!(!gated.ready_for(wall, Some(40_010), true), "RF's air was heard 10 ms ago: no gap yet");
+        assert!(gated.ready_for(wall, Some(40_040), true), "in the gap");
     }
 
     /// Heard frames are told apart by SEDSnet source: the station's open no

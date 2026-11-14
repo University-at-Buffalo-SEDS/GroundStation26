@@ -40,6 +40,12 @@ const AV_BAY_CONFIRM_WINDOW: Duration = Duration::from_secs(20);
 /// An AV-bay board that answered without showing the Abort is asked again
 /// after this: each radio query holds the one ordered stream.
 const AV_BAY_REQUERY: Duration = Duration::from_secs(2);
+/// An AV-bay Abort owner not shown Aborted this long after the press is asked
+/// even while the umbilical readback is still open. A board's own Abort status
+/// push is 4 copies over 1.2 s: in the T30 fullnet all four were lost at 30%
+/// loss and the station showed FC Aborted only 11.7 s after it latched
+/// (radio-sched-sim: never-shown cycles 5/300 -> 0 at 30% loss, 59 -> 1 at 50%).
+const AV_BAY_EARLY: Duration = Duration::from_millis(1500);
 
 /// Bumped each time a BOARD_RECOVERY_REQUEST head gave up its retries. The
 /// SDK drops the queued tail with it, so every prompt query asked before the
@@ -76,6 +82,12 @@ pub(crate) struct AbortConfirmRefresh {
     av_bay_owed: u8,
 }
 impl AbortConfirmRefresh {
+    /// Move the window's start back (tests: time passing without sleeping).
+    #[cfg(test)]
+    pub(crate) fn backdate(&mut self, by: Duration) {
+        self.since = self.since.map(|s| s - by);
+        self.av_bay_since = self.av_bay_since.map(|s| s - by);
+    }
     /// Start (or restart) the window for an Abort the station just sent.
     pub(crate) fn start(&mut self) {
         self.since = Some(Stamp::now());
@@ -158,10 +170,18 @@ impl AbortConfirmRefresh {
     /// umbilical readback (an AV-bay query ahead of those would hold them in
     /// the one ordered stream) and keeps one AV-bay query in flight at a time.
     pub(crate) fn poll_av_bay(&mut self, state: &Arc<AppState>) -> u8 {
-        if !self.av_bay_active() || self.active() || crate::rrls::is_rrls() {
+        let active = self.av_bay_active();
+        crate::comms::set_abort_readback_active(active && !crate::rrls::is_rrls());
+        if !active || crate::rrls::is_rrls() {
             return 0;
         }
         let Some(since) = self.av_bay_since else { return 0 };
+        // The umbilical readback goes first (an AV-bay query ahead of it would
+        // hold it in the one ordered stream) until AV_BAY_EARLY has passed.
+        let early = Stamp::now().checked_duration_since(since).is_some_and(|age| age >= AV_BAY_EARLY);
+        if self.active() && !early {
+            return 0;
+        }
         let Some(router) = state.topology_router.get() else { return 0 };
         let aborted = state.board_abort.masks().0;
         self.av_bay_owed &= scope::mode_scope(crate::station_mode::local_mode())
@@ -430,6 +450,45 @@ mod tests {
 
     /// Review of 925b07a: a silent FC (unreachable over the relay) comes due
     /// again each time its query gives up, and must not starve PB and RF.
+    /// T30 fullnet: FC latched in 31 ms but all four copies of its Abort status
+    /// push were lost, and the station showed FC Aborted 11.7 s later. An
+    /// AV-bay owner not shown Aborted 1.5 s after the press is asked even while
+    /// the umbilical readback is still open; before that the umbilical
+    /// readback goes first.
+    #[tokio::test]
+    async fn an_unshown_av_bay_owner_is_asked_1500_ms_after_the_abort() {
+        let fixture = crate::board_recovery::tests::http_fixture().await;
+        let state = fixture.state.clone();
+        if scope::mode_scope(crate::station_mode::local_mode()) & 0b111 == 0 {
+            return; // test fire tracks no AV bay
+        }
+        let host = Arc::new(Router::new(RouterConfig::new([]).with_sender("GS")));
+        assert!(state.topology_router.set(host.clone()).is_ok());
+        let opts = RouterSideOptions { reliable_enabled: true, ..Default::default() };
+        let radio = host.add_side_packed_with_options("rocket_comms", |_| Ok(()), opts.clone());
+        let umbilical = host.add_side_packed_with_options("umbilical_comms", |_| Ok(()), opts);
+        for board in BOARDS {
+            let side = if UMBILICAL.contains(&index(board).unwrap()) { umbilical } else { radio };
+            let announce = sedsnet::discovery::build_discovery_announce(
+                board.sender_id(), 1, &[crate::telemetry_schema::endpoint(endpoint(board))]).unwrap();
+            host.rx_from_side(&announce, side).unwrap();
+            state.board_status.lock().unwrap().get_mut(&board).unwrap().last_seen_instant = Some(std::time::Instant::now());
+        }
+        let mut service = crate::telemetry_task::RouterServiceForTest::default();
+        service.pump(&host);
+        let mut confirm = AbortConfirmRefresh::default();
+        confirm.start();
+        // The umbilical boards have not answered yet: their readback window is open.
+        assert_eq!(confirm.poll(&state), 0b111_1000);
+        assert_eq!(confirm.poll_av_bay(&state), 0, "umbilical readback goes first");
+        assert!(crate::comms::abort_readback_active(), "the AV-bay readback is Abort-critical while it runs");
+        confirm.backdate(Duration::from_millis(1400));
+        assert_eq!(confirm.poll_av_bay(&state), 0, "1.4 s: still the umbilical readback's turn");
+        confirm.backdate(Duration::from_millis(100));
+        assert!(confirm.active(), "the umbilical readback is still owed");
+        assert_eq!(confirm.poll_av_bay(&state), 0b010, "1.5 s: FC, not yet shown Aborted, is asked");
+    }
+
     #[tokio::test]
     async fn a_silent_av_bay_board_does_not_starve_the_others() {
         let _tuning = crate::network_delivery_tuning_for_test();
