@@ -4,7 +4,7 @@ use crate::types::{
     NetworkTopologyLink, NetworkTopologyNode, NetworkTopologyNodeKind, NetworkTopologyStatus,
 };
 
-/// The primary shows the RRLS Offline, and stops owing it reliable frames,
+/// The primary shows the RRLS Offline
 /// once its last verified exchange is this old.
 pub(crate) const OFFLINE_AFTER_MS: u64 = 15_000;
 

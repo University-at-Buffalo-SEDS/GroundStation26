@@ -417,13 +417,6 @@ pub(crate) fn takeover_changed(router: &Router, takeover: bool) -> Result<()> {
     }
     Ok(())
 }
-/// A primary whose RRLS went Offline (unheard for 15 s, see rrls_topology)
-/// forgets it as a destination the same way.
-pub(crate) fn rrls_offline(router: &Router) -> Result<()> {
-    let retired = router.forget_peer("RRLS")?;
-    log::info!("RRLS offline: no longer a destination ({retired} pending frame(s) released)");
-    Ok(())
-}
 fn initialize_for_role_seed(router: &Router, observer: bool, seed: bool) -> Result<()> {
     for data_type in STATION_VARIABLES {
         router.enable_network_variable(
