@@ -2548,7 +2548,7 @@ impl UartWriteState {
 /// An SDK FLIGHT_STATE frame carrying Aborted (15): the Abort's flight-state
 /// write. RF latches the Abort from it, so like ABORT it is never held for an
 /// air turn.
-fn is_abort_flight_state(payload: &[u8]) -> bool {
+pub(crate) fn is_abort_flight_state(payload: &[u8]) -> bool {
     serialize::peek_frame_info_unchecked(payload).is_ok_and(|info| {
         info.envelope.ty == crate::telemetry_schema::data_type("FLIGHT_STATE")
     }) && serialize::unpack_packet(payload).is_ok_and(|packet| packet.payload() == [15])

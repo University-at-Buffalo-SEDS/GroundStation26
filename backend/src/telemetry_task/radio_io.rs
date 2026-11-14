@@ -1947,6 +1947,14 @@ impl WireBacklog {
             self.control_bytes = self.control_bytes.saturating_add(abort.1.len());
             return Some(abort);
         }
+        // The Abort's FLIGHT_STATE=15 follows it at once: nothing (a held
+        // BOARD_RECOVERY_REQUEST, now Abort-critical during the readback) may
+        // be written between them (clock-sync combo fullnets: FLIGHT_STATE=15
+        // left 256-292 ms after the ABORT, behind a held query).
+        if let Some(state) = self.pop_abort_flight_state() {
+            self.control_bytes = self.control_bytes.saturating_add(state.1.len());
+            return Some(state);
+        }
         // Canonical controls are independent of the ordered SDT dictionaries.
         // Routine heartbeat/GPS/discovery must not hide one eligible loan.
         let application = self.priorities.iter().rev().find_map(|(priority, queue)| {
@@ -1979,6 +1987,14 @@ impl WireBacklog {
         }
         packet
     }
+    /// The Abort's FLIGHT_STATE=15 write, from whichever lane holds it.
+    fn pop_abort_flight_state(&mut self) -> Option<(u8, Vec<u8>)> {
+        if let Some(state) = self.pop_first_matching(crate::comms::is_abort_flight_state) {
+            return Some(state);
+        }
+        let index = self.ordered.iter().position(|(_, bytes)| crate::comms::is_abort_flight_state(bytes))?;
+        self.ordered.remove(index)
+    }
     /// The frame `backlog_pop` would take next from the priority lanes.
     fn next_priority_frame(&self) -> Option<&Vec<u8>> {
         self.priorities.last_key_value().and_then(|(_, queue)| queue.front())
@@ -2000,6 +2016,13 @@ impl WireBacklog {
         Some((priority, bytes))
     }
     fn pop(&mut self) -> Option<(u8, Vec<u8>)> {
+        // An ABORT, then its FLIGHT_STATE=15, before anything else (pop_critical).
+        if let Some(abort) = self.pop_first_matching(is_abort_frame) {
+            return Some(abort);
+        }
+        if let Some(state) = self.pop_abort_flight_state() {
+            return Some(state);
+        }
         // The station heartbeat first (FC GND_TIMEOUT 3 s, about 70 B/s),
         // then receipts, then time sync, all ahead of bulk SDT.
         // A heartbeat goes ahead of waiting receipts at most once a second,
@@ -2390,6 +2413,46 @@ mod priority_tests {
             "closed-channel rollback cannot leave background permanently held"
         );
         assert_eq!(budget.pending.load(Ordering::Acquire), 0);
+    }
+
+    /// An ABORT and its FLIGHT_STATE=15 leave back to back: a
+    /// BOARD_RECOVERY_REQUEST queued ahead of them in the 255 lane (Abort-critical
+    /// during the readback since db3c280) is never written between them, on
+    /// either selection path, whichever lane the FLIGHT_STATE write sits in.
+    #[test]
+    fn nothing_is_written_between_an_abort_and_its_flight_state() {
+        crate::telemetry_schema::initialize().unwrap();
+        let pack = |name: &str, endpoint: &str, payload: &[u8]| {
+            serialize::pack_packet(
+                &Packet::new(
+                    crate::telemetry_schema::data_type(name),
+                    &[crate::telemetry_schema::endpoint(endpoint)],
+                    "GS",
+                    1,
+                    std::sync::Arc::from(payload),
+                )
+                .unwrap(),
+            )
+            .to_vec()
+        };
+        let query = pack("BOARD_RECOVERY_REQUEST", "FLIGHT_CONTROLLER", &[0; 32]);
+        let abort = pack("ABORT", "ABORT", b"SEDS_MANUAL_ABORT_V1:K");
+        let aborted = pack("FLIGHT_STATE", "FLIGHT_STATE", &[15]);
+        for state_priority in [255u8, 3] {
+            for critical in [true, false] {
+                let mut backlog = WireBacklog::new(true);
+                backlog.push(255, query.clone(), false);
+                backlog.push(255, abort.clone(), false);
+                backlog.push(state_priority, aborted.clone(), false);
+                let mut order = Vec::new();
+                while let Some((_, bytes)) = if critical { backlog.pop_critical().or_else(|| backlog.pop()) } else { backlog.pop() } {
+                    order.push(bytes);
+                }
+                let at = |frame: &Vec<u8>| order.iter().position(|b| b == frame).unwrap();
+                assert_eq!(at(&abort) + 1, at(&aborted), "FLIGHT_STATE=15 right after the ABORT (priority {state_priority}, critical {critical})");
+                assert!(at(&query) > at(&aborted), "the query after both (priority {state_priority}, critical {critical})");
+            }
+        }
     }
 
     #[test]
