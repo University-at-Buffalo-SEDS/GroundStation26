@@ -2557,12 +2557,13 @@ mod priority_tests {
         while let Some((_, f)) = backlog.pop() {
             rest.push(f);
         }
-        // Whatever order the backlog chose, the bundle is its prefix and ends
-        // before the ABORT, which is the very next write.
+        // The backlog takes the ABORT before anything else (f37b742): it
+        // leaves alone, never inside a bundle; the bundle that follows is the
+        // rest, in order.
         let mut order = sent.clone();
         order.extend(rest.iter().cloned());
-        assert!(!sent.contains(&abort));
-        assert_eq!(rest.first(), Some(&abort), "the ABORT goes next, alone: {} sent", sent.len());
+        assert_eq!(sent, vec![abort.clone()], "the ABORT goes first and alone");
+        assert!(!rest.contains(&abort));
         assert_eq!(order.len(), 4);
     }
     #[test]
