@@ -2763,6 +2763,9 @@ pub(crate) const ABORT_STATE_COPY_OFFSETS_MS: [u64; 2] = [110, 220];
 pub(crate) struct AbortStateBurst {
     copies: Vec<(u64, Vec<u8>)>,
     last: Option<u64>,
+    /// The last FLIGHT_STATE=15 frame written (packet ID, bytes): what an
+    /// ABORT gap copy carries while the station's own write is owed.
+    frame: Option<(u64, Vec<u8>)>,
 }
 impl AbortStateBurst {
     /// A FLIGHT_STATE=15 write went out: schedule its copies (once per packet).
@@ -2772,6 +2775,7 @@ impl AbortStateBurst {
         }
         let Ok(packet) = serialize::unpack_packet(payload) else { return false };
         let id = packet.packet_id();
+        self.frame = Some((id, payload.to_vec()));
         if self.last == Some(id) {
             return false;
         }
@@ -2791,6 +2795,33 @@ impl AbortStateBurst {
     }
 }
 static ABORT_STATE_BURST: std::sync::Mutex<Option<AbortStateBurst>> = std::sync::Mutex::new(None);
+/// The station's own Aborted FLIGHT_STATE write (its packet ID, from
+/// own_network_variable) while it is owed: pending in the SDK, or an AV-bay
+/// board does not read Aborted yet. Every ABORT gap copy carries it in the
+/// same write (R2-range: RF and PB, which take an Abort only from
+/// FLIGHT_STATE, waited 3.3 s for it while ABORT copies kept going).
+static ABORT_GAP_FLIGHT_STATE: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
+/// Set by the operator Abort re-send while the station's Aborted FLIGHT_STATE
+/// is owed; None when every AV-bay board reads Aborted, or on Reset.
+pub(crate) fn set_abort_gap_flight_state(own_write: Option<u64>) {
+    *ABORT_GAP_FLIGHT_STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = own_write;
+}
+#[cfg(test)]
+pub(crate) fn abort_gap_flight_state_for_test() -> Option<u64> {
+    *ABORT_GAP_FLIGHT_STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+/// The FLIGHT_STATE=15 frame an ABORT gap copy carries now, if any: the last
+/// one written, only when it is the station's owed own write.
+fn abort_gap_flight_state_frame() -> Option<Vec<u8>> {
+    let owed = (*ABORT_GAP_FLIGHT_STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner))?;
+    ABORT_STATE_BURST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .and_then(|burst| burst.frame.as_ref())
+        .filter(|(id, _)| *id == owed)
+        .map(|(_, bytes)| bytes.clone())
+}
 /// Set while the radio writer sends one of those copies (one station radio
 /// writer per process).
 static SENDING_ABORT_STATE_COPY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -4538,7 +4569,12 @@ impl CommsDevice for UartComms {
                 .and_then(|copies| copies.take_due(now, heard_gap));
             if let Some(copy) = due {
                 SENDING_ABORT_GAP_COPY.store(true, std::sync::atomic::Ordering::Release);
-                let refused = self.send_data_with_priority(&copy, 255).is_err();
+                // The station's owed Aborted FLIGHT_STATE rides in the same
+                // write, right behind the ABORT copy.
+                let refused = match abort_gap_flight_state_frame() {
+                    Some(state) => self.send_abort_pair_tracked(&copy, &state, 255, &[]).is_err(),
+                    None => self.send_data_with_priority(&copy, 255).is_err(),
+                };
                 SENDING_ABORT_GAP_COPY.store(false, std::sync::atomic::Ordering::Release);
                 if refused && let Some(copies) = ABORT_GAP_COPIES
                     .lock()
@@ -7879,6 +7915,126 @@ mod raw_uart_tests {
         // Every owner acknowledged it after 700 ms: no copy after that.
         let (acked, _) = abort_copy_times(|_| true, 700);
         assert!(acked.iter().all(|at| *at < 700), "{acked:?}");
+    }
+
+    /// R2-range: RF and PB (which take an Abort only from FLIGHT_STATE)
+    /// waited 3.3 s for the Aborted FLIGHT_STATE while ABORT gap copies kept
+    /// going. Under the turn gate, every ABORT gap copy write carries the
+    /// station's owed Aborted FLIGHT_STATE, right behind the ABORT and within
+    /// the turn's write share; once it is no longer owed (every AV-bay board
+    /// reads Aborted, or Reset) the copies go alone.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn every_abort_gap_copy_carries_the_owed_aborted_flight_state() {
+        if !cfg!(feature = "firmware_sim") {
+            crate::mode_suite!(Hitl);
+        }
+        const CHILD: &str = "GS_ABORT_GAP_STATE_CHILD";
+        const NAME: &str = "comms::raw_uart_tests::every_abort_gap_copy_carries_the_owed_aborted_flight_state";
+        if std::env::var_os(CHILD).is_none() {
+            let clock = std::env::temp_dir().join(format!("gs-abort-gap-state-{}.clock", std::process::id()));
+            std::fs::write(&clock, "30000").unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("GS_SIM_CLOCK_FILE", &clock)
+                .env("GS_SIMULATED_SERIAL_PTY", "1")
+                .env_remove("GS_RADIO_TURN_TAKING")
+                .output()
+                .unwrap();
+            let _ = std::fs::remove_file(clock);
+            assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        crate::telemetry_schema::initialize().unwrap();
+        let clock = std::path::PathBuf::from(std::env::var_os("GS_SIM_CLOCK_FILE").unwrap());
+        let pack = |name: &str, endpoint: &str, payload: &[u8]| {
+            serialize::pack_packet(
+                &Packet::new(
+                    crate::telemetry_schema::data_type(name),
+                    &[crate::telemetry_schema::endpoint(endpoint)],
+                    "GS",
+                    1,
+                    std::sync::Arc::from(payload),
+                )
+                .unwrap(),
+            )
+            .to_vec()
+        };
+        let abort = pack("ABORT", "ABORT", b"SEDS_MANUAL_ABORT_V1:G");
+        let aborted = pack("FLIGHT_STATE", "FLIGHT_STATE", &[15]);
+        let rf_frame = serialize::pack_packet(
+            &Packet::new(
+                crate::telemetry_schema::data_type("GPS_STATUS"),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                "RF",
+                1,
+                std::sync::Arc::from([0u8; 16]),
+            )
+            .unwrap(),
+        )
+        .to_vec();
+        let (mut peer, port) = serialport::TTYPort::pair().unwrap();
+        peer.set_timeout(Duration::from_millis(1)).unwrap();
+        let (mut uart, mesh, _) = recovery_uart_fixture(port);
+        {
+            let mut capacity = rfd_capacity::Capacity::new(64000, 15, 16).with_turn_period(200);
+            capacity.enable_turn_gate();
+            uart.write_lock.lock().unwrap().radio_capacity = Some(capacity);
+        }
+        uart.enable_radio_capacity_control();
+        // The Abort and its FLIGHT_STATE=15 were written at 30000.
+        ABORT_GAP_COPIES
+            .lock()
+            .unwrap()
+            .get_or_insert_with(Default::default)
+            .note_written(serialize::unpack_packet(&abort).unwrap().packet_id(), &abort, 30_000);
+        ABORT_STATE_BURST.lock().unwrap().get_or_insert_with(Default::default).note_written(30_000, &aborted);
+        // No early FLIGHT_STATE copies of their own here: only what rides along.
+        AV_BAY_ABORT_SHOWN.store(0b111, std::sync::atomic::Ordering::Release);
+        set_abort_gap_flight_state(Some(serialize::unpack_packet(&aborted).unwrap().packet_id()));
+        let marker = b"SEDS_MANUAL_ABORT_V1:G";
+        let has = |bytes: &[u8], frame: &[u8]| bytes.windows(frame.len()).any(|w| w == frame);
+        let has_abort = |bytes: &[u8]| bytes.windows(marker.len()).any(|w| w == marker);
+        // The turn's write share at the UART rate, less the join reserve.
+        let share = 30 * 115_200 / 10 / 1_000 - rfd_capacity::TURN_JOIN_RESERVE_BYTES as usize;
+        let mut buf = [0u8; 2048];
+        let (mut owed_copies, mut alone_copies) = (0, 0);
+        for now in (30_000u64..31_400).step_by(5) {
+            if now == 30_700 {
+                // Every AV-bay board reads Aborted (or Reset): no longer owed.
+                set_abort_gap_flight_state(None);
+            }
+            std::fs::write(&clock, now.to_string()).unwrap();
+            if now % 200 < 90 {
+                note_air_rx_now();
+                note_heard_frame(&rf_frame);
+                mesh.lock().unwrap().incoming(true, b"RS\x01\x00\x00\x00\x00\x00\x00", now);
+            }
+            uart.service_transmit().unwrap();
+            let mut bytes = Vec::new();
+            while let Ok(n) = peer.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buf[..n]);
+            }
+            if !has_abort(&bytes) {
+                continue;
+            }
+            if now < 30_700 {
+                assert!(has(&bytes, &aborted), "an ABORT gap copy at {now} without the owed FLIGHT_STATE=15");
+                let a = bytes.windows(marker.len()).position(|w| w == marker).unwrap();
+                let f = bytes.windows(aborted.len()).position(|w| w == &aborted[..]).unwrap();
+                assert!(a < f, "FLIGHT_STATE=15 rides behind the ABORT at {now}");
+                assert!(bytes.len() <= share, "the pair ({} B) exceeds the turn write share ({share} B)", bytes.len());
+                owed_copies += 1;
+            } else {
+                assert!(!has(&bytes, &aborted), "FLIGHT_STATE=15 rode along at {now} after it was no longer owed");
+                alone_copies += 1;
+            }
+        }
+        assert!(owed_copies >= 2 && alone_copies >= 2, "copies: owed {owed_copies}, alone {alone_copies}");
     }
 
     /// The station's write order in a heard gap, on the real writer: the

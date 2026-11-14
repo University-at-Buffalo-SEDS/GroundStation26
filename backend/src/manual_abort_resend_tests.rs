@@ -283,3 +283,39 @@ fn routed_mark() -> SendMark {
 fn observation(now_ms: u64, owed: u8, unheard: u8) -> Observation {
     Observation { now_ms, epoch: 1, station_aborted: true, recovery: None, owed, unheard }
 }
+
+/// The station's own Aborted FLIGHT_STATE rides every ABORT gap copy while it
+/// is owed (comms::set_abort_gap_flight_state), and from own_network_variable
+/// only: it stops once every AV-bay board reads Aborted, on Reset (the
+/// station leaves Aborted), and when the re-send is disarmed for a recovery.
+#[test]
+fn the_owed_aborted_flight_state_rides_abort_gap_copies_until_readback_or_reset() {
+    let _serial = crate::RUNTIME_TUNING_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    crate::telemetry_schema::initialize().unwrap();
+    let gs = Router::new(RouterConfig::new([]).with_sender("GS"));
+    let ty = crate::telemetry_schema::data_type("FLIGHT_STATE");
+    gs.enable_network_variable(ty, sedsnet::router::NetworkVariablePermissions::READ_WRITE).unwrap();
+    let own = sedsnet::packet::Packet::new(ty, &[crate::telemetry_schema::endpoint("FLIGHT_STATE")], "GS", 1_767_225_600_000, Arc::from([15u8])).unwrap();
+    gs.set_network_variable(own).unwrap();
+    let id = gs.own_network_variable(ty).expect("the station's own write").packet_id();
+    let seen = |owed, station_aborted| Observation {
+        now_ms: 100_000, epoch: 1, station_aborted, recovery: None, owed, unheard: 0,
+    };
+    let resender = AbortResend::default();
+    resender.arm(1, WirePolicy::Untimed, None, routed_mark());
+    resender.step(&gs, seen(0b100, true));
+    assert_eq!(crate::comms::abort_gap_flight_state_for_test(), Some(id), "owed: PB does not read Aborted yet");
+    resender.step(&gs, seen(0, true));
+    assert_eq!(crate::comms::abort_gap_flight_state_for_test(), None, "every AV-bay board reads Aborted");
+    let resender = AbortResend::default();
+    resender.arm(1, WirePolicy::Untimed, None, routed_mark());
+    resender.step(&gs, seen(0b100, true));
+    assert_eq!(crate::comms::abort_gap_flight_state_for_test(), Some(id));
+    resender.step(&gs, seen(0b100, false));
+    assert_eq!(crate::comms::abort_gap_flight_state_for_test(), None, "Reset: the station left Aborted");
+    let resender = AbortResend::default();
+    resender.arm(1, WirePolicy::Untimed, None, routed_mark());
+    resender.step(&gs, seen(0b100, true));
+    resender.disarm("recovery prepared");
+    assert_eq!(crate::comms::abort_gap_flight_state_for_test(), None, "disarmed for a recovery");
+}

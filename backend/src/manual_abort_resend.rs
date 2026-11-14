@@ -278,6 +278,7 @@ impl AbortResend {
     /// coordinator drains in-flight ABORTs and takes its fresh queries, so no
     /// later copy can move a board's abort epoch under the prepared intent.
     pub(crate) fn disarm(&self, why: &str) {
+        crate::comms::set_abort_gap_flight_state(None);
         let taken = self.armed.lock().unwrap().take();
         if let Some(armed) = taken {
             if armed.resends > 0 {
@@ -326,8 +327,18 @@ impl AbortResend {
             }
             *guard = None;
             FLIGHT_STATE_UNACKED.store(0, Ordering::Release);
+            crate::comms::set_abort_gap_flight_state(None);
             return None;
         }
+        // The station's own Aborted FLIGHT_STATE rides every ABORT gap copy
+        // while it is owed: still pending in the SDK, or a board does not read
+        // Aborted yet (owed | unheard is non-zero here).
+        crate::comms::set_abort_gap_flight_state(
+            router
+                .own_network_variable(crate::telemetry_schema::data_type("FLIGHT_STATE"))
+                .filter(|own| own.payload() == [crate::types::NetworkFlightState::Aborted as u8])
+                .map(|own| own.packet_id()),
+        );
         let sent = Self::step_abort(armed, router, &seen, owed, unheard);
         // After any ABORT copy of this pass, so the FLIGHT_STATE queues behind
         // it: the Aborted FLIGHT_STATE an owed board never acknowledged (it
