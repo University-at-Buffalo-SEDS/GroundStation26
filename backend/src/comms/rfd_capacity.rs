@@ -96,6 +96,9 @@ pub(crate) struct TurnGate {
     /// budget/RF-profile control). Written in the gap it does not spend the
     /// station's turn: the gap stays open for the turn's own write.
     control_only: bool,
+    /// The current packet is a HEALTH started in the station's gap that no
+    /// frame has joined yet: the first frame joining its burst spends the turn.
+    health_turn: bool,
     /// The last heard air that carried an AV-bay frame (HeardSource::AvBay,
     /// stamped when the frame decoded). Once AV-bay air is known only it
     /// opens a station turn: the RRLS's writes and the station's own frames
@@ -188,14 +191,27 @@ impl TurnGate {
         // frames do not join its burst (mid-turn that would open the air to
         // frames that must wait for the gap). Started in the station's own
         // gap, it is the turn's write: ordinary frames may join it, so
-        // HEALTH does not cost an extra air packet.
+        // HEALTH does not cost an extra air packet (R2-confirm: HEALTH alone
+        // was 2 of the station's 6.95 air packets/s).
         self.out_of_turn = (self.bypass || self.control_only)
             && !self.standby
-            && (self.control_only || !TurnGate { bypass: false, ..*self }.open(wall, virtual_ms));
+            && !TurnGate { bypass: false, ..*self }.open(wall, virtual_ms);
         if self.out_of_turn {
             return;
         }
         self.last_start = Some((wall, virtual_ms));
+        // HEALTH in the station's gap lets the turn's frames join its burst
+        // (one air packet) and spends the turn only once one does: alone, a
+        // frame that misses the burst (its airtime pacing not yet due) still
+        // gets the gap, as before.
+        self.health_turn = self.control_only;
+        if self.control_only {
+            return;
+        }
+        self.spend();
+    }
+    fn spend(&mut self) {
+        self.health_turn = false;
         self.served_rx = self.last_air_rx;
         self.served_av = self.av_rx;
     }
@@ -1349,6 +1365,10 @@ impl Capacity {
         }
         if let Some(turn) = self.gate_mut() {
             turn.packet_bytes = turn.packet_bytes.saturating_add(u32::try_from(framed_bytes).unwrap_or(u32::MAX));
+            // A frame joining an in-gap HEALTH's burst: now the turn is used.
+            if !boundary_passed && turn.health_turn && !turn.control_only {
+                turn.spend();
+            }
         }
         self.next_packet = Some((
             wall.checked_add(Duration::from_millis(packet_ms))
@@ -1475,6 +1495,43 @@ mod tests {
         assert!(cap.packet_ready(wall, Some(5100)));
         cap.committed(wall, Some(5100), 20);
         assert!(cap.packet_ready(wall, Some(5200)), "normal pacing: ready after the packet gap");
+    }
+    /// Bench check R2-confirm: the station sent 6.95 air packets/s against about
+    /// 5 (one write per AV-bay turn). HEALTH, mesh control written alone in
+    /// the station's own gap, went out of turn, so the turn's frames could not
+    /// join it and left 13-16 ms later as a second air packet (HEALTH alone
+    /// 1.99/s). Started in the station's own gap, the turn's frames join its
+    /// burst, and the first that joins spends the turn; alone it leaves the
+    /// gap to the turn's write as before. Mid-turn it stays out of turn.
+    #[test]
+    fn ordinary_frames_join_a_health_started_in_the_station_own_gap() {
+        let wall = Instant::now();
+        let mut cap = Capacity::new(64000, 100, 16).with_turn_period(200);
+        cap.enable_turn_gate();
+        cap.note_air_rx((wall, Some(1000)));
+        cap.set_turn_control_only(true);
+        cap.committed(wall, Some(1005), 20);
+        cap.set_turn_control_only(false);
+        assert!(!cap.packet_ready(wall, Some(1010)), "ordinary frames do not join a mid-turn HEALTH");
+        let mut cap = Capacity::new(64000, 100, 16).with_turn_period(200);
+        cap.enable_turn_gate();
+        cap.note_air_rx((wall, Some(1000)));
+        assert!(cap.ready(wall, Some(1040)), "the gap is the station's");
+        cap.set_turn_control_only(true);
+        cap.committed(wall, Some(1040), 20);
+        cap.set_turn_control_only(false);
+        assert!(cap.packet_ready(wall, Some(1045)), "ordinary frames ride the in-turn HEALTH");
+        assert!(cap.packet_ready(wall, Some(1150)), "alone, HEALTH does not spend the turn: a later frame still gets the gap");
+        // A frame that joins it: one air packet, and the turn is used.
+        let mut cap = Capacity::new(64000, 100, 16).with_turn_period(200);
+        cap.enable_turn_gate();
+        cap.note_air_rx((wall, Some(1000)));
+        cap.set_turn_control_only(true);
+        cap.committed(wall, Some(1040), 20);
+        cap.set_turn_control_only(false);
+        assert!(cap.packet_ready(wall, Some(1045)));
+        cap.committed(wall, Some(1045), 40);
+        assert!(!cap.packet_ready(wall, Some(1150)), "one write per AV-bay turn");
     }
     /// A standby RRLS's own frames (observe refresh, discovery) wait for
     /// 20 ms of quiet air, at most 200 ms; ABORT and relayed frames never wait.
