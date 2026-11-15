@@ -583,8 +583,8 @@ pub(crate) fn endpoint_advertisement_age(
 /// It can only raise that board's Abort: it never becomes a readback, never
 /// counts as launch or ignition proof, and never clears anything. A forged or
 /// replayed push can at worst show a false Abort (the safe direction), so it
-/// needs no query issuer (0 before the board's first query); it must come
-/// from that board's verified endpoint. Within one boot generation, a push is
+/// needs no query issuer (0 before the board's first query) and no fresh
+/// topology route: its sender must resolve to that board. Within one boot generation, a push is
 /// taken only if it is later by (abort epoch, uptime) than the last push
 /// taken and not earlier than the board's latest readback, so a replay is
 /// ignored even on a board whose epoch does not advance on every latch.
@@ -592,12 +592,17 @@ fn observe_abort_push(state: &AppState, board: Board, push: Readback) -> Result<
     if push.flags & 1 == 0 {
         return Err("Abort push without the Abort-latched flag (ignored)");
     }
+    // The sender already resolved to this board (observe: compact identity).
+    // A fresh topology route is not required: after a cut longer than the
+    // route TTL the station re-learns the AV bay seconds after its boards push
+    // (R3-C: PB's push 110 ms after the Abort was dropped and PB shown 7.5 s
+    // later). A push only ever raises the Abort, the safe direction.
     let verified = state
         .topology_router
         .get()
         .is_some_and(|router| endpoint_verified(state, board, &router.export_topology()));
     if !verified {
-        return Err("Abort push from an unverified board endpoint");
+        log::info!("{} Abort push taken before its topology route is fresh", board.sender_id());
     }
     let at = index(board).unwrap();
     {
@@ -3042,7 +3047,7 @@ mod abort_push_tests {
     }
 
     #[tokio::test]
-    async fn a_push_without_the_latch_flag_or_from_an_unverified_board_does_nothing() {
+    async fn a_push_without_the_latch_flag_does_nothing() {
         let state = verified_ab().await;
         let revision = state.board_abort.abort_revision();
         assert!(observe(&state, &push(0, 9, 1_000)).is_err());
@@ -3053,12 +3058,37 @@ mod abort_push_tests {
         observe(&state, &push(1, 9, 1_000)).unwrap();
         assert!(observe(&state, &push(0, 10, 2_000)).is_err());
         assert_ne!(state.board_abort.masks().0 & (1 << AB), 0);
-        // GB never announced its endpoint here.
+    }
+
+    /// R3-C: after a cut longer than the route TTL, PB pushed its latch 110 ms
+    /// after the Abort, but the station had no fresh topology route to PB yet
+    /// and dropped the push as "unverified"; PB was shown 7.5 s later from a
+    /// readback. A push from a board the sender resolves to (compact identity)
+    /// raises its Abort without a fresh route: it can only raise an Abort (the
+    /// safe direction), and never clears one. A push without the latch flag
+    /// still does nothing.
+    #[tokio::test]
+    async fn a_resolved_board_push_raises_its_abort_before_its_topology() {
+        let state = verified_ab().await;
+        const PB: usize = 2;
         let mut wire = push(1, 9, 1_000).payload().to_vec();
         wire[20] = 9;
-        let gb = Packet::new(crate::telemetry_schema::data_type(STATUS_TYPE),
-            &[crate::telemetry_schema::endpoint("GROUND_STATION")], "GB", 125, Arc::from(wire)).unwrap();
-        assert!(observe(&state, &gb).is_err());
-        assert_eq!(state.board_abort.masks().0 & (1 << 5), 0);
+        let pb = Packet::new(crate::telemetry_schema::data_type(STATUS_TYPE),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")], "PB", 125, Arc::from(wire.clone())).unwrap();
+        assert_eq!(state.board_abort.masks().0 & (1 << PB), 0);
+        observe(&state, &pb).unwrap();
+        assert_ne!(state.board_abort.masks().0 & (1 << PB), 0, "PB is shown Aborted from its push at once");
+        // Never a clear, and a push without the latch flag raises nothing.
+        let mut clear = wire.clone();
+        clear[3] &= !1;
+        clear[24..28].copy_from_slice(&2_000u32.to_le_bytes());
+        let pb_clear = Packet::new(crate::telemetry_schema::data_type(STATUS_TYPE),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")], "PB", 126, Arc::from(clear)).unwrap();
+        assert!(observe(&state, &pb_clear).is_err());
+        assert_ne!(state.board_abort.masks().0 & (1 << PB), 0, "still Aborted");
+        // An unknown sender is never a board.
+        let stranger = Packet::new(crate::telemetry_schema::data_type(STATUS_TYPE),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")], "XYZ", 127, Arc::from(wire)).unwrap();
+        assert!(observe(&state, &stranger).is_err());
     }
 }
