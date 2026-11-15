@@ -53,6 +53,15 @@ fn station_child(name: &str, rrls: bool) -> bool {
     true
 }
 
+/// The Abort re-send service owes only the boards in the mode's scope, and
+/// test fire leaves the AV bay out (board_recovery::scope::mode_scope): RF,
+/// FC and PB are not on a static fire. Tests of its AV-bay delivery therefore
+/// run in flight scope when the suite runs in test fire mode.
+fn flight_scope() -> Option<crate::runtime_mode::test_support::ThreadMode> {
+    crate::runtime_mode::is_test_fire()
+        .then(|| crate::runtime_mode::test_support::thread_mode(crate::station_mode::Mode::Normal))
+}
+
 struct Bay {
     /// Every router's clock (ms).
     now: Arc<AtomicU64>,
@@ -673,6 +682,7 @@ async fn a_primary_keeps_delivering_its_aborted_flight_state_to_pb_after_it_exha
     if primary_child("a_primary_keeps_delivering_its_aborted_flight_state_to_pb_after_it_exhausts") {
         return;
     }
+    let _scope = flight_scope();
     let bay = bay(false).await;
     let mut worker = aborted_flight_state_exhausts_on_pb(&bay);
     pb_comes_back(&bay);
@@ -686,6 +696,7 @@ async fn a_takeover_rrls_keeps_delivering_its_aborted_flight_state_to_pb_after_i
     if rrls_child("a_takeover_rrls_keeps_delivering_its_aborted_flight_state_to_pb_after_it_exhausts") {
         return;
     }
+    let _scope = flight_scope();
     let bay = bay(true).await;
     let mut worker = aborted_flight_state_exhausts_on_pb(&bay);
     pb_comes_back(&bay);
@@ -788,6 +799,7 @@ async fn a_primary_abort_reaches_rf_and_pb_once_they_are_routed_again() {
     if primary_child("a_primary_abort_reaches_rf_and_pb_once_they_are_routed_again") {
         return;
     }
+    let _scope = flight_scope();
     let bay = bay(false).await;
     // RF and PB fall out of reach both ways; FC stays reachable and keeps announcing.
     bay.both_ways.store(true, Ordering::Relaxed);
@@ -914,6 +926,7 @@ async fn a_primary_resends_its_aborted_flight_state_to_a_proxied_pb_that_does_no
     if primary_child("a_primary_resends_its_aborted_flight_state_to_a_proxied_pb_that_does_not_read_aborted") {
         return;
     }
+    let _scope = flight_scope();
     a_proxied_pb_gets_the_aborted_flight_state_from_a_readback_resend("GS").await;
 }
 
@@ -922,5 +935,6 @@ async fn a_takeover_rrls_resends_its_aborted_flight_state_to_a_proxied_pb_that_d
     if rrls_child("a_takeover_rrls_resends_its_aborted_flight_state_to_a_proxied_pb_that_does_not_read_aborted") {
         return;
     }
+    let _scope = flight_scope();
     a_proxied_pb_gets_the_aborted_flight_state_from_a_readback_resend("RRLS").await;
 }
