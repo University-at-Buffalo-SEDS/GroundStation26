@@ -531,7 +531,6 @@ impl TxQueueBudget {
         }
     }
 
-    #[cfg(test)]
     pub fn try_send(
         &self,
         sender: &mpsc::UnboundedSender<(u8, Vec<u8>)>,
