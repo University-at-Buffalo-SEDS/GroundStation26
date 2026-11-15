@@ -157,17 +157,26 @@ pub(crate) fn queue_manual_abort_wire(
 }
 
 /// Receipt metadata exists only after the actual original entered SDK ownership.
-pub(crate) fn queue_manual_abort_wire_receipted(
+/// The operator's manual ABORT packet for `wire` (the same contents the
+/// station queues; also written straight onto the radio when unrouted).
+pub(crate) fn manual_abort_packet(
     router: &Router,
     wire: crate::manual_abort_intent::WirePolicy,
-) -> sedsnet::TelemetryResult<(u64, String, u64)> {
+) -> sedsnet::TelemetryResult<Packet> {
     let (body, original) = match wire {
         crate::manual_abort_intent::WirePolicy::Untimed => (MANUAL_ABORT_PREFIX, 0),
         crate::manual_abort_intent::WirePolicy::KnownUtc(original) => {
             ("SEDS_MANUAL_ABORT_V1:K", original)
         }
     };
-    let packet = abort_packet_from_at(router, body, &router.sender(), original)?;
+    abort_packet_from_at(router, body, &router.sender(), original)
+}
+
+pub(crate) fn queue_manual_abort_wire_receipted(
+    router: &Router,
+    wire: crate::manual_abort_intent::WirePolicy,
+) -> sedsnet::TelemetryResult<(u64, String, u64)> {
+    let packet = manual_abort_packet(router, wire)?;
     let receipt = (packet.packet_id(), packet.sender().to_string(), packet.timestamp());
     router.tx_queue(packet)?;
     Ok(receipt)

@@ -2287,6 +2287,15 @@ async fn main() -> anyhow::Result<()> {
         TxQueueBudget::new(2048)
     });
     telemetry_task::register_radio_tx_budget(rocket_tx_budget.clone());
+    {
+        // An operator Abort with an AV-bay board lacking a route is written
+        // straight onto the radio (manual_abort_resend::inject_abort_on_radio).
+        let rocket_tx = rocket_tx.clone();
+        let budget = rocket_tx_budget.clone();
+        manual_abort_resend::set_radio_injector(Some(Box::new(move |bytes: Vec<u8>| {
+            budget.try_send(&rocket_tx, u8::MAX, &bytes).is_ok()
+        })));
+    }
     let (rocket_side, rocket_retry_tracker) = {
         let rocket_tx = rocket_tx.clone();
         let budget = rocket_tx_budget.clone();

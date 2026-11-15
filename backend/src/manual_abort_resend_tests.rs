@@ -319,3 +319,114 @@ fn the_owed_aborted_flight_state_rides_abort_gap_copies_until_readback_or_reset(
     resender.disarm("recovery prepared");
     assert_eq!(crate::comms::abort_gap_flight_state_for_test(), None, "disarmed for a recovery");
 }
+
+/// R3-C hand-back: RF's announcer was fresh but the station's route to FC had
+/// aged out (RF's topology naming FC was lost), so the SDK put the operator's
+/// ABORT on no radio frame for 5.6 s and FC latched at 6.1 s. An Abort is
+/// never held for want of a route: an owed AV-bay board without a route of its
+/// own gets the ABORT and the Aborted FLIGHT_STATE written straight onto the
+/// radio side at once (end to end: GS writer -> radio -> RF router -> CAN ->
+/// FC router, with RF holding no station-side owner row for it), and the
+/// station asks for topology on each held re-send.
+#[test]
+fn an_abort_with_no_route_to_fc_still_reaches_fc_and_rf_at_once() {
+    let _serial = crate::RUNTIME_TUNING_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let previous = sedsnet::config::runtime_tuning_config();
+    sedsnet::config::set_runtime_tuning_config(crate::network_delivery_tuning()).unwrap();
+    crate::telemetry_schema::initialize().unwrap();
+    let now = Arc::new(AtomicU64::new(1_000));
+    let clock = |n: &Arc<AtomicU64>| {
+        let n = n.clone();
+        Box::new(move || n.load(Ordering::Relaxed)) as Box<dyn sedsnet::router::Clock + Send + Sync>
+    };
+    let abort = crate::telemetry_schema::data_type("ABORT");
+    let fstate = crate::telemetry_schema::data_type("FLIGHT_STATE");
+    let fc_got = Arc::new(Mutex::new(None::<u64>));
+    let (seen, at) = (fc_got.clone(), now.clone());
+    let fc = Arc::new(Router::new_with_clock(
+        RouterConfig::new([EndpointHandler::new_packet_handler(crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER"), move |p| {
+            if p.data_type() == abort { seen.lock().unwrap().get_or_insert(at.load(Ordering::Relaxed)); }
+            Ok(())
+        })]).with_sender("FC"),
+        clock(&now),
+    ));
+    let rf_fs = Arc::new(Mutex::new(None::<(u64, u8)>));
+    let rf = Arc::new(Router::new_with_clock(RouterConfig::new([]).with_sender("RF"), clock(&now)));
+    rf.enable_network_variable(fstate, sedsnet::router::NetworkVariablePermissions::READ_ONLY).unwrap();
+    let (seen, at) = (rf_fs.clone(), now.clone());
+    rf.on_network_variable_update(fstate, move |p| {
+        if p.payload() == [15] { seen.lock().unwrap().get_or_insert((at.load(Ordering::Relaxed), 15)); }
+        Ok(())
+    }).unwrap();
+    let gs = Arc::new(Router::new_with_clock(RouterConfig::new([]).with_sender("GS"), clock(&now)));
+    gs.enable_network_variable(fstate, sedsnet::router::NetworkVariablePermissions::READ_WRITE).unwrap();
+    type Wire = Arc<Mutex<Vec<Vec<u8>>>>;
+    let (to_rf, rf_to_gs, rf_to_fc, fc_to_rf): (Wire, Wire, Wire, Wire) = Default::default();
+    let link: crate::comms_config::CommsLinkConfig =
+        serde_json::from_value(serde_json::json!({"interface": "serial", "port": "/dev/test-radio", "protocol": "raw_uart"})).unwrap();
+    let tx = |w: &Wire| { let w = w.clone(); move |b: &[u8]| { w.lock().unwrap().push(b.to_vec()); Ok(()) } };
+    let gs_radio = gs.add_side_packed_with_options("rocket_comms", tx(&to_rf), crate::rocket_router_side_options(&link, false));
+    let rf_radio = rf.add_side_packed_with_options("radio", tx(&rf_to_gs), crate::rocket_router_side_options(&link, false));
+    let rf_can = rf.add_side_packed("can", tx(&rf_to_fc));
+    let fc_can = fc.add_side_packed("can", tx(&fc_to_rf));
+    // The station's radio writer: a frame injected here goes on the radio next.
+    let injected = to_rf.clone();
+    set_radio_injector(Some(Box::new(move |bytes: Vec<u8>| { injected.lock().unwrap().push(bytes); true })));
+    let can_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let topology_to_gs = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let pump = |steps: usize| {
+        for _ in 0..steps {
+            now.fetch_add(10, Ordering::Relaxed);
+            for r in [&gs, &rf, &fc] {
+                let _ = r.poll_discovery();
+                let _ = r.process_all_queues();
+            }
+            for b in std::mem::take(&mut *to_rf.lock().unwrap()) { let _ = rf.rx_packed_from_side(&b, rf_radio); }
+            for b in std::mem::take(&mut *rf_to_gs.lock().unwrap()) {
+                // Phase 2 drops RF's discovery frames to the station (lost on
+                // air, as RF's topology naming FC was in R3-C); data still flows.
+                let topology = sedsnet::wire_format::peek_frame_info(&b).is_ok_and(|f| {
+                    sedsnet::discovery::is_discovery_type(f.envelope.ty)
+                });
+                if !topology || topology_to_gs.load(Ordering::Relaxed) { let _ = gs.rx_packed_from_side(&b, gs_radio); }
+            }
+            if can_up.load(Ordering::Relaxed) {
+                for b in std::mem::take(&mut *rf_to_fc.lock().unwrap()) { let _ = fc.rx_packed_from_side(&b, fc_can); }
+                for b in std::mem::take(&mut *fc_to_rf.lock().unwrap()) { let _ = rf.rx_packed_from_side(&b, rf_can); }
+            } else {
+                rf_to_fc.lock().unwrap().clear();
+                fc_to_rf.lock().unwrap().clear();
+            }
+        }
+    };
+    // The station knows RF, but RF's topology naming FC never reaches it.
+    gs.announce_discovery().unwrap();
+    rf.announce_discovery().unwrap();
+    pump(100);
+    topology_to_gs.store(false, Ordering::Relaxed);
+    can_up.store(true, Ordering::Relaxed);
+    fc.announce_discovery().unwrap();
+    pump(100);
+    assert_eq!(routed_av_bay_boards(&gs) & 0b010, 0, "the station has no route to FC");
+    // The operator Abort, with the station's Aborted FLIGHT_STATE.
+    let own = sedsnet::packet::Packet::new(fstate, &[crate::telemetry_schema::endpoint("FLIGHT_STATE")], "GS", now.load(Ordering::Relaxed), Arc::from([15u8])).unwrap();
+    gs.set_network_variable(own).unwrap();
+    let resender = AbortResend::default();
+    let mark = send_mark(&gs);
+    crate::telemetry_task::queue_manual_abort_wire_receipted(&gs, WirePolicy::Untimed).unwrap();
+    resender.arm(1, WirePolicy::Untimed, None, mark);
+    let pressed = now.load(Ordering::Relaxed);
+    while now.load(Ordering::Relaxed) < pressed + 2_000 {
+        let t = now.load(Ordering::Relaxed);
+        let owed = if fc_got.lock().unwrap().is_some() { 0 } else { 0b010 };
+        resender.step(&gs, observation(t, owed, 0));
+        pump(10);
+    }
+    set_radio_injector(None);
+    sedsnet::config::set_runtime_tuning_config(previous).unwrap();
+    let fc_ms = fc_got.lock().unwrap().map(|t| t - pressed);
+    let rf_ms = rf_fs.lock().unwrap().map(|(t, _)| t - pressed);
+    eprintln!("UNROUTED_ABORT fc={fc_ms:?} rf_fstate={rf_ms:?}");
+    assert!(fc_ms.is_some_and(|ms| ms <= 200), "FC got the ABORT {fc_ms:?} ms after the press (one turn: 200 ms)");
+    assert!(rf_ms.is_some_and(|ms| ms <= 200), "RF applied the Aborted FLIGHT_STATE {rf_ms:?} ms after the press");
+}

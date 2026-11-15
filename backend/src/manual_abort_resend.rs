@@ -38,6 +38,38 @@ use std::sync::atomic::{AtomicU8, Ordering};
 /// supersedes it. PB takes an Abort only from FLIGHT_STATE.
 static FLIGHT_STATE_UNACKED: AtomicU8 = AtomicU8::new(0);
 
+/// The station's radio writer, bypassing routing (set by main where the
+/// rocket_comms side is created; tests set their own).
+type RadioInjector = Box<dyn Fn(Vec<u8>) -> bool + Send + Sync>;
+static RADIO_INJECTOR: Mutex<Option<RadioInjector>> = Mutex::new(None);
+pub(crate) fn set_radio_injector(injector: Option<RadioInjector>) {
+    *RADIO_INJECTOR.lock().unwrap() = injector;
+}
+/// How often an Abort with an AV-bay board lacking a route is written
+/// straight onto the radio, and topology asked for.
+const UNROUTED_INJECT_MS: u64 = 1_000;
+
+/// Write the operator ABORT, then the station's own Aborted FLIGHT_STATE (same
+/// packet), straight onto the radio side, bypassing routing: with no route to
+/// a board the SDK puts the ABORT on no radio frame (R3-C: 5.6 s). RF relays
+/// it by its own routes (FC over CAN) and applies the FLIGHT_STATE. Returns
+/// whether anything was written.
+pub(crate) fn inject_abort_on_radio(router: &Router, wire: WirePolicy) -> bool {
+    let guard = RADIO_INJECTOR.lock().unwrap();
+    let Some(inject) = guard.as_ref() else { return false };
+    let mut wrote = false;
+    if let Ok(packet) = crate::telemetry_task::manual_abort_packet(router, wire) {
+        wrote |= inject(sedsnet::wire_format::pack_packet(&packet).to_vec());
+    }
+    if let Some(own) = router
+        .own_network_variable(crate::telemetry_schema::data_type("FLIGHT_STATE"))
+        .filter(|own| own.payload() == [crate::types::NetworkFlightState::Aborted as u8])
+    {
+        wrote |= inject(sedsnet::wire_format::pack_packet(&own).to_vec());
+    }
+    wrote
+}
+
 fn board_mask(router: &Router, owners: &[u64]) -> u8 {
     owners.iter().fold(0u8, |mask, owner| {
         crate::board_recovery::coordinator::pending_destination_board(router, *owner)
@@ -124,6 +156,9 @@ struct Armed {
     /// When the station's own Aborted FLIGHT_STATE was last sent (the first
     /// pass after the Abort, then each re-send).
     flight_state_sent_ms: Option<u64>,
+    /// When the ABORT (and the Aborted FLIGHT_STATE) were last written
+    /// straight onto the radio for a board without a route.
+    injected_ms: Option<u64>,
 }
 
 #[derive(Default)]
@@ -272,6 +307,7 @@ impl AbortResend {
             unaddressed: AV_BAY_MASK & !mark.routed_boards, flight_state_sent_ms: None, mark,
             last_topology_request_ms: None,
             unrouted_reported: false,
+            injected_ms: None,
         });
     }
     /// A recovery is being prepared: stop re-sending at once, before the
@@ -377,6 +413,27 @@ impl AbortResend {
 
     /// The ABORT part of `step`.
     fn step_abort(armed: &mut Armed, router: &Router, seen: &Observation, owed: u8, unheard: u8) -> Option<u8> {
+        // An Abort is never held for want of a route: an owed AV-bay board
+        // without one gets the ABORT and the Aborted FLIGHT_STATE straight on
+        // the radio now and every UNROUTED_INJECT_MS, and topology is asked
+        // for; the routed re-send below carries on as before.
+        let without_route = (owed | unheard)
+            & (armed.unaddressed | if armed.unrouted { AV_BAY_MASK } else { 0 })
+            & !routed_av_bay_boards(router);
+        if without_route != 0
+            && armed.injected_ms.is_none_or(|last| seen.now_ms.saturating_sub(last) >= UNROUTED_INJECT_MS)
+        {
+            armed.injected_ms = Some(seen.now_ms);
+            if inject_abort_on_radio(router, armed.wire) {
+                log::warn!(
+                    "operator Abort written onto the radio for {} (no route of its own)",
+                    board_names(without_route)
+                );
+            }
+            if let Err(error) = router.request_topology() {
+                log::warn!("operator Abort topology request refused: {error}");
+            }
+        }
         let abort = crate::telemetry_schema::data_type("ABORT");
         let rows = router.export_reliable_pending_stats();
         let abort_rows: Vec<(u8, u32)> = rows
