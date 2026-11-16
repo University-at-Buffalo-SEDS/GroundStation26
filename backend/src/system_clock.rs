@@ -187,6 +187,22 @@ fn select_client_network_source(
     Ok(())
 }
 
+/// After the OS clock was set to `utc_ms`, the host clock is the source
+/// again: set the network clock to it (stepping when allowed) and resume the
+/// one-second host refresh instead of free-running from a one-off client set.
+fn select_host_network_source(
+    router: &Arc<sedsnet::router::Router>,
+    utc_ms: i64,
+) -> Result<(), String> {
+    let mut sources = CLIENT_TIME_ROUTERS.lock().unwrap();
+    retain_live_client_sources(&mut sources);
+    set_network_utc(router, utc_ms)?;
+    // A correction learned against the old host clock no longer applies.
+    crate::telemetry_task::reset_absolute_time_correction();
+    sources.retain(|source| !source.ptr_eq(&Arc::downgrade(router)));
+    Ok(())
+}
+
 fn capability_from_linux_status(status: &str) -> bool {
     status
         .lines()
@@ -282,7 +298,7 @@ pub async fn sync(
     };
     let before = snapshot(true).utc_ms;
     match update_os_and_network_time(utc, set_os_time, |utc| {
-        select_client_network_source(router, utc)
+        select_host_network_source(router, utc)
     })
     .await
     {
@@ -372,19 +388,70 @@ pub(crate) async fn apply_authorized_network_utc(
     Json(snapshot(true)).into_response()
 }
 
+/// An operator UTC set larger than this steps the network clock when a step
+/// is allowed. SEDSnet followers re-anchor on a source jump over 1 s.
+const OPERATOR_STEP_THRESHOLD_MS: u64 = 1_000;
+
+/// Whether an operator UTC correction may step the network clock now: the
+/// same rule as the station's absolute-time coarse set (Startup/Idle, or no
+/// board locked yet; never Armed through Recovery).
+fn operator_step_allowed() -> bool {
+    crate::absolute_time::may_step(
+        crate::network_variables::flight_state(),
+        crate::network_health::any_board_time_locked(),
+    )
+}
+
 fn set_network_utc(router: &sedsnet::router::Router, utc_ms: i64) -> Result<(), String> {
+    set_network_utc_with(router, utc_ms, operator_step_allowed()).map(|_| ())
+}
+
+/// Sets the station's network UTC. Returns `true` when the clock was stepped.
+///
+/// SEDSnet slews every correction to an anchored clock at its 5% cap, so a
+/// correction of hours (a Pi booted without RTC or NTP) would take days and
+/// the button would appear to do nothing; meanwhile the station clock runs
+/// 5% fast, faster than followers may correct their frequency (3%), so board
+/// clocks fall behind it. A large correction is therefore stepped while a
+/// step is allowed: followers see the source re-anchor and step with it.
+/// Otherwise (a flight state) it slews as before.
+fn set_network_utc_with(
+    router: &sedsnet::router::Router,
+    utc_ms: i64,
+    may_step: bool,
+) -> Result<bool, String> {
     time_argument(utc_ms).map_err(str::to_string)?;
+    let off_by = router
+        .network_time_ms()
+        .map(|now| now.abs_diff(utc_ms as u64));
+    if may_step && off_by.is_some_and(|off| off > OPERATOR_STEP_THRESHOLD_MS) {
+        if router.step_local_network_time_ns(utc_ms.saturating_mul(1_000_000)) {
+            let _ = router.network_time();
+            log::warn!(
+                "Network UTC stepped by {} ms to the operator's time",
+                off_by.unwrap_or(0)
+            );
+            return Ok(true);
+        }
+        return Err("Network UTC step was not admitted".into());
+    }
     router
         .try_set_local_network_time(sedsnet::timesync::PartialNetworkTime::from_unix_ms(
             utc_ms as u64,
         ))
         .map_err(|error| format!("Network UTC source was not admitted: {error}"))?;
+    if off_by.is_some_and(|off| off > OPERATOR_STEP_THRESHOLD_MS) {
+        log::warn!(
+            "Network UTC is {} ms off the operator's time; a step is not allowed in this flight state, so it slews at 5% (50 ms per second)",
+            off_by.unwrap_or(0)
+        );
+    }
     // SEDSnet marks its clock UTC-anchored on the next time refresh, and steps
     // (rather than slews) any correction over 5 s that lands before then.
     // Refresh now so an admitted UTC anchors at once and every later
     // correction steers the running clock instead of jumping it.
     let _ = router.network_time();
-    Ok(())
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -495,12 +562,60 @@ mod network_tests {
             Box::new(move || input.load(Ordering::Relaxed)),
         );
         let base = 1_800_000_000_000;
-        super::set_network_utc(&router, base).unwrap();
+        // A flight state (no step allowed): corrections slew.
+        super::set_network_utc_with(&router, base, false).unwrap();
         clock.store(1000, Ordering::Relaxed);
-        super::set_network_utc(&router, base + 11_000).unwrap();
+        assert!(!super::set_network_utc_with(&router, base + 11_000, false).unwrap());
         assert_eq!(router.network_time_ms(), Some(base as u64 + 1000));
         clock.store(2000, Ordering::Relaxed);
         assert_eq!(router.network_time_ms(), Some(base as u64 + 2050));
+    }
+
+    /// A station whose network clock is hours off (a Pi booted without RTC
+    /// or NTP) must be correctable by the operator, in either direction: a
+    /// slew at the 5% SEDSnet cap would need about three days for 3.8 h.
+    #[test]
+    fn operator_utc_set_steps_an_hours_off_network_clock() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        };
+        for behind in [13_700_000i64, -13_700_000] {
+            let clock = Arc::new(AtomicU64::new(0));
+            let input = clock.clone();
+            let router = sedsnet::router::Router::new_with_clock(
+                sedsnet::router::RouterConfig::new([]),
+                Box::new(move || input.load(Ordering::Relaxed)),
+            );
+            let stale = 1_800_000_000_000i64;
+            super::set_network_utc_with(&router, stale, true).unwrap();
+            clock.store(60_000, Ordering::Relaxed);
+            assert_eq!(router.network_time_ms(), Some(stale as u64 + 60_000));
+            let real = stale + 60_000 + behind;
+            assert!(super::set_network_utc_with(&router, real, true).unwrap());
+            clock.store(61_000, Ordering::Relaxed);
+            let now = router.network_time_ms().unwrap() as i64;
+            assert!(
+                (now - (real + 1_000)).abs() <= 1,
+                "network time {now} must read the operator's UTC {} at once, not slew",
+                real + 1_000
+            );
+        }
+    }
+
+    /// After an OS clock set the host refresh resumes (it is not left
+    /// free-running from a one-off client source).
+    #[test]
+    fn os_clock_set_resumes_the_host_refresh() {
+        use std::sync::Arc;
+        let router = Arc::new(sedsnet::router::Router::new(
+            sedsnet::router::RouterConfig::new([]),
+        ));
+        super::select_client_network_source(&router, 1_800_000_000_000).unwrap();
+        super::select_host_network_source(&router, 1_800_000_000_000).unwrap();
+        super::refresh_network_source(&router, 1_900_000_000_000);
+        let actual = router.network_time_ms().unwrap();
+        assert!((1_900_000_000_000..1_900_000_001_000).contains(&actual), "{actual}");
     }
 
     #[test]

@@ -187,6 +187,14 @@ impl AbsoluteTime {
         self.correction_ns
     }
 
+    /// The host clock was set by the operator: corrections and GPS samples
+    /// measured against the old host clock no longer apply.
+    pub fn reset_correction(&mut self) {
+        self.correction_ns = 0;
+        self.window.clear();
+        self.last_gps = None;
+    }
+
     pub fn status(&self) -> AbsoluteStatus {
         self.status
     }

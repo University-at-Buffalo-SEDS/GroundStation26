@@ -255,6 +255,11 @@ pub(crate) fn set_absolute_time_data_dir(dir: &std::path::Path) {
     *ABSOLUTE_TIME.lock().unwrap() = crate::absolute_time::AbsoluteTime::with_data_dir(dir);
 }
 
+/// Forgets the absolute correction after the operator set the host clock.
+pub(crate) fn reset_absolute_time_correction() {
+    ABSOLUTE_TIME.lock().unwrap().reset_correction();
+}
+
 /// Station host UTC in ns: the model clock in simulation (ms resolution, the
 /// simulator's truth), else CLOCK_REALTIME at full resolution.
 /// The station's host UTC in milliseconds: the clock network time is built
@@ -353,14 +358,15 @@ fn refresh_station_network_time_at(router: &Router, host_ns: i64) {
             status.error_bound_ns.saturating_add(20_000_000),
         ));
     }
+    let may_step = crate::absolute_time::may_step(
+        crate::network_variables::flight_state(),
+        crate::network_health::any_board_time_locked(),
+    );
     let stepped = abs.update(crate::absolute_time::Inputs {
         now: std::time::Instant::now(),
         ntp_synced: host_clock_ntp_synced(),
         reports,
-        may_step: crate::absolute_time::may_step(
-            crate::network_variables::flight_state(),
-            crate::network_health::any_board_time_locked(),
-        ),
+        may_step,
     });
     let status = abs.status();
     let utc_ns = host_ns.saturating_add(abs.correction_ns());
@@ -371,11 +377,23 @@ fn refresh_station_network_time_at(router: &Router, host_ns: i64) {
     {
         return;
     }
-    if stepped {
+    // The host clock itself jumped (set by the operator or by NTP after an
+    // RTC-less boot): SEDSnet would slew the hours at 5%, days during which
+    // the station runs faster than its followers can track. Step instead
+    // while a step is allowed, as for an absolute correction.
+    let host_jumped = !stepped
+        && may_step
+        && host_jump_needs_step(
+            router.network_time_ns(),
+            utc_ns,
+            leading_station_clock(router),
+        );
+    if stepped || host_jumped {
         log::warn!(
-            "station UTC coarse-set by {} us ({:?})",
+            "station UTC coarse-set by {} us ({:?}{})",
             status.correction_us,
-            status.source
+            status.source,
+            if host_jumped { ", host clock jumped" } else { "" }
         );
         router.step_local_network_time_ns(utc_ns);
     } else if let Some(t) = sedsnet::timesync::NetworkTime::from_unix_ns(i128::from(utc_ns)) {
@@ -387,6 +405,65 @@ fn refresh_station_network_time_at(router: &Router, host_ns: i64) {
             status.gps_delay_us,
             if status.gps_delay_learned { "learned" } else { "default" }
         );
+    }
+}
+
+/// A fed host reading this far from the running network clock is a host
+/// clock jump, not oscillator drift (the clock is fed every second).
+const HOST_JUMP_STEP_NS: i128 = 1_000_000_000;
+
+/// The station leads network time (it does not follow a remote such as RF).
+fn leading_station_clock(router: &Router) -> bool {
+    router
+        .timesync_status()
+        .is_none_or(|status| status.is_reference)
+}
+
+/// Whether a fed host UTC must step the running network clock.
+fn host_jump_needs_step(network_ns: Option<i128>, fed_utc_ns: i64, leading: bool) -> bool {
+    leading
+        && network_ns.is_some_and(|now| (now - i128::from(fed_utc_ns)).abs() > HOST_JUMP_STEP_NS)
+}
+
+#[cfg(test)]
+mod host_jump_tests {
+    use super::*;
+
+    /// A Pi booted on a stale clock leads the network hours behind; when its
+    /// OS clock is then corrected (either way), the next refresh must step.
+    #[test]
+    fn corrected_host_clock_steps_the_leading_network_clock() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        };
+        let clock = Arc::new(AtomicU64::new(0));
+        let input = clock.clone();
+        let router = Router::new_with_clock(
+            sedsnet::router::RouterConfig::new([]),
+            Box::new(move || input.load(Ordering::Relaxed)),
+        );
+        let stale_ns = 1_800_000_000_000_000_000i64;
+        router.set_local_network_time(
+            sedsnet::timesync::NetworkTime::from_unix_ns(i128::from(stale_ns))
+                .unwrap()
+                .into(),
+        );
+        clock.store(10_000, Ordering::Relaxed);
+        let now = router.network_time_ns().unwrap();
+        for jump_ns in [13_700_000_000_000i64, -13_700_000_000_000] {
+            let corrected = now as i64 + jump_ns;
+            assert!(host_jump_needs_step(
+                Some(now),
+                corrected,
+                leading_station_clock(&router)
+            ));
+            // A station following a remote leader leaves it to time sync.
+            assert!(!host_jump_needs_step(Some(now), corrected, false));
+        }
+        // Ordinary per-second feeding (sub-second disagreement) never steps.
+        assert!(!host_jump_needs_step(Some(now), now as i64 + 5_000_000, true));
+        assert!(!host_jump_needs_step(None, now as i64, true));
     }
 }
 
