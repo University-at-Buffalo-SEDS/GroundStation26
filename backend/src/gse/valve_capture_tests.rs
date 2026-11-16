@@ -49,7 +49,7 @@ fn utc_age_future_backwards_and_underflow_guards_survive_opposite_exception() {
     );
     let accepted = history;
     for (source, receipt, now, id) in [
-        (utc - 3000, utc, 5000, 3),
+        (utc - 5001, utc, 6000, 3),
         (utc + 101, utc, 5000, 4),
         (utc - 1600, utc, 5000, 5),
         (utc - 1000, utc, 100, 6),
@@ -68,7 +68,7 @@ fn utc_age_future_backwards_and_underflow_guards_survive_opposite_exception() {
     let mut expired = ValveCaptureHistory::default();
     let at = expired.admit(utc - 1500, utc, 5000, true, 1, None).unwrap();
     assert_eq!(
-        expired.admit(utc - 1500, utc + 501, 5501, false, 2, Some(at)),
+        expired.admit(utc - 1500, utc + 3501, 8501, false, 2, Some(at)),
         None
     );
 }
@@ -102,7 +102,7 @@ fn rebooted_boot_clock_is_compatible_but_stale_or_regressed_tick_does_not_rearm(
         None
     );
     assert_eq!(
-        history.admit(1234, 1_798_000_000_000, 2011, false, 1, Some(10)),
+        history.admit(1234, 1_798_000_000_000, 5011, false, 1, Some(10)),
         None
     );
     assert_eq!(history, first);
@@ -160,7 +160,7 @@ async fn source_age_is_backdated_in_display_and_does_not_acknowledge_replayed_ta
 
 #[test]
 fn delayed_or_regressed_processing_clock_never_commits_capture_or_history() {
-    for (model_at, processing_now) in [(1000, 3001), (1000, 999)] {
+    for (model_at, processing_now) in [(1000, 6001), (1000, 999)] {
         let mut runtime = Runtime::default();
         let before = runtime.last_valve_captures;
         let receipt = ValveReceipt {
@@ -175,7 +175,7 @@ fn delayed_or_regressed_processing_clock_never_commits_capture_or_history() {
         assert_eq!(runtime.last_valve_captures, before);
         assert!(runtime.valves[0].is_none());
     }
-    let mut runtime = Runtime { clock: Instant::now() - std::time::Duration::from_secs(5), ..Runtime::default() };
+    let mut runtime = Runtime { clock: Instant::now() - std::time::Duration::from_secs(8), ..Runtime::default() };
     let before = runtime.last_valve_captures;
     let receipt = ValveReceipt {
         network_ms: 1_798_000_000_000,

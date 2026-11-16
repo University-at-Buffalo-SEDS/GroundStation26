@@ -1005,6 +1005,25 @@ impl ValveSnapshot {
             retract: valve(ActuatorBoardCommands::RetractPlumbing as u8),
             pending_retract: pending(ActuatorBoardCommands::RetractPlumbing as u8),
         }
+        .with_retract_running(
+            crate::actuator_plumbing::retract_motion_active(state)
+                || crate::actuator_plumbing::retract_motion_completed(state),
+        )
+    }
+
+    /// An accepted retraction the actuator reports running shows as active
+    /// (the auxiliary drive output is on) instead of unconfirmed.
+    fn with_retract_running(mut self, running: bool) -> Self {
+        if running {
+            self.retract = Some(true);
+            self.pending_retract = None;
+        }
+        self
+    }
+
+    #[cfg(test)]
+    fn read_for_test(state: &AppState) -> Self {
+        Self::read(state)
     }
 
     fn actuated_for_cmd(&self, cmd: &str) -> Option<bool> {
@@ -1020,6 +1039,11 @@ impl ValveSnapshot {
         };
         if pending.is_some() { None } else { confirmed }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn retract_actuated_for_test(state: &AppState) -> Option<bool> {
+    ValveSnapshot::read_for_test(state).actuated_for_cmd("RetractPlumbing")
 }
 
 fn is_fill_state(state: FlightState) -> bool {

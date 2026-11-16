@@ -201,7 +201,7 @@ impl Controller {
                     v.open == expected
                         && v.at_ms > self.since[i]
                         && v.at_ms <= input.now_ms
-                        && input.now_ms - v.at_ms <= FRESH_MS
+                        && input.now_ms - v.at_ms <= crate::VALVE_REPORT_FRESH_MS
                 })
             })
     }
@@ -210,7 +210,7 @@ impl Controller {
             v.open == self.desired[i]
                 && v.at_ms > self.since[i]
                 && v.at_ms <= input.now_ms
-                && input.now_ms - v.at_ms <= FRESH_MS
+                && input.now_ms - v.at_ms <= crate::VALVE_REPORT_FRESH_MS
         })
     }
     fn all_reported(&self, input: Inputs) -> bool {
@@ -263,7 +263,7 @@ impl Controller {
                         && v.at_ms > floor
                         && v.at_ms > self.since[i]
                         && v.at_ms <= input.now_ms
-                        && input.now_ms - v.at_ms <= FRESH_MS
+                        && input.now_ms - v.at_ms <= crate::VALVE_REPORT_FRESH_MS
                 })
             })
         })
@@ -367,7 +367,7 @@ impl Controller {
         );
         if !cancelling && !parked {
             if input.valves[4].is_some_and(|v| {
-                v.open && v.at_ms <= input.now_ms && input.now_ms - v.at_ms <= FRESH_MS
+                v.open && v.at_ms <= input.now_ms && input.now_ms - v.at_ms <= crate::VALVE_REPORT_FRESH_MS
             }) {
                 let effects = self.park(input.now_ms);
                 self.issue = Some(Issue::UnexpectedNitrous);
@@ -777,7 +777,7 @@ mod tests {
                     assert!(e.valves.is_empty());
                 }
                 _ => {
-                    r.input.now_ms += FRESH_MS + 10;
+                    r.input.now_ms += crate::VALVE_REPORT_FRESH_MS + 10;
                     r.input.pressure.as_mut().unwrap().at_ms = r.input.now_ms;
                     let e = r.c.tick(r.input);
                     assert!(e.valves.is_empty());
@@ -869,13 +869,13 @@ mod tests {
                 let since = r.c.since;let command_since = r.c.command_since;
                 assert!(r.c.cancel(floor + 100).valves.is_empty());
                 assert_eq!(r.c.since, since);assert_eq!(r.c.command_since, command_since);
-                r.input.now_ms = floor + 3000;
+                r.input.now_ms = floor + crate::VALVE_REPORT_FRESH_MS + 1000;
                 r.input.pressure = None;r.input.interlock = false;
                 r.input.valves = [Some(ValveState { open: false, at_ms: r.input.now_ms }); 5];
                 r.input.valves[missing] = Some(ValveState { open: false, at_ms: match bad_age {
                     0 => floor, // Equal command timestamp is not a new physical report.
                     1 => r.input.now_ms + 1,
-                    _ => r.input.now_ms - 2001,
+                    _ => r.input.now_ms - crate::VALVE_REPORT_FRESH_MS - 1,
                 }});
                 let blocked = r.c.tick(r.input);
                 assert!(blocked.valves.is_empty());

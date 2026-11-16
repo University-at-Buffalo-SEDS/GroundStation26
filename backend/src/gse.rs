@@ -80,7 +80,7 @@ const ACTIONS: [(&str, Action); 5] = [
 fn completion_valve_snapshot(input: Inputs) -> [Option<bool>; 5] {
     input.valves.map(|value| {
         value
-            .filter(|value| value.at_ms <= input.now_ms && input.now_ms - value.at_ms <= 2000)
+            .filter(|value| value.at_ms <= input.now_ms && input.now_ms - value.at_ms <= gse_sequence::VALVE_REPORT_FRESH_MS)
             .map(|value| value.open)
     })
 }
@@ -152,7 +152,7 @@ impl ValveCaptureHistory {
         // Boot-time captures cannot be aged from UTC. An equal-tick exception
         // still retains its first capture anchor and the existing two-second
         // freshness bound; a late opposite value cannot rearm confirmation.
-        if now.checked_sub(at)? > 2_000 {
+        if now.checked_sub(at)? > gse_sequence::VALVE_REPORT_FRESH_MS {
             return None;
         }
         if !same_tick {
@@ -273,7 +273,7 @@ fn source_sample_at(
             return None;
         }
         let age = delta.max(0) as u64;
-        if age > 2_000 || previous.is_some_and(|old| old >= UTC_2020_MS && source < old) {
+        if age > gse_sequence::VALVE_REPORT_FRESH_MS || previous.is_some_and(|old| old >= UTC_2020_MS && source < old) {
             return None;
         }
         now.checked_sub(age)?
@@ -302,7 +302,7 @@ fn scalar_capture_at(
     };
     let mut next = *previous;
     let captured = source_sample_at(source, receipt.network_ms, received_at, &mut next)?;
-    if processing_now.checked_sub(captured)? > 2_000 {
+    if processing_now.checked_sub(captured)? > gse_sequence::VALVE_REPORT_FRESH_MS {
         return None;
     }
     *previous = next;
@@ -584,7 +584,7 @@ impl Runtime {
         // Waiting for the mutex may have consumed the original freshness
         // budget. Do not acknowledge or poison replay history with a capture
         // that was fresh at receipt but stale (or future) at processing time.
-        if processing_now.checked_sub(at_ms)? > 2_000 {
+        if processing_now.checked_sub(at_ms)? > gse_sequence::VALVE_REPORT_FRESH_MS {
             return None;
         }
         Some(PreparedValveSource {
@@ -932,7 +932,7 @@ fn supply_refusal(state: &AppState, rt: &Runtime, cmd: &TelemetryCommand) -> Opt
 }
 fn supply_refusal_at(rt: &Runtime, now: u64, cmd: &TelemetryCommand) -> Option<&'static str> {
     let closed = |index: usize| {
-        rt.valves[index].is_some_and(|v| !v.open && v.at_ms <= now && now - v.at_ms <= 2_000)
+        rt.valves[index].is_some_and(|v| !v.open && v.at_ms <= now && now - v.at_ms <= gse_sequence::VALVE_REPORT_FRESH_MS)
     };
     match cmd {
         TelemetryCommand::Nitrogen if !rt.valves[3].is_some_and(|v| v.open) => {
@@ -2529,8 +2529,8 @@ mod tests {
         let mut rt = Runtime::default();
         let now = 10_000;
         let valve = |open, at_ms| Some(ValveState { open, at_ms });
-        // Nitrogen closed but its report is 3 s old: Nitrous may not open.
-        rt.valves = [None, None, None, valve(false, now - 3_000), valve(false, now)];
+        // Nitrogen closed but its report is 6 s old: Nitrous may not open.
+        rt.valves = [None, None, None, valve(false, now - 6_000), valve(false, now)];
         assert!(supply_refusal_at(&rt, now, &TelemetryCommand::Nitrous).unwrap().contains("Nitrogen must read closed"));
         // A fresh closed Nitrogen admits it; closes are never refused.
         rt.valves[3] = valve(false, now - 500);
@@ -2544,14 +2544,14 @@ mod tests {
     fn completion_valve_snapshot_retains_only_fresh_actual_open_and_closed() {
         use super::*;
         let input = Inputs {
-            now_ms: 5000,
+            now_ms: 8000,
             pressure: None,
             valves: [
-                Some(ValveState { open: true, at_ms: 4999 }),
+                Some(ValveState { open: true, at_ms: 7999 }),
                 Some(ValveState { open: false, at_ms: 3000 }),
                 None,
                 Some(ValveState { open: false, at_ms: 2999 }),
-                Some(ValveState { open: false, at_ms: 5001 }),
+                Some(ValveState { open: false, at_ms: 8001 }),
             ],
             prelaunch: false,
             interlock: false,
@@ -3161,7 +3161,7 @@ mod tests {
             let rt = state.gse.lock().unwrap();
             let now = rt.now();
             assert!(rt.valves.iter().all(|value| value.is_some_and(|value|
-                !value.open && value.at_ms <= now && now - value.at_ms <= 2000)),
+                !value.open && value.at_ms <= now && now - value.at_ms <= gse_sequence::VALVE_REPORT_FRESH_MS)),
                 "trim completion requires all five fresh actual closed reports: {:?}", rt.valves);
         }
         let completed_status = state.gse.lock().unwrap().engine.status.clone();
@@ -4106,7 +4106,7 @@ fn apply_cold_flow_override(
         .pressure
         .is_some_and(|p| p.at_ms <= now && now - p.at_ms <= 2000 && baseline.is_zero(p.value))
         || ![3, 4].into_iter().all(|i| {
-            rt.valves[i].is_some_and(|v| !v.open && v.at_ms <= now && now - v.at_ms <= 2000)
+            rt.valves[i].is_some_and(|v| !v.open && v.at_ms <= now && now - v.at_ms <= gse_sequence::VALVE_REPORT_FRESH_MS)
         })
     {
         return Err(
@@ -4177,7 +4177,7 @@ fn hitl_nitrogen_override_blocker(rt: &Runtime, interlocked: bool, now: u64) -> 
     let Some(pressure) = rt.pressure.filter(|p| p.at_ms <= now && now - p.at_ms <= 2000) else {
         return Some("A fresh tank pressure reading is required".into());
     };
-    if ![3, 4].into_iter().all(|i| rt.valves[i].is_some_and(|v| !v.open && v.at_ms <= now && now - v.at_ms <= 2000)) {
+    if ![3, 4].into_iter().all(|i| rt.valves[i].is_some_and(|v| !v.open && v.at_ms <= now && now - v.at_ms <= gse_sequence::VALVE_REPORT_FRESH_MS)) {
         return Some("Both supply valves must report closed".into());
     }
     match (&rt.engine.status.baseline, rt.engine.config.maximum_zero_offset_psi) {

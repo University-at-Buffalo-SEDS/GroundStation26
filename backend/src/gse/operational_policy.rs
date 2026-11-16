@@ -93,7 +93,7 @@ fn topology(state: &AppState) -> (bool, String) {
     ];
     let fresh = required
         .iter()
-        .all(|board| state.operational_board_recent(*board, 3_000));
+        .all(|board| state.operational_board_recent(*board, gse_sequence::FILL_BOARD_RECENT_MS));
     let Some(router) = state.topology_router.get() else {
         return (false, String::new());
     };
@@ -1943,7 +1943,7 @@ mod tests {
             .unwrap()
             .get_mut(&Board::ValveBoard)
             .unwrap()
-            .last_seen_instant = Some(Instant::now() - std::time::Duration::from_secs(4));
+            .last_seen_instant = Some(Instant::now() - std::time::Duration::from_secs(6));
         assert!(operational_tick(&state, true));
         assert_eq!(
             state
@@ -2289,7 +2289,7 @@ mod tests {
                 .unwrap()
                 .get_mut(&Board::ValveBoard)
                 .unwrap()
-                .last_seen_instant = Some(Instant::now() - std::time::Duration::from_secs(4));
+                .last_seen_instant = Some(Instant::now() - std::time::Duration::from_secs(6));
             assert!(operational_tick(&state, true));
             {
                 // Lost routes are missing data: the filled hold re-closes and

@@ -194,7 +194,7 @@ fn routes_current(state: &AppState) -> bool {
         crate::types::Board::GatewayBoard,
     ]
     .into_iter()
-    .all(|b| state.operational_board_recent(b, 3000))
+    .all(|b| state.operational_board_recent(b, gse_sequence::FILL_BOARD_RECENT_MS))
 }
 
 fn prerequisites(state: &AppState, rt: &Runtime, input: Inputs) -> bool {
@@ -857,12 +857,12 @@ mod tests {
         };
         let mut previous = None;
         assert_eq!(
-            scalar_capture_at(clock, 3001, Some(source), receipt, &mut previous),
+            scalar_capture_at(clock, 6001, Some(source), receipt, &mut previous),
             None
         );
         assert_eq!(previous, None);
         assert_eq!(
-            scalar_capture_at(clock, 3000, Some(source), receipt, &mut previous),
+            scalar_capture_at(clock, 6000, Some(source), receipt, &mut previous),
             Some(1000)
         );
         assert_eq!(previous, Some(source));

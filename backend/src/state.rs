@@ -30,7 +30,9 @@ pub const LAUNCH_COUNTDOWN_DURATION_MS: i64 = 10_000;
 pub(crate) fn default_hitl_safety_interlocks() -> Arc<[AtomicBool; 4]> {
     Arc::new(std::array::from_fn(|_| AtomicBool::new(false)))
 }
-pub const UMBILICAL_PENDING_VALVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+pub const UMBILICAL_PENDING_VALVE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(gse_sequence::VALVE_REPORT_FRESH_MS);
+const RETRACT_PLUMBING_KEY: u8 = crate::rocket_commands::ActuatorBoardCommands::RetractPlumbing as u8;
 const BOARD_STATUS_BROADCAST_MIN_INTERVAL_MS: u64 = 200;
 pub(crate) const BOARD_SEEN_TIMEOUT_MS: u64 = 12_000;
 
@@ -2569,11 +2571,15 @@ impl AppState {
     }
 
     pub fn expire_pending_umbilical_valve_states(&self, max_age: std::time::Duration) -> bool {
+        let retract_running = crate::actuator_plumbing::retract_motion_active(self);
         let mut pending = self.pending_umbilical_valve_states.lock().unwrap();
         let before = pending.len();
         let mut confirmed = self.umbilical_valve_states.lock().unwrap();
         pending.retain(|key, state| {
-            let fresh = !state.expired(max_age);
+            // A retraction the actuator reports running keeps its intent
+            // until the timed move completes and reports retracted.
+            let fresh = !state.expired(max_age)
+                || (retract_running && *key == RETRACT_PLUMBING_KEY && state.target);
             if !fresh {
                 confirmed.remove(key);
             }
@@ -2588,6 +2594,8 @@ impl AppState {
         actual: bool,
         mismatch_timeout: std::time::Duration,
     ) -> bool {
+        let retract_running = cmd_id == RETRACT_PLUMBING_KEY
+            && crate::actuator_plumbing::retract_motion_active(self);
         let mut pending = self.pending_umbilical_valve_states.lock().unwrap();
         let Some(entry) = pending.get(&cmd_id).copied() else {
             return false;
@@ -2602,7 +2610,7 @@ impl AppState {
             pending.remove(&cmd_id);
             return true;
         }
-        if entry.expired(mismatch_timeout) {
+        if entry.expired(mismatch_timeout) && !(retract_running && entry.target) {
             pending.remove(&cmd_id);
             confirmed.remove(&cmd_id);
             return true;
@@ -3362,7 +3370,7 @@ pub(crate) mod tests {
         assert_eq!(state.get_umbilical_valve_state(9), Some(true));
         let mut states = state.umbilical_valve_states.lock().unwrap();
         let observed = states.get_mut(&9).unwrap();
-        observed.received_at -= std::time::Duration::from_secs(3);
+        observed.received_at -= std::time::Duration::from_secs(6);
         observed.simulation_ms = None;
         drop(states);
         assert_eq!(state.get_umbilical_valve_state(9), None);
@@ -4945,7 +4953,7 @@ mod valve_source_clock_tests {
         );
         assert!(ConfirmedUmbilicalValveState::source_capture(true, receipt, Some(0), 1).is_none());
         assert!(
-            ConfirmedUmbilicalValveState::source_capture(true, receipt, Some(3000), 2001).is_none()
+            ConfirmedUmbilicalValveState::source_capture(true, receipt, Some(6000), 5001).is_none()
         );
     }
 }
@@ -5011,7 +5019,7 @@ mod capture_order_tests {
         .unwrap();
         assert!(fresh.after_pending(&pending, at + Duration::from_millis(30), None));
         assert!(
-            !fresh.after_pending(&pending, at + Duration::from_secs(3), None),
+            !fresh.after_pending(&pending, at + Duration::from_secs(6), None),
             "expired source capture is not a new confirmation"
         );
         assert!(!fresh.fresh_at(at, None), "future capture is fail-closed");

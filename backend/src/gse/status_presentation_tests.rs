@@ -96,7 +96,7 @@ fn external_trim_status_expires_missing_stale_and_future_reports_instead_of_reus
         }),
         Some(ValveState {
             open: true,
-            at_ms: 5_001,
+            at_ms: 13_002,
         }),
         Some(ValveState {
             open: false,
@@ -104,15 +104,15 @@ fn external_trim_status_expires_missing_stale_and_future_reports_instead_of_reus
         }),
         Some(ValveState {
             open: true,
-            at_ms: 5_000,
+            at_ms: 8_000,
         }),
     ];
     assert_eq!(
-        rt.presentation_status_at(5_000, true, true).valves,
+        rt.presentation_status_at(8_000, true, true).valves,
         [None, None, None, Some(false), Some(true)]
     );
     assert_eq!(
-        rt.presentation_status_at(7_002, true, true).valves,
+        rt.presentation_status_at(13_001, true, true).valves,
         [None; 5]
     );
     assert_eq!(

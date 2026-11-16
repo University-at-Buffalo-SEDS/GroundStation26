@@ -54,7 +54,9 @@ pub const RESTART_EXIT_CODE: i32 = 75;
 pub(crate) const SELECTION_FILE: &str = "selection.json";
 const INSTANCE_FILE: &str = "instance-id";
 const TICKET_TTL: Duration = Duration::from_millis(15_000);
-const VALID_FOR_MS: u64 = 5_000;
+/// How long a client may present a mode reading as current. A Pi under load
+/// can take most of a 2 s poll to answer; 5 s lapsed between polls.
+const VALID_FOR_MS: u64 = 10_000;
 /// Gives the Confirm receipt time to reach the client before shutdown starts.
 const RESTART_DELAY: Duration = Duration::from_millis(600);
 /// Gives the Confirm receipt time to reach the client before the mode changes.

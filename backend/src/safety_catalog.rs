@@ -104,11 +104,11 @@ impl Sources {
 fn station_values(state: &AppState) -> Value {
     let policy = state.action_policy_snapshot();
     json!({
-        "valve_report_fresh_ms": 2000,
+        "valve_report_fresh_ms": gse_sequence::VALVE_REPORT_FRESH_MS,
         "pressure_fresh_ms": 2000,
         "valve_ack_timeout_ms": gse_sequence::VALVE_ACK_TIMEOUT_MS,
         "unconfirmed_valve_timeout_ms": crate::state::UMBILICAL_PENDING_VALVE_TIMEOUT.as_millis() as u64,
-        "board_recent_ms": 3000,
+        "board_recent_ms": gse_sequence::FILL_BOARD_RECENT_MS,
         "refill_noop_kg": 0.2,
         "overpressure_sustain_ms": crate::gse::overpressure::SUSTAIN_MS,
         "overpressure_max_step_psi": crate::gse::overpressure::MAX_STEP_PSI,

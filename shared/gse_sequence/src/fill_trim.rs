@@ -227,7 +227,7 @@ impl Controller {
             !v.is_some_and(|v| {
                 v.open == self.desired[i]
                     && v.at_ms <= input.now_ms
-                    && input.now_ms - v.at_ms <= 2000
+                    && input.now_ms - v.at_ms <= crate::VALVE_REPORT_FRESH_MS
             })
         }) {
             return self.fail("Fill trim valve feedback is missing, stale or mismatched");

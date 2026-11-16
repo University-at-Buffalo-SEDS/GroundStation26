@@ -7,11 +7,11 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// Valve evidence expires after two seconds. Boards report every 500 ms, so
-/// this flags a gap that already spans several lost reports.
-pub const STALE_AFTER_MS: u64 = 3_000;
+/// Valve evidence expires after five seconds. Boards report every 500 ms, so
+/// this flags a gap that already spans many lost reports.
+pub const STALE_AFTER_MS: u64 = gse_sequence::VALVE_REPORT_FRESH_MS;
 /// The board counts as present if any packet arrived this recently.
-pub const PRESENT_WITHIN_MS: u64 = 3_000;
+pub const PRESENT_WITHIN_MS: u64 = gse_sequence::FILL_BOARD_RECENT_MS;
 const OUTPUT_BOARDS: [Board; 2] = [Board::ValveBoard, Board::ActuatorBoard];
 const UTC_2020_MS: i64 = 1_577_836_800_000;
 
@@ -19,7 +19,7 @@ const UTC_2020_MS: i64 = 1_577_836_800_000;
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Refusal {
     /// The report's source time was outside the station's acceptance window
-    /// (more than 100 ms ahead of station network time, or over 2 s behind).
+    /// (more than 100 ms ahead of station network time, or over 5 s behind).
     ClockSkew { source_minus_station_ms: i64 },
     /// The station could not attribute the report's sender to the board that
     /// owns the valve (unresolved or mismatched network address).
@@ -220,7 +220,7 @@ pub fn reason_text(snapshot: &BoardValveReports) -> String {
 pub fn classify_refusal(source_ms: i64, station_network_ms: i64) -> Refusal {
     if source_ms >= UTC_2020_MS && station_network_ms >= UTC_2020_MS {
         let skew = source_ms.saturating_sub(station_network_ms);
-        if !(-2_000..=100).contains(&skew) {
+        if !(-(gse_sequence::VALVE_REPORT_FRESH_MS as i64)..=100).contains(&skew) {
             return Refusal::ClockSkew {
                 source_minus_station_ms: skew,
             };
@@ -353,7 +353,7 @@ mod tests {
         let (at, Edge::Stale(message)) = &edges[0] else {
             panic!("{edges:?}")
         };
-        assert_eq!(*at, 3_500);
+        assert_eq!(*at, 5_500);
         assert!(message.starts_with("AB valve state STALE"), "{message}");
         assert!(
             message.contains("no valve-state reports are arriving"),
@@ -361,12 +361,12 @@ mod tests {
         );
         let snapshot = t.snapshot(AB, 30_000, Some(100));
         assert!(snapshot.stale && snapshot.board_present);
-        assert_eq!(snapshot.stale_for_ms, Some(26_500));
+        assert_eq!(snapshot.stale_for_ms, Some(24_500));
         t.observe(AB, 8, 30_000, true, Refusal::Refused);
         let Some(Edge::Resumed(message)) = t.tick(AB, 30_000, Some(0)) else {
             panic!()
         };
-        assert_eq!(message, "AB valve-state reports resumed after 26 s stale");
+        assert_eq!(message, "AB valve-state reports resumed after 24 s stale");
         assert_eq!(t.tick(AB, 30_500, Some(0)), None);
     }
 
@@ -376,14 +376,14 @@ mod tests {
         t.observe(AB, 8, 0, true, Refusal::Refused);
         let base = 1_800_000_000_000_i64;
         for now in (1_000..10_000).step_by(1000) {
-            t.observe(AB, 8, now, false, classify_refusal(base - 4_200, base));
+            t.observe(AB, 8, now, false, classify_refusal(base - 6_200, base));
         }
         let edges = stale_edges(&mut t, 500, 10_000, |_| Some(0));
         let [(_, Edge::Stale(message))] = edges.as_slice() else {
             panic!("{edges:?}")
         };
         assert!(
-            message.contains("board clock behind station network time by 4200 ms"),
+            message.contains("board clock behind station network time by 6200 ms"),
             "{message}"
         );
         assert_eq!(
@@ -392,7 +392,7 @@ mod tests {
                 source_minus_station_ms: 150
             }
         );
-        assert_eq!(classify_refusal(base - 1_500, base), Refusal::Refused);
+        assert_eq!(classify_refusal(base - 4_500, base), Refusal::Refused);
         assert_eq!(classify_refusal(12_345, base), Refusal::Refused);
     }
 
@@ -403,7 +403,7 @@ mod tests {
         let [(at, Edge::Stale(message))] = edges.as_slice() else {
             panic!("{edges:?}")
         };
-        assert_eq!(*at, 3_000);
+        assert_eq!(*at, 5_000);
         assert!(message.contains("no valve-state reports"), "{message}");
     }
 

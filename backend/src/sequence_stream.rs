@@ -18,10 +18,10 @@ pub struct CapturedOutput {
     pub age_ms: u64,
 }
 fn output(value: Option<CapturedOutput>) -> serde_json::Value {
-    value.filter(|v|v.age_ms<=2000).map_or(serde_json::Value::Null,|v|serde_json::json!({"value":v.value,"age_ms":v.age_ms,"valid_for_ms":2000,"evidence":"board_reported"}))
+    value.filter(|v|v.age_ms<=gse_sequence::VALVE_REPORT_FRESH_MS).map_or(serde_json::Value::Null,|v|serde_json::json!({"value":v.value,"age_ms":v.age_ms,"valid_for_ms":gse_sequence::VALVE_REPORT_FRESH_MS,"evidence":"board_reported"}))
 }
 fn queued_command(value: Option<CapturedOutput>) -> serde_json::Value {
-    value.filter(|v|v.age_ms<=2000).map_or(serde_json::Value::Null,|v|serde_json::json!({"value":v.value,"age_ms":v.age_ms,"valid_for_ms":2000,"evidence":"command_accepted","source_kind":"station_command_queue"}))
+    value.filter(|v|v.age_ms<=gse_sequence::VALVE_REPORT_FRESH_MS).map_or(serde_json::Value::Null,|v|serde_json::json!({"value":v.value,"age_ms":v.age_ms,"valid_for_ms":gse_sequence::VALVE_REPORT_FRESH_MS,"evidence":"command_accepted","source_kind":"station_command_queue"}))
 }
 pub fn project(
     clock: Clock,
@@ -130,7 +130,7 @@ mod tests {
         });
         outputs[5] = Some(CapturedOutput {
             value: true,
-            age_ms: 2001,
+            age_ms: gse_sequence::VALVE_REPORT_FRESH_MS + 1,
         });
         let value = project(clock(6000), Some(view), outputs, [None; 6]);
         assert_eq!(value["valves"]["nitrous"]["plan"]["value"], true);

@@ -10,6 +10,12 @@ pub mod turbocharge;
 /// Order is pilot, vent, dump, nitrogen, nitrous. Ignition/retraction are never tested.
 pub const RELIEVED: [bool; 5] = [false, true, true, false, false];
 pub const VALVE_ACK_TIMEOUT_MS: u64 = 5000;
+/// Fill-side (umbilical) valve reports confirm a valve for this long after
+/// their capture. Boards report every 500 ms; the window rides out reports
+/// the gateway drops under load instead of flickering to unconfirmed.
+pub const VALVE_REPORT_FRESH_MS: u64 = 5000;
+/// Fill-side boards count as recently heard (connectivity) for this long.
+pub const FILL_BOARD_RECENT_MS: u64 = 5000;
 
 pub const CLOSED: [bool; 5] = [false; 5];
 pub const FILL_READY: [bool; 5] = [false, true, false, false, false];
@@ -654,7 +660,7 @@ impl Engine {
                 v.open == target
                     && v.at_ms <= input.now_ms
                     && if phase == Phase::BaselineSetup {
-                        input.now_ms - v.at_ms <= 2000
+                        input.now_ms - v.at_ms <= VALVE_REPORT_FRESH_MS
                     } else {
                         self.target[i] == target && v.at_ms >= self.self_ack_since[i]
                     }
@@ -1275,7 +1281,7 @@ impl Engine {
                 v.is_some_and(|v| {
                     v.open == target
                         && v.at_ms <= input.now_ms
-                        && input.now_ms - v.at_ms <= 2000
+                        && input.now_ms - v.at_ms <= VALVE_REPORT_FRESH_MS
                         && v.at_ms
                             >= if self.self_confirmation_phase() {
                                 self.self_ack_since[i]
@@ -1311,7 +1317,7 @@ impl Engine {
                             v.at_ms >= since
                         }
                         && v.at_ms <= input.now_ms
-                        && input.now_ms - v.at_ms <= 2000
+                        && input.now_ms - v.at_ms <= VALVE_REPORT_FRESH_MS
                 }) && input.now_ms.saturating_sub(since) >= VALVE_ACK_TIMEOUT_MS
             })
     }
@@ -1365,7 +1371,7 @@ impl Engine {
                             v.open
                                 && v.at_ms >= self.self_ack_since[i]
                                 && v.at_ms <= input.now_ms
-                                && input.now_ms - v.at_ms <= 2000
+                                && input.now_ms - v.at_ms <= VALVE_REPORT_FRESH_MS
                         })
                 });
                 let climbing = match (Self::fresh_pressure(input), self.pause_reference_psi) {
@@ -1441,7 +1447,7 @@ impl Engine {
                     v.open == self.target[i]
                         && v.at_ms > self.self_ack_since[i]
                         && v.at_ms <= input.now_ms
-                        && input.now_ms - v.at_ms <= 2000
+                        && input.now_ms - v.at_ms <= VALVE_REPORT_FRESH_MS
                 })
             {
                 self.self_waiting = None;
@@ -2922,7 +2928,7 @@ mod tests {
         input.valves = input.valves.map(|v| {
             v.map(|mut v| {
                 v.open = false;
-                v.at_ms = 7000;
+                v.at_ms = 10000 - VALVE_REPORT_FRESH_MS - 1;
                 v
             })
         });

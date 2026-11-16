@@ -5,7 +5,7 @@ pub const TIMEOUT_MS: u64 = 12_000;
 /// Silence that marks a board offline, by its link. Umbilical (CAN) boards report at 1-250 Hz (frame age
 /// p99 under 1 s in the fullnet); radio boards need margin for loss (30% loss: RF 4.3 s, PB 2.8 s, FC 1.3 s
 /// longest gaps). A board whose link is not known yet keeps TIMEOUT_MS.
-pub const WIRED_TIMEOUT_MS: u64 = 3_000;
+pub const WIRED_TIMEOUT_MS: u64 = gse_sequence::FILL_BOARD_RECENT_MS;
 pub const RADIO_TIMEOUT_MS: u64 = 6_000;
 /// Window for the board clock estimate (see `observe_clock`).
 const CLOCK_WINDOW_MS: u64 = 10_000;
@@ -518,13 +518,13 @@ mod tests {
         let healthy = |tracker: &mut Tracker, b: &str, ms| tracker.snapshot(at(t, ms), false).into_iter()
             .find(|row| row.sender_id == b).map(|row| row.healthy).unwrap();
         assert!(tracker.connected_for("FC", at(t, 5_900)).is_some());
-        assert!(healthy(&mut tracker, "VB", 2_900));
-        assert!(!healthy(&mut tracker, "VB", 3_100));
+        assert!(healthy(&mut tracker, "VB", 4_900));
+        assert!(!healthy(&mut tracker, "VB", 5_100));
         assert!(healthy(&mut tracker, "FC", 5_900));
         assert!(!healthy(&mut tracker, "FC", 6_100));
         assert!(healthy(&mut tracker, "XX", 11_900));
         assert!(!healthy(&mut tracker, "XX", 12_100));
-        assert!(tracker.connected_for("VB", at(t, 3_100)).is_none());
+        assert!(tracker.connected_for("VB", at(t, 5_100)).is_none());
     }
     #[test]
     fn clock_offset_ignores_transport_delay_within_its_window() {

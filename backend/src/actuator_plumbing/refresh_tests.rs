@@ -127,3 +127,81 @@ async fn drive_mismatch_is_distinct_from_busy_or_unready_feedback() {
     let unready = motion_ready_inner(&fixture.state, &inner).unwrap_err();
     assert!(unready.contains("not ready"), "{unready}");
 }
+
+fn running_retract(remaining_ms: u32, issuer: u64) -> motion_wire::MotionStatus {
+    motion_wire::MotionStatus {
+        setting: Status {
+            result: 0,
+            mode: Some(Mode::Auxiliary),
+            capabilities: 5,
+            nonce: 9,
+            generation: 42,
+            epoch: 8,
+            issuer,
+            active_action: 1,
+            busy: true,
+            remaining_ms,
+        },
+        lifecycle: 1,
+        accepted_action: 1,
+        original_utc_ms: 1_800_000_000_000,
+        minimum_delay_remaining_ms: remaining_ms,
+        origin_epoch: 8,
+    }
+}
+
+/// The auxiliary drive reports "retracted" only after its 45 s timed move.
+/// An accepted, running retraction keeps the operator's intent and shows as
+/// active instead of expiring to Unconfirmed and then "not triggered".
+#[tokio::test]
+async fn running_auxiliary_retraction_stays_active_until_it_reports_retracted() {
+    let fixture = http_tests::Fixture::new().await;
+    let state = &fixture.state;
+    let key = crate::rocket_commands::ActuatorBoardCommands::RetractPlumbing as u8;
+    state.set_umbilical_valve_state(key, false);
+    state.set_pending_umbilical_valve_state(key, true);
+    assert!(!retract_motion_active(state));
+    {
+        let mut inner = state.plumbing_drive.inner.lock().unwrap();
+        let revision = inner.desired.revision;
+        inner.motion_observed = Some(MotionObservation {
+            value: running_retract(44_000, state.plumbing_drive.issuer),
+            after: Moment::now(),
+            received: Instant::now(),
+            generation: crate::gse::automatic_generation(state),
+            mode_revision: revision,
+        });
+    }
+    assert!(retract_motion_active(state));
+    // Past the 2 s pending window, with the board still reporting not retracted.
+    assert!(!state.expire_pending_umbilical_valve_states(Duration::ZERO));
+    assert!(!state.reconcile_pending_umbilical_valve_state(key, false, Duration::ZERO));
+    assert_eq!(state.get_pending_umbilical_valve_state(key), Some(true));
+    let valves = crate::sequences::retract_actuated_for_test(state);
+    assert_eq!(valves, Some(true), "a running retraction shows active");
+    // Completion report: the intent resolves to the confirmed retracted state.
+    state.set_umbilical_valve_state(key, true);
+    // A finished or cancelled motion no longer holds the intent.
+    {
+        let mut inner = state.plumbing_drive.inner.lock().unwrap();
+        let row = inner.motion_observed.as_mut().unwrap();
+        row.value.lifecycle = 3;
+    }
+    assert!(!retract_motion_active(state));
+    assert!(state.expire_pending_umbilical_valve_states(Duration::ZERO));
+}
+
+#[test]
+fn running_retraction_lapses_after_its_reported_remaining_time() {
+    let row = MotionObservation {
+        value: running_retract(10_000, 7),
+        after: Moment::now(),
+        received: Instant::now(),
+        generation: 3,
+        mode_revision: 1,
+    };
+    assert!(retract_row_active(&row, 3, 1, Duration::from_millis(12_000)));
+    assert!(!retract_row_active(&row, 3, 1, Duration::from_millis(13_001)));
+    assert!(!retract_row_active(&row, 4, 1, Duration::ZERO), "Stop/recovery generation");
+    assert!(!retract_row_active(&row, 3, 2, Duration::ZERO), "drive changed");
+}

@@ -731,6 +731,53 @@ pub(crate) fn request_motion_query(state: &AppState) -> Result<(), String> {
     }
     Ok(())
 }
+/// Margin after the actuator's reported remaining motion time during which
+/// a retraction still counts as running (its completion report, sent once,
+/// may take one report period plus transit).
+const RETRACT_ACTIVE_MARGIN_MS: u64 = 3_000;
+
+/// The actuator reports an accepted retraction still running: its motion
+/// status said busy with the retract action, and the remaining time it then
+/// reported (the auxiliary drive's timed 45 s move) has not yet run out.
+/// The plumbing report says "retracted" only once that move completes, so
+/// without this the station would show an accepted, running retraction as
+/// unconfirmed and then not triggered. This is display and pending-intent
+/// retention only: it never confirms a retraction or admits Launch.
+pub(crate) fn retract_motion_active(state: &AppState) -> bool {
+    let generation = crate::gse::automatic_generation(state);
+    let inner = state.plumbing_drive.inner.lock().unwrap();
+    inner.motion_observed.as_ref().is_some_and(|row| {
+        retract_row_active(row, generation, inner.desired.revision, row.received.elapsed())
+    })
+}
+/// A fresh motion status reports the accepted retraction COMPLETED.
+pub(crate) fn retract_motion_completed(state: &AppState) -> bool {
+    let generation = crate::gse::automatic_generation(state);
+    let inner = state.plumbing_drive.inner.lock().unwrap();
+    inner.motion_observed.as_ref().is_some_and(|row| {
+        row.generation == generation
+            && row.mode_revision == inner.desired.revision
+            && row.value.completed_retract()
+            && row.received.elapsed().as_millis() <= u128::from(gse_sequence::VALVE_REPORT_FRESH_MS)
+    })
+}
+fn retract_row_active(
+    row: &MotionObservation,
+    generation: u64,
+    revision: u64,
+    since_received: std::time::Duration,
+) -> bool {
+    let v = row.value;
+    row.generation == generation
+        && row.mode_revision == revision
+        && v.lifecycle == 1
+        && v.accepted_action == 1
+        && v.setting.busy
+        && v.setting.active_action == 1
+        && since_received.as_millis()
+            <= u128::from(u64::from(v.setting.remaining_ms).saturating_add(RETRACT_ACTIVE_MARGIN_MS))
+}
+
 pub(crate) fn receive_motion_status(state: &AppState, packet: &Packet) {
     if packet.data_type() != crate::telemetry_schema::data_type(motion_wire::TYPE)
         || state.board_from_network_sender(packet.sender()) != Some(Board::ActuatorBoard)

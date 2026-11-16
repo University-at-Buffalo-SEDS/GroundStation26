@@ -105,6 +105,6 @@
     "state": "applied",
     "target_id": "hitl"
   },
-  "valid_for_ms": 5000,
+  "valid_for_ms": 10000,
   "version": 2
 }
