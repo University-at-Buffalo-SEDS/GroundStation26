@@ -5626,6 +5626,9 @@ pub(super) fn spawn_router_worker_thread(
                             crate::telemetry_task::station_host_utc_ms(),
                         );
                         last_clock_refresh = std::time::Instant::now();
+                        if crate::telemetry_task::take_due_step_republish(last_clock_refresh) {
+                            crate::telemetry_task::republish_after_clock_step(&state, &router);
+                        }
                     }
                     if let Ok(queued) = router.poll_timesync() {
                         did_work |= queued;

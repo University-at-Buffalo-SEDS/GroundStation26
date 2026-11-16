@@ -427,6 +427,7 @@ fn set_network_utc_with(
     if may_step && off_by.is_some_and(|off| off > OPERATOR_STEP_THRESHOLD_MS) {
         if router.step_local_network_time_ns(utc_ms.saturating_mul(1_000_000)) {
             let _ = router.network_time();
+            crate::telemetry_task::note_network_clock_step();
             log::warn!(
                 "Network UTC stepped by {} ms to the operator's time",
                 off_by.unwrap_or(0)

@@ -395,7 +395,9 @@ fn refresh_station_network_time_at(router: &Router, host_ns: i64) {
             status.source,
             if host_jumped { ", host clock jumped" } else { "" }
         );
-        router.step_local_network_time_ns(utc_ns);
+        if router.step_local_network_time_ns(utc_ns) {
+            note_network_clock_step();
+        }
     } else if let Some(t) = sedsnet::timesync::NetworkTime::from_unix_ns(i128::from(utc_ns)) {
         router.set_local_network_time(t.into());
     }
@@ -405,6 +407,68 @@ fn refresh_station_network_time_at(router: &Router, host_ns: i64) {
             status.gps_delay_us,
             if status.gps_delay_learned { "learned" } else { "default" }
         );
+    }
+}
+
+/// After the station steps its network clock, boards re-anchor within one or
+/// two seconds. A managed FLIGHT_STATE written in between carries the new
+/// timescale's stamp and a board's managed cache can still drop it as older
+/// than the value it cached (while acknowledging it). Re-send the current
+/// values once boards have re-anchored.
+const STEP_REPUBLISH_AFTER: [std::time::Duration; 2] =
+    [std::time::Duration::from_secs(3), std::time::Duration::from_secs(6)];
+static STEP_REPUBLISH_AT: std::sync::Mutex<Vec<std::time::Instant>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Records a network-clock step; the re-sends follow at +3 s and +6 s.
+pub(crate) fn note_network_clock_step() {
+    note_network_clock_step_at(std::time::Instant::now());
+}
+fn note_network_clock_step_at(at: std::time::Instant) {
+    let mut due = STEP_REPUBLISH_AT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    due.clear();
+    due.extend(STEP_REPUBLISH_AFTER.iter().map(|after| at + *after));
+}
+
+/// Whether a post-step re-send is due at `now` (each fires once).
+pub(crate) fn take_due_step_republish(now: std::time::Instant) -> bool {
+    let mut due = STEP_REPUBLISH_AT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let before = due.len();
+    due.retain(|at| *at > now);
+    due.len() != before
+}
+
+/// Re-sends this station's latest FLIGHT_STATE (same stamp, fresh identity;
+/// never Launch, never while one is pending) and the other station-owned
+/// network variables.
+pub(crate) fn republish_after_clock_step(state: &AppState, router: &Router) {
+    match crate::network_variables::resend_latest_flight_state_after_clock_step(router) {
+        Ok(true) => log::info!("FLIGHT_STATE re-sent after a network clock step"),
+        Ok(false) => {}
+        Err(error) => log::warn!("FLIGHT_STATE re-send after a clock step failed: {error}"),
+    }
+    if let Err(error) = crate::network_variables::publish_bootstrap_for_state(state, router) {
+        log::warn!("Network variables re-publish after a clock step failed: {error}");
+    }
+}
+
+#[cfg(test)]
+mod step_republish_tests {
+    use super::*;
+
+    #[test]
+    fn a_clock_step_schedules_two_resends_that_fire_once_each() {
+        let t = std::time::Instant::now();
+        note_network_clock_step_at(t);
+        assert!(!take_due_step_republish(t + std::time::Duration::from_millis(2_900)));
+        assert!(take_due_step_republish(t + std::time::Duration::from_millis(3_100)));
+        assert!(!take_due_step_republish(t + std::time::Duration::from_millis(3_200)));
+        assert!(take_due_step_republish(t + std::time::Duration::from_millis(6_100)));
+        assert!(!take_due_step_republish(t + std::time::Duration::from_secs(60)));
     }
 }
 
