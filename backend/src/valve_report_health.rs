@@ -7,7 +7,8 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// Valve evidence expires after two seconds; allow one missed 1 Hz report.
+/// Valve evidence expires after two seconds. Boards report every 500 ms, so
+/// this flags a gap that already spans several lost reports.
 pub const STALE_AFTER_MS: u64 = 3_000;
 /// The board counts as present if any packet arrived this recently.
 pub const PRESENT_WITHIN_MS: u64 = 3_000;
