@@ -67,6 +67,7 @@ mod launch_history;
 mod launch_mode_gate;
 mod layout;
 mod kg50_input_sync;
+mod board_config_sync;
 mod loadcell;
 mod loadcell_zero;
 mod log_redaction;
@@ -1726,6 +1727,7 @@ async fn main() -> anyhow::Result<()> {
         fill_comms_connected: Arc::new(AtomicBool::new(false)),
         topology_router: Arc::new(std::sync::OnceLock::new()),
         kg50_input_sync: Default::default(),
+        board_config_sync: Default::default(),
         auth,
     });
     // The RFD modem check may enter command mode only outside flight and
@@ -2524,6 +2526,10 @@ async fn main() -> anyhow::Result<()> {
         state.shutdown_subscribe(),
     ));
     let _kg50_input_sync = tokio::spawn(crate::kg50_input_sync::service(
+        state.clone(),
+        state.shutdown_subscribe(),
+    ));
+    let _board_config_sync = tokio::spawn(crate::board_config_sync::service(
         state.clone(),
         state.shutdown_subscribe(),
     ));

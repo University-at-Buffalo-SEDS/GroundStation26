@@ -22,7 +22,9 @@ impl MotionStatus {
         legacy.copy_from_slice(&bytes[..40]);
         legacy[0] = 1;
         legacy[34..36].fill(0);
-        let setting = Status::decode(&legacy)?;
+        let mut setting = Status::decode(&legacy)?;
+        // V2 bytes 34..35 are the motion lifecycle, not a selection identity.
+        setting.setting_id = 0;
         let value = Self {
             setting,
             lifecycle: bytes[34],

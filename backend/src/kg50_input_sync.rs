@@ -210,6 +210,14 @@ pub async fn service(
         let Some(router) = state.topology_router.get().filter(|_| !crate::rrls::is_rrls()) else {
             continue;
         };
+        // Board config resync: the input changes only in Startup or Idle,
+        // never mid-sequence (board_config_sync shows it out of sync).
+        if !matches!(
+            state.local_flight_state_snapshot(),
+            crate::types::FlightState::Startup | crate::types::FlightState::Idle
+        ) {
+            continue;
+        }
         let selected = state.loadcell_calibration.lock().unwrap().kg50_input;
         let now = Instant::now();
         let Some(plan) = state.kg50_input_sync.resend_plan(selected, now) else {

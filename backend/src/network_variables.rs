@@ -604,6 +604,9 @@ fn initialize_for_role_seed(router: &Router, observer: bool, seed: bool) -> Resu
     let selected = crate::loadcell::load_or_default();
     router.seed_managed_variable(kg50_input_packet(&selected)?)?;
     let calibration = crate::loadcell::amp2_calibration(&selected);
+    if let Ok(identity) = daq_calibration_identity(&selected) {
+        crate::board_config_sync::note_daq_published(router, identity);
+    }
     router.seed_managed_variable(calibration_packet(&calibration)?)?;
     router.seed_managed_variable(kg50_calibration_packet(&calibration)?)?;
     router.seed_managed_variable(cached_daq_log_clock_packet()?)?;
@@ -1284,10 +1287,42 @@ fn kg50_calibration_packet(cfg: &crate::loadcell::LoadcellCalibrationFile) -> Re
     packet_bytes(DAQ_KG50_CALIBRATION_TYPE, "SD_CARD", Arc::from(payload))
 }
 
+/// The config identity the DAQ reports for the calibration this station
+/// publishes from `cfg` (DAQ-Board `daq_calibration_identity`): CRC-32 of the
+/// four payloads in the order loadcell, KG50, thermal, filter. Opaque: it
+/// hashes the bytes on the wire, whatever their units.
+pub fn daq_calibration_identity(cfg: &crate::loadcell::LoadcellCalibrationFile) -> Result<u32> {
+    let amp2 = crate::loadcell::amp2_calibration(cfg);
+    let mut hasher = crc32fast::Hasher::new();
+    for packet in [
+        calibration_packet(&amp2)?,
+        kg50_calibration_packet(&amp2)?,
+        thermal_packet(&amp2)?,
+        filter_packet(&amp2)?,
+    ] {
+        hasher.update(packet.payload());
+    }
+    Ok(hasher.finalize())
+}
+
+/// The identity of the DAQ's built-in calibration (a wiped store with nothing
+/// from the station yet): unit slopes, zero offsets, identity KG50 polynomial,
+/// no thermal compensation, no filtering.
+pub fn daq_default_identity() -> u32 {
+    let values: [f32; 17] = [
+        1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    ];
+    let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    crc32fast::hash(&bytes)
+}
+
 pub fn set_daq_calibration(
     router: &Router,
     cfg: &crate::loadcell::LoadcellCalibrationFile,
 ) -> Result<()> {
+    if let Ok(identity) = daq_calibration_identity(cfg) {
+        crate::board_config_sync::note_daq_published(router, identity);
+    }
     let request = crate::qualification_requests::Request::begin("set_daq_calibration");
     // The input stands alone: unusable AMP2 coefficients must not hold back a
     // physical input selection, so it is sent even when they fail.

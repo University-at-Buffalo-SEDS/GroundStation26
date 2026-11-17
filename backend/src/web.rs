@@ -381,6 +381,7 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .route("/api/boards", get(get_boards))
         .merge(crate::board_recovery::routes())
         .merge(crate::actuator_plumbing::routes())
+        .merge(crate::board_config_sync::routes())
         .route("/api/layout", get(get_layout))
         .route("/api/i18n/catalog", get(get_translation_catalog))
         .route("/api/i18n/translate", post(post_translate_texts))

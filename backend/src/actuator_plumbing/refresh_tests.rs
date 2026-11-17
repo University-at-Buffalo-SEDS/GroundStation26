@@ -141,6 +141,7 @@ fn running_retract(remaining_ms: u32, issuer: u64) -> motion_wire::MotionStatus 
             active_action: 1,
             busy: true,
             remaining_ms,
+            setting_id: 0,
         },
         lifecycle: 1,
         accepted_action: 1,

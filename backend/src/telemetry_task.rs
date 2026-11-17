@@ -2790,6 +2790,9 @@ async fn handle_packet_inner(
                 if crate::types::canonical_sender_id(sender_id.trim()) == "AB" {
                     crate::ab_command_gate::observe(state, &words);
                 }
+                if crate::types::canonical_sender_id(sender_id.trim()) == "DAQ" {
+                    crate::board_config_sync::observe_daq_health(state, &words);
+                }
             }
         }
         return Vec::new();
@@ -6367,6 +6370,7 @@ mod tests {
             fill_comms_connected: Arc::new(AtomicBool::new(false)),
             topology_router: Arc::new(OnceLock::new()),
             kg50_input_sync: Default::default(),
+            board_config_sync: Default::default(),
             auth: Arc::new(AuthManager::new(PathBuf::from(
                 "/tmp/groundstation-test-users.json",
             ))),

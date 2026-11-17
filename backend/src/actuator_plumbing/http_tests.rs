@@ -184,12 +184,16 @@ pub(crate) struct Fixture {
     handled: usize,
     host_worker_running: bool,
     worker_wall: Arc<Mutex<Option<std::time::Instant>>>,
-    mode: u8,
+    pub(crate) mode: u8,
     result: u8,
-    outputs: u32,
+    pub(crate) outputs: u32,
     board_state: FlightState,
-    board_boot: u64,
+    pub(crate) board_boot: u64,
     motion: Option<Vec<u8>>,
+    /// The fake actuator's saved-selection identity (0: factory default).
+    pub(crate) drive_id: u16,
+    /// SETs the fake actuator applied.
+    pub(crate) sets: u32,
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -369,6 +373,8 @@ impl Fixture {
             board_state: FlightState::Idle,
             board_boot: 42,
             motion: None,
+            drive_id: 0,
+            sets: 0,
         }
     }
     async fn request(
@@ -490,10 +496,13 @@ impl Fixture {
                     if p[1] == 1 {
                         self.mode = p[2];
                         self.outputs = 0;
+                        self.drive_id = super::wire::setting_identity(packet.timestamp());
+                        self.sets += 1;
                     }
                     bytes[1] = self.result;
                     bytes[2] = self.mode;
                     bytes[3] = 5;
+                    bytes[34..36].copy_from_slice(&self.drive_id.to_le_bytes());
                     bytes[24..32].copy_from_slice(&p[24..32]);
                     STATUS_TYPE
                 };

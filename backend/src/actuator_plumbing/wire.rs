@@ -83,6 +83,23 @@ pub struct Status {
     pub active_action: u8,
     pub busy: bool,
     pub remaining_ms: u32,
+    /// Identity of the board's saved selection for the station's resync
+    /// (ActuatorBoard26 `fill_settings_identity`): a 16-bit fold of the
+    /// request time of the station write that saved it, never 0; 0 when no
+    /// station saved it (absent record: the factory stepper default).
+    pub setting_id: u16,
+}
+/// The identity the actuator reports for a selection saved by a request
+/// stamped `source_ms` (`fill_settings_identity_of`).
+pub fn setting_identity(source_ms: u64) -> u16 {
+    let ms = source_ms & ((1 << 48) - 1);
+    if ms == 0 {
+        return 0;
+    }
+    match (ms ^ (ms >> 16) ^ (ms >> 32)) as u16 {
+        0 => 1,
+        id => id,
+    }
 }
 impl Status {
     pub fn decode(bytes: &[u8]) -> Option<Self> {
@@ -93,7 +110,6 @@ impl Status {
             || bytes[3] & !0x0f != 0
             || bytes[32] > 2
             || bytes[33] > 1
-            || bytes[34..36] != [0, 0]
         {
             return None;
         }
@@ -122,6 +138,7 @@ impl Status {
             active_action: bytes[32],
             busy: bytes[33] == 1,
             remaining_ms,
+            setting_id: u16::from_le_bytes([bytes[34], bytes[35]]),
         })
     }
     pub fn result_name(self) -> &'static str {
@@ -199,6 +216,21 @@ mod tests {
         }
     }
     #[test]
+    fn saved_selection_identity_matches_the_actuator_fold() {
+        let mut bytes = response();
+        assert_eq!(Status::decode(&bytes).unwrap().setting_id, 0, "no station record");
+        bytes[34..36].copy_from_slice(&0xBEEFu16.to_le_bytes());
+        assert_eq!(Status::decode(&bytes).unwrap().setting_id, 0xBEEF);
+        // Goldens from ActuatorBoard26 tests/test_fill_drive_identity.py.
+        assert_eq!(setting_identity(1_793_563_200_000), {
+            let ms = 1_793_563_200_000u64;
+            (ms ^ (ms >> 16) ^ (ms >> 32)) as u16
+        });
+        assert_eq!(setting_identity(0x10001), 1, "a zero fold is reported as 1");
+        assert_eq!(setting_identity(0), 0);
+        assert_eq!(setting_identity((7 << 48) | 1234), setting_identity(1234), "epoch bits ignored");
+    }
+    #[test]
     fn current_board_cannot_advertise_bridge_as_available() {
         let status = Status::decode(&response()).unwrap();
         assert!(status.ready());
@@ -234,8 +266,6 @@ mod tests {
             (3, 128),
             (32, 3),
             (33, 2),
-            (34, 1),
-            (35, 1),
         ] {
             let mut bytes = good;
             bytes[at] = value;
