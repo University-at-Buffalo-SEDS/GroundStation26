@@ -9,7 +9,7 @@ import struct
 
 FC_HEAD='ec188c6daac84e3c957f57ca95d872953cbda588'
 DAQ_HEAD='ef3702d87071f204e5ccb9a124b739af82538ac2'
-DAQ_SD_HEAD='eca3d4ec49267feee4fa2a058ecadc5bb132c8dc'
+DAQ_SD_HEAD='44a9195cb6a793ab89d0848683a140509f72cbbc'
 # Earlier DAQ firmware with the same raw-record format that also wrote the
 # scalar row kg1000_window_input_v (always equal to kg1000_window_v; removed).
 # Its files still import under the same profile; no mapping reads that row.
