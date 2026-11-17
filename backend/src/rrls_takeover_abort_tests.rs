@@ -759,26 +759,33 @@ async fn a_takeover_rrls_never_sends_a_non_aborted_flight_state() {
 }
 
 /// fullnet C-fix3 (+1 h RRLS clock): the RRLS stamped its HEARTBEAT and the
-/// cosmetic outputs with its own host clock. The FC advances its station
-/// clock from a station's heartbeat, so it then took station time as an hour
-/// ahead and refused the RRLS's correctly stamped Deploy as stale. Every
-/// station frame an RRLS originates is stamped like a control: the station
-/// time it heard, never its host clock.
+/// cosmetic outputs with its own host clock, and the FC refused its correctly
+/// stamped Deploy. Every station frame an RRLS originates is stamped from its
+/// network clock (which follows the station's time base and epochs), never
+/// its host clock.
 #[tokio::test]
-async fn a_takeover_rrls_stamps_its_heartbeat_and_outputs_with_the_heard_station_clock() {
-    if rrls_child("a_takeover_rrls_stamps_its_heartbeat_and_outputs_with_the_heard_station_clock") {
+async fn a_takeover_rrls_stamps_its_heartbeat_and_outputs_with_network_time() {
+    if rrls_child("a_takeover_rrls_stamps_its_heartbeat_and_outputs_with_network_time") {
         return;
     }
     let bay = bay(true).await;
-    // The station time it heard from the AV bay: an hour behind its host clock.
-    let heard = crate::telemetry_task::get_current_timestamp_ms() - 3_600_000;
-    crate::system_clock::observe_station_timestamp(heard);
-    let stamps: Vec<(String, u64)> = vec![
-        ("HEARTBEAT".into(), crate::telemetry_task::station_heartbeat(&bay.rrls).unwrap().timestamp()),
-        ("FLIGHT_BUZZER".into(), crate::network_variables::network_output_packet(&bay.rrls, crate::network_variables::NetworkOutput::FlightBuzzer, true).unwrap().timestamp()),
-    ];
-    assert!(stamps.len() >= 2, "both sent: {stamps:?}");
-    assert!(stamps.iter().all(|(_, t)| t.abs_diff(heard) < 60_000), "stamped with the heard station clock {heard}: {stamps:?}");
+    // Network time an hour behind the RRLS host clock.
+    let network = crate::telemetry_task::get_current_timestamp_ms() - 3_600_000;
+    bay.rrls
+        .try_set_local_network_time(sedsnet::timesync::PartialNetworkTime::from_unix_ms(network))
+        .unwrap();
+    let epoch = bay.rrls.network_time_epoch();
+    let stamps: Vec<(String, u64, u16)> = [
+        ("HEARTBEAT", crate::telemetry_task::station_heartbeat(&bay.rrls).unwrap()),
+        ("FLIGHT_BUZZER", crate::network_variables::network_output_packet(&bay.rrls, crate::network_variables::NetworkOutput::FlightBuzzer, true).unwrap()),
+    ]
+    .into_iter()
+    .map(|(name, packet)| (name.to_string(), packet.timestamp(), packet.time_epoch().max(epoch)))
+    .collect();
+    assert!(
+        stamps.iter().all(|(_, t, e)| t.abs_diff(network) < 60_000 && *e == epoch),
+        "stamped with network time {network} (epoch {epoch}): {stamps:?}"
+    );
 }
 
 fn flight_state_of(bay: &Bay, board: usize) -> Option<(String, u8)> {

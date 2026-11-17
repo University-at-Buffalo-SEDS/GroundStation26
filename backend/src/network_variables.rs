@@ -1,4 +1,5 @@
 use crate::telemetry_task::get_current_timestamp_ms;
+use crate::network_stamp::Stamp;
 use crate::types::{Board, FlightState, NetworkFlightState};
 use anyhow::{Context, Result};
 use sedsnet::packet::Packet;
@@ -56,6 +57,11 @@ struct PersistentVariables {
     /// Original network timestamp; zero denotes an unknown legacy origin.
     #[serde(default)]
     flight_state_stamp: u64,
+    /// Time-base epoch of `flight_state_stamp` (records written before
+    /// SEDSnet 6 read as epoch 0). At boot the router's epoch is raised to it
+    /// so a re-sent retained state never names an epoch the network left.
+    #[serde(default)]
+    flight_state_epoch: u16,
     #[serde(default)]
     daq_log_clock: [u64; 2],
     #[serde(default)]
@@ -149,8 +155,7 @@ pub(crate) fn capture_automatic_phase_store(expected: u8, generation: u64) -> Op
 }
 pub(crate) fn automatic_phase_packet(router: &Router, phase: u8) -> Result<Packet> {
     anyhow::ensure!((1..=6).contains(&phase), "invalid automatic prelaunch phase");
-    let timestamp = crate::system_clock::required_control_network_utc_ms(router)?;
-    flight_state_wire_packet(network_phase(phase)?, timestamp)
+    flight_state_wire_packet(network_phase(phase)?, control_stamp(router)?)
 }
 pub(crate) struct AutomaticIdleStoreGuard<'a>(std::sync::MutexGuard<'a, VariableStore>);
 impl AutomaticIdleStoreGuard<'_> {
@@ -186,8 +191,7 @@ pub(crate) fn try_automatic_idle_store() -> Option<AutomaticIdleStoreGuard<'stat
     STORE.get()?.try_lock().ok().map(AutomaticIdleStoreGuard)
 }
 pub(crate) fn automatic_idle_packet(router: &Router) -> Result<Packet> {
-    let timestamp = crate::system_clock::required_control_network_utc_ms(router)?;
-    flight_state_wire_packet(NetworkFlightState::Idle, timestamp)
+    flight_state_wire_packet(NetworkFlightState::Idle, control_stamp(router)?)
 }
 pub(crate) fn automatic_idle_batch_limits() -> sedsnet::router::ManagedBatchPreparationLimits {
     // Nine actual registered variables, one original, and a complete registry
@@ -258,6 +262,7 @@ fn default_values() -> PersistentVariables {
             .unwrap_or(0),
         daq_log_clock: [0, 0],
         flight_state_stamp: 0,
+        flight_state_epoch: 0,
         daq_log_clock_stamp: 0,
         daq_log_last_session: 0,
     }
@@ -306,10 +311,24 @@ pub(crate) fn network_output_packet(router: &Router, output: NetworkOutput, valu
 
 /// The single FLIGHT_STATE wire funnel. Only set (a) is ever built here; the
 /// store keeps the GS-internal phase, and fill sub-phases leave as Fill.
-fn flight_state_wire_packet(state: NetworkFlightState, timestamp: u64) -> Result<Packet> {
+/// A FLIGHT_STATE write stamped `stamp`: its timestamp with the time-base
+/// epoch it was taken in, so boards order it by (epoch, timestamp) also when
+/// it is re-sent after a network clock step.
+fn flight_state_wire_packet(state: NetworkFlightState, stamp: Stamp) -> Result<Packet> {
     // The simulator's set-(a) wire assertion reads this line.
     log::info!("FLIGHT_STATE wire value={} ({})", state as u8, state.label());
-    packet_bytes_at(FLIGHT_STATE_TYPE, "FLIGHT_STATE", Arc::from([state as u8]), timestamp)
+    Ok(packet_bytes_at(
+        FLIGHT_STATE_TYPE,
+        "FLIGHT_STATE",
+        Arc::from([state as u8]),
+        stamp.ms.max(0) as u64,
+    )?
+    .with_time_epoch(stamp.epoch))
+}
+
+/// A fresh control stamp from the station's network clock (with its epoch).
+fn control_stamp(router: &Router) -> Result<Stamp> {
+    Ok(crate::system_clock::required_control_network_stamp(router)?)
 }
 /// A stored (GS-internal) phase as it goes on the wire.
 fn network_phase(phase: u8) -> Result<NetworkFlightState> {
@@ -362,6 +381,14 @@ pub fn initialize(router: &Router) -> Result<()> {
 /// services without synthesizing any cache/default write while CLOSED. An
 /// ordinary open bootstrap owns the same actual producer lease through IO/SDK.
 pub fn initialize_for_state(state: &crate::state::AppState, router: &Router) -> Result<()> {
+    // The retained FLIGHT_STATE keeps its epoch: never let the network epoch
+    // fall below it, even after a whole-stack power cycle.
+    let retained_epoch = store()
+        .lock()
+        .expect("network-variable store lock poisoned")
+        .values
+        .flight_state_epoch;
+    router.raise_network_time_epoch(retained_epoch);
     let claim = crate::gse::capture_operator_origin(state)
         .and_then(|generation| crate::gse::claim_operator_dispatch(state, generation));
     if claim.is_some() {
@@ -529,6 +556,7 @@ fn initialize_for_role_seed(router: &Router, observer: bool, seed: bool) -> Resu
             let mut next = guard.values;
             if next.flight_state != state || next.flight_state_stamp == 0 {
                 next.flight_state_stamp = packet.timestamp();
+                next.flight_state_epoch = packet.time_epoch();
             }
             next.flight_state = state;
             guard.commit_flight_state(next).map_err(|err| {
@@ -977,17 +1005,16 @@ pub fn set_flight_buzzer(router: &Router, enabled: bool) -> Result<()> {
 }
 
 pub fn set_flight_state(router: &Router, state: u8) -> Result<()> {
-    let timestamp = crate::system_clock::required_control_network_utc_ms(router)?;
-    set_flight_state_at(router, state, timestamp)
+    set_flight_state_at(router, state, control_stamp(router)?)
 }
 
-/// An RRLS in takeover writing its operator's Abort. An RRLS runs no time sync
-/// (telemetry_task::timesync_enabled), so its router has no network UTC and
-/// set_flight_state refused the write (fullnet C-fix2): it is stamped like
-/// every other control (system_clock::control_packet_timestamp_ms), network UTC
-/// when present and the station's wall clock otherwise, never the primary's.
+/// An RRLS in takeover writing its operator's Abort. It must not depend on
+/// network UTC (fullnet C-fix2): it is stamped like every other control
+/// (system_clock::control_packet_stamp), network UTC with its epoch when
+/// present and the station's wall clock otherwise. Boards take an Abort
+/// whatever its stamp.
 pub(crate) fn set_takeover_flight_state(router: &Router, state: u8) -> Result<()> {
-    set_flight_state_at(router, state, crate::system_clock::control_packet_timestamp_ms(router))
+    set_flight_state_at(router, state, crate::system_clock::control_packet_stamp(router))
 }
 
 /// An RRLS writes FLIGHT_STATE only for its operator's takeover Abort (and that
@@ -1009,9 +1036,10 @@ pub(crate) fn publish_flight_state(router: &Router, packet: Packet) -> sedsnet::
     router.set_network_variable(packet)
 }
 
-fn set_flight_state_at(router: &Router, state: u8, timestamp: u64) -> Result<()> {
+fn set_flight_state_at(router: &Router, state: u8, stamp: Stamp) -> Result<()> {
     let request = crate::qualification_requests::Request::begin("set_flight_state");
-    let packet = flight_state_wire_packet(network_phase(state)?, timestamp)?;
+    let packet = flight_state_wire_packet(network_phase(state)?, stamp)?;
+    let timestamp = packet.timestamp();
     {
         let mut guard = store()
             .lock()
@@ -1019,6 +1047,7 @@ fn set_flight_state_at(router: &Router, state: u8, timestamp: u64) -> Result<()>
         let mut next = guard.values;
         next.flight_state = state;
         next.flight_state_stamp = timestamp;
+        next.flight_state_epoch = stamp.epoch;
         #[cfg(test)]
         if crate::runtime_mode::is_test_fire() {
             crate::telemetry_task::flight_state_timeline::event(router, "durable_commit_start", state, Some(packet.packet_id()), Some(timestamp), None);
@@ -1101,7 +1130,9 @@ fn resend_latest_flight_state(
         .filter(|value| latest.payload().len() == 1 && wanted(*value)) else {
         return Ok(false);
     };
-    let again = flight_state_wire_packet(value, latest.timestamp())?;
+    // Its original stamp and epoch: the router stamped the epoch on the copy
+    // it cached when the value was written.
+    let again = flight_state_wire_packet(value, Stamp::of(&latest))?;
     publish_flight_state(router, again)?;
     Ok(true)
 }
@@ -1114,11 +1145,7 @@ pub(crate) struct PreparedLaunchState {
     expected: (u8, u64),
 }
 pub(crate) fn prepare_launch_state(router: &Router) -> Result<PreparedLaunchState> {
-    let timestamp = crate::system_clock::required_control_network_utc_ms(router)?;
-    let packet = flight_state_wire_packet(
-        NetworkFlightState::Launch,
-        timestamp,
-    )?;
+    let packet = flight_state_wire_packet(NetworkFlightState::Launch, control_stamp(router)?)?;
     let guard = store()
         .lock()
         .expect("network-variable store lock poisoned");
@@ -1148,6 +1175,7 @@ pub(crate) fn commit_admitted_launch(prepared: &PreparedLaunchState) -> Result<(
     let mut next = guard.values;
     next.flight_state = 7;
     next.flight_state_stamp = prepared.packet.timestamp();
+    next.flight_state_epoch = prepared.packet.time_epoch();
     guard.commit_flight_state(next)
 }
 
@@ -1156,18 +1184,19 @@ pub(crate) fn commit_admitted_launch(prepared: &PreparedLaunchState) -> Result<(
 /// Stop fence and require fresh actual board readbacks before reopening.
 pub(crate) fn operator_phase_packet(router:&Router,phase:u8)->Result<Packet> {
     anyhow::ensure!(matches!(crate::types::u8_to_flight_state(phase),Some(crate::types::FlightState::Startup|crate::types::FlightState::Idle|crate::types::FlightState::PreFill|crate::types::FlightState::FillTest|crate::types::FlightState::NitrogenFill|crate::types::FlightState::NitrousFill|crate::types::FlightState::Armed)),"Operator phase cannot enter Fire or flight");
-    flight_state_wire_packet(network_phase(phase)?,crate::system_clock::required_control_network_utc_ms(router)?)
+    flight_state_wire_packet(network_phase(phase)?,control_stamp(router)?)
 }
 
 pub(crate) fn prepare_verified_recovery_startup(router: &Router) -> Result<Packet> {
-    let timestamp = crate::system_clock::required_control_network_utc_ms(router)?;
-    let packet = flight_state_wire_packet(NetworkFlightState::Startup, timestamp)?;
+    let stamp = control_stamp(router)?;
+    let packet = flight_state_wire_packet(NetworkFlightState::Startup, stamp)?;
     let mut guard = store()
         .lock()
         .expect("network-variable store lock poisoned");
     let mut next = guard.values;
     next.flight_state = 0;
-    next.flight_state_stamp = timestamp;
+    next.flight_state_stamp = packet.timestamp();
+    next.flight_state_epoch = stamp.epoch;
     guard.commit_flight_state(next)?;
     Ok(packet)
 }
@@ -1194,7 +1223,10 @@ fn retained_non_launch_packet() -> Result<Option<Packet>> {
 
 fn flight_state_packet(values: PersistentVariables) -> Result<Packet> {
     // Reconnect must not make a retained Abort newer than a recovery cutoff.
-    flight_state_wire_packet(network_phase(values.flight_state)?, values.flight_state_stamp)
+    flight_state_wire_packet(
+        network_phase(values.flight_state)?,
+        Stamp::new(values.flight_state_epoch, values.flight_state_stamp as i64),
+    )
 }
 
 fn filter_packet(cfg: &crate::loadcell::LoadcellCalibrationFile) -> Result<Packet> {
@@ -2047,6 +2079,7 @@ mod tests {
                 flight_buzzer: true,
                 flight_state: 6,
                 flight_state_stamp: 0,
+                flight_state_epoch: 0,
                 daq_log_clock: [0, 0],
                 daq_log_clock_stamp: 0,
                 daq_log_last_session: 0,
@@ -3305,6 +3338,7 @@ mod persistence_callback_tests {
             flight_buzzer: true,
             flight_state: 4,
             flight_state_stamp: 100,
+            flight_state_epoch: 0,
             daq_log_clock: [7, 123456],
             daq_log_clock_stamp: 0,
             daq_log_last_session: 7,
@@ -3317,6 +3351,7 @@ mod persistence_callback_tests {
             flight_buzzer: false,
             flight_state: 5,
             flight_state_stamp: 200,
+            flight_state_epoch: 0,
             daq_log_clock: [8, 123789],
             daq_log_clock_stamp: 0,
             daq_log_last_session: 8,

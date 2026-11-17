@@ -47,111 +47,44 @@ pub(crate) fn required_control_network_utc_ms(
         .ok_or(sedsnet::TelemetryError::Io("network UTC is not available"))
 }
 
+/// A fresh control stamp: network UTC with the time-base epoch it was read
+/// in, read together, for packets the station builds itself
+/// (`Packet::with_time_epoch`).
+pub(crate) fn required_control_network_stamp(
+    router: &sedsnet::router::Router,
+) -> sedsnet::TelemetryResult<crate::network_stamp::Stamp> {
+    router
+        .network_time_ms_with_epoch()
+        .filter(|(timestamp, _)| *timestamp != 0)
+        .map(|(timestamp, epoch)| crate::network_stamp::Stamp::new(epoch, timestamp as i64))
+        .ok_or(sedsnet::TelemetryError::Io("network UTC is not available"))
+}
+
 /// Ordinary controls share the board's network clock once it is established.
 /// Retain boot-time wall fallback so a manual Stop never needs clock sync.
 /// This does not change receipt timestamps used for UI freshness or recording.
 ///
-/// An RRLS runs no time sync, so it has no network UTC, and its host clock (a
-/// Pi without RTC, maybe without NTP) can be minutes or hours off: boards with
-/// an active recovery floor refuse a station command more than 15 s older or
-/// more than 1 s newer than their station clock. Its controls are stamped
-/// with the station clock as the AV bay holds it (`heard_station_ms`), and
-/// with the wall clock only when nothing has been heard.
+/// An RRLS follows the station's network time (and its epochs) like a board,
+/// so its controls carry the same time base the boards judge them on.
 pub(crate) fn control_packet_timestamp_ms(router: &sedsnet::router::Router) -> u64 {
-    let network = required_control_network_utc_ms(router).ok();
-    let heard = if crate::rrls::is_rrls() { heard_station_ms() } else { None };
-    let wall = crate::telemetry_task::get_current_timestamp_ms();
-    if network.is_none() && heard.is_none() && crate::rrls::is_rrls() {
-        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            log::warn!("RRLS control stamped with the host wall clock: no network UTC and no station time heard yet");
+    control_packet_stamp(router).ms.max(0) as u64
+}
+
+/// [`control_packet_timestamp_ms`] with its epoch: the wall-clock fallback is
+/// labelled with the router's current epoch, as the router stamps it.
+pub(crate) fn control_packet_stamp(router: &sedsnet::router::Router) -> crate::network_stamp::Stamp {
+    required_control_network_stamp(router).unwrap_or_else(|_| {
+        if crate::rrls::is_rrls() {
+            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log::warn!("RRLS control stamped with the host wall clock: no network UTC yet");
+            }
         }
-    }
-    control_stamp(network, heard, wall)
-}
-
-/// Network UTC, then the heard station clock, then the wall clock.
-fn control_stamp(network: Option<u64>, heard: Option<u64>, wall: u64) -> u64 {
-    network.or(heard).unwrap_or(wall)
-}
-
-/// The station clock as the boards hold it, mirroring their rule
-/// (board_recovery_transport.c station_estimate): the newest station timestamp
-/// seen, advanced by local monotonic time since, only ever moving forward.
-#[derive(Default)]
-pub(crate) struct HeardStation {
-    newest: Option<(u64, std::time::Instant)>,
-}
-impl HeardStation {
-    pub(crate) fn now_at(&self, now: std::time::Instant) -> Option<u64> {
-        self.newest.map(|(stamp, at)| {
-            stamp.saturating_add(u64::try_from(now.saturating_duration_since(at).as_millis()).unwrap_or(u64::MAX))
-        })
-    }
-    pub(crate) fn observe_at(&mut self, stamp: u64, now: std::time::Instant) {
-        // Calendar range shared with refresh_host_network_time.
-        if !(315_532_800_000..4_354_819_200_000).contains(&stamp) {
-            return;
-        }
-        if self.now_at(now).is_none_or(|current| stamp > current) {
-            self.newest = Some((stamp, now));
-        }
-    }
-}
-static HEARD_STATION: std::sync::Mutex<HeardStation> = std::sync::Mutex::new(HeardStation { newest: None });
-
-/// A packet heard from the primary or an AV-bay board (never this RRLS): its
-/// timestamp is station time as the AV bay uses it.
-pub(crate) fn observe_station_timestamp(stamp: u64) {
-    HEARD_STATION
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .observe_at(stamp, std::time::Instant::now());
-}
-pub(crate) fn heard_station_ms() -> Option<u64> {
-    HEARD_STATION
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .now_at(std::time::Instant::now())
-}
-
-#[cfg(test)]
-mod heard_station_tests {
-    use super::*;
-    use std::time::{Duration, Instant};
-
-    /// A board's recovery-floor freshness band for a station command
-    /// (board_recovery_transport.c board_recovery_command_is_stale).
-    fn board_refuses(board_now: u64, stamp: u64) -> bool {
-        if board_now >= stamp { board_now - stamp > 15_000 } else { stamp - board_now > 1_000 }
-    }
-
-    #[test]
-    fn a_takeover_stamp_falls_in_the_boards_band_whatever_the_rrls_wall_clock() {
-        let t0 = Instant::now();
-        let station = 1_767_225_700_000;
-        let mut heard = HeardStation::default();
-        heard.observe_at(station, t0);
-        heard.observe_at(station - 5_000, t0 + Duration::from_millis(100)); // older: ignored
-        // The cut: nothing heard for 10 s; the board's station clock ran on.
-        let at = t0 + Duration::from_secs(10);
-        let board_now = station + 10_000;
-        for skew in [3_600_000i64, -3_600_000] {
-            let wall = (board_now as i64 + skew) as u64;
-            let stamp = control_stamp(None, heard.now_at(at), wall);
-            assert!(!board_refuses(board_now, stamp), "skew {skew}: stamp {stamp} vs board {board_now}");
-            assert!(board_refuses(board_now, wall), "the skewed wall clock alone would be refused");
-        }
-    }
-
-    #[test]
-    fn with_nothing_heard_the_wall_clock_is_used() {
-        let heard = HeardStation::default();
-        assert_eq!(heard.now_at(Instant::now()), None);
-        assert_eq!(control_stamp(None, None, 42_000), 42_000);
-        assert_eq!(control_stamp(Some(7), Some(9), 42_000), 7, "network UTC first");
-        assert_eq!(control_stamp(None, Some(9), 42_000), 9, "then the heard station clock");
-    }
+        crate::network_stamp::Stamp::new(
+            router.network_time_epoch(),
+            crate::telemetry_task::get_current_timestamp_ms() as i64,
+        )
+    })
 }
 
 fn retain_live_client_sources(sources: &mut Vec<std::sync::Weak<sedsnet::router::Router>>) {
@@ -173,6 +106,15 @@ pub(crate) fn refresh_network_source(router: &sedsnet::router::Router, host_utc_
         return;
     }
     crate::telemetry_task::refresh_station_network_time_from_host_ms(router, host_utc_ms);
+}
+
+#[cfg(test)]
+fn client_source_selected(router: &Arc<sedsnet::router::Router>) -> bool {
+    CLIENT_TIME_ROUTERS
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|source| source.ptr_eq(&Arc::downgrade(router)))
 }
 
 fn select_client_network_source(
@@ -689,8 +631,13 @@ mod network_tests {
             sedsnet::router::RouterConfig::new([]),
         ));
         super::select_client_network_source(&router, 1_800_000_000_000).unwrap();
+        assert!(super::client_source_selected(&router));
         super::select_host_network_source(&router, 1_800_000_000_000).unwrap();
-        super::refresh_network_source(&router, 1_900_000_000_000);
+        assert!(!super::client_source_selected(&router), "the host refresh feeds again");
+        // While the step policy allows it (flight state and board locks are
+        // process-wide here), the next host reading steps the clock to it.
+        router.set_timesync_steps_allowed(true);
+        super::admit_network_utc(&router, 1_900_000_000_000).unwrap();
         let actual = router.network_time_ms().unwrap();
         assert!((1_900_000_000_000..1_900_000_001_000).contains(&actual), "{actual}");
     }
