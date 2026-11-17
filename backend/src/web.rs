@@ -2618,6 +2618,16 @@ fn abort_fence_block(state: &AppState, cmd: &TelemetryCommand) -> Option<String>
     if !state.abort_indicator_latched() || crate::rrls::is_rrls() {
         return None;
     }
+    // The explicit closes share their toggle's control name but always send
+    // the safe direction.
+    let output = match cmd {
+        TelemetryCommand::NitrogenClose => "NitrogenClose",
+        TelemetryCommand::NitrousClose => "NitrousClose",
+        other => command_name(other),
+    };
+    if let Some(reason) = crate::gse::abort_latch_output_refusal(state, output) {
+        return Some(format!("{}: {reason}", command_name(cmd)));
+    }
     let byte = crate::telemetry_task::hitl_flight_command_id(cmd)?;
     let payload = [byte];
     if crate::gse::abort_safe_control(crate::telemetry_schema::data_type("FLIGHT_COMMAND"), &payload) {

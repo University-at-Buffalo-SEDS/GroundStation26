@@ -2026,10 +2026,39 @@ fn umbilical_state_key(cmd_id: u8, on: bool) -> Option<(u8, bool)> {
     }
 }
 
-fn effective_umbilical_valve_state(state: &Arc<AppState>, key_cmd_id: u8) -> Option<bool> {
+fn effective_umbilical_valve_state(state: &AppState, key_cmd_id: u8) -> Option<bool> {
     state
         .get_pending_umbilical_valve_state(key_cmd_id)
         .or_else(|| state.get_umbilical_valve_state(key_cmd_id))
+}
+
+/// The fill-side controller packet an operator output press sends now: the
+/// direction its dispatch arm above picks from the effective valve state.
+/// None for any other command.
+pub(crate) fn fill_output_packet(state: &AppState, name: &str) -> Option<(DataType, u8)> {
+    use ActuatorBoardCommands as A;
+    use ValveBoardCommands as V;
+    let on = |key: u8| effective_umbilical_valve_state(state, key).unwrap_or(false);
+    let valve = crate::telemetry_schema::data_type("VALVE_COMMAND");
+    let actuator = crate::telemetry_schema::data_type("ACTUATOR_COMMAND");
+    let pick = |is_on: bool, off: u8, open: u8| if is_on { off } else { open };
+    Some(match name {
+        "Pilot" => (valve, pick(on(V::PilotOpen as u8), V::PilotClose as u8, V::PilotOpen as u8)),
+        "NormallyOpen" => {
+            let key = V::NormallyOpenOpen as u8;
+            let close = effective_umbilical_valve_state(state, key).unwrap_or(
+                state.local_flight_state_snapshot() == FlightState::Armed,
+            );
+            (valve, pick(close, V::NormallyOpenClose as u8, V::NormallyOpenOpen as u8))
+        }
+        "Dump" => (valve, pick(on(V::DumpOpen as u8), V::DumpClose as u8, V::DumpOpen as u8)),
+        "Igniter" => (actuator, pick(on(A::IgniterOn as u8), A::IgniterOff as u8, A::IgniterOn as u8)),
+        "Nitrogen" => (actuator, pick(on(A::NitrogenOpen as u8), A::NitrogenClose as u8, A::NitrogenOpen as u8)),
+        "Nitrous" => (actuator, pick(on(A::NitrousOpen as u8), A::NitrousClose as u8, A::NitrousOpen as u8)),
+        "NitrogenClose" => (actuator, A::NitrogenClose as u8),
+        "NitrousClose" => (actuator, A::NitrousClose as u8),
+        _ => return None,
+    })
 }
 
 fn queue_guarded_plumbing_motion(
@@ -2097,7 +2126,11 @@ fn queue_guarded_fill_command(
         Ok(false) => {
             emit_notification_warning(
                 state,
-                "Manual Stop is pending; control command was not queued",
+                if state.abort_indicator_latched() {
+                    crate::gse::ABORT_LATCH_OUTPUT_REFUSAL
+                } else {
+                    "Manual Stop is pending; control command was not queued"
+                },
             );
             return;
         }

@@ -4532,6 +4532,23 @@ pub(crate) fn manual_stop_pending(state: &AppState) -> bool {
         })
 }
 // Safety catalog (About safety): manual-stop. Keep backend/src/safety_catalog_rules.rs in step.
+/// While the operator Abort is latched, `queue_controller_*` sends only the
+/// abort-safe directions and drops every other fill-side output. Only Reset
+/// all boards clears the latch; recovering boards one at a time does not.
+pub(crate) const ABORT_LATCH_OUTPUT_REFUSAL: &str = "The station Abort is still latched. \
+Recovering boards does not clear it; Reset all boards does. Until then the station sends only \
+the safe direction (open Vent or Dump; close Pilot, Nitrogen or Nitrous; Igniter off).";
+/// Why an operator fill-side output press would be dropped by the latched
+/// station Abort, so the policy and /api/command refuse it with the reason
+/// instead of answering "ok" and dropping it at send time. This reports the
+/// existing rule; it does not change which directions the latch allows.
+pub(crate) fn abort_latch_output_refusal(state: &AppState, name: &str) -> Option<&'static str> {
+    if !state.abort_indicator_latched() || crate::rrls::is_rrls() {
+        return None;
+    }
+    let (kind, byte) = crate::telemetry_task::fill_output_packet(state, name)?;
+    (!abort_safe_control(kind, &[byte])).then_some(ABORT_LATCH_OUTPUT_REFUSAL)
+}
 pub(crate) fn abort_safe_control(kind: sedsnet::config::DataType, payload: &[u8]) -> bool {
     if payload.len() != 1 {
         return false;

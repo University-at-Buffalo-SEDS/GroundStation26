@@ -891,6 +891,17 @@ pub(crate) fn block_policy(state: &AppState, policy: &mut crate::sequences::Acti
             control.blink = crate::sequences::BlinkMode::None;
         }
     }
+    // The latched station Abort outlives a per-board recovery and drops every
+    // fill-side output except its safe direction until Reset all boards.
+    for control in &mut policy.controls {
+        if control.enabled
+            && let Some(reason) = crate::gse::abort_latch_output_refusal(state, &control.cmd)
+        {
+            control.enabled = false;
+            control.disabled_reason = Some(reason.into());
+            control.blink = crate::sequences::BlinkMode::None;
+        }
+    }
     if let Some(reason) = reason {
         for control in &mut policy.controls {
             if launch_command(&control.cmd) {
