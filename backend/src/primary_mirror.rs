@@ -275,6 +275,13 @@ fn netvar_byte(views: [crate::network_variables::NetworkOutputView; 2]) -> u8 {
             << (3 * i)
     })
 }
+/// Primary: its underglow/buzzer view as the observation carries it, for the
+/// station-state broadcast.
+pub(crate) fn primary_netvar_byte() -> u8 {
+    netvar_byte(NETVAR_OUTPUTS.map(|cmd| {
+        crate::sequences::network_output_view(cmd).expect("network-variable output")
+    }))
+}
 fn netvar_view(byte: u8, index: usize) -> crate::network_variables::NetworkOutputView {
     let bits = byte >> (3 * index);
     let requested = bits & 1 != 0;
@@ -1302,6 +1309,52 @@ mod tests {
         // A newer observation from the primary wins over older relayed frames.
         std::thread::sleep(std::time::Duration::from_millis(2));
         value.netvar = Some(0b000_111);
+        assert!(accept_control_observation(&state, &value.encode(), 10));
+        assert_eq!(row("ToggleAvBayUnderglow"), (Some(true), Some(true)));
+        relayed_outputs::reset_for_test();
+    }
+    /// The relayed write or its readback may be compact side-transport frames
+    /// the decoder skips; the primary's station-state broadcast carries its
+    /// own view of both rows within a second, and a newer source still wins.
+    #[tokio::test]
+    async fn an_rrls_shows_a_toggle_from_the_primarys_station_state_broadcast() {
+        let _serial = relayed_outputs::TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        relayed_outputs::reset_for_test();
+        let state = crate::state::tests::test_app_state().await;
+        let mut value = example();
+        value.enabled = u64::MAX;
+        value.board_guard = Some((0, 0, 0, [UNKNOWN; 7]));
+        value.launch_revision = Some(8);
+        value.safety = Some((0b111101, 4, 45));
+        value.board_proof_policy = Some(true);
+        let row = |cmd: &str| {
+            let policy = action_policy(&state).unwrap();
+            let c = policy.controls.iter().find(|c| c.cmd == cmd).unwrap();
+            (c.requested, c.actuated)
+        };
+        // The last observation: underglow and buzzer Off, confirmed.
+        value.netvar = Some(0b110_110);
+        assert!(accept_control_observation(&state, &value.encode(), 10));
+        assert_eq!(row("ToggleAvBayUnderglow"), (Some(false), Some(false)));
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        // The broadcast: underglow On requested, not yet confirmed.
+        relayed_outputs::primary_view_for_test(0b110_101, std::time::Instant::now());
+        assert_eq!(row("ToggleAvBayUnderglow"), (Some(true), None));
+        assert_eq!(row("ToggleFlightBuzzer"), (Some(false), Some(false)));
+        // A repeat of the same view keeps it; then the primary confirms it.
+        relayed_outputs::primary_view_for_test(0b110_101, std::time::Instant::now());
+        assert_eq!(row("ToggleAvBayUnderglow"), (Some(true), None));
+        relayed_outputs::primary_view_for_test(0b110_111, std::time::Instant::now());
+        assert_eq!(row("ToggleAvBayUnderglow"), (Some(true), Some(true)));
+        // A relayed write after it (Off) is newer still.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let gs = crate::types::Board::GroundStation.sender_id();
+        let off = relayed("AV_BAY_UNDERGLOW", "AV_BAY_UNDERGLOW_OWNER", gs, 5_000, vec![0]);
+        relayed_outputs::observe_packet_for_test(&off, std::time::Instant::now());
+        assert_eq!(row("ToggleAvBayUnderglow"), (Some(false), None));
+        // A newer observation wins over both.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        value.netvar = Some(0b110_111);
         assert!(accept_control_observation(&state, &value.encode(), 10));
         assert_eq!(row("ToggleAvBayUnderglow"), (Some(true), Some(true)));
         relayed_outputs::reset_for_test();

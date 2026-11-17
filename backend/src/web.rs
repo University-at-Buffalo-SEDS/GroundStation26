@@ -674,6 +674,8 @@ pub struct FlightStateWire {
 
 impl FlightStateWire {
     pub fn new(local: FlightState, state: &AppState) -> Self {
+        // An RRLS shows the primary's state while its broadcast is current.
+        let local = crate::station_state::presented_flight_state(local);
         let network = local.network();
         let fill_phase = crate::mission_phase::fill_phase(local);
         Self {

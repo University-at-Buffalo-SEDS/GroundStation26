@@ -121,6 +121,7 @@ mod sim_daq_cadence;
 mod sim_freshness;
 mod state;
 mod station_mode;
+mod station_state;
 mod station_mode_switch;
 mod station_pairing;
 mod system_clock;
@@ -3364,6 +3365,7 @@ async fn main() -> anyhow::Result<()> {
     let _station_mode = station_mode::start(state.clone());
     station_mode_switch::start();
     let _launch_clock_sync = launch_clock_sync::start(state.clone());
+    let _station_state = station_state::start(state.clone());
     let _command_proxy = command_proxy::start(state.clone());
     let _station_pairing = station_pairing::manage::start(state.clone());
 

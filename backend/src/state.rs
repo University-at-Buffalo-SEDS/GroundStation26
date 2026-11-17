@@ -763,7 +763,9 @@ impl AppState {
             let mono = history.monotonic_ms(clock_now.model_monotonic_ms());
             history.apply_primary(record.clone(), true, clock_now.timestamp_ms(), mono)?
         };
-        if changed {
+        // A newer clock from the primary's station-state broadcast stays on
+        // screen; this slower signed reply only updates the journal.
+        if changed && !crate::station_state::clock_newer_than(&record) {
             *current = record.clock.clone();
             drop(current);
             let _ = self.launch_clock_tx.send(record.clock);

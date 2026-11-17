@@ -91,6 +91,12 @@ const VOICE_QUEUE: usize = 2;
 const SETTINGS: u8 = 10;
 // Host application control; kind12 remains reserved for legacy framing. Budget negotiation uses13.
 const HOST_CONTROL: u8 = 11;
+/// The primary's station state (T clock, station mode, flight state, mission
+/// phase, underglow/buzzer view) for the RRLS's display; see station_state.rs.
+/// Kinds 12-15 are taken (legacy framing, budget, RF profile, settings framing).
+const STATION_STATE: u8 = 16;
+/// Below Abort and control (254) and HEALTH/READY (255): it never delays them.
+const STATION_STATE_PRIORITY: u8 = 250;
 const MAX_SETTINGS_INBOX: usize = 4;
 const SETTINGS_PEER_AGE_MS: u64 = 15_000;
 /// Covers the RRLS's 2 s pairing resend with margin.
@@ -406,6 +412,9 @@ impl Queued {
         if self.frame.bytes.get(3) == Some(&HOST_CONTROL) {
             return true;
         }
+        if self.frame.bytes.get(3) == Some(&STATION_STATE) {
+            return false;
+        }
         !self.independent_discovery()
             && decode(&self.frame.bytes).is_some_and(|(_, body)| {
                 crate::comms::closes_radio_packet_batch(self.priority, body)
@@ -416,7 +425,7 @@ impl Queued {
             let (_, body) = decode(&self.frame.bytes)?;
             return crate::command_proxy::wire_boundary(body).map(|id| (id, false));
         }
-        if self.independent_discovery() {
+        if self.independent_discovery() || self.frame.bytes.get(3) == Some(&STATION_STATE) {
             return None;
         }
         decode(&self.frame.bytes)
@@ -574,6 +583,10 @@ pub struct Mesh {
     /// The last HEALTH payload, until its one relaying repeat is sent.
     health_repeat: Option<Vec<u8>>,
     last_position_sent: Option<u64>,
+    /// Primary: the station state it broadcasts and when.
+    station_state: crate::station_state::Broadcast,
+    /// RRLS: (session, revision) of the newest station state accepted.
+    station_state_seen: Option<(u32, u32)>,
     primary_session: Option<u32>,
     primary_sequence: u32,
     health_received: Option<u64>,
@@ -670,6 +683,8 @@ impl Mesh {
             last_health_sent: None,
             health_repeat: None,
             last_position_sent: None,
+            station_state: Default::default(),
+            station_state_seen: None,
             primary_session: None,
             primary_sequence: 0,
             health_received: None,
@@ -982,7 +997,47 @@ impl Mesh {
                 );
                 self.last_position_sent = Some(now);
             }
+        self.queue_station_state(now);
         self.poll_budget(now);
+    }
+    /// Primary: the station state to broadcast. A change is queued at once
+    /// (then two more copies within 750 ms); unchanged state every
+    /// station_state::PERIOD_MS, from tick.
+    pub(crate) fn publish_station_state(
+        &mut self,
+        body: [u8; crate::station_state::BODY_LEN],
+        now: u64,
+    ) {
+        if self.role != Role::Primary {
+            return;
+        }
+        self.station_state.update(body, now);
+        self.queue_station_state(now);
+    }
+    fn queue_station_state(&mut self, now: u64) {
+        if self.role != Role::Primary {
+            return;
+        }
+        let Some(payload) = self.station_state.due(self.session, now) else {
+            return;
+        };
+        // Only the newest copy waits: it supersedes any queued older one.
+        if let Some(i) = self
+            .queue
+            .iter()
+            .position(|q| q.frame.bytes.get(3) == Some(&STATION_STATE))
+        {
+            let old = self.queue.remove(i).unwrap();
+            self.bytes -= old.frame.bytes.len();
+        }
+        self.enqueue(
+            Outgoing {
+                command: true,
+                bytes: encode(STATION_STATE, &payload),
+            },
+            STATION_STATE_PRIORITY,
+            now,
+        );
     }
     fn secure_budget_nonce() -> Option<budget_negotiation::Nonce> {
         let mut bytes = [0; 16];
@@ -1386,6 +1441,8 @@ impl Mesh {
                 5_000
             } else if q.frame.bytes.get(3) == Some(&VOICE) {
                 VOICE_EXPIRY_MS
+            } else if q.frame.bytes.get(3) == Some(&STATION_STATE) {
+                crate::station_state::TTL_MS
             } else if q.independent_discovery() {
                 3_000
             } else if q.frame.bytes.get(3) == Some(&HOST_CONTROL) {
@@ -1484,7 +1541,7 @@ impl Mesh {
             DOWN_COMMAND|UP_COMMAND|AV_BAY_COMMAND|HOST_CONTROL=>true,
             DOWN_DATA|UP_DATA|AV_BAY_DATA=>self.classify_namespace(body,kind!=DOWN_DATA)
                 .is_none_or(|class|class.recovery_control),
-            HEALTH|READY|POSITION|VOICE|BUDGET_CONTROL|RF_PROFILE_CONTROL=>false,
+            HEALTH|READY|POSITION|VOICE|BUDGET_CONTROL|RF_PROFILE_CONTROL|STATION_STATE=>false,
             SETTINGS=>origin!=SettingsOrigin::FramingOffer,
             _=>true,
         }
@@ -1653,8 +1710,10 @@ impl Mesh {
     /// The primary's owed settings turn (see radio_io SETTINGS_TURN_MS): one
     /// relay budget frame (the RRLS's grant), else one settings framing offer,
     /// else one station-mode reply, else one HOST_CONTROL reply to the RRLS,
-    /// even while protected Mesh frames such as HEALTH wait for the normal
-    /// path. Nothing else.
+    /// else one station-state copy, even while protected Mesh frames such as
+    /// HEALTH wait for the normal path. Nothing else. A receipt stream that
+    /// never lets background admission pass would otherwise hold these back
+    /// for its whole length.
     pub(crate) fn begin_owed_settings_transmission(&mut self, now: u64) -> Option<Transmission> {
         if self.role != Role::Primary {
             return None;
@@ -1666,6 +1725,7 @@ impl Mesh {
                 .begin_framing_offer_transmission(now, 0)
                 .or_else(|| self.begin_mode_reply(now, true))
                 .or_else(|| self.begin_owed_host_control(now))
+                .or_else(|| self.begin_station_state_transmission(now))
         {
             self.owed_turn_was_budget = false;
             return Some(settings);
@@ -1678,6 +1738,7 @@ impl Mesh {
         self.begin_framing_offer_transmission(now, 0)
             .or_else(|| self.begin_mode_reply(now, true))
             .or_else(|| self.begin_owed_host_control(now))
+            .or_else(|| self.begin_station_state_transmission(now))
     }
     /// The primary's queued HOST_CONTROL reply, in the owed turn: written
     /// only when no SDK control is queued, the lane otherwise waited 1.4-3 s
@@ -1708,6 +1769,37 @@ impl Mesh {
         self.active_recovery_control = queued.recovery_control();
         self.active_fair_delta_bytes = 0;
         self.active_survives_clear = true;
+        Some(Transmission {
+            queued,
+            follower: None,
+            id,
+            physical: None,
+            settings_action: None,
+        })
+    }
+    /// One queued station-state copy, alone (the owed settings turn).
+    fn begin_station_state_transmission(&mut self, now: u64) -> Option<Transmission> {
+        if self.role != Role::Primary || self.active_transmission.is_some() {
+            return None;
+        }
+        let index = self
+            .queue
+            .iter()
+            .position(|q| q.frame.bytes.get(3) == Some(&STATION_STATE))?;
+        if self.queued_expired(&self.queue[index], now) {
+            let old = self.queue.remove(index).unwrap();
+            self.bytes -= old.frame.bytes.len();
+            self.dropped += 1;
+            return None;
+        }
+        let id = self.next_transmission.checked_add(1)?;
+        let queued = self.queue.remove(index).unwrap();
+        self.next_transmission = id;
+        self.active_transmission = Some(id);
+        self.active_frame_count = 1;
+        self.active_recovery_control = false;
+        self.active_fair_delta_bytes = 0;
+        self.active_survives_clear = false;
         Some(Transmission {
             queued,
             follower: None,
@@ -2846,6 +2938,24 @@ impl Mesh {
                     }
                     None
                 }
+                (Role::Rrls, STATION_STATE) => {
+                    // Display only, and only the current primary's: its HEALTH
+                    // session, never an older revision than one already shown.
+                    // A takeover shows this station's own state.
+                    let (session, revision, body) = crate::station_state::parse(data)?;
+                    if self.takeover || self.primary_session != Some(session) {
+                        return None;
+                    }
+                    if let Some((seen_session, seen)) = self.station_state_seen
+                        && seen_session == session
+                        && revision.wrapping_sub(seen) > i32::MAX as u32
+                    {
+                        return None;
+                    }
+                    self.station_state_seen = Some((session, revision));
+                    crate::station_state::receive(body);
+                    None
+                }
                 (_, HOST_CONTROL) => {
                     // Verify signatures in the bounded dedicated worker, never in a
                     // radio callback. This metadata grants no HEALTH/settings lease.
@@ -3000,6 +3110,73 @@ fn encode(kind: u8, payload: &[u8]) -> Vec<u8> {
     v.extend_from_slice(payload);
     v.extend_from_slice(&crc(&v).to_le_bytes());
     v
+}
+#[cfg(test)]
+impl Mesh {
+    /// This primary's next HEALTH frame as the RRLS hears it.
+    pub(crate) fn health_frame_for_test(&mut self, direct: bool) -> Vec<u8> {
+        let mut payload = self.session.to_le_bytes().to_vec();
+        payload.extend_from_slice(&self.sequence.to_le_bytes());
+        payload.push(if direct { HEALTH_DIRECT } else { 0 } | HEALTH_AV_BAY_ROUTED);
+        self.sequence = self.sequence.wrapping_add(1);
+        encode(HEALTH, &payload)
+    }
+    /// Queued station-state frames and their priorities, oldest first.
+    pub(crate) fn queued_station_state_for_test(&self) -> Vec<(Vec<u8>, u8)> {
+        self.queue
+            .iter()
+            .filter(|q| q.frame.bytes.get(3) == Some(&STATION_STATE))
+            .map(|q| (q.frame.bytes.clone(), q.priority))
+            .collect()
+    }
+    /// Removes and returns the oldest queued station-state frame (it was sent).
+    pub(crate) fn take_station_state_for_test(&mut self) -> Option<Vec<u8>> {
+        let index = self
+            .queue
+            .iter()
+            .position(|q| q.frame.bytes.get(3) == Some(&STATION_STATE))?;
+        let queued = self.queue.remove(index)?;
+        self.bytes -= queued.frame.bytes.len();
+        Some(queued.frame.bytes)
+    }
+    /// A HOST_CONTROL frame waits (an RRLS command or observe refresh).
+    pub(crate) fn queue_control_for_test(&mut self, now: u64) {
+        self.enqueue(
+            Outgoing {
+                command: true,
+                bytes: encode(HOST_CONTROL, b"control"),
+            },
+            254,
+            now,
+        );
+    }
+    pub(crate) fn begin_owed_for_test(&mut self, now: u64) -> Option<Vec<u8>> {
+        let tx = self.begin_owed_settings_transmission(now)?;
+        let bytes = tx.frame().bytes.clone();
+        self.finish_bounded_transmission(tx, true);
+        Some(bytes)
+    }
+    pub(crate) fn begin_any_for_test(&mut self, now: u64) -> Option<Vec<u8>> {
+        let tx = self.begin_bounded_transmission(now, 0, false, 1)?;
+        let bytes = tx.frame().bytes.clone();
+        self.finish_bounded_transmission(tx, true);
+        Some(bytes)
+    }
+    pub(crate) fn begin_critical_for_test(&mut self, now: u64) -> Option<Vec<u8>> {
+        let tx = self.begin_bounded_transmission(now, 254, false, 1)?;
+        let bytes = tx.frame().bytes.clone();
+        self.finish_bounded_transmission(tx, true);
+        Some(bytes)
+    }
+}
+/// A station-state frame with an arbitrary session and revision.
+#[cfg(test)]
+pub(crate) fn station_state_frame_for_test(session: u32, revision: u32, body: &[u8]) -> Vec<u8> {
+    let mut payload = vec![1];
+    payload.extend_from_slice(&session.to_le_bytes());
+    payload.extend_from_slice(&revision.to_le_bytes());
+    payload.extend_from_slice(body);
+    encode(STATION_STATE, &payload)
 }
 /// The SEDSnet frame inside an RR mesh wrapper, or the bytes unchanged.
 pub(crate) fn sdk_payload_of(bytes: &[u8]) -> &[u8] {

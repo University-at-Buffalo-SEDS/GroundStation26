@@ -151,6 +151,59 @@ fn readback(index: usize, value: bool, now: Instant) {
     }
 }
 
+/// The primary's own view of both rows from its station-state broadcast
+/// (sent within a second of any change, also when the frames the RRLS relays
+/// are compact side-transport frames this decoder skips): the byte, when it
+/// last changed (its age against the observation and the relayed frames) and
+/// when it was last confirmed (its freshness).
+#[derive(Clone, Copy, Debug)]
+struct PrimaryView {
+    byte: u8,
+    changed: Instant,
+    seen: Instant,
+}
+static PRIMARY_VIEW: Mutex<Option<PrimaryView>> = Mutex::new(None);
+
+/// RRLS, not in takeover: the primary's view from its station-state broadcast.
+pub(crate) fn observe_primary_view(byte: u8) {
+    if crate::rrls::is_rrls() && !crate::rrls::takeover_active() {
+        primary_view_at(byte, Instant::now());
+    }
+}
+fn primary_view_at(byte: u8, now: Instant) {
+    if !super::netvar_valid(byte) {
+        return;
+    }
+    let mut view = PRIMARY_VIEW.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let changed = match *view {
+        Some(old) if old.byte == byte => old.changed,
+        _ => {
+            CHANGED.store(true, Ordering::Release);
+            now
+        }
+    };
+    *view = Some(PrimaryView { byte, changed, seen: now });
+}
+/// The base the relayed frames update: the newer of the observation and the
+/// broadcast view (while that is as fresh as the observation must be).
+fn base(
+    index: usize,
+    observed: Option<NetworkOutputView>,
+    observed_at: Instant,
+) -> (Option<NetworkOutputView>, Instant) {
+    let view = *PRIMARY_VIEW.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    match view {
+        Some(view)
+            if view.seen.elapsed().as_millis() <= u128::from(super::POLICY_FRESH_MS)
+                && (view.changed > observed_at || observed.is_none()) =>
+        {
+            (Some(super::netvar_view(view.byte, index)), view.changed.max(observed_at))
+        }
+        _ => (observed, observed_at),
+    }
+}
+
+/// True once since a relayed write or readback changed what the rows show.
 /// True once since a relayed write or readback changed what the rows show.
 pub(crate) fn take_changed() -> bool {
     CHANGED.swap(false, Ordering::AcqRel)
@@ -165,6 +218,7 @@ pub(super) fn view(
     observed_at: Instant,
 ) -> Option<NetworkOutputView> {
     let output = outputs()[index];
+    let (observed, observed_at) = base(index, observed, observed_at);
     combine(output, observed, observed_at)
 }
 
@@ -203,12 +257,18 @@ pub(super) static TEST_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(test)]
 pub(super) fn reset_for_test() {
     *outputs() = [Output::default(); 2];
+    *PRIMARY_VIEW.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     CHANGED.store(false, Ordering::Release);
 }
 
 #[cfg(test)]
 pub(super) fn observe_packet_for_test(packet: &Packet, now: Instant) {
     observe_packet(packet, now);
+}
+
+#[cfg(test)]
+pub(super) fn primary_view_for_test(byte: u8, now: Instant) {
+    primary_view_at(byte, now);
 }
 
 #[cfg(test)]

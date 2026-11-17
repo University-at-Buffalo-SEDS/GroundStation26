@@ -433,6 +433,21 @@ fn fc_contact_lost(state: &crate::state::AppState) -> bool {
 pub fn refresh(state: &crate::state::AppState) -> MissionPhaseMsg {
     let current = CHANNEL.borrow().clone();
     let previous = (current.since_ms != 0).then_some(current.phase);
+    // An RRLS shows the primary's phase while its broadcast is current: its
+    // own board presence, build mode and GSE activity are not the primary's.
+    if let Some(primary) = crate::station_state::presented_mission_phase(0) {
+        let now_ms = crate::telemetry_task::get_current_timestamp_ms();
+        let since_ms = if previous == Some(primary.phase) {
+            current.since_ms
+        } else {
+            now_ms as i64
+        };
+        let next = MissionPhaseMsg { since_ms, ..primary }.with_fc_phase(state.fc_phase.dto(now_ms));
+        if !next.same_as(&current) {
+            CHANNEL.send_replace(next.clone());
+        }
+        return next;
+    }
     let inputs = gather(state, previous);
     let phase = mission_phase(&inputs);
     let since_ms = if previous == Some(phase) {

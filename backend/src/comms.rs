@@ -2689,10 +2689,11 @@ fn is_mesh_control_frame(bytes: &[u8]) -> bool {
     matches!(bytes.get(3), Some(0 | 7 | 13 | 14))
 }
 /// A station's own RR mesh frames other than mesh control: POSITION 8,
-/// SETTINGS 10 (pairing included) and HOST_CONTROL 11 (the RRLS's observe
-/// refresh and discovery queries). Relayed DOWN/UP data and commands are not.
+/// SETTINGS 10 (pairing included), HOST_CONTROL 11 (the RRLS's observe
+/// refresh and discovery queries) and the primary's STATION_STATE 16. Relayed
+/// DOWN/UP data and commands are not.
 fn is_station_own_mesh_frame(bytes: &[u8]) -> bool {
-    matches!(bytes.get(3), Some(8 | 10 | 11))
+    matches!(bytes.get(3), Some(8 | 10 | 11 | 16))
 }
 /// Longest a write of RR mesh control alone waits for the station's turn gap
 /// before it goes anyway. RF's turns open a gap every 200 ms, so this only

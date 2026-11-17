@@ -102,8 +102,44 @@ pub fn snapshot() -> Snapshot {
         .lock()
         .unwrap()
         .clone();
+    // The primary's mode from its station-state broadcast, shown at once.
+    // Display only: until the mode sync verifies it, it is not synchronized,
+    // so it enables no command capability (command_proxy needs both).
+    if let Some(mode) = crate::station_state::presented_mode()
+        && snapshot.effective_mode != Some(mode)
+    {
+        snapshot.effective_mode = Some(mode);
+        snapshot.synchronized = false;
+        snapshot.local_capabilities_match = mode == local_mode();
+    }
     snapshot.retained_configuration = Some(crate::command_proxy::retained_config::snapshot(snapshot.effective_mode, snapshot.synchronized));
     snapshot
+}
+/// RRLS: the primary's mode from its station-state broadcast. A mode that
+/// differs from the verified one is shown at once (`snapshot`, not
+/// synchronized) and asks the mode sync to verify again: the unpaired display
+/// sync re-queries; the signed sync keeps its per-generation rule (an
+/// in-process switch keeps the primary's generation, so only a new HEALTH
+/// session verifies it).
+pub(crate) fn observe_primary_mode(mode: Mode) {
+    let verified = STATUS
+        .get_or_init(|| Mutex::new(Snapshot::unknown()))
+        .lock()
+        .unwrap()
+        .effective_mode;
+    if verified.is_some_and(|verified| verified != mode) {
+        REVERIFY.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+static REVERIFY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+pub(crate) fn reverify_requested_for_test() -> bool {
+    REVERIFY.load(std::sync::atomic::Ordering::Acquire)
+}
+/// The mode the mode sync itself verified (no broadcast).
+#[cfg(test)]
+pub(crate) fn verified_mode_for_test() -> Option<Mode> {
+    STATUS.get_or_init(|| Mutex::new(Snapshot::unknown())).lock().unwrap().effective_mode
 }
 pub(crate) fn recognizes(wire: &[u8]) -> bool {
     wire.starts_with(MAGIC) || wire.starts_with(DISPLAY_MAGIC)
@@ -661,6 +697,11 @@ impl WorkerRuntime {
             Self::Display(rt) => {
                 anyhow::ensure!(pairing.is_none(), "Configured pairing cannot downgrade");
                 rt.connect(session);
+                if rt.observer && REVERIFY.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                    rt.pending = None;
+                    rt.last_sent = None;
+                    rt.verified = None;
+                }
                 for wire in frames {
                     match rt.receive(&wire, now) {
                         Ok(_) => *verified = true,
