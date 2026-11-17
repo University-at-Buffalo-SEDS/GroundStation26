@@ -2629,9 +2629,11 @@ async fn handle_packet_at_ingress(
     let automatic_origin = original_entry.filter(|_| {
         matches!(state.board_from_network_sender(pkt.sender()), Some(board) if board != Board::GroundStation)
     });
-    let source = i64::try_from(pkt.timestamp()).ok().and_then(|source| {
-        crate::telemetry_provenance::canonical_source(source, procedure_clock::timestamp_ms())
-    });
+    let source = crate::telemetry_provenance::canonical_source_on(
+        network_time_router(),
+        crate::network_stamp::Stamp::of(&pkt),
+        procedure_clock::timestamp_ms(),
+    );
     let rows = handle_packet_inner(state, db_tx, db_overflow, pkt, primary_role, automatic_origin, receive_generation).await;
     for row in &rows {
         crate::telemetry_provenance::note(row, source);

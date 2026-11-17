@@ -171,7 +171,15 @@ pub(crate) fn manual_abort_packet(
             ("SEDS_MANUAL_ABORT_V1:K", original.ms.max(0) as u64, original.epoch)
         }
     };
-    abort_packet_from_at(router, body, &router.sender(), original).map(|packet| packet.with_time_epoch(epoch))
+    // An untimed Stop takes the router's current epoch; a known original
+    // states its own (epoch 0 included).
+    abort_packet_from_at(router, body, &router.sender(), original).map(|packet| {
+        if matches!(wire, crate::manual_abort_intent::WirePolicy::KnownUtc(_)) {
+            packet.with_time_epoch(epoch)
+        } else {
+            packet
+        }
+    })
 }
 
 pub(crate) fn queue_manual_abort_wire_receipted(

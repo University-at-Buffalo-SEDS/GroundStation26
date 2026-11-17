@@ -65,6 +65,9 @@ struct TimedFix {
     received: Instant,
     received_model_ms: Option<u64>,
     publication_ms: Option<u64>,
+    /// Time-base epoch of `publication_ms`: publications order by
+    /// (epoch, timestamp).
+    publication_epoch: u16,
 }
 impl TimedFix {
     fn snapshot(&self) -> Fix {
@@ -89,6 +92,7 @@ impl TimedFix {
 #[derive(Clone, Copy)]
 struct NoFix {
     publication_ms: u64,
+    publication_epoch: u16,
     network_utc_ms: Option<u64>,
 }
 fn comparable_publications(left: u64, right: u64) -> bool {
@@ -97,9 +101,9 @@ fn comparable_publications(left: u64, right: u64) -> bool {
     left >= UTC_FLOOR_MS && right >= UTC_FLOOR_MS
 }
 impl NoFix {
-    fn precedes(self, publication_ms: u64) -> bool {
+    fn precedes(self, publication_ms: u64, epoch: u16) -> bool {
         if comparable_publications(self.publication_ms, publication_ms) {
-            return publication_ms > self.publication_ms;
+            return (epoch, publication_ms) > (self.publication_epoch, self.publication_ms);
         }
         // RF can acquire GPS UTC after starting with a boot-relative clock.
         // Order that transition only against a known UTC receipt bound; never
@@ -149,7 +153,7 @@ fn receipt_utc_ms(source: crate::network_stamp::Stamp) -> Option<u64> {
 }
 
 pub(crate) fn observe_source_gps(row: &TelemetryRow, source: crate::network_stamp::Stamp) {
-    observe_at(row, u64::try_from(source.ms).ok(), receipt_utc_ms(source));
+    observe_at_epoch(row, u64::try_from(source.ms).ok(), source.epoch, receipt_utc_ms(source));
 }
 
 /// A positive satellite count alone never establishes a receiver lock.
@@ -158,38 +162,60 @@ pub(crate) fn observe_source_satellites(sender: &str, count: u8, source: crate::
     let Ok(source_ms) = u64::try_from(source.ms) else {
         return;
     };
-    observe_satellites_at(sender, count, source_ms, receipt_utc_ms(source));
+    observe_satellites_at_epoch(sender, count, source_ms, source.epoch, receipt_utc_ms(source));
 }
+#[cfg(test)]
 fn observe_satellites_at(sender: &str, count: u8, source_ms: u64, network_utc_ms: Option<u64>) {
+    observe_satellites_at_epoch(sender, count, source_ms, 0, network_utc_ms);
+}
+fn observe_satellites_at_epoch(
+    sender: &str,
+    count: u8,
+    source_ms: u64,
+    epoch: u16,
+    network_utc_ms: Option<u64>,
+) {
     if sender != "RF" || count != 0 || source_fix_age_ms(Some(source_ms), network_utc_ms).is_none()
     {
         return;
     }
     let mut cache = cache().lock().unwrap();
-    let older_than =
-        |previous| comparable_publications(source_ms, previous) && source_ms < previous;
+    let older_than = |previous: u64, previous_epoch: u16| {
+        comparable_publications(source_ms, previous) && (epoch, source_ms) < (previous_epoch, previous)
+    };
     if cache.rocket[0]
         .as_ref()
-        .and_then(|fix| fix.publication_ms)
-        .is_some_and(older_than)
+        .and_then(|fix| fix.publication_ms.map(|ms| (ms, fix.publication_epoch)))
+        .is_some_and(|(ms, e)| older_than(ms, e))
         || cache
             .rf_no_fix
-            .is_some_and(|lost| older_than(lost.publication_ms))
+            .is_some_and(|lost| older_than(lost.publication_ms, lost.publication_epoch))
     {
         return;
     }
     cache.rocket[0] = None;
     cache.rf_no_fix = Some(NoFix {
         publication_ms: source_ms,
+        publication_epoch: epoch,
         network_utc_ms: network_utc_ms.filter(|now| *now >= UTC_FLOOR_MS),
     });
 }
 
 pub fn observe(row: &TelemetryRow) {
-    observe_at(row, None, None);
+    observe_at_epoch(row, None, 0, None);
 }
 
+#[cfg(test)]
 fn observe_at(row: &TelemetryRow, source_ms: Option<u64>, network_utc_ms: Option<u64>) {
+    observe_at_epoch(row, source_ms, 0, network_utc_ms);
+}
+
+fn observe_at_epoch(
+    row: &TelemetryRow,
+    source_ms: Option<u64>,
+    epoch: u16,
+    network_utc_ms: Option<u64>,
+) {
     if row.data_type == "GPS_DATA" {
         let index = match row.sender_id.as_str() {
             "RF" => 0,
@@ -230,7 +256,7 @@ fn observe_at(row: &TelemetryRow, source_ms: Option<u64>, network_utc_ms: Option
                         lost.network_utc_ms = network_utc_ms;
                         cache.rf_no_fix = Some(lost);
                     }
-                    if !source_ms.is_some_and(|source| lost.precedes(source)) {
+                    if !source_ms.is_some_and(|source| lost.precedes(source, epoch)) {
                         return;
                     }
                 }
@@ -238,9 +264,12 @@ fn observe_at(row: &TelemetryRow, source_ms: Option<u64>, network_utc_ms: Option
                     && source_ms.is_some_and(|source| {
                         cache.rocket[0]
                             .as_ref()
-                            .and_then(|previous| previous.publication_ms)
-                            .is_some_and(|previous| {
-                                comparable_publications(source, previous) && source < previous
+                            .and_then(|previous| {
+                                previous.publication_ms.map(|ms| (ms, previous.publication_epoch))
+                            })
+                            .is_some_and(|(previous, previous_epoch)| {
+                                comparable_publications(source, previous)
+                                    && (epoch, source) < (previous_epoch, previous)
                             })
                     })
                 {
@@ -251,6 +280,7 @@ fn observe_at(row: &TelemetryRow, source_ms: Option<u64>, network_utc_ms: Option
                     received: Instant::now(),
                     received_model_ms: crate::simulation_clock_ms(),
                     publication_ms: source_ms,
+                    publication_epoch: epoch,
                 });
             }
         }
@@ -319,6 +349,7 @@ pub fn accept_remote_fix(mut fix: Fix) {
         received: Instant::now(),
         received_model_ms: None,
         publication_ms: None,
+        publication_epoch: 0,
     });
 }
 pub fn snapshot() -> Snapshot {
@@ -458,6 +489,7 @@ pub fn start_gpsd(
                                     received: Instant::now(),
                                     received_model_ms: None,
                                     publication_ms: None,
+                                    publication_epoch: 0,
                                 });
                             }
                             line.clear();
@@ -576,6 +608,7 @@ mod tests {
             received: Instant::now() - Duration::from_secs(11),
             received_model_ms: None,
             publication_ms: None,
+            publication_epoch: 0,
         };
         assert!(timed.snapshot().stale);
     }
@@ -603,6 +636,7 @@ mod tests {
             received: wall,
             received_model_ms: Some(1000),
             publication_ms: None,
+            publication_epoch: 0,
         };
         timed.fix.age_ms = 1200;
         assert_eq!(
@@ -743,6 +777,22 @@ mod tests {
         );
         observe_at(&row, Some(now + 1), Some(now));
         assert!(locked(), "a comparable UTC bridge permits valid recovery");
+
+        // A network clock step back: a fix published in the newer epoch is
+        // newer than the cached one despite its lower timestamp; a late
+        // no-fix from before the step cannot revoke it.
+        clear_rocket_fix_for_test();
+        observe_at_epoch(&row, Some(now), 3, Some(now));
+        assert!(locked());
+        let after = now - 4 * 3_600_000;
+        observe_at_epoch(&row, Some(after), 4, Some(after));
+        assert!(locked(), "post-step fix accepted");
+        observe_satellites_at_epoch("RF", 0, now - 1, 3, Some(now));
+        assert!(locked(), "a pre-step no-fix is older than the post-step fix");
+        observe_satellites_at_epoch("RF", 0, after + 1, 4, Some(after + 1));
+        assert!(!locked(), "a post-step no-fix revokes it");
+        observe_at_epoch(&row, Some(now), 3, Some(now + 1));
+        assert!(!locked(), "a pre-step fix cannot revive it");
 
         clear_rocket_fix_for_test();
         observe_at(&row, Some(9_990), Some(now));

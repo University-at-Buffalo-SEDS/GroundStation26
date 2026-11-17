@@ -71,6 +71,10 @@ struct Desired {
     mode: u8,
     revision: u64,
     source_ms: u64,
+    /// Time-base epoch of `source_ms` (files written before SEDSnet 6 read
+    /// as epoch 0).
+    #[serde(default)]
+    source_epoch: u16,
 }
 impl Default for Desired {
     fn default() -> Self {
@@ -79,10 +83,14 @@ impl Default for Desired {
             mode: 0,
             revision: 0,
             source_ms: 0,
+            source_epoch: 0,
         }
     }
 }
 impl Desired {
+    fn source(&self) -> crate::network_stamp::Stamp {
+        crate::network_stamp::Stamp::new(self.source_epoch, self.source_ms as i64)
+    }
     fn load(path: &Path) -> Result<Option<Self>, String> {
         match fs::read(path) {
             Ok(bytes) => {
@@ -180,6 +188,7 @@ struct Inner {
     settings_busy: bool,
     pending_setting: Option<u64>,
     last_motion_stamp: u64,
+    last_motion_epoch: u16,
     message: String,
     /// The last retraction this station started that never reached the
     /// actuator, for the QD control's failed state.
@@ -198,6 +207,11 @@ struct RetractSent {
 struct RetractFailure {
     at: Instant,
     message: String,
+}
+impl Inner {
+    fn last_motion(&self) -> crate::network_stamp::Stamp {
+        crate::network_stamp::Stamp::new(self.last_motion_epoch, self.last_motion_stamp as i64)
+    }
 }
 pub(crate) struct Runtime {
     issuer: u64,
@@ -247,6 +261,7 @@ impl Default for Runtime {
                 settings_busy: false,
                 pending_setting: None,
                 last_motion_stamp: 0,
+                last_motion_epoch: 0,
                 message: "Query the actuator for its saved drive selection.".into(),
                 retract_failure: None,
                 retract_sent: None,
@@ -274,6 +289,8 @@ impl Drop for SettingsBusy<'_> {
 #[derive(Clone, Copy, Debug)]
 pub struct MotionOrigin {
     pub(crate) source_ms: Option<u64>,
+    /// Time-base epoch of `source_ms` / `fallback_ms`.
+    source_epoch: u16,
     fallback_ms: u64,
     revision: u64,
     backend: u64,
@@ -288,12 +305,12 @@ pub(crate) fn capture_motion_origin(
     // Freeze the selected-mode context before the existing SDK clock call.
     // A mode commit while that call waits must invalidate this original intent.
     let revision = state.plumbing_drive.inner.lock().unwrap().desired.revision;
-    let source_ms = state
-        .topology_router
-        .get()
-        .and_then(|r| crate::system_clock::required_control_network_utc_ms(r).ok());
+    let router = state.topology_router.get();
+    let stamp = router.and_then(|r| crate::system_clock::required_control_network_stamp(r).ok());
+    let source_ms = stamp.map(|s| s.ms as u64);
     Some(MotionOrigin {
         source_ms,
+        source_epoch: stamp.map_or_else(|| router.map_or(0, |r| r.network_time_epoch()), |s| s.epoch),
         fallback_ms: source_ms.unwrap_or_else(crate::telemetry_task::get_current_timestamp_ms),
         revision,
         backend: state.plumbing_drive.issuer,
@@ -301,8 +318,10 @@ pub(crate) fn capture_motion_origin(
 }
 pub(crate) fn capture_remote_motion_origin(state: &AppState, source_ms: u64) -> MotionOrigin {
     let revision = state.plumbing_drive.inner.lock().unwrap().desired.revision;
+    // A proxied station stamp is in the network's current time base.
     MotionOrigin {
         source_ms: Some(source_ms),
+        source_epoch: state.topology_router.get().map_or(0, |r| r.network_time_epoch()),
         fallback_ms: source_ms,
         revision,
         backend: state.plumbing_drive.issuer,
@@ -314,9 +333,8 @@ fn motion_stamp(
     state: &AppState,
     router: &sedsnet::router::Router,
     origin: Option<MotionOrigin>,
-) -> Result<u64, String> {
-    let current = crate::system_clock::required_control_network_utc_ms(router).ok();
-    let fallback = crate::system_clock::control_packet_timestamp_ms(router);
+) -> Result<crate::network_stamp::Stamp, String> {
+    let fallback = crate::system_clock::control_packet_stamp(router);
     let stamp = {
         let inner = state.plumbing_drive.inner.lock().unwrap();
         motion_ready_inner(state, &inner)?;
@@ -334,14 +352,24 @@ fn motion_stamp(
             return Err("This motion lacks original drive context; use an updated primary or recovery station and submit a fresh command.".into());
         }
         let stamp = origin
-            .and_then(|context| context.source_ms)
-            .or_else(|| (!explicit).then(|| origin.map_or(fallback, |context| context.fallback_ms)))
+            .and_then(|context| {
+                context
+                    .source_ms
+                    .map(|ms| crate::network_stamp::Stamp::new(context.source_epoch, ms as i64))
+            })
+            .or_else(|| {
+                (!explicit).then(|| {
+                    origin.map_or(fallback, |context| {
+                        crate::network_stamp::Stamp::new(context.source_epoch, context.fallback_ms as i64)
+                    })
+                })
+            })
             .ok_or("Original network UTC is required for the selected drive.")?;
+        // Ordered and aged as network stamps (epoch, timestamp), so a motion
+        // after a network clock step back is newer than the drive selection.
         if explicit
-            && (stamp <= inner.desired.source_ms
-                || current.is_none_or(|now| {
-                    now.saturating_sub(stamp) > REQUEST_TTL || stamp.saturating_sub(now) > 1_000
-                }))
+            && (stamp <= inner.desired.source()
+                || !crate::network_stamp::is_fresh_on(router, stamp, REQUEST_TTL, 1_000))
         {
             return Err(
                 "Motion predates the drive selection or has expired; submit a fresh command."
@@ -357,7 +385,7 @@ pub(crate) fn validated_motion_stamp(
     router: &sedsnet::router::Router,
     origin: Option<MotionOrigin>,
 ) -> Result<u64, String> {
-    motion_stamp(state, router, origin)
+    motion_stamp(state, router, origin).map(|stamp| stamp.ms as u64)
 }
 pub(crate) fn validate_motion_origin(
     state: &AppState,
@@ -418,7 +446,8 @@ pub(crate) fn schedule_motion_under_dispatch(
     let (generation, manual_epoch, observed_manual_epoch) = ticket.original_ownership();
     let record = motion_journal::Record {
         version: 1,
-        original_utc_ms: source,
+        original_utc_ms: source.ms as u64,
+        original_epoch: source.epoch,
         mode,
         mode_revision,
         boot: safe.boot,
@@ -428,8 +457,9 @@ pub(crate) fn schedule_motion_under_dispatch(
         observed_manual_epoch,
     };
     let origin = origin.or(Some(MotionOrigin {
-        source_ms: Some(source),
-        fallback_ms: source,
+        source_ms: Some(source.ms as u64),
+        source_epoch: source.epoch,
+        fallback_ms: source.ms as u64,
         revision: mode_revision,
         backend: state.plumbing_drive.issuer,
     }));
@@ -459,7 +489,7 @@ pub(crate) fn schedule_motion_under_dispatch(
             // Sender, clock/schema lookup, endpoints, allocation and Packet ID
             // are prepared outside every final Stop/board admission mutex.
             let prepared = prepare_motion_packet(&state,router,origin,logged)?;
-            if prepared.packet.timestamp()!=record.original_utc_ms {
+            if prepared.packet.timestamp()!=record.original_utc_ms || prepared.packet.time_epoch()!=record.original_epoch {
                 return Err("Original retraction timestamp changed; no motion sent".into());
             }
             let deadline = prepared.deadline;
@@ -514,7 +544,10 @@ pub(crate) fn schedule_motion_under_dispatch(
             }
             {
                 let mut inner=state.plumbing_drive.inner.lock().unwrap();
-                inner.last_motion_stamp=inner.last_motion_stamp.max(record.original_utc_ms);
+                if record.original() > inner.last_motion() {
+                    inner.last_motion_stamp=record.original_utc_ms;
+                    inner.last_motion_epoch=record.original_epoch;
+                }
                 inner.retract_sent=Some(RetractSent{at:Instant::now(),mode:record.mode,
                     mode_revision:record.mode_revision,generation:record.generation});
             }
@@ -587,12 +620,13 @@ fn prepare_motion_packet(
     logged: bool,
 ) -> Result<PreparedMotion, String> {
     let stamp = motion_stamp(state, router, origin)?;
-    let now =
-        crate::system_clock::required_control_network_utc_ms(router).map_err(|e| e.to_string())?;
-    if matches!(stamp, 0 | u64::MAX)
-        || now.saturating_sub(stamp) > REQUEST_TTL
-        || stamp.saturating_sub(now) > 1_000
-    {
+    // Its age on the network clock, translated across any step.
+    let age = match crate::network_stamp::age_on(router, stamp) {
+        sedsnet::timesync::NetworkStampAge::Age(age) => age,
+        sedsnet::timesync::NetworkStampAge::NewerEpoch { since_ms } => since_ms as i64,
+        _ => i64::MAX,
+    };
+    if stamp.ms <= 0 || age > REQUEST_TTL as i64 || age < -1_000 {
         return Err("Original retraction UTC expired; submit a fresh explicit request".into());
     }
     let kind = crate::telemetry_schema::data_type("ACTUATOR_COMMAND");
@@ -608,11 +642,12 @@ fn prepare_motion_packet(
         kind,
         &endpoints,
         &router.sender(),
-        stamp,
+        stamp.ms as u64,
         Arc::from([crate::rocket_commands::ActuatorBoardCommands::RetractPlumbing as u8]),
     )
-    .map_err(|e| e.to_string())?;
-    let remaining = REQUEST_TTL.saturating_sub(now.saturating_sub(stamp));
+    .map_err(|e| e.to_string())?
+    .with_time_epoch(stamp.epoch);
+    let remaining = REQUEST_TTL.saturating_sub(age.max(0) as u64);
     Ok(PreparedMotion {
         packet,
         deadline: Instant::now() + std::time::Duration::from_millis(remaining),
@@ -699,7 +734,7 @@ pub(crate) fn request_drive_query(state: &AppState) -> Result<(), String> {
         generation: 0,
         epoch: 0,
         issuer: state.plumbing_drive.issuer,
-    }, crate::system_clock::control_packet_timestamp_ms(router))
+    }, crate::system_clock::control_packet_stamp(router))
 }
 
 /// Nonce-correlated read-only observation, shared by background refresh and
@@ -1068,6 +1103,12 @@ fn modeled_remaining(started: Instant, now: Instant) -> u32 {
             .min(u32::MAX as u128) as u32,
     )
 }
+/// The retraction was requested after the drive selection, ordered as
+/// network stamps (epoch, timestamp): one requested after a network clock
+/// step back is newer even though its timestamp is lower.
+fn retraction_follows_selection(record: &motion_journal::Record, desired: &Desired) -> bool {
+    record.original() > desired.source()
+}
 pub(crate) fn retraction_gate(state: &AppState) -> RetractionGate {
     let (record, error) = state.plumbing_drive.motion_journal.snapshot();
     let pending = state.plumbing_drive.motion_journal.pending();
@@ -1224,7 +1265,7 @@ pub(crate) fn retraction_gate(state: &AppState) -> RetractionGate {
     if !record.valid()
         || record.mode != desired.mode
         || record.mode_revision != desired.revision
-        || record.original_utc_ms <= desired.source_ms
+        || !retraction_follows_selection(&record, &desired)
         || record.generation != crate::gse::automatic_generation(state)
         || record.manual_epoch != state.manual_abort_intent.epoch()
         || record.observed_manual_epoch != state.deferred_abort.manual_epoch()
@@ -1437,7 +1478,7 @@ struct PreparedRequest {
 fn prepare_request(
     state: &AppState,
     request: Request,
-    stamp: u64,
+    stamp: crate::network_stamp::Stamp,
 ) -> Result<PreparedRequest, String> {
     let router = state
         .topology_router
@@ -1448,17 +1489,18 @@ fn prepare_request(
         crate::telemetry_schema::data_type(REQUEST_TYPE),
         &[crate::telemetry_schema::endpoint("ACTUATOR_BOARD")],
         &router.sender(),
-        stamp,
+        stamp.ms.max(0) as u64,
         Arc::from(bytes),
     )
-    .map_err(|_| "Cannot prepare drive request")?;
+    .map_err(|_| "Cannot prepare drive request")?
+    .with_time_epoch(stamp.epoch);
     Ok(PreparedRequest {
         request,
         packet,
         sent: Moment::now(),
     })
 }
-fn queue(state: &AppState, request: Request, stamp: u64) -> Result<(), String> {
+fn queue(state: &AppState, request: Request, stamp: crate::network_stamp::Stamp) -> Result<(), String> {
     let prepared = prepare_request(state, request, stamp)?;
     queue_prepared_request(state, prepared, false)
 }
@@ -1606,7 +1648,7 @@ async fn settings(
     let origin = state
         .topology_router
         .get()
-        .and_then(|router| crate::system_clock::required_control_network_utc_ms(router).ok());
+        .and_then(|router| crate::system_clock::required_control_network_stamp(router).ok());
     let principal =
         match crate::web::authorize_headers(&state, &headers, Permission::SendCommands).await {
             Ok(p) => p,
@@ -1651,7 +1693,7 @@ fn apply_settings(
     state: &AppState,
     body: SettingsRequest,
     generation: u64,
-    origin: u64,
+    origin: crate::network_stamp::Stamp,
     admission: crate::gse::LaunchAdmission,
 ) -> Result<bool, (StatusCode, String)> {
     let fail = |message: &str| (StatusCode::CONFLICT, message.to_string());
@@ -1670,12 +1712,11 @@ fn apply_settings(
     if !primary(state) || !configuration_state(state) {
         return Err(fail("Drive changes require primary GS in Startup or Idle."));
     }
-    let current_time = state
+    let router = state
         .topology_router
         .get()
-        .and_then(|router| crate::system_clock::required_control_network_utc_ms(router).ok())
         .ok_or_else(|| fail("Network UTC is unavailable."))?;
-    if current_time.saturating_sub(origin) > 5_000 || origin.saturating_sub(current_time) > 1_000 {
+    if !crate::network_stamp::is_fresh_on(router, origin, 5_000, 1_000) {
         return Err(fail(
             "Drive request expired during authorization; submit a new request.",
         ));
@@ -1772,7 +1813,7 @@ fn apply_settings(
                 "Explicit release of idle stepper holding torque is required.",
             ));
         }
-        if origin <= inner.desired.source_ms || origin <= inner.last_motion_stamp {
+        if origin <= inner.desired.source() || origin <= inner.last_motion() {
             return Err(fail("Drive request predates the saved selection."));
         }
         Desired {
@@ -1783,7 +1824,8 @@ fn apply_settings(
                 .revision
                 .checked_add(1)
                 .ok_or_else(|| fail("Drive revision exhausted."))?,
-            source_ms: origin,
+            source_ms: origin.ms as u64,
+            source_epoch: origin.epoch,
         }
     };
     let nonce = rand::random::<u64>().max(1);
@@ -1834,13 +1876,7 @@ fn apply_settings(
             "Desired drive saved, but actuator configuration proof changed; no SET was queued. Query again.",
         ));
     }
-    let now = state
-        .topology_router
-        .get()
-        .and_then(|r| crate::system_clock::required_control_network_utc_ms(r).ok());
-    if now.is_none_or(|now| {
-        now.saturating_sub(origin) > REQUEST_TTL || origin.saturating_sub(now) > 1_000
-    }) {
+    if !crate::network_stamp::is_fresh_on(router, origin, REQUEST_TTL, 1_000) {
         return Err(fail(
             "Desired drive saved, but its original request expired before admission. Query and explicitly retry.",
         ));
@@ -2080,7 +2116,7 @@ mod tests {
             &state,
             body,
             generation + 1,
-            1000,
+            crate::network_stamp::Stamp::new(0, 1000),
             crate::gse::plumbing_admission_ticket(&state),
         )
         .unwrap_err();
@@ -2092,6 +2128,40 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Acquire),
             0
         );
+    }
+    /// After a 4 h network clock step back, a retraction requested after the
+    /// drive selection still follows it (no needs_check); one stamped before
+    /// the selection does not. Journals and selections written before
+    /// SEDSnet 6 read as epoch 0.
+    #[test]
+    fn retraction_after_a_backward_step_follows_the_selection() {
+        let selected = 1_800_000_000_000u64;
+        let desired = Desired { version: 1, mode: 2, revision: 4, source_ms: selected, source_epoch: 3 };
+        let record = |epoch: u16, ms: u64| motion_journal::Record {
+            version: 1,
+            original_utc_ms: ms,
+            original_epoch: epoch,
+            mode: 2,
+            mode_revision: 4,
+            boot: 7,
+            epoch: 2,
+            generation: 1,
+            manual_epoch: 0,
+            observed_manual_epoch: 0,
+        };
+        let after_step = record(4, selected - 4 * 3_600_000 + 60_000);
+        assert!(retraction_follows_selection(&after_step, &desired));
+        assert!(!retraction_follows_selection(&record(3, selected - 1), &desired));
+        let legacy: motion_journal::Record = serde_json::from_value(serde_json::json!({
+            "version": 1, "original_utc_ms": 5, "mode": 2, "mode_revision": 4, "boot": 7,
+            "epoch": 2, "generation": 1, "manual_epoch": 0, "observed_manual_epoch": 0
+        }))
+        .unwrap();
+        assert_eq!(legacy.original_epoch, 0);
+        let legacy: Desired =
+            serde_json::from_value(serde_json::json!({"version":1,"mode":2,"revision":4,"source_ms":5}))
+                .unwrap();
+        assert_eq!(legacy.source_epoch, 0);
     }
     #[test]
     fn desired_selection_round_trips_and_invalid_storage_never_becomes_a_default_write() {
@@ -2105,6 +2175,7 @@ mod tests {
             mode: 2,
             revision: 8,
             source_ms: 123456,
+            source_epoch: 0,
         };
         value.save(&path, 3).unwrap();
         let loaded = Desired::load(&path).unwrap().unwrap();

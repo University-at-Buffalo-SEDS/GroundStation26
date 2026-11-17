@@ -17,6 +17,10 @@ use std::{
 pub(super) struct Record {
     pub(super) version: u8,
     pub(super) original_utc_ms: u64,
+    /// Time-base epoch of `original_utc_ms` (records written before SEDSnet 6
+    /// read as epoch 0): retractions order by (epoch, timestamp).
+    #[serde(default, skip_serializing_if = "is_zero_epoch")]
+    pub(super) original_epoch: u16,
     pub(super) mode: u8,
     pub(super) mode_revision: u64,
     pub(super) boot: u64,
@@ -25,7 +29,13 @@ pub(super) struct Record {
     pub(super) manual_epoch: u64,
     pub(super) observed_manual_epoch: u64,
 }
+fn is_zero_epoch(value: &u16) -> bool {
+    *value == 0
+}
 impl Record {
+    pub(super) fn original(&self) -> crate::network_stamp::Stamp {
+        crate::network_stamp::Stamp::new(self.original_epoch, self.original_utc_ms as i64)
+    }
     pub(super) fn valid(&self) -> bool {
         self.version == 1
             && matches!(self.mode, 0 | 2)
