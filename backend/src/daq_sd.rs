@@ -174,11 +174,7 @@ pub async fn retry(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Re
         return error.into_response();
     }
     let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
-        return (
-            StatusCode::CONFLICT,
-            "Recovery admission is closed or request is stale",
-        )
-            .into_response();
+        return crate::web::admission_refused(&state, "Retrying the DAQ SD card");
     };
     let Some(router) = state.topology_router.get() else {
         return (

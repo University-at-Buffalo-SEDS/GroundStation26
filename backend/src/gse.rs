@@ -2217,11 +2217,7 @@ async fn self_test_confirmation(
         return StatusCode::FORBIDDEN.into_response();
     }
     let Some(_claim) = claim_operator_dispatch(&state, admission_generation) else {
-        return (
-            StatusCode::CONFLICT,
-            "Recovery admission is closed or request is stale",
-        )
-            .into_response();
+        return crate::web::admission_refused(&state, "Confirming the self-test");
     };
     {
         let mut rt = state.gse.lock().unwrap();
@@ -2357,11 +2353,7 @@ async fn save_config(
         Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error).into_response(),
     };
     let Some(_claim) = claim_operator_dispatch(&state, admission_generation) else {
-        return (
-            StatusCode::CONFLICT,
-            "Recovery admission is closed or request is stale",
-        )
-            .into_response();
+        return crate::web::admission_refused(&state, "Saving the settings");
     };
     if let Err(err) = config.validate_settings() {
         return (StatusCode::BAD_REQUEST, err).into_response();
@@ -3900,11 +3892,7 @@ async fn reset_qualification(State(state): State<Arc<AppState>>, headers: Header
         return StatusCode::FORBIDDEN.into_response();
     }
     let Some(_claim) = claim_operator_dispatch(&state, admission_generation) else {
-        return (
-            StatusCode::CONFLICT,
-            "Recovery admission is closed or request is stale",
-        )
-            .into_response();
+        return crate::web::admission_refused(&state, "Resetting the qualification");
     };
     if crate::runtime_mode::is_hitl() {
         (
@@ -4040,11 +4028,7 @@ async fn override_cold_flow(
         return StatusCode::FORBIDDEN.into_response();
     }
     let Some(_claim) = claim_operator_dispatch(&state, admission_generation) else {
-        return (
-            StatusCode::CONFLICT,
-            "Recovery admission is closed or request is stale",
-        )
-            .into_response();
+        return crate::web::admission_refused(&state, "Overriding the cold-flow check");
     };
     if crate::runtime_mode::is_hitl() {
         match apply_hitl_nitrogen_override(

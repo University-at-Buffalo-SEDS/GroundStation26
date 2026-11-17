@@ -270,3 +270,61 @@ async fn prepare_replaces_a_lost_background_query_at_once_and_never_accepts_its_
     assert!(super::super::observe(&state, &late).unwrap_err().contains("Query the board again"));
     assert_ne!(state.board_recovery.inner.lock().unwrap().values[at].as_ref().unwrap().value.nonce, lost);
 }
+
+/// A failed Reset all whose only unhealthy board then leaves the network
+/// stays closed: the absence alone never reopens the station. An
+/// administrator's explicit waiver naming exactly that board finishes it,
+/// is journaled, and sends nothing to any board.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_finishes_recovery_without_an_absent_board_only_explicitly() {
+    if isolated("admin_finishes_recovery_without_an_absent_board_only_explicitly") { return; }
+    let fixture = Fixture::new().await;
+    let state = fixture.state();
+    *state.state.lock().unwrap() = crate::types::FlightState::Aborted;
+    for board in BOARDS { fixture.query(board).await; }
+    let daq = fixture.models.iter().find(|(board, _)| *board == Board::DaqBoard).unwrap().1.clone();
+    daq.lock().unwrap().fail_result = Some(4);
+    let ticket = fixture.prepare("reset_startup", None).await;
+    assert_eq!(fixture.confirm(&ticket).await.status(), StatusCode::OK);
+    assert_eq!(fixture.terminal().await["success"], false);
+    for board in BOARDS { fixture.query(board).await; }
+    let finish = |token: &'static str, boards: Value| {
+        let state = state.clone();
+        async move {
+            super::super::tests::http(state, "POST", "/api/board-recovery/finish-without-absent",
+                Some(token), json!({"boards": boards, "confirm": true})).await
+        }
+    };
+    // DAQ is on the network and unhealthy: nothing to waive.
+    assert_eq!(finish("administrator", json!(["DAQ"])).await.status(), StatusCode::CONFLICT);
+    // DAQ leaves the network. Absence alone does not reopen the station.
+    // Its route ages out only after the board-seen timeout.
+    daq.lock().unwrap().offline = true;
+    tokio::time::sleep(Duration::from_millis(crate::state::BOARD_SEEN_TIMEOUT_MS + 500)).await;
+    for board in BOARDS { if board != Board::DaqBoard { fixture.query(board).await; } }
+    assert!(!complete_satisfied_pending(&state));
+    assert_ne!(state.operator_admission_barrier.load(Ordering::Acquire), 0);
+    let message = admission_closed_message(&state, "Saving the calibration");
+    assert!(message.contains("DAQ") && message.contains("not on the network") && message.contains("Finish without absent boards"), "{message}");
+    let status = body(super::super::tests::http(state.clone(), "GET", "/api/board-recovery/status",
+        Some("operator"), json!({})).await).await;
+    assert_eq!(status["host_recovery"]["absent"], json!(["DAQ"]), "{status}");
+    // Only an administrator, only confirmed, only naming exactly the absent boards.
+    assert_eq!(finish("operator", json!(["DAQ"])).await.status(), StatusCode::FORBIDDEN);
+    assert_eq!(finish("administrator", json!(["DAQ", "AB"])).await.status(), StatusCode::CONFLICT);
+    assert_eq!(super::super::tests::http(state.clone(), "POST", "/api/board-recovery/finish-without-absent",
+        Some("administrator"), json!({"boards":["DAQ"],"confirm":false})).await.status(), StatusCode::BAD_REQUEST);
+    assert_ne!(state.operator_admission_barrier.load(Ordering::Acquire), 0);
+    let requests_before = daq.lock().unwrap().requests.len();
+    let done = finish("administrator", json!(["DAQ"])).await;
+    let status = done.status();
+    let done = body(done).await;
+    assert_eq!(status, StatusCode::OK, "{done}");
+    assert_eq!(state.operator_admission_barrier.load(Ordering::Acquire), 0);
+    assert!(crate::gse::capture_operator_origin(&state).is_some(), "operator commands are admitted again");
+    let history = state.launch_history.lock().unwrap();
+    assert!(history.recovery_pending().is_none() && !history.recovery_closed());
+    assert_eq!(history.recovery_waivers().last().unwrap().boards, vec!["DAQ".to_string()]);
+    drop(history);
+    assert_eq!(daq.lock().unwrap().requests.len(), requests_before, "nothing was sent to the board");
+}

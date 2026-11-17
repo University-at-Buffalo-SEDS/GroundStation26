@@ -810,6 +810,7 @@ pub(crate) fn routes() -> axum::Router<Arc<AppState>> {
         .route("/api/board-recovery/query", post(query))
         .route("/api/board-recovery/prepare", post(coordinator::prepare))
         .route("/api/board-recovery/confirm", post(coordinator::confirm))
+        .route("/api/board-recovery/finish-without-absent", post(coordinator::finish_without_absent))
 }
 #[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 fn primary_only() -> Result<(), Response> {
@@ -908,9 +909,12 @@ fn readback_healthy_idle(board: Board, observation: &Observation, now: Stamp) ->
         }
 }
 /// A durable pending recovery target that a later fresh verified readback has
-/// satisfied: the same boot identity, the same or a newer recovery epoch, and
-/// a healthy Startup/Idle state. Commissioning (FIRST) uncertainty is never
-/// satisfied this way; it needs its explicit reconciliation.
+/// satisfied: a healthy Startup/Idle state with safe outputs and either the
+/// same boot identity with the same or a newer recovery epoch, or a new boot
+/// (a power cycle restarts the board in Startup with safe outputs, which is
+/// what the recovery was for; its epoch counter restarts with it).
+/// Commissioning (FIRST) uncertainty is never satisfied this way; it needs
+/// its explicit reconciliation.
 // Safety catalog (About safety): reset-all-boards. Keep backend/src/safety_catalog_rules.rs in step.
 fn pending_target_satisfied(
     board: Board,
@@ -925,25 +929,68 @@ fn pending_target_satisfied(
         && target.kind == crate::launch_history::RecoveryIntentKind::Normal
         && target.uncertain_first.is_none()
         && target.original_first.is_none()
-        && observation.value.boot == target.boot
-        && observation.value.epoch >= target.epoch
+        && (observation.value.boot != target.boot || observation.value.epoch >= target.epoch)
         && readback_healthy_idle(board, observation, now)
 }
-/// Boards of the durable unpublished pending recovery that still need it.
-pub(crate) fn unsatisfied_pending_mask(state: &AppState) -> u8 {
+/// Whether the station's current mode expects this board at all. A pending
+/// target on a board the mode does not use (the AV bay in test fire) can
+/// never read back and must not hold the station closed.
+fn pending_board_expected(at: usize) -> bool {
+    expected_boards() & (1 << at) != 0
+}
+/// Unsatisfied targets of the durable pending recovery, split by whether
+/// their board has been seen on the network within `BOARD_SEEN_TIMEOUT_MS`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PendingBlockers {
+    /// Every unsatisfied expected target (bit 0x80: a target this build
+    /// does not know).
+    pub unsatisfied: u8,
+    /// The subset of `unsatisfied` whose board is absent from the network.
+    pub absent: u8,
+}
+fn expected_boards() -> u8 {
+    scope::mode_scope(crate::station_mode::local_mode())
+}
+fn pending_blockers_from(
+    targets: &[crate::launch_history::RecoveryTarget],
+    present: u8,
+    expected: u8,
+    mut satisfied: impl FnMut(usize, Board, &crate::launch_history::RecoveryTarget) -> bool,
+) -> PendingBlockers {
+    targets.iter().fold(PendingBlockers::default(), |mut out, target| {
+        let Some((at, board)) = BOARDS.iter().enumerate().find(|(_, b)| b.sender_id() == target.board) else {
+            out.unsatisfied |= 0x80;
+            return out;
+        };
+        if expected & (1 << at) != 0 && !satisfied(at, *board, target) {
+            out.unsatisfied |= 1 << at;
+            if present & (1 << at) == 0 {
+                out.absent |= 1 << at;
+            }
+        }
+        out
+    })
+}
+pub(crate) fn pending_blockers(state: &AppState) -> PendingBlockers {
     let Some(pending) = state.launch_history.lock().unwrap().recovery_pending().filter(|p| !p.published) else {
-        return 0;
+        return PendingBlockers::default();
     };
+    let present = crate::board_abort::present_mask(state);
     let topology = state.topology_router.get().map(|router| router.export_topology());
     let now = Stamp::now();
     let inner = state.board_recovery.inner.lock().unwrap();
-    pending.targets.iter().fold(0, |mask, target| {
-        let Some((at, board)) = BOARDS.iter().enumerate().find(|(_, b)| b.sender_id() == target.board) else {
-            return mask | 0x80;
-        };
-        let verified = topology.as_ref().is_some_and(|topology| endpoint_verified(state, *board, topology));
-        if pending_target_satisfied(*board, target, inner.values[at].as_ref(), verified, now) { mask } else { mask | (1 << at) }
+    pending_blockers_from(&pending.targets, present, expected_boards(), |at, board, target| {
+        let verified = topology.as_ref().is_some_and(|topology| endpoint_verified(state, board, topology));
+        pending_target_satisfied(board, target, inner.values[at].as_ref(), verified, now)
     })
+}
+/// Labels of the boards in `mask`.
+pub(crate) fn board_names(mask: u8) -> Vec<&'static str> {
+    BOARDS.iter().enumerate().filter(|(at, _)| mask & (1 << at) != 0).map(|(_, b)| b.sender_id()).collect()
+}
+/// Boards of the durable unpublished pending recovery that still need it.
+pub(crate) fn unsatisfied_pending_mask(state: &AppState) -> u8 {
+    pending_blockers(state).unsatisfied
 }
 /// Board readbacks must be sampled at least this long after a launch attempt
 /// before they can release its lock, so a pre-launch reply still in flight, or
@@ -1130,6 +1177,7 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
         .coordinator
         .confirmation(&state, &principal_identity);
     let host_pending = state.launch_history.lock().unwrap().recovery_pending();
+    let pending_blocking = pending_blockers(&state);
     let actual_abort_mask = state.board_abort.masks().0;
     let unsatisfied_pending = unsatisfied_pending_mask(&state);
     let av_bay_paused = state.board_recovery.av_bay_pause_reason();
@@ -1248,7 +1296,7 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
         "permissions":{"query":primary,"recover":can_recover,"reset_startup":can_reset_startup,"change_mode":false},"reset_startup_blocked_reason":reset_startup_blocked,"recover_blocked_reason":recover_blocked,"av_bay_status_queries_paused":av_bay_paused,
         "resync_target_state":resync_target_state,"resync_target_label":resync_target_state.map(phase_label),
         "reset_startup_policy":reset_startup_policy,
-        "confirmation":confirmation,"host_recovery":host_pending.map(|pending|json!({"pending":!pending.published,"verified":pending.verified,"publication_acknowledged":pending.published,"targets":pending.targets.iter().map(|target|target.board.as_str()).collect::<Vec<_>>()})),
+        "confirmation":confirmation,"host_recovery":host_pending.map(|pending|json!({"unsatisfied":board_names(pending_blocking.unsatisfied & 0x7f),"absent":board_names(pending_blocking.unsatisfied & pending_blocking.absent),"pending":!pending.published,"verified":pending.verified,"publication_acknowledged":pending.published,"targets":pending.targets.iter().map(|target|target.board.as_str()).collect::<Vec<_>>()})),
         "rejected_statuses":rejected_statuses,"last_rejection":last_rejection,
         "mode_capability":{"current":current,"build_mode":build,"supported_modes":["normal","hitl","test_fire","testing"],"runtime_switch_supported":true,"requires_restart":[],"message":"One backend holds every mode; it switches in process from Station mode settings while the station is idle. Only a Simulation change restarts the backend."},"boards":boards,"operation":state.board_recovery.coordinator.operation()})).into_response()
 }
@@ -1834,7 +1882,8 @@ mod tests {
         let path = directory.join("auth.json");
         std::fs::write(&path, json!({"users":[
             {"username":"viewer","roles":[],"password":{"salt_b64":"","hash_b64":""},"permissions":{"view_data":true,"send_commands":false}},
-            {"username":"operator","roles":[],"password":{"salt_b64":"","hash_b64":""},"permissions":{"view_data":true,"send_commands":true}}
+            {"username":"operator","roles":[],"password":{"salt_b64":"","hash_b64":""},"permissions":{"view_data":true,"send_commands":true}},
+            {"username":"administrator","roles":["admin"],"password":{"salt_b64":"","hash_b64":""},"permissions":{"view_data":true,"send_commands":true}}
         ]}).to_string()).unwrap();
         let mut state = crate::state::tests::test_app_state().await;
         Arc::get_mut(&mut state).unwrap().auth = Arc::new(crate::auth::AuthManager::new(path));
@@ -1846,7 +1895,7 @@ mod tests {
         crate::ensure_auth_sessions_table(&state.auth_db)
             .await
             .unwrap();
-        for (user, commands) in [("viewer", 0), ("operator", 1)] {
+        for (user, commands) in [("viewer", 0), ("operator", 1), ("administrator", 1)] {
             sqlx::query("INSERT INTO auth_sessions(token,username,session_type,can_view_data,can_send_commands,created_at_ms,expires_at_ms) VALUES(?,?,'session',1,?,0,9999999999999)")
                 .bind(user).bind(user).bind(commands).execute(&state.auth_db).await.unwrap();
         }
@@ -2912,7 +2961,7 @@ mod launch_lock_release_tests {
         assert!(!readback_healthy_idle(Board::ActuatorBoard, &row(Board::ActuatorBoard, 0, PHYSICAL_OK, 3), now + READBACK_TTL + Duration::from_millis(1)), "stale");
     }
     #[test]
-    fn pending_target_is_satisfied_only_by_a_fresh_healthy_same_identity_readback() {
+    fn pending_target_is_satisfied_only_by_a_fresh_healthy_readback() {
         let now = Stamp::now();
         let ab = Board::ActuatorBoard;
         assert!(pending_target_satisfied(ab, &target(ab, 3), Some(&row(ab, 0, PHYSICAL_OK, 3)), true, now), "same epoch");
@@ -2923,11 +2972,42 @@ mod launch_lock_release_tests {
         assert!(!pending_target_satisfied(ab, &target(ab, 3), None, true, now), "no readback");
         let mut rebooted = row(ab, 0, PHYSICAL_OK, 3);
         rebooted.value.boot = 43;
-        assert!(!pending_target_satisfied(ab, &target(ab, 3), Some(&rebooted), true, now), "identity changed");
+        assert!(pending_target_satisfied(ab, &target(ab, 3), Some(&rebooted), true, now), "power-cycled board back healthy");
+        let mut rebooted_low_epoch = row(ab, 0, PHYSICAL_OK, 1);
+        rebooted_low_epoch.value.boot = 43;
+        assert!(pending_target_satisfied(ab, &target(ab, 3), Some(&rebooted_low_epoch), true, now), "new boot restarts its epoch");
+        let mut rebooted_aborted = row(ab, 0, PHYSICAL_OK | 1, 3);
+        rebooted_aborted.value.boot = 43;
+        assert!(!pending_target_satisfied(ab, &target(ab, 3), Some(&rebooted_aborted), true, now), "power-cycled but aborted");
+        let mut rebooted_unsafe = row(ab, 0, PHYSICAL_OK & !2, 3);
+        rebooted_unsafe.value.boot = 43;
+        assert!(!pending_target_satisfied(ab, &target(ab, 3), Some(&rebooted_unsafe), true, now), "power-cycled, unsafe outputs");
         let mut first = target(ab, 3);
         first.kind = crate::launch_history::RecoveryIntentKind::First;
         assert!(!pending_target_satisfied(ab, &first, Some(&row(ab, 0, PHYSICAL_OK, 3)), true, now), "commissioning uncertainty");
         assert!(!pending_target_satisfied(Board::ValveBoard, &target(ab, 3), Some(&row(Board::ValveBoard, 0, PHYSICAL_OK, 3)), true, now), "other board");
+    }
+    #[test]
+    fn pending_blockers_ignore_unexpected_boards_and_name_absent_ones() {
+        let ab = index(Board::ActuatorBoard).unwrap();
+        let vb = index(Board::ValveBoard).unwrap();
+        let fc = index(Board::FlightComputer).unwrap();
+        let targets = [target(Board::ActuatorBoard, 3), target(Board::ValveBoard, 3), target(Board::FlightComputer, 3)];
+        let test_fire = scope::mode_scope(crate::station_mode::Mode::TestFire);
+        let hitl = scope::mode_scope(crate::station_mode::Mode::Hitl);
+        // Test fire never expects the AV bay: an unreadable FC target does not block.
+        let out = pending_blockers_from(&targets, 1 << ab | 1 << vb, test_fire, |at, _, _| at != fc);
+        assert_eq!(out, PendingBlockers::default());
+        // HITL expects the FC: absent and unsatisfied, it blocks and is named absent.
+        let out = pending_blockers_from(&targets, 1 << ab | 1 << vb, hitl, |at, _, _| at != fc);
+        assert_eq!(out, PendingBlockers { unsatisfied: 1 << fc, absent: 1 << fc });
+        // A present unsatisfied board is never reported absent.
+        let out = pending_blockers_from(&targets, 1 << ab | 1 << vb, hitl, |at, _, _| at == ab);
+        assert_eq!(out, PendingBlockers { unsatisfied: 1 << vb | 1 << fc, absent: 1 << fc });
+        let mut unknown = target(Board::ActuatorBoard, 3);
+        unknown.board = "XX".into();
+        assert_eq!(pending_blockers_from(&[unknown], 0x7f, hitl, |_, _, _| true).unsatisfied, 0x80);
+        assert_eq!(board_names(1 << fc | 1 << vb), vec![Board::FlightComputer.sender_id(), Board::ValveBoard.sender_id()]);
     }
     #[test]
     fn launch_lock_releases_only_when_every_present_required_board_is_healthy() {

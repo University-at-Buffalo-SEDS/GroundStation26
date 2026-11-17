@@ -1253,8 +1253,10 @@ fn prepare_inner(
         pending.targets.iter().filter(|old| {
             !targets.iter().any(|new| new.board.sender_id() == old.board)
                 && !BOARDS.iter().enumerate().any(|(at, board)| {
-                    super::pending_target_satisfied(*board, old, inner.values[at].as_ref(),
-                        endpoint_verified(state, *board, &topology), now)
+                    // A board this mode does not use is never carried.
+                    board.sender_id() == old.board && (!super::pending_board_expected(at)
+                        || super::pending_target_satisfied(*board, old, inner.values[at].as_ref(),
+                            endpoint_verified(state, *board, &topology), now))
                 })
         }).cloned().collect::<Vec<_>>()
     });
@@ -2451,52 +2453,130 @@ async fn wait_sdk(
 /// ready). Returns true when it finished the recovery.
 // Safety catalog (About safety): reset-all-boards. Keep backend/src/safety_catalog_rules.rs in step.
 pub(crate) fn complete_satisfied_pending(state: &Arc<AppState>) -> bool {
+    let Ok(names) = finish_pending(state, 0) else { return false; };
+    log::info!("Unfinished board recovery finished: {names} read back healthy");
+    state.add_notification(format!(
+        "Board recovery finished: {names} now read back healthy, not aborted, in Startup or Idle. Commands are available again."));
+    true
+}
+/// Shared by the automatic finish and the explicit operator waiver. Every
+/// target the current mode expects must be satisfied by a fresh verified
+/// readback, except boards in `waived`, which must still be absent from the
+/// network (not seen within `BOARD_SEEN_TIMEOUT_MS`) when the journal is
+/// written. Returns the pending targets' board names.
+fn finish_pending(state: &Arc<AppState>, waived: u8) -> Result<String, &'static str> {
     if crate::rrls::is_rrls() || state.shutdown_requested.load(Ordering::Acquire) {
-        return false;
+        return Err("Recovery can only be finished on the primary station");
     }
     let pending = state.launch_history.try_lock().ok().and_then(|history| history.recovery_pending()).filter(|p| !p.published);
-    if pending.is_none() || super::unsatisfied_pending_mask(state) != 0 {
-        return false;
+    if pending.is_none() {
+        return Err("No unfinished board recovery");
     }
-    let Some(router) = state.topology_router.get() else { return false; };
+    let blockers = super::pending_blockers(state);
+    if blockers.unsatisfied & !(waived & blockers.absent) != 0 {
+        return Err("A board of the unfinished recovery is not healthy yet");
+    }
+    let Some(router) = state.topology_router.get() else { return Err("Router unavailable"); };
     let topology = router.export_topology();
     // Serialize with PREPARE/CONFIRM and any running operation.
-    let Ok(control) = state.board_recovery.coordinator.0.try_lock() else { return false; };
+    let Ok(control) = state.board_recovery.coordinator.0.try_lock() else { return Err("Board recovery is busy"); };
     if control.shutdown_closed
         || control.ticket.as_ref().is_some_and(|ticket| ticket.created.elapsed() < CONFIRM_TTL)
         || control.operation.as_ref().is_some_and(|value| value["completed"] == false)
     {
-        return false;
+        return Err("A board recovery is being prepared or is running");
     }
-    let Ok(proxy) = crate::command_proxy::begin_primary_recovery() else { return false; };
+    let Ok(proxy) = crate::command_proxy::begin_primary_recovery() else { return Err("Proxy owner busy"); };
     if proxy.as_ref().is_some_and(|p| !p.is_quiescent()) {
-        return false;
+        return Err("Proxy traffic still in flight");
     }
+    // Sampled before the dispatch gate; the waived boards must stay absent.
+    let present = crate::board_abort::present_mask(state);
     let now = Stamp::now();
     let finished = crate::gse::reset_generation::finish_satisfied_recovery(state, |pending| {
         let Ok(inner) = state.board_recovery.inner.try_lock() else { return false; };
-        pending.targets.iter().all(|target| {
-            BOARDS.iter().enumerate().any(|(at, board)| {
-                super::pending_target_satisfied(*board, target, inner.values[at].as_ref(),
-                    endpoint_verified(state, *board, &topology), now)
-            })
-        })
+        let blockers = super::pending_blockers_from(&pending.targets, present, super::expected_boards(), |at, board, target| {
+            super::pending_target_satisfied(board, target, inner.values[at].as_ref(),
+                endpoint_verified(state, board, &topology), now)
+        });
+        blockers.unsatisfied & !(waived & blockers.absent) == 0
     });
     drop(control);
-    if finished.is_err() {
-        return false;
-    }
+    finished?;
     if let Some(proxy) = proxy {
         let nonce = crate::command_proxy::recovery::Barrier::prepare_reopen_nonce();
         if let Ok(mut owner) = proxy.try_prepare_reopen(nonce) { owner.commit(); }
     }
-    let names = pending.map(|p| p.targets.iter().map(|t| t.board.clone()).collect::<Vec<_>>().join(", ")).unwrap_or_default();
-    log::info!("Unfinished board recovery finished: {names} read back healthy");
-    state.add_notification(format!(
-        "Board recovery finished: {names} now read back healthy, not aborted, in Startup or Idle. Commands are available again."));
     crate::sequences::refresh_action_policy_now(state);
     state.broadcast_action_policy_snapshot();
-    true
+    Ok(pending.map(|p| p.targets.iter().map(|t| t.board.clone()).collect::<Vec<_>>().join(", ")).unwrap_or_default())
+}
+#[derive(serde::Deserialize)]
+pub(crate) struct FinishWithoutAbsentRequest {
+    /// The absent boards the operator confirmed leaving out, exactly as the
+    /// status endpoint names them (`host_recovery.absent`).
+    boards: Vec<String>,
+    confirm: bool,
+}
+/// Explicit administrator waiver: finish an unfinished recovery whose every
+/// present target reads back healthy, leaving out boards that have not been
+/// on the network for `BOARD_SEEN_TIMEOUT_MS`. Nothing is sent to any board.
+/// The request must name exactly the absent boards, and the waiver is
+/// recorded in the launch journal. A board left out that comes back aborted
+/// still blocks Launch through the Abort roster.
+// Safety catalog (About safety): reset-all-boards. Keep backend/src/safety_catalog_rules.rs in step.
+pub(crate) async fn finish_without_absent(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<FinishWithoutAbsentRequest>,
+) -> Response {
+    let refuse = |status: StatusCode, message: &str| {
+        (status, Json(json!({"error":"finish_without_absent_refused","message":message}))).into_response()
+    };
+    let principal = match crate::web::authorize_headers(&state, &headers, Permission::SendCommands).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    if principal.anonymous || !principal.is_admin() {
+        return refuse(StatusCode::FORBIDDEN, "Only an administrator can finish a recovery without absent boards.");
+    }
+    if !request.confirm {
+        return refuse(StatusCode::BAD_REQUEST, "Confirm leaving out the absent boards.");
+    }
+    let blockers = super::pending_blockers(&state);
+    let absent = blockers.unsatisfied & blockers.absent;
+    let present_blocking = blockers.unsatisfied & !blockers.absent;
+    if present_blocking != 0 {
+        return refuse(StatusCode::CONFLICT, &format!(
+            "{} on the network still need recovery. Recover them first.",
+            super::board_names(present_blocking).join(", ")));
+    }
+    if absent == 0 {
+        return refuse(StatusCode::CONFLICT, "No absent board holds the unfinished recovery.");
+    }
+    let mut named = request.boards.clone();
+    named.sort();
+    named.dedup();
+    let mut expected = super::board_names(absent).into_iter().map(String::from).collect::<Vec<_>>();
+    expected.sort();
+    if named != expected {
+        return refuse(StatusCode::CONFLICT, &format!(
+            "The absent boards are now {}. Review and confirm again.", expected.join(", ")));
+    }
+    let actor = principal.username.clone().unwrap_or_default();
+    let names = match finish_pending(&state, absent) {
+        Ok(names) => names,
+        Err(message) => return refuse(StatusCode::CONFLICT, message),
+    };
+    let waived = expected.join(", ");
+    if let Err(error) = state.launch_history.lock().unwrap().record_recovery_waiver(
+        crate::telemetry_task::get_current_timestamp_ms() as u64, &actor, expected.clone()) {
+        log::error!("Recording the recovery waiver for {waived} failed: {error:#}");
+    }
+    log::warn!("Board recovery ({names}) finished by {actor} without absent boards: {waived}");
+    state.add_notification(format!(
+        "Board recovery finished by {actor} without {waived} (not on the network). Commands are available again. Recover {waived} when they return."));
+    Json(json!({"finished":true,"waived":expected,"targets":names})).into_response()
 }
 /// Why an operator command found host admission closed, with what to do.
 pub(crate) fn admission_closed_message(state: &AppState, action: &str) -> String {
@@ -2504,17 +2584,20 @@ pub(crate) fn admission_closed_message(state: &AppState, action: &str) -> String
         return format!("A board recovery is running. {action} is available when it finishes.");
     }
     let pending = state.launch_history.lock().unwrap().recovery_pending().filter(|p| !p.published);
-    if let Some(pending) = pending {
-        let mask = super::unsatisfied_pending_mask(state);
-        let names = pending.targets.iter()
-            .filter(|t| BOARDS.iter().position(|b| b.sender_id() == t.board).is_none_or(|i| mask & (1 << i) != 0))
-            .map(|t| t.board.as_str()).collect::<Vec<_>>();
-        return if names.is_empty() {
-            format!("The unfinished board recovery is finishing now that its boards read back healthy. Retry {action} in a moment.")
-        } else {
-            format!("Board recovery is unfinished for {}. Recover {} with Review recovery or use Reset all boards; {action} is available afterwards.",
-                names.join(", "), if names.len() == 1 { "it" } else { "them" })
-        };
+    if pending.is_some() {
+        let blockers = super::pending_blockers(state);
+        if blockers.unsatisfied == 0 {
+            return format!("The unfinished board recovery is finishing now that its boards read back healthy. Retry {action} in a moment.");
+        }
+        let names = super::board_names(blockers.unsatisfied).join(", ");
+        let absent = blockers.unsatisfied & blockers.absent;
+        if absent != 0 && blockers.unsatisfied & !absent & 0x7f == 0 {
+            let verb = if absent.count_ones() == 1 { "is" } else { "are" };
+            let absent = super::board_names(absent).join(", ");
+            return format!("Board recovery is unfinished for {absent}, which {verb} not on the network. Bring {absent} back and use Reset all boards, or have an administrator use Finish without absent boards in Board recovery; {action} is available afterwards.");
+        }
+        return format!("Board recovery is unfinished for {names}. Recover {} with Review recovery or use Reset all boards; {action} is available afterwards.",
+            if blockers.unsatisfied.count_ones() == 1 { "it" } else { "them" });
     }
     if state.operator_admission_barrier.load(Ordering::Acquire) != 0 {
         return format!("Commands are closed by an unfinished board recovery. Use Reset all boards; {action} is available afterwards.");
@@ -3107,6 +3190,8 @@ mod tests {
         lose_proof_replies: usize,
         /// Every QUERY reply is lost (a board that never answers).
         silent_queries: bool,
+        /// The board left the network: it answers nothing at all.
+        offline: bool,
         /// Link latency for QUERY replies (a radio round trip).
         query_delay: Duration,
         /// Every other QUERY reply is lost, the first included (50% loss).
@@ -3498,6 +3583,7 @@ mod tests {
                             first_receipt: HashMap::new(),
                             lose_proof_replies: 0,
                             silent_queries: false,
+                            offline: false,
                             query_delay: Duration::ZERO,
                             lose_alternate_queries: false,
                             queries_seen: 0,
@@ -3546,6 +3632,11 @@ mod tests {
                     }
                     // The actual telemetry task is the sole host queue owner.
                     for link in &mut links {
+                        if link.model.lock().unwrap().offline {
+                            // Off the network: nothing reaches it and it sends nothing.
+                            link.outgoing.lock().unwrap().clear();
+                            continue;
+                        }
                         if link.board==Board::GatewayBoard && native_probe.as_ref().is_some_and(|p|p.get_due()) {
                             link.router.request_managed_variable(crate::telemetry_schema::data_type("FLIGHT_STATE")).unwrap();
                         }
@@ -3684,7 +3775,7 @@ mod tests {
                                     m.seen.insert(nonce, response.clone());
                                 }
                             }
-                            if wire[1] == 0 && m.silent_queries {
+                            if m.offline || wire[1] == 0 && m.silent_queries {
                                 continue;
                             }
                             if wire[1] == 0 && m.lose_alternate_queries {

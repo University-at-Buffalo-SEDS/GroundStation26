@@ -967,6 +967,16 @@ pub(crate) fn publish_daq_calibration(
         .map_err(|error| format!("publish DAQ calibration: {error}"))
 }
 
+/// 409 for an operator request refused because recovery admission is
+/// closed or moved on, naming why and what the operator can do about it.
+pub(crate) fn admission_refused(state: &AppState, action: &str) -> axum::response::Response {
+    (
+        StatusCode::CONFLICT,
+        crate::board_recovery::coordinator::admission_closed_message(state, action),
+    )
+        .into_response()
+}
+
 /// Saves only the explicitly selected channel; unscoped snapshot replacement
 /// is rejected by deserialization, including requests from older frontends.
 async fn set_loadcell_calibration(
@@ -983,11 +993,7 @@ async fn set_loadcell_calibration(
         return calibration_edit_forbidden_response();
     }
     let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
-        return (
-            StatusCode::CONFLICT,
-            "Recovery admission is closed or request is stale",
-        )
-            .into_response();
+        return admission_refused(&state, "Saving the calibration");
     };
     let cfg = {
         let mut current = state.loadcell_calibration.lock().unwrap();
@@ -1042,11 +1048,7 @@ async fn set_kg50_input(
         return calibration_edit_forbidden_response();
     }
     let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
-        return (
-            StatusCode::CONFLICT,
-            "Recovery admission is closed or request is stale",
-        )
-            .into_response();
+        return admission_refused(&state, "Changing the 50 kg input");
     };
     if state.loadcell_processing.status().running {
         return (
@@ -1095,11 +1097,7 @@ async fn capture_loadcell_zero(
         return calibration_edit_forbidden_response();
     }
     let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
-        return (
-            StatusCode::CONFLICT,
-            "Recovery admission is closed or request is stale",
-        )
-            .into_response();
+        return admission_refused(&state, "Capturing the zero point");
     };
     let updated = {
         let mut cfg = state.loadcell_calibration.lock().unwrap();
@@ -1146,11 +1144,7 @@ async fn capture_loadcell_span(
         return calibration_edit_forbidden_response();
     }
     let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
-        return (
-            StatusCode::CONFLICT,
-            "Recovery admission is closed or request is stale",
-        )
-            .into_response();
+        return admission_refused(&state, "Capturing the span point");
     };
     let updated = {
         let mut cfg = state.loadcell_calibration.lock().unwrap();
@@ -2022,11 +2016,7 @@ async fn set_flight_setup(
         return (StatusCode::FORBIDDEN, "permission denied").into_response();
     }
     let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
-        return (
-            StatusCode::CONFLICT,
-            "Recovery admission is closed or request is stale",
-        )
-            .into_response();
+        return admission_refused(&state, "Saving the flight setup");
     };
     match flight_setup::save(&cfg) {
         Ok(()) => Json(flight_setup::load_or_default()).into_response(),
@@ -2058,11 +2048,7 @@ async fn set_auto_zero(
         return calibration_edit_forbidden_response();
     }
     let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
-        return (
-            StatusCode::CONFLICT,
-            "Recovery admission is closed or request is stale",
-        )
-            .into_response();
+        return admission_refused(&state, "Changing auto zero");
     };
     if crate::gse::active(&state)
         || matches!(
@@ -2125,11 +2111,7 @@ async fn set_fill_targets(
         return (StatusCode::FORBIDDEN, "permission denied").into_response();
     }
     let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
-        return (
-            StatusCode::CONFLICT,
-            "Recovery admission is closed or request is stale",
-        )
-            .into_response();
+        return admission_refused(&state, "Saving the fill targets");
     };
     let result = (|| -> Result<FillTargetsConfig, (StatusCode, String)> {
         let mut gse = state.gse.lock().unwrap();
@@ -2181,11 +2163,7 @@ async fn apply_flight_setup(
         return (StatusCode::FORBIDDEN, "permission denied").into_response();
     }
     let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
-        return (
-            StatusCode::CONFLICT,
-            "Recovery admission is closed or request is stale",
-        )
-            .into_response();
+        return admission_refused(&state, "Applying the flight setup");
     };
 
     let cfg = flight_setup::load_or_default();
@@ -6488,11 +6466,7 @@ async fn capture_thermal_zero(
         return calibration_edit_forbidden_response();
     }
     let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
-        return (
-            StatusCode::CONFLICT,
-            "Recovery admission is closed or request is stale",
-        )
-            .into_response();
+        return admission_refused(&state, "Capturing the thermal zero");
     };
     if !matches!(req.sensor_id.as_str(), "KG1000" | "KG50") {
         return (StatusCode::BAD_REQUEST, "Select KG1000 or KG50").into_response();
@@ -6607,11 +6581,7 @@ async fn long_zero_apply(
         return calibration_edit_forbidden_response();
     }
     let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
-        return (
-            StatusCode::CONFLICT,
-            "Recovery admission is closed or request is stale",
-        )
-            .into_response();
+        return admission_refused(&state, "Applying the long zero");
     };
     let updated = {
         let mut slot = state.loadcell_calibration.lock().unwrap();
@@ -6813,6 +6783,34 @@ mod recovery_direct_ingress_tests {
         assert_eq!(wire["selected"], "p6_differential");
         assert_eq!(wire["board_input"], "p6_differential");
         assert_eq!(wire["state"], "synced");
+    }
+    #[tokio::test]
+    async fn closed_admission_refuses_calibration_with_its_reason_and_next_step() {
+        if crate::operator_queue::isolated_case(
+            module_path!(),
+            "closed_admission_refuses_calibration_with_its_reason_and_next_step",
+        ) {
+            return;
+        }
+        for kind in 0..2 {
+            let (_root, state, headers, _router, _) = fixture().await;
+            state.operator_admission_barrier.store(77, Ordering::Release);
+            let response = calibration_request(state.clone(), headers.clone(), kind).await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = axum::body::to_bytes(response.into_body(), 1 << 16).await.unwrap();
+            let text = String::from_utf8_lossy(&body);
+            assert!(
+                text.contains("unfinished board recovery") && text.contains("Reset all boards"),
+                "kind {kind}: {text}"
+            );
+            state.operator_admission_barrier.store(0, Ordering::Release);
+            // A request that crossed a reset says to retry, naming the action.
+            let generation = crate::gse::automatic_generation(&state);
+            state.automatic_generation.store(generation + 1, Ordering::Release);
+            let stale = admission_refused(&state, "Saving the calibration");
+            let body = axum::body::to_bytes(stale.into_body(), 1 << 16).await.unwrap();
+            assert!(String::from_utf8_lossy(&body).contains("Retry Saving the calibration"));
+        }
     }
     #[tokio::test]
     async fn real_calibration_ingress_keeps_preauth_origin_before_file_ram_and_sdk_effects() {

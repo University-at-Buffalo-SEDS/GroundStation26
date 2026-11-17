@@ -102,7 +102,11 @@ impl Selection {
         let scope = mode_scope(crate::station_mode::local_mode());
         // `actual` from a board that left the network can't be verified; a fresh
         // report counts as present even before board status records it.
-        let targets = selected_mask(present & scope, actual & state.board_abort.launch_abort_mask(state), pending, explicit)
+        // A retained pending target on a board this mode does not use (the
+        // AV bay in test fire) is not carried: it can never read back and
+        // would hold the station closed for good. A board actually reporting
+        // Abort is still reset whatever the mode.
+        let targets = selected_mask(present & scope, actual & state.board_abort.launch_abort_mask(state), pending & scope, explicit)
             | launch_proof_mask(state);
         Ok(Self {
             context,

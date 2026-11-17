@@ -544,3 +544,18 @@ fn launch_lock_release_is_refused_while_a_recovery_is_unfinished() {
     wait(&store);
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn recovery_waiver_is_journaled_bounded_and_restored() {
+    let path = path();
+    let mut state = Store::open(path.clone(), false, None, 10_000, 0).unwrap();
+    for i in 0..(RECOVERY_WAIVER_LIMIT as u64 + 3) {
+        state.record_recovery_waiver(i, "admin", vec!["FC".into()]).unwrap();
+    }
+    wait(&state);
+    let restored = Store::open(path.clone(), false, None, 11_000, 0).unwrap();
+    let waivers = restored.recovery_waivers();
+    assert_eq!(waivers.len(), RECOVERY_WAIVER_LIMIT);
+    assert_eq!(waivers.last().unwrap(), &RecoveryWaiver { utc_ms: RECOVERY_WAIVER_LIMIT as u64 + 2, actor: "admin".into(), boards: vec!["FC".into()] });
+    assert_eq!(restored.restored_recovery_barrier().0, 0);
+}

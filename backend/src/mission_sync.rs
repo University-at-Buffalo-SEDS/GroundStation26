@@ -558,7 +558,7 @@ async fn resolve(
             .into_response();
     }
     let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
-        return (StatusCode::CONFLICT, "Recovery admission is closed or request is stale").into_response();
+        return crate::web::admission_refused(&state, "Saving the mission settings");
     };
     let Some(runtime) = RUNTIME.get() else {
         return (

@@ -320,7 +320,20 @@ struct Disk {
     awaiting_new_launch: bool,
     #[serde(default)]
     new_cycle_confirmed: bool,
+    /// Administrator decisions to finish an unfinished recovery without
+    /// boards that were absent from the network (newest last, bounded).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    recovery_waivers: Vec<RecoveryWaiver>,
 }
+/// One explicit "finish recovery without absent boards" decision.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryWaiver {
+    pub utc_ms: u64,
+    pub actor: String,
+    pub boards: Vec<String>,
+}
+const RECOVERY_WAIVER_LIMIT: usize = 32;
 
 fn is_zero_manual_ceiling(value: &u64) -> bool {
     *value == 0
@@ -466,6 +479,7 @@ impl Store {
                 legacy_anchor_unknown: cached_daq.is_some_and(|value| value.0[0] != 0),
                 awaiting_new_launch: false,
                 new_cycle_confirmed: false,
+                recovery_waivers: Vec::new(),
             }
         };
         ensure!(
@@ -541,6 +555,7 @@ impl Store {
                 legacy_anchor_unknown: false,
                 awaiting_new_launch: false,
                 new_cycle_confirmed: false,
+                recovery_waivers: Vec::new(),
             },
             observer: false,
             synchronized: true,
@@ -1046,6 +1061,23 @@ impl Store {
         self.recovery_owner = 0;
         self.recovery_revision_staged = false;
         Ok(())
+    }
+    /// Journal an administrator's waiver of absent recovery boards. Called
+    /// after the recovery finished; the record is evidence only.
+    pub(crate) fn record_recovery_waiver(&mut self, utc_ms: u64, actor: &str, boards: Vec<String>) -> Result<()> {
+        ensure!(!self.observer && self.error.is_none(), "Journal unavailable");
+        let writer = self.writer.clone().context("A journal writer is required")?;
+        let mut next = self.data.clone();
+        next.recovery_waivers.push(RecoveryWaiver { utc_ms, actor: actor.to_string(), boards });
+        let excess = next.recovery_waivers.len().saturating_sub(RECOVERY_WAIVER_LIMIT);
+        next.recovery_waivers.drain(..excess);
+        self.last_write = writer.enqueue(next.clone())?;
+        self.data = next;
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn recovery_waivers(&self) -> &[RecoveryWaiver] {
+        &self.data.recovery_waivers
     }
     pub(crate) fn restored_recovery_barrier(&self) -> (u64, u64) {
         if self.error.is_some() {
