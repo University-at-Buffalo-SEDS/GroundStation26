@@ -9,7 +9,7 @@ import struct
 
 FC_HEAD='ec188c6daac84e3c957f57ca95d872953cbda588'
 DAQ_HEAD='ef3702d87071f204e5ccb9a124b739af82538ac2'
-DAQ_SD_HEAD='d8a398179295a6e6199816be558227ee1bfa1ff5'
+DAQ_SD_HEAD='55fe7a811b74001ea2e9db07de24f57b97feb176'
 # field, element reordering, target type, units. BARO existing summary is alt/prs/tmp;
 # raw barometer_sample is pressure/temperature/altitude. These must not be swapped.
 PROFILES={
