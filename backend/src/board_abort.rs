@@ -980,14 +980,15 @@ impl ActuatorReadbackRefresh {
         self.last = Some(now);
         // The board query verifies the dedicated discovered endpoint and keeps
         // any outstanding nonce alive. Do not probe legacy command endpoints.
-        if crate::board_recovery::request_board_query(state, Board::ActuatorBoard).status()
-            != axum::http::StatusCode::OK
-        {
-            return false;
-        }
-        let _ = crate::actuator_plumbing::request_drive_query(state);
-        let _ = crate::actuator_plumbing::request_motion_query(state);
-        true
+        let board = crate::board_recovery::request_board_query(state, Board::ActuatorBoard).status()
+            == axum::http::StatusCode::OK;
+        // The drive selection and the retraction's motion status have their
+        // own nonces and dedup, and go to the actuator's plumbing endpoint.
+        // A board query that is still outstanding or refused must not starve
+        // them, or a running QD retraction goes unreported.
+        let drive = crate::actuator_plumbing::request_drive_query(state).is_ok();
+        let motion = crate::actuator_plumbing::request_motion_query(state).is_ok();
+        board || drive || motion
     }
 }
 
@@ -1004,6 +1005,7 @@ pub(crate) async fn query_service(
     let mut confirm = crate::board_recovery::abort_confirm::AbortConfirmRefresh::default();
     // AV-bay demand that waits while an Abort's umbilical readback is owed.
     let mut held_demand = 0u8;
+    let mut retract_progress = crate::actuator_plumbing::ProgressPublisher::default();
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -1013,6 +1015,8 @@ pub(crate) async fn query_service(
             refresh.clear_av_bay_backoff();
         }
         let demand = state.board_abort.take_queries();
+        // The QD control's countdown moves without a new board report.
+        retract_progress.poll(&state);
         if crate::rrls::is_rrls() || !crate::board_recovery::coordinator::readonly_query_idle(&state) {
             continue;
         }

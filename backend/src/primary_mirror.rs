@@ -742,6 +742,7 @@ pub fn action_policy(state: &AppState) -> Option<ActionPolicyMsg> {
                     };
                     ActionControl { disabled_reason: None, requested: netvar.map(|view| view.requested),
                         network_note: netvar.and_then(crate::sequences::network_output_note),
+                        progress: None,
                         cmd: (*name).into(),
                         enabled: fresh
                             && (*name!="ToggleBoardStateProofInterlock"||r.board_proof_policy.is_some())

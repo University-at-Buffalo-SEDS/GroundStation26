@@ -384,6 +384,15 @@ async fn action_policy(app: &axum::Router, state: &Arc<AppState>, out: &mut Fixt
     out.add("action-policy/get", policy);
     let mut snapshot = state.action_policy_snapshot();
     snapshot.controls.retain(|control| crate::sequences::network_output_view(&control.cmd).is_none());
+    // A QD retraction the station sent and the actuator has not yet reported.
+    if let Some(qd) = snapshot.controls.iter_mut().find(|control| control.cmd == "RetractPlumbing") {
+        qd.progress = Some(crate::sequences::ControlProgress {
+            state: crate::sequences::ControlProgressState::Running,
+            confirmed: false,
+            remaining_ms: Some(31_000),
+            message: Some("Retraction command sent; running, not confirmed by the actuator.".into()),
+        });
+    }
     snapshot.controls.push(crate::sequences::ActionControl {
         disabled_reason: None,
         cmd: "ToggleAvBayUnderglow".into(),
@@ -392,6 +401,7 @@ async fn action_policy(app: &axum::Router, state: &Arc<AppState>, out: &mut Fixt
         actuated: view.confirmed,
         requested: Some(view.requested),
         network_note: note,
+        progress: None,
     });
     out.add("websocket/action-policy", serde_json::to_value(WsOutMsg::ActionPolicy(snapshot)).unwrap());
 }

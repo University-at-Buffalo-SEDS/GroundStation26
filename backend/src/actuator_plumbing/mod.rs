@@ -4,6 +4,8 @@
 pub(crate) mod http_tests;
 #[cfg(test)]
 mod refresh_tests;
+#[cfg(test)]
+mod progress_tests;
 mod motion_journal;
 mod motion_wire;
 mod wire;
@@ -179,6 +181,23 @@ struct Inner {
     pending_setting: Option<u64>,
     last_motion_stamp: u64,
     message: String,
+    /// The last retraction this station started that never reached the
+    /// actuator, for the QD control's failed state.
+    retract_failure: Option<RetractFailure>,
+    /// When this station put its latest retraction on the network.
+    retract_sent: Option<RetractSent>,
+}
+#[derive(Clone, Copy)]
+struct RetractSent {
+    at: Instant,
+    mode: u8,
+    mode_revision: u64,
+    generation: u64,
+}
+#[derive(Clone)]
+struct RetractFailure {
+    at: Instant,
+    message: String,
 }
 pub(crate) struct Runtime {
     issuer: u64,
@@ -229,6 +248,8 @@ impl Default for Runtime {
                 pending_setting: None,
                 last_motion_stamp: 0,
                 message: "Query the actuator for its saved drive selection.".into(),
+                retract_failure: None,
+                retract_sent: None,
             }),
         }
     }
@@ -420,6 +441,11 @@ pub(crate) fn schedule_motion_under_dispatch(
     }) {
         return Err("Retraction journal is closed/busy or original admission changed. Inspect status before an explicit retry.".into());
     }
+    {
+        let mut inner = state.plumbing_drive.inner.lock().unwrap();
+        inner.retract_failure = None;
+        inner.retract_sent = None;
+    }
     let state = state.clone();
     let reservation = MotionWorkerReservation(state.clone());
     handle.spawn_blocking(move || {
@@ -489,12 +515,16 @@ pub(crate) fn schedule_motion_under_dispatch(
             {
                 let mut inner=state.plumbing_drive.inner.lock().unwrap();
                 inner.last_motion_stamp=inner.last_motion_stamp.max(record.original_utc_ms);
+                inner.retract_sent=Some(RetractSent{at:Instant::now(),mode:record.mode,
+                    mode_revision:record.mode_revision,generation:record.generation});
             }
             crate::telemetry_task::flush_command_tx(router,"Durable original retraction intent");
             schedule_post_motion_queries(state.clone(),record.clone());
             Ok(())
         })();
         if let Err(error)=result {
+            state.plumbing_drive.inner.lock().unwrap().retract_failure =
+                Some(RetractFailure { at: Instant::now(), message: format!("Retraction was not sent: {error}") });
             crate::web::emit_notification_warning(&state,format!("Retraction was not confirmed: {error}. Launch remains inhibited; inspect status before an explicit retry."));
         }
     });
@@ -760,6 +790,128 @@ pub(crate) fn retract_motion_completed(state: &AppState) -> bool {
             && row.value.completed_retract()
             && row.received.elapsed().as_millis() <= u128::from(gse_sequence::VALVE_REPORT_FRESH_MS)
     })
+}
+/// How long a retraction that never reached the actuator shows as failed.
+const RETRACT_FAILURE_SHOWN_MS: u128 = 60_000;
+/// The auxiliary drive's timed retraction move (the actuator's
+/// FILL_DURATION_MS). A retraction the station sent with no actuator motion
+/// report is shown running for this long, then unconfirmed.
+const RETRACT_MOVE_MS: u32 = 45_000;
+
+/// The QD control's progress: starting (being sent), running (confirmed by
+/// the actuator's motion status, or estimated from the station's own send
+/// when the actuator has not reported it), completed, failed, or
+/// unconfirmed once the estimated move is over without a report. This is
+/// presentation only: it never confirms the retraction or admits Launch,
+/// which stays with `retraction_gate`.
+pub(crate) fn retract_progress(state: &AppState) -> Option<crate::sequences::ControlProgress> {
+    use crate::sequences::{ControlProgress, ControlProgressState as S};
+    let key = crate::rocket_commands::ActuatorBoardCommands::RetractPlumbing as u8;
+    let retracted = state.get_umbilical_valve_state(key) == Some(true);
+    let pending = state.get_pending_umbilical_valve_state(key) == Some(true);
+    let worker_pending = state.plumbing_drive.motion_journal.pending();
+    let generation = crate::gse::automatic_generation(state);
+    let inner = state.plumbing_drive.inner.lock().unwrap();
+    let revision = inner.desired.revision;
+    let make = |state, confirmed, remaining_ms, message: Option<&str>| {
+        Some(ControlProgress { state, confirmed, remaining_ms, message: message.map(str::to_owned) })
+    };
+    let row = inner
+        .motion_observed
+        .as_ref()
+        .filter(|row| row.generation == generation && row.mode_revision == revision);
+    let sent = inner
+        .retract_sent
+        .filter(|sent| sent.generation == generation && sent.mode_revision == revision);
+    if let Some(row) = row {
+        let since = row.received.elapsed();
+        if retract_row_active(row, generation, revision, since) {
+            let reported = row.value.setting.remaining_ms;
+            let remaining = (reported != 0).then(|| {
+                reported.saturating_sub(since.as_millis().min(u128::from(u32::MAX)) as u32)
+            });
+            return make(S::Running, true, remaining, None);
+        }
+    }
+    // Cleared when a new retraction is scheduled, so it is the latest one.
+    if let Some(failure) = inner.retract_failure.as_ref()
+        && failure.at.elapsed().as_millis() <= RETRACT_FAILURE_SHOWN_MS
+    {
+        return make(S::Failed, false, None, Some(&failure.message));
+    }
+    if worker_pending {
+        return make(S::Starting, false, None, None);
+    }
+    // A terminal motion report counts only when it was asked for after the
+    // station's latest send, so an earlier operation's result is not shown
+    // as this one's.
+    let terminal = row.filter(|row| {
+        row.received.elapsed().as_millis() <= u128::from(gse_sequence::VALVE_REPORT_FRESH_MS)
+            && row.value.accepted_action == 1
+            && sent.is_none_or(|sent| row.after.wall > sent.at)
+    });
+    if let Some(row) = terminal {
+        if row.value.completed_retract() {
+            return make(S::Completed, true, Some(0), None);
+        }
+        match row.value.lifecycle {
+            3 => return make(S::Failed, true, None,
+                Some("The actuator stopped the retraction before it completed.")),
+            4 => return make(S::Failed, true, None,
+                Some("The actuator reported a fill-drive fault during the retraction.")),
+            _ => {}
+        }
+    }
+    if retracted {
+        return make(S::Completed, true, Some(0), None);
+    }
+    if let Some(sent) = sent {
+        let elapsed = sent.at.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+        if elapsed < RETRACT_MOVE_MS {
+            let remaining = (sent.mode == Mode::Auxiliary as u8)
+                .then(|| RETRACT_MOVE_MS - elapsed);
+            return make(S::Running, false, remaining, Some(
+                "Retraction command sent; running, not confirmed by the actuator.",
+            ));
+        }
+        return make(S::Unconfirmed, false, None, Some(
+            "The retraction move time has passed but the actuator has not confirmed it retracted.",
+        ));
+    }
+    if pending {
+        return make(S::Starting, false, None, None);
+    }
+    None
+}
+/// Republishes the action policy every second while a QD retraction is
+/// starting or running, and once when it leaves that state, so its
+/// countdown and end show without waiting for an unrelated policy change.
+#[derive(Default)]
+pub(crate) struct ProgressPublisher {
+    last: Option<Instant>,
+    active: bool,
+}
+impl ProgressPublisher {
+    pub(crate) fn poll(&mut self, state: &AppState) -> bool {
+        if crate::rrls::is_rrls() {
+            return false;
+        }
+        let active = retract_progress(state).is_some_and(|p| {
+            matches!(
+                p.state,
+                crate::sequences::ControlProgressState::Starting
+                    | crate::sequences::ControlProgressState::Running
+            )
+        });
+        let due = self.last.is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(1));
+        let publish = (active && due) || (self.active && !active);
+        self.active = active;
+        if publish {
+            self.last = Some(Instant::now());
+            state.broadcast_action_policy_snapshot();
+        }
+        publish
+    }
 }
 fn retract_row_active(
     row: &MotionObservation,

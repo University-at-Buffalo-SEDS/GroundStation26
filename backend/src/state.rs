@@ -437,7 +437,7 @@ fn rrls_takeover_policy(local: ActionPolicyMsg) -> ActionPolicyMsg {
     for name in crate::sequences::all_command_names() {
         if crate::command_proxy::takeover_operation(name) && !policy.controls.iter().any(|c| c.cmd == name) {
             policy.controls.push(crate::sequences::ActionControl {
-                disabled_reason: None, requested: None, network_note: None,
+                disabled_reason: None, requested: None, network_note: None, progress: None,
                 cmd: name.into(), enabled: true, blink: crate::sequences::BlinkMode::None, actuated: None,
             });
         }
@@ -2135,6 +2135,9 @@ impl AppState {
             }
             crate::sequence_access::project_policy(self, &mut local);
             crate::sequences::explain_disabled_policy(&mut local);
+            if let Some(control) = local.controls.iter_mut().find(|c| c.cmd == "RetractPlumbing") {
+                control.progress = crate::actuator_plumbing::retract_progress(self);
+            }
             return local;
         }
         if crate::rrls::takeover_active() {

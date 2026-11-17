@@ -206,7 +206,7 @@ async fn ignition_pair_policy_disables_sequence_without_disabling_manual_off_cat
             "Abort",
         ]
         .into_iter()
-        .map(|name| crate::sequences::ActionControl { disabled_reason: None, requested: None, network_note: None,
+        .map(|name| crate::sequences::ActionControl { disabled_reason: None, requested: None, network_note: None, progress: None,
             cmd: name.into(),
             enabled: true,
             blink: crate::sequences::BlinkMode::Slow,

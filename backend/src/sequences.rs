@@ -46,6 +46,41 @@ pub struct ActionControl {
     /// while the GS has seen no network value for the variable at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_note: Option<String>,
+    /// A timed physical operation behind this control (the QD retraction),
+    /// as the owning board reports it. Presentation only: it never enables,
+    /// confirms or admits anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<ControlProgress>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlProgressState {
+    /// The station sent the request; the board has not yet reported it running.
+    Starting,
+    /// The board reports the operation running.
+    Running,
+    /// The board reports the operation completed.
+    Completed,
+    /// The operation was stopped, faulted or never started.
+    Failed,
+    /// The operation should be over but the board never confirmed it.
+    Unconfirmed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ControlProgress {
+    pub state: ControlProgressState,
+    /// The owning board reported this state. False for the station's own
+    /// estimate from what it sent.
+    #[serde(default)]
+    pub confirmed: bool,
+    /// Time the board reported left in the move, aged by the time since that
+    /// report. Absent when the board reports no timed move.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -573,7 +608,7 @@ mod network_note_tests {
 
     #[test]
     fn network_note_round_trips_and_is_omitted_when_absent() {
-        let mut control = ActionControl { disabled_reason: None, requested: None, network_note: None,
+        let mut control = ActionControl { disabled_reason: None, requested: None, network_note: None, progress: None,
             cmd: "ToggleAvBayUnderglow".into(), enabled: true, blink: BlinkMode::None, actuated: None };
         let json = serde_json::to_string(&control).unwrap();
         assert!(!json.contains("network_note") && !json.contains("owner_note"));
@@ -1299,7 +1334,7 @@ pub fn default_action_policy() -> ActionPolicyMsg {
                 let enabled = is_station_utility_command(cmd)
                     || default_recording_command_enabled(cmd)
                         .unwrap_or(matches!(cmd, "Abort" | "Postinit" | "ResetSim"));
-                ActionControl { disabled_reason: None, requested: None, network_note: None,
+                ActionControl { disabled_reason: None, requested: None, network_note: None, progress: None,
                     cmd: cmd.to_string(),
                     enabled,
                     blink: backend_blink_for(cmd, enabled, None),
@@ -1346,7 +1381,7 @@ fn policy_with_overrides(
             } else {
                 key_enabled
             };
-            ActionControl { disabled_reason: None, requested: None, network_note: None,
+            ActionControl { disabled_reason: None, requested: None, network_note: None, progress: None,
                 cmd: cmd.to_string(),
                 enabled,
                 blink: backend_blink_for(cmd, enabled, recommended.get(cmd)),
@@ -2386,7 +2421,7 @@ fn hitl_action_policy(valves: ValveSnapshot) -> ActionPolicyMsg {
         .into_iter()
         .map(|cmd| {
             let actuated = default_command_actuated(cmd).or_else(|| valves.actuated_for_cmd(cmd));
-            ActionControl { disabled_reason: None, requested: None, network_note: None,
+            ActionControl { disabled_reason: None, requested: None, network_note: None, progress: None,
                 cmd: cmd.to_string(),
                 enabled: true,
                 blink: BlinkMode::None,

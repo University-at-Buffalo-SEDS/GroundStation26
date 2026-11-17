@@ -1018,7 +1018,7 @@ pub fn decorate_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
                 .or_else(|| rt.engine.refusal_reason(Action::StartFill, input).filter(|_| !input.prelaunch || !input.interlock))
                 .unwrap_or_else(|| "Turbocharge runs only during a fill, after the nitrogen test passes.".into())
         }),
-        requested: None, network_note: None,
+        requested: None, network_note: None, progress: None,
         cmd: "Turbocharge".into(),
         enabled: turbo_enabled,
         blink: BlinkMode::None,
@@ -1047,7 +1047,7 @@ pub fn decorate_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
                 "Not available at this step of the operational sequence.".into()
             }))
         };
-        policy.controls.push(ActionControl { disabled_reason: reason, requested: None, network_note: None,
+        policy.controls.push(ActionControl { disabled_reason: reason, requested: None, network_note: None, progress: None,
             cmd: cmd.into(),
             enabled,
             blink: BlinkMode::None,
@@ -1063,7 +1063,7 @@ pub fn decorate_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
         policy
             .controls
             .retain(|c| c.cmd != "ToggleGroundStationControl");
-        policy.controls.push(ActionControl { disabled_reason: None, requested: None, network_note: None,
+        policy.controls.push(ActionControl { disabled_reason: None, requested: None, network_note: None, progress: None,
             cmd: "ToggleGroundStationControl".into(),
             enabled: true,
             blink: BlinkMode::None,

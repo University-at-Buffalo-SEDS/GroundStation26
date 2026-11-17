@@ -45,7 +45,13 @@
         "blink": "none",
         "cmd": "RetractPlumbing",
         "disabled_reason": "This command is unavailable under the current GroundStation policy.",
-        "enabled": false
+        "enabled": false,
+        "progress": {
+          "confirmed": false,
+          "message": "Retraction command sent; running, not confirmed by the actuator.",
+          "remaining_ms": 31000,
+          "state": "running"
+        }
       },
       {
         "actuated": null,

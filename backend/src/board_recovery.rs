@@ -1698,6 +1698,14 @@ fn rejected_query_offer(reason: sedsnet::TelemetryError) -> Response {
 pub(crate) fn request_board_query(state: &Arc<AppState>, board: Board) -> Response {
     send_board_query(state, board, QueryMode::Background)
 }
+/// Leaves an unanswered background query outstanding for `board`, so the
+/// next background query is refused as still pending.
+#[cfg(test)]
+pub(crate) fn hold_unanswered_query_for_test(state: &AppState, board: Board) {
+    let at = index(board).unwrap();
+    state.board_recovery.inner.lock().unwrap().queries[at] =
+        Some(Query { abort_revision: 0, nonce: 1, sent: Stamp::now(), received: false });
+}
 /// A fresh query even while an older one is unanswered; the older query's
 /// reply still counts. Used for prompt Abort readback (`abort_confirm`).
 fn requery_board_query(state: &Arc<AppState>, board: Board) -> Response {

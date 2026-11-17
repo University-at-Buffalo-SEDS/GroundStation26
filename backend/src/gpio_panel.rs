@@ -762,6 +762,17 @@ fn led_for(state: &AppState, policy: &ActionPolicyMsg, cmd: &str, now_ms: u64) -
     {
         return 1.0;
     }
+    // A running QD retraction blinks its LED whether or not the control can
+    // be pressed again.
+    if control.progress.as_ref().is_some_and(|p| {
+        matches!(
+            p.state,
+            crate::sequences::ControlProgressState::Starting
+                | crate::sequences::ControlProgressState::Running
+        )
+    }) {
+        return blink_brightness(BlinkMode::Fast, Some(false), now_ms);
+    }
     if !control.enabled {
         return LED_DISABLED_BRIGHTNESS;
     }
