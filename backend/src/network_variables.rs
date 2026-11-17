@@ -1078,14 +1078,6 @@ pub(crate) fn resend_aborted_flight_state(router: &Router) -> Result<bool> {
     resend_latest_flight_state(router, &[], |value| value == NetworkFlightState::Aborted)
 }
 
-/// After a network-clock step: send this station's latest FLIGHT_STATE again
-/// (its original stamp, a fresh identity) so a board whose managed cache
-/// dropped it during re-anchoring receives it. Launch and a pending write are
-/// skipped, as for every re-send. Returns whether it was sent.
-pub(crate) fn resend_latest_flight_state_after_clock_step(router: &Router) -> Result<bool> {
-    resend_latest_flight_state(router, &[], |_| true)
-}
-
 fn resend_latest_flight_state(
     router: &Router,
     exhausted_heads: &[u64],

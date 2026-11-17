@@ -305,7 +305,14 @@ pub(crate) fn station_time_status() -> Option<crate::types::StationTimeStatus> {
         utc_bound_us: abs.bound_us,
         gps_delay_us: abs.gps_delay_us,
         gps_delay_learned: abs.gps_delay_learned,
+        time_base: crate::types::NetworkTimeBase::from_status(&status),
     })
+}
+
+/// The station router's network time base for the clock status API.
+pub(crate) fn network_time_base() -> Option<crate::types::NetworkTimeBase> {
+    let status = NETWORK_TIME_ROUTER.get()?.timesync_status()?;
+    Some(crate::types::NetworkTimeBase::from_status(&status))
 }
 
 /// Absolute-time source and bound for the UI ("UTC via GPS +-X ms").
@@ -358,10 +365,7 @@ fn refresh_station_network_time_at(router: &Router, host_ns: i64) {
             status.error_bound_ns.saturating_add(20_000_000),
         ));
     }
-    let may_step = crate::absolute_time::may_step(
-        crate::network_variables::flight_state(),
-        crate::network_health::any_board_time_locked(),
-    );
+    let may_step = apply_timesync_step_policy(router);
     let stepped = abs.update(crate::absolute_time::Inputs {
         now: std::time::Instant::now(),
         ntp_synced: host_clock_ntp_synced(),
@@ -377,30 +381,22 @@ fn refresh_station_network_time_at(router: &Router, host_ns: i64) {
     {
         return;
     }
-    // The host clock itself jumped (set by the operator or by NTP after an
-    // RTC-less boot): SEDSnet would slew the hours at 5%, days during which
-    // the station runs faster than its followers can track. Step instead
-    // while a step is allowed, as for an absolute correction.
-    let host_jumped = !stepped
-        && may_step
-        && host_jump_needs_step(
-            router.network_time_ns(),
-            utc_ns,
-            leading_station_clock(router),
-        );
-    if stepped || host_jumped {
+    let before = router.timesync_status();
+    // An absolute coarse set (absolute_time steps its correction beyond
+    // 100 ms only while the policy allows a step) is applied as an explicit
+    // step. Every other reading, including a host clock the operator or NTP
+    // just set, is a plain local source: SEDSnet steps it beyond its 1 s
+    // threshold (a new epoch) while steps are allowed and slews it otherwise.
+    if stepped && router.step_local_network_time_ns(utc_ns) {
         log::warn!(
-            "station UTC coarse-set by {} us ({:?}{})",
+            "station UTC coarse-set by {} us ({:?})",
             status.correction_us,
-            status.source,
-            if host_jumped { ", host clock jumped" } else { "" }
+            status.source
         );
-        if router.step_local_network_time_ns(utc_ns) {
-            note_network_clock_step();
-        }
     } else if let Some(t) = sedsnet::timesync::NetworkTime::from_unix_ns(i128::from(utc_ns)) {
         router.set_local_network_time(t.into());
     }
+    log_network_time_step(router, before, "station host UTC");
     if let Some(diff) = status.gps_minus_ntp_us {
         log::debug!(
             "GPS UTC (delay {} us, {}) minus NTP host UTC: {diff} us",
@@ -410,124 +406,39 @@ fn refresh_station_network_time_at(router: &Router, host_ns: i64) {
     }
 }
 
-/// After the station steps its network clock, boards re-anchor within one or
-/// two seconds. A managed FLIGHT_STATE written in between carries the new
-/// timescale's stamp and a board's managed cache can still drop it as older
-/// than the value it cached (while acknowledging it). Re-send the current
-/// values once boards have re-anchored.
-const STEP_REPUBLISH_AFTER: [std::time::Duration; 2] =
-    [std::time::Duration::from_secs(3), std::time::Duration::from_secs(6)];
-static STEP_REPUBLISH_AT: std::sync::Mutex<Vec<std::time::Instant>> =
-    std::sync::Mutex::new(Vec::new());
-
-/// Records a network-clock step; the re-sends follow at +3 s and +6 s.
-pub(crate) fn note_network_clock_step() {
-    note_network_clock_step_at(std::time::Instant::now());
-}
-fn note_network_clock_step_at(at: std::time::Instant) {
-    let mut due = STEP_REPUBLISH_AT
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    due.clear();
-    due.extend(STEP_REPUBLISH_AFTER.iter().map(|after| at + *after));
+/// Applies the station's step policy to SEDSnet and returns it: local time
+/// sources may step the network clock before any board is locked or in
+/// Startup/Idle, never from Armed through Recovery (`absolute_time::may_step`).
+/// Called before every local time source is handed to the router, so the
+/// decision always uses the current flight state.
+pub(crate) fn apply_timesync_step_policy(router: &Router) -> bool {
+    let allowed = crate::absolute_time::may_step(
+        crate::network_variables::flight_state(),
+        crate::network_health::any_board_time_locked(),
+    );
+    router.set_timesync_steps_allowed(allowed);
+    allowed
 }
 
-/// Whether a post-step re-send is due at `now` (each fires once).
-pub(crate) fn take_due_step_republish(now: std::time::Instant) -> bool {
-    let mut due = STEP_REPUBLISH_AT
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let before = due.len();
-    due.retain(|at| *at > now);
-    due.len() != before
-}
-
-/// Re-sends this station's latest FLIGHT_STATE (same stamp, fresh identity;
-/// never Launch, never while one is pending) and the other station-owned
-/// network variables.
-pub(crate) fn republish_after_clock_step(state: &AppState, router: &Router) {
-    match crate::network_variables::resend_latest_flight_state_after_clock_step(router) {
-        Ok(true) => log::info!("FLIGHT_STATE re-sent after a network clock step"),
-        Ok(false) => {}
-        Err(error) => log::warn!("FLIGHT_STATE re-send after a clock step failed: {error}"),
-    }
-    if let Err(error) = crate::network_variables::publish_bootstrap_for_state(state, router) {
-        log::warn!("Network variables re-publish after a clock step failed: {error}");
-    }
-}
-
-#[cfg(test)]
-mod step_republish_tests {
-    use super::*;
-
-    #[test]
-    fn a_clock_step_schedules_two_resends_that_fire_once_each() {
-        let t = std::time::Instant::now();
-        note_network_clock_step_at(t);
-        assert!(!take_due_step_republish(t + std::time::Duration::from_millis(2_900)));
-        assert!(take_due_step_republish(t + std::time::Duration::from_millis(3_100)));
-        assert!(!take_due_step_republish(t + std::time::Duration::from_millis(3_200)));
-        assert!(take_due_step_republish(t + std::time::Duration::from_millis(6_100)));
-        assert!(!take_due_step_republish(t + std::time::Duration::from_secs(60)));
-    }
-}
-
-/// A fed host reading this far from the running network clock is a host
-/// clock jump, not oscillator drift (the clock is fed every second).
-const HOST_JUMP_STEP_NS: i128 = 1_000_000_000;
-
-/// The station leads network time (it does not follow a remote such as RF).
-fn leading_station_clock(router: &Router) -> bool {
-    router
-        .timesync_status()
-        .is_none_or(|status| status.is_reference)
-}
-
-/// Whether a fed host UTC must step the running network clock.
-fn host_jump_needs_step(network_ns: Option<i128>, fed_utc_ns: i64, leading: bool) -> bool {
-    leading
-        && network_ns.is_some_and(|now| (now - i128::from(fed_utc_ns)).abs() > HOST_JUMP_STEP_NS)
-}
-
-#[cfg(test)]
-mod host_jump_tests {
-    use super::*;
-
-    /// A Pi booted on a stale clock leads the network hours behind; when its
-    /// OS clock is then corrected (either way), the next refresh must step.
-    #[test]
-    fn corrected_host_clock_steps_the_leading_network_clock() {
-        use std::sync::{
-            Arc,
-            atomic::{AtomicU64, Ordering},
-        };
-        let clock = Arc::new(AtomicU64::new(0));
-        let input = clock.clone();
-        let router = Router::new_with_clock(
-            sedsnet::router::RouterConfig::new([]),
-            Box::new(move || input.load(Ordering::Relaxed)),
+/// Logs a step (or epoch change) SEDSnet made since `before` was read.
+pub(crate) fn log_network_time_step(
+    router: &Router,
+    before: Option<sedsnet::timesync::TimeSyncStatus>,
+    source: &str,
+) {
+    let Some(after) = router.timesync_status() else {
+        return;
+    };
+    if before.is_none_or(|before| before.steps != after.steps)
+        && let Some(step) = after.last_step
+    {
+        log::warn!(
+            "network time stepped by {} ms from {source} ({}), epoch {} -> {}",
+            step.delta_ns / 1_000_000,
+            step.reason.name(),
+            step.from_epoch,
+            step.to_epoch
         );
-        let stale_ns = 1_800_000_000_000_000_000i64;
-        router.set_local_network_time(
-            sedsnet::timesync::NetworkTime::from_unix_ns(i128::from(stale_ns))
-                .unwrap()
-                .into(),
-        );
-        clock.store(10_000, Ordering::Relaxed);
-        let now = router.network_time_ns().unwrap();
-        for jump_ns in [13_700_000_000_000i64, -13_700_000_000_000] {
-            let corrected = now as i64 + jump_ns;
-            assert!(host_jump_needs_step(
-                Some(now),
-                corrected,
-                leading_station_clock(&router)
-            ));
-            // A station following a remote leader leaves it to time sync.
-            assert!(!host_jump_needs_step(Some(now), corrected, false));
-        }
-        // Ordinary per-second feeding (sub-second disagreement) never steps.
-        assert!(!host_jump_needs_step(Some(now), now as i64 + 5_000_000, true));
-        assert!(!host_jump_needs_step(None, now as i64, true));
     }
 }
 

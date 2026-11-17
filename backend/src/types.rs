@@ -683,6 +683,62 @@ pub struct StationTimeStatus {
     pub gps_delay_us: i64,
     #[serde(default)]
     pub gps_delay_learned: bool,
+    /// Time-base epoch, step policy and the last step (SEDSnet 6).
+    #[serde(default)]
+    pub time_base: NetworkTimeBase,
+}
+
+/// The station's network time base: SEDSnet starts a new epoch on every step
+/// of the network clock (an operator or host UTC correction over 1 s while
+/// steps are allowed) and followers adopt it within an exchange.
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default)]
+pub struct NetworkTimeBase {
+    /// Epoch of the station's network clock.
+    pub epoch: u16,
+    /// Newest epoch heard on the network; above `epoch` the station is
+    /// re-anchoring to it.
+    pub newest_seen_epoch: u16,
+    /// The station holds its clock until its source adopts its epoch.
+    pub holding: bool,
+    /// A local time source may step the network clock now (Startup/Idle or
+    /// no board locked); otherwise every correction slews at 20 ppm.
+    pub steps_allowed: bool,
+    /// Steps and epoch changes since the station started.
+    pub steps: u32,
+    /// The most recent step or epoch change.
+    pub last_step: Option<NetworkTimeStep>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default)]
+pub struct NetworkTimeStep {
+    /// New reading minus old reading, ms (0 for an epoch rename).
+    pub delta_ms: i64,
+    /// "local_source", "explicit", "utc_anchor", "source_epoch", "resync",
+    /// "diverged", "renamed", "joined" or "raised".
+    pub reason: String,
+    pub from_epoch: u16,
+    pub to_epoch: u16,
+    /// Age of the step, ms.
+    pub age_ms: u64,
+}
+
+impl NetworkTimeBase {
+    pub fn from_status(status: &sedsnet::timesync::TimeSyncStatus) -> Self {
+        Self {
+            epoch: status.epoch,
+            newest_seen_epoch: status.newest_seen_epoch,
+            holding: status.holding,
+            steps_allowed: status.steps_allowed,
+            steps: status.steps,
+            last_step: status.last_step.map(|step| NetworkTimeStep {
+                delta_ms: step.delta_ns / 1_000_000,
+                reason: step.reason.name().to_string(),
+                from_epoch: step.from_epoch,
+                to_epoch: step.to_epoch,
+                age_ms: step.age_ms,
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default)]
