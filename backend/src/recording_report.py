@@ -366,11 +366,11 @@ def export_daq(streams, metadata, request, delimiter=",", provenance=None, all_s
         for candidate,samples in (all_streams or streams).items():
             for _,_,_,rec,rid in samples:
                 original=provenance.get((rec,rid),{})
-                if original.get("origin")=="sd":
+                if original.get("origin")=="sd" and not derived_sd(original):
                     physical_channels[(rec,original.get("sd_sample_id"))].add(candidate)
     for received, recording, row_id, key, value, source in sorted(selected):
         origin=(provenance or {}).get((recording,row_id))
-        if origin and origin.get("origin")=="sd":
+        if origin and origin.get("origin")=="sd" and not derived_sd(origin):
             sample_id=origin.get("sd_sample_id")
             if sample_id is None or not isinstance(origin.get("fields"),dict):
                 raise ValueError("Resolved SD recording lacks its original thirteen fields; no substitute was produced.")
@@ -384,7 +384,7 @@ def export_daq(streams, metadata, request, delimiter=",", provenance=None, all_s
             continue
         sender, kind, index = json.loads(key)
         utc = source if isinstance(source, int) and 315532800000 <= source < 4354819200000 else None
-        sensor = "kg1000_network" if (sender, kind, index) == ("DAQ", "KG1000", 0) else key
+        sensor = DAQ_SD_SENSORS.get((sender, kind, index), key)
         labels = metadata[key].get("boolean_labels")
         provenance = {"recording": recording, "row_id": row_id, "channel": key,
                       "received_timestamp_ms": received, "source_timestamp_ms": source,
@@ -394,6 +394,20 @@ def export_daq(streams, metadata, request, delimiter=",", provenance=None, all_s
         out.append(daq_record({"timestamp_ms": utc, "sensor": sensor, "value": daq_float(value),
                                "time_source": "network" if utc is not None else "unknown"}, delimiter))
     return "".join(out).encode()
+
+
+# Station channels written in DAQ SD layout under the DAQ's own SD names
+# (<sensor>_<unit>; DAQ-Board docs/sd-record-format.md). Values sit in the
+# value column, like any scalar row.
+DAQ_SD_SENSORS = {("DAQ", "KG1000", 0): "kg1000_v", ("DAQ", "KG50", 0): "kg50_v",
+                  ("DAQ", "DAQ_POWER_MONITOR", 2): "input_voltage_v",
+                  ("DAQ", "DAQ_POWER_MONITOR", 3): "input_current_a"}
+
+
+def derived_sd(origin):
+    """An SD value computed from several records (KG1000/KG50 boxcar, paired
+    supply), so not one physical SD record to copy verbatim."""
+    return isinstance(origin.get("mapping"), dict) and origin["mapping"].get("derived") in ("boxcar", "pair")
 
 
 def export_daq_sd_rows(samples, delimiter=","):

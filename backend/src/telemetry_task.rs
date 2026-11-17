@@ -6956,7 +6956,12 @@ mod tests {
         );
         assert_eq!(
             &header[15..],
-            &["Chamber Pressure (psig)", "Chamber Connector Voltage (V)"]
+            &[
+                "Chamber Pressure (psig)",
+                "Chamber Connector Voltage (V)",
+                "DAQ Input Voltage (V)",
+                "DAQ Input Current (A)"
+            ]
         );
         let data: Vec<Vec<_>> = csv
             .lines()
@@ -6968,9 +6973,9 @@ mod tests {
             4,
             "one original loadcell sample each; combined and projection are not extra samples"
         );
-        assert!(data.iter().all(|row| row.len() == 17));
-        assert_eq!(&data[0][15..], &["", ""], "absent pressure is not zero");
-        assert_eq!(&data[1][15..], &["1000", "5"]);
+        assert!(data.iter().all(|row| row.len() == 19));
+        assert_eq!(&data[0][15..17], &["", ""], "absent pressure is not zero");
+        assert_eq!(&data[1][15..17], &["1000", "5"]);
         assert_eq!(
             data[1][0], expected_rx,
             "actual PT packet receive clock retained"
@@ -6981,13 +6986,13 @@ mod tests {
             "recorded load-cell volts remain unchanged"
         );
         assert_eq!(
-            &data[2][15..],
+            &data[2][15..17],
             &["", ""],
             "previous PT must not carry into a later independent sample"
         );
         assert_eq!(data[2][3], "300");
         assert_eq!(
-            &data[3][15..],
+            &data[3][15..17],
             &["", ""],
             "invalid PT does not become a pressure or voltage measurement"
         );
@@ -7018,7 +7023,7 @@ mod tests {
             .collect();
         assert_eq!(conflict_rows.len(), 4);
         assert_eq!(
-            &conflict_rows[1][15..],
+            &conflict_rows[1][15..17],
             &["", ""],
             "ambiguous same-packet PT is unknown"
         );

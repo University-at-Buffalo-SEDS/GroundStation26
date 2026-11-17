@@ -9,6 +9,7 @@ import struct
 
 FC_HEAD='ec188c6daac84e3c957f57ca95d872953cbda588'
 DAQ_HEAD='ef3702d87071f204e5ccb9a124b739af82538ac2'
+DAQ_SD_HEAD='d8a398179295a6e6199816be558227ee1bfa1ff5'
 # field, element reordering, target type, units. BARO existing summary is alt/prs/tmp;
 # raw barometer_sample is pressure/temperature/altitude. These must not be swapped.
 PROFILES={
@@ -29,8 +30,28 @@ PROFILES={
   'mcp3564r_raw':('calibrated_value',[0],'LOADCELL_WEIGHT_KG',['kg']),
   'kg50_network':('value',[0],'KG50',['sensor_raw']),
   'kg1000_network':('value',[0],'KG1000',['sensor_raw']),
- }}
+ }},
+ # DAQ firmware that keeps each load-cell conversion once, as a raw record
+ # named <sensor>_<unit> (DAQ-Board docs/sd-record-format.md). SEDSnet
+ # KG1000/KG50 are rebuilt from those records with the DAQ's own boxcar, so
+ # SD backfill equals what the station would have received. Selections are
+ # mapping names; 'sensors' lists the SD rows each one reads.
+ 'daq-20261117': {'head':DAQ_SD_HEAD,'mappings':{
+  'kg1000_v':('raw_value',[0],'KG1000',['V'],{'boxcar':True,'sensors':('kg1000_v',)}),
+  # The selected KG50 input: AMP2 (CH1) or P6. The DAQ restarts the boxcar
+  # when the selection changes, and so does this reader.
+  'kg50_v':('raw_value',[0],'KG50',['V'],{'boxcar':True,'sensors':('kg50_v','kg50_p6_v')}),
+  'kg1000_kg':('calibrated_value',[0],'LOADCELL_WEIGHT_KG',['kg'],{'sensors':('kg1000_v',)}),
+  'kg50_kg':('calibrated_value',[0],'LOADCELL_50_WEIGHT_KG',['kg'],{'sensors':('kg50_v',)}),
+  # Board supply rows pair into the DAQ_POWER_MONITOR layout
+  # [VMON pin V, IMON pin V, input V, input A].
+  'input_supply':(None,[0,1,2,3],'DAQ_POWER_MONITOR',['V','V','V','A'],{'pair':('input_voltage_v','input_current_a'),
+      'sensors':('input_voltage_v','input_current_a')}),
+ }},
 }
+# Width of the DAQ KG1000/KG50 network boxcar bins (DAQ_BROADCAST_PERIOD_MS);
+# files that state loadcell_boxcar_ms on their # calibration line use theirs.
+DAQ_BOXCAR_MS=4
 UTC_MIN,UTC_MAX=946684800000,4102444800000
 # DAQ KG1000/AMP2 KG50 legacy raw (code*2.2104/2^27) to ADC-pin volts
 # (code*2.4/2^23): exactly 16000/921, as loadcell::LEGACY_RAW_TO_VOLTS.
@@ -40,6 +61,47 @@ LEGACY_LOADCELL_KINDS=('KG1000','KG50','DAQ_LOADCELL_CHAMBER')
 
 def _f32(value):
     return struct.unpack('<f',struct.pack('<f',value))[0]
+
+
+def _options(mapping):
+    return mapping[4] if len(mapping)>4 else {}
+
+
+class Boxcar:
+    """daq_bin_average_add on SD raw records: the mean of each fixed bin of
+    uptime ms (bin = uptime // period), summed in double precision in record
+    order and rounded once to binary32. A bin is complete when a record of a
+    later bin arrives. Non-finite values are skipped, as on the DAQ."""
+    def __init__(self,period_ms):
+        self.period=period_ms;self.reset()
+    def reset(self):
+        self.bin=None;self.sum=0.0;self.count=0;self.last=None;self.first=None
+    def add(self,value,uptime_ms,sample):
+        """Returns (mean, count, first sample, last sample) of a completed bin, or None."""
+        value=_f32(value)
+        if not math.isfinite(value):return None
+        bin_=uptime_ms//self.period;done=None
+        if self.count and bin_!=self.bin:
+            done=(_f32(self.sum/self.count),self.count,self.first,self.last)
+            self.sum=0.0;self.count=0;self.first=None
+        self.bin=bin_;self.sum+=value;self.count+=1;self.last=sample
+        if self.first is None:self.first=sample
+        return done
+
+
+def _boxcar_ms(metadata):
+    """loadcell_boxcar_ms from the file's # calibration lines (one value)."""
+    found=set()
+    for item in metadata or []:
+        fields=item.get('fields') if isinstance(item,dict) else None
+        if not fields or fields[0]!='# calibration':continue
+        for field in fields[1:]:
+            if field.startswith('loadcell_boxcar_ms='):
+                text=field.split('=',1)[1]
+                if not text.isdigit() or not 1<=int(text)<=1000:raise ValueError('Invalid loadcell_boxcar_ms')
+                found.add(int(text))
+    if len(found)>1:raise ValueError('One SD file states two load-cell boxcar widths')
+    return found.pop() if found else DAQ_BOXCAR_MS
 
 
 def legacy_raw_to_volts(raw):
@@ -106,7 +168,7 @@ def _resolution_manifest(manifest):
     for sensor in selected:
         if sensor not in profile['mappings']:
             raise ValueError('Unsupported sensor mapping: '+str(sensor))
-        _,indices,kind,_=profile['mappings'][sensor]
+        _,indices,kind,_=profile['mappings'][sensor][:4]
         if kind in mapped_kinds: raise ValueError('Choose one SD source for each semantic channel')
         mapped_kinds.append(kind)
         element=definitions.get(kind,{}).get('element',{})
@@ -163,21 +225,17 @@ def resolve_recording(db,max_database_bytes=MAX_DATABASE_BYTES):
                         db.execute('INSERT INTO sd_sequence_holes VALUES(?,?,?)',(import_id,min(stamp,previous_record[1]),max(stamp,previous_record[1])))
                 previous_record=(seq,stamp,time_source)
             previous={}
-            for sample in iter_sd_rows(db,[import_id]):
-                fields=sample['fields'];sensor=sample['sensor']
-                if sensor not in selected:continue
-                field,indices,kind,units=profile['mappings'][sensor];key=(assignment['sender_id'],kind)
-                stamp=sample['utc_timestamp_ms']
-                if stamp is None or not canonical_utc(stamp) or not lo<=stamp<hi or sample['ambiguous'] or int(fields['uptime_frequency_hz'])!=1000:
-                    previous.pop(key,None);unresolved+=1;continue
-                try:
-                    vector=[float(x) for x in fields[field].split()]
-                    values=[vector[i] if math.isfinite(vector[i]) else None for i in indices]
-                    if len(vector)!=len(indices):raise ValueError('Vector width mismatch')
-                    if 'sensor_raw' in units:
-                        values=[None if v is None else legacy_raw_to_volts(v) for v in values]
-                except (ValueError,IndexError):
-                    previous.pop(key,None);unresolved+=1;continue
+            by_sensor={}
+            for name in selected:
+                for source_sensor in _options(profile['mappings'][name]).get('sensors',(name,)):
+                    by_sensor.setdefault(source_sensor,[]).append(name)
+            boxcars={};pending_pair={};boxcar_ms=None
+
+            def emit(name,stamp,values,sample,extra=None,ambiguous=False):
+                nonlocal unresolved,processed
+                field,indices,kind,units=profile['mappings'][name][:4];key=(assignment['sender_id'],kind)
+                if stamp is None or not canonical_utc(stamp) or not lo<=stamp<hi or ambiguous:
+                    previous.pop(key,None);unresolved+=1;return
                 state=previous.get(key)
                 continuous=state and state[1]<=stamp and stamp-state[1]<=assignment['max_gap_ms']
                 if continuous:
@@ -190,15 +248,64 @@ def resolve_recording(db,max_database_bytes=MAX_DATABASE_BYTES):
                 previous[key]=(segment_id,stamp)
                 provenance={k:v for k,v in sample.items() if k not in ('config','calibration_metadata')}
                 provenance.update(origin='sd',sd_sample_id=sample['sample_id'],received_timestamp_ms=None,
-                    source_timestamp_ms=int(fields['timestamp_ms']),coverage_segment_id=segment_id,
-                    mapping={'profile':manifest['mapping_profile'],'sensor':sensor,'field':field,'indices':indices,
+                    source_timestamp_ms=int(sample['fields']['timestamp_ms']),coverage_segment_id=segment_id,
+                    mapping={'profile':manifest['mapping_profile'],'sensor':name,'field':field,'indices':indices,
                              'data_type':kind,'units':['V' if u=='sensor_raw' else u for u in units],'source_evidence':profile['head']})
                 if 'sensor_raw' in units:provenance['mapping']['converted_from']={'units':'legacy_raw','volts_per_raw':'16000/921'}
+                if extra:provenance['mapping'].update(extra)
                 processed+=1
                 if processed%4096==0:check_disk_limit(db,max_database_bytes)
                 db.execute('INSERT OR IGNORE INTO sd_resolution_candidates VALUES(?,?,?,?,?,?,?,?,?,?)',
                     (stamp,key[0],kind,canonical(values),None,canonical(provenance),sample['sample_id'],
                      manifest['board_id'],manifest['boot_id'],manifest.get('launch_session')))
+
+            def number(text):
+                value=float(text)
+                return value if math.isfinite(value) else None
+
+            for sample in iter_sd_rows(db,[import_id]):
+                fields=sample['fields'];sensor=sample['sensor']
+                for name in by_sensor.get(sensor,()):
+                    mapping=profile['mappings'][name];field,indices,kind,units=mapping[:4];options=_options(mapping)
+                    stamp=sample['utc_timestamp_ms']
+                    try:
+                        if int(fields['uptime_frequency_hz'])!=1000:raise ValueError('Uptime scale')
+                        if options.get('boxcar'):
+                            # Accumulate every record whatever its clock; a bin is
+                            # dated by its last record when it completes.
+                            if boxcar_ms is None:boxcar_ms=_boxcar_ms(sample['calibration_metadata'])
+                            box=boxcars.get(name)
+                            if box is None:box=boxcars[name]=[Boxcar(boxcar_ms),sensor]
+                            if box[1]!=sensor:box[0].reset();box[1]=sensor
+                            done=box[0].add(float(fields[field]),int(fields['uptime_ticks']),sample)
+                            if done:
+                                mean,count,first,last=done
+                                emit(name,last['utc_timestamp_ms'],[mean if math.isfinite(mean) else None],last,
+                                     {'derived':'boxcar','boxcar_ms':boxcar_ms,'records':count,'source_sensor':last['sensor'],
+                                      'first_sd_sample_id':first['sample_id'],'last_sd_sample_id':last['sample_id']},last['ambiguous'])
+                            continue
+                        if options.get('pair'):
+                            voltage,current=options['pair']
+                            if sensor==voltage:
+                                pending_pair[name]=sample;continue
+                            first=pending_pair.pop(name,None)
+                            if first is None or first['fields']['uptime_ticks']!=fields['uptime_ticks']:
+                                unresolved+=1;continue
+                            values=[number(first['fields']['raw_value']),number(fields['raw_value']),
+                                    number(first['fields']['calibrated_value']),number(fields['calibrated_value'])]
+                            emit(name,first['utc_timestamp_ms'],values,first,
+                                 {'derived':'pair','paired_sd_sample_id':sample['sample_id']},first['ambiguous'] or sample['ambiguous'])
+                            continue
+                        vector=[float(x) for x in fields[field].split()]
+                        values=[vector[i] if math.isfinite(vector[i]) else None for i in indices]
+                        if len(vector)!=len(indices):raise ValueError('Vector width mismatch')
+                        if 'sensor_raw' in units:
+                            values=[None if v is None else legacy_raw_to_volts(v) for v in values]
+                    except (ValueError,IndexError,KeyError):
+                        previous.pop((assignment['sender_id'],kind),None)
+                        if name in boxcars:boxcars[name][0].reset()
+                        unresolved+=1;continue
+                    emit(name,stamp,values,sample,ambiguous=sample['ambiguous'])
         for row_id,received,source,sender,kind,values,payload in db.execute('SELECT id,timestamp_ms,source_timestamp_ms,sender_id,data_type,values_json,payload_json FROM main.telemetry ORDER BY id'):
             if not canonical_utc(source):unresolved+=1;continue
             identities=db.execute("SELECT DISTINCT board_id,boot_id,launch_session FROM sd_coverage_segments s WHERE sender_id=? AND data_type=? AND start_ms<=? AND end_ms>=? AND NOT EXISTS(SELECT 1 FROM sd_sequence_holes h WHERE h.import_id=s.import_id AND h.start_ms<=? AND h.end_ms>=?) LIMIT 2",(sender,kind,source,source,source,source)).fetchall()

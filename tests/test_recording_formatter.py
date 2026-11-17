@@ -51,7 +51,7 @@ class Formatter(unittest.TestCase):
     def test_exact_channel_recording_range_and_missing_values(self):
         rows = data_rows(report.run(self.request))
         self.assertEqual(len(rows),2)
-        self.assertEqual([row["sensor"] for row in rows],["kg1000_network"]*2)
+        self.assertEqual([row["sensor"] for row in rows],["kg1000_v"]*2)
         self.assertEqual(float(rows[0]["value"]),1.25)
         selected = data_rows(report.run(dict(self.request,start_ms=self.utc+1,end_ms=self.utc+3)))
         self.assertEqual(len(selected),1)
@@ -60,6 +60,17 @@ class Formatter(unittest.TestCase):
             report.run(dict(self.request,recording=""))
         for channels in [[],["unknown"]]:
             with self.assertRaises(ValueError):report.run(dict(self.request,channels=channels))
+
+    def test_daq_layout_uses_the_daq_sd_names(self):
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("INSERT INTO telemetry VALUES(NULL,?,?,'DAQ','DAQ_POWER_MONITOR','[1.29,0.24,14.2,0.5]','[]')",(self.utc+6,self.utc-6))
+        channels=[json.dumps(["DAQ","DAQ_POWER_MONITOR",i],separators=(",",":")) for i in (2,3)]
+        rows=data_rows(report.run(dict(self.request,channels=channels)))
+        self.assertEqual([(row["sensor"],float(row["value"])) for row in rows],[("input_voltage_v",14.2),("input_current_a",0.5)])
+        # SD values rebuilt from several records are not one physical record to copy.
+        self.assertTrue(report.derived_sd({"mapping":{"derived":"boxcar"}}))
+        self.assertTrue(report.derived_sd({"mapping":{"derived":"pair"}}))
+        self.assertFalse(report.derived_sd({"mapping":{"sensor":"kg1000_kg"}}))
 
     def test_unknown_adc_uptime_and_clock_never_fabricated(self):
         payload = report.run(self.request)
@@ -156,9 +167,9 @@ int main(void) {
  char line[1024],value[24];sd_raw_format_cache_t cache={0};
  fputs(SD_CSV_HEADER,stdout);
  sd_format_float(value,1.25f);
- sd_format_csv_record(line,sizeof(line),1793491200000ULL,4294967297ULL,"kg1000_network",value,42);fputs(line,stdout);
+ sd_format_csv_record(line,sizeof(line),1793491200000ULL,4294967297ULL,"kg1000_v",value,42);fputs(line,stdout);
  sd_format_csv_record(line,sizeof(line),0,4294967298ULL,"Message","a,\"quoted\"\nsecond line",43);fputs(line,stdout);
- sd_format_csv_raw_record(line,sizeof(line),1793491200001ULL,4294967299ULL,"mcp3564r_raw",-123,1.25f,250.0f,26.125f,-5,44,&cache);fputs(line,stdout);
+ sd_format_csv_raw_record(line,sizeof(line),1793491200001ULL,4294967299ULL,"kg1000_v",-123,1.25f,250.0f,26.125f,-5,44,&cache);fputs(line,stdout);
  const uint32_t bits[]={0,0x80000000U,1,0x7f7fffffU,0x00800000U,0x3eaaaaabU};
  fputs("__FLOATS__\n",stdout);
  for (unsigned i=0;i<sizeof(bits)/sizeof(bits[0]);++i) {float v;memcpy(&v,&bits[i],4);sd_format_float(value,v);printf("%u:%s\n",bits[i],value);}

@@ -65,7 +65,8 @@ pub async fn export_recording_csv(
             'IADC',
             'BATTERY_VOLTAGE',
             'PRESSURE_TRANSDUCER_CALIBRATED',
-            'LOADCELL_WEIGHT_KG'
+            'LOADCELL_WEIGHT_KG',
+            'DAQ_POWER_MONITOR'
         )
         ORDER BY id ASC
         "#,
@@ -111,12 +112,12 @@ pub async fn export_recording_csv(
     let mut writer = std::io::BufWriter::new(std::fs::File::create(csv_path)?);
     writeln!(
         writer,
-        "Rx_Timestamp,Header,Seq,Timestamp,1000kg ADC (V),Tank Pressure Raw,Battery Voltage,CRC,1000kg Calibrated,Weight,Thrust,Tank Pressure Calibrated,50kg ADC (V),50kg Calibrated,ADC Temperature C,Chamber Pressure (psig),Chamber Connector Voltage (V)"
+        "Rx_Timestamp,Header,Seq,Timestamp,1000kg ADC (V),Tank Pressure Raw,Battery Voltage,CRC,1000kg Calibrated,Weight,Thrust,Tank Pressure Calibrated,50kg ADC (V),50kg Calibrated,ADC Temperature C,Chamber Pressure (psig),Chamber Connector Voltage (V),DAQ Input Voltage (V),DAQ Input Current (A)"
     )?;
     // Load-cell coefficients are kg = f(ADC-pin volts): m in kg/V, b in kg.
     writeln!(
         writer,
-        "CALIBRATION,,,,\"{} (kg/V)\",\"{}\",,,,,,,,,,",
+        "CALIBRATION,,,,\"{} (kg/V)\",\"{}\",,,,,,,,,,,,",
         linear_formula(calibration.ch1.m, calibration.ch1.b),
         linear_formula(calibration.iadc.m, calibration.iadc.b)
     )?;
@@ -124,7 +125,7 @@ pub async fn export_recording_csv(
     let kg50 = crate::loadcell::kg50_daq_coefficients(calibration).map_err(anyhow::Error::msg)?;
     writeln!(
         writer,
-        "CALIBRATION_50KG,,,,,,,,,,,,\"c0={};c1={};c2={};c3={};c4={};x0={};tare={} (x in V)\",,,,",
+        "CALIBRATION_50KG,,,,,,,,,,,,\"c0={};c1={};c2={};c3={};c4={};x0={};tare={} (x in V)\",,,,,,",
         kg50[0], kg50[1], kg50[2], kg50[3], kg50[4], kg50[5], kg50[6]
     )?;
     let mut state = ExportState::default();
@@ -160,6 +161,19 @@ pub async fn export_recording_csv(
             }
             "BATTERY_VOLTAGE" => {
                 state.battery_voltage = first_value;
+            }
+            // The DAQ board supply ([VMON V, IMON V, input V, input A]) gets a
+            // row of its own at its own source time, so supply dips plot
+            // against the load-cell rows around them.
+            "DAQ_POWER_MONITOR" if row.get::<&str, _>("sender_id") == "DAQ" => {
+                let rx_timestamp: String = row.get("rx_timestamp");
+                let source_timestamp_ms: i64 = row.get("source_timestamp_ms");
+                let mut fields = vec![String::new(); 19];
+                fields[0] = rx_timestamp;
+                fields[3] = source_timestamp_ms.to_string();
+                fields[17] = display_opt(values.get(2).copied().flatten());
+                fields[18] = display_opt(values.get(3).copied().flatten());
+                writeln!(writer, "{}", fields.join(","))?;
             }
             "PRESSURE_TRANSDUCER_CALIBRATED" => {
                 state.pressure_calibrated = first_value;
@@ -197,7 +211,7 @@ pub async fn export_recording_csv(
                     });
                 writeln!(
                     writer,
-                    "{},{},{},{},,,,,,,,,{},{},{},,",
+                    "{},{},{},{},,,,,,,,,{},{},{},,,,",
                     rx_timestamp,
                     TEST_FIRE_HEADER,
                     seq % 256,
@@ -233,7 +247,7 @@ pub async fn export_recording_csv(
                 let crc = crc16_ccitt_false(&parse_payload_json(&payload_json));
                 writeln!(
                     writer,
-                    "{},{},{},{},{},{},{},{},{},{},{},{},,,{},{},{}",
+                    "{},{},{},{},{},{},{},{},{},{},{},{},,,{},{},{},,",
                     rx_timestamp,
                     TEST_FIRE_HEADER,
                     seq % 256,
@@ -387,15 +401,75 @@ mod tests {
             .map(|line| line.split(',').collect())
             .collect();
         assert_eq!(samples.len(), 2);
-        assert_eq!(samples[0].len(), 17);
-        assert_eq!(samples[0][15..], ["", ""]);
-        assert_eq!(samples[1][15..], ["", ""]);
+        assert_eq!(samples[0].len(), 19);
+        assert_eq!(samples[0][15..], ["", "", "", ""]);
+        assert_eq!(samples[1][15..], ["", "", "", ""]);
         assert_eq!(samples[0][3], "9000");
         assert_eq!(samples[0][12..14], ["0.0625", "3"]);
         assert_eq!(samples[0][14], ""); // No invented ADC temperature.
         assert_eq!(samples[1][3], "9001");
         assert_eq!(samples[1][12..14], ["0.09375", "4"]);
         assert_eq!(samples[0][4], ""); // No fabricated 1000 kg readings.
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// DAQ supply samples (DAQ_POWER_MONITOR) get their own rows at their own
+    /// source time, between the load-cell rows, so a supply dip lines up with
+    /// the KG1000/KG50 samples around it.
+    #[tokio::test]
+    async fn daq_supply_samples_export_between_load_cell_rows() {
+        crate::mode_suite!(TestFire);
+        let dir = std::env::temp_dir().join(format!(
+            "gs-supply-csv-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("recording.db");
+        let csv_path = dir.join("recording.csv");
+        let db = SqlitePool::connect(&format!("sqlite://{}?mode=rwc", db_path.display()))
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE telemetry (id INTEGER PRIMARY KEY, timestamp_ms INTEGER, source_timestamp_ms INTEGER, data_type TEXT, values_json TEXT, payload_json TEXT, sender_id TEXT)")
+            .execute(&db).await.unwrap();
+        crate::telemetry_db::mark_loadcell_volts(&db).await.unwrap();
+        for (id, kind, source, values, sender) in [
+            (1, "KG1000", 9000, "[0.5]", "DAQ"),
+            (2, "DAQ_POWER_MONITOR", 9002, "[1.29,0.24,14.2,0.5]", "DAQ"),
+            (3, "KG1000", 9004, "[0.5]", "DAQ"),
+            (4, "DAQ_POWER_MONITOR", 9006, "[1.01,0.24,11.1,null]", "DAQ"),
+            (5, "DAQ_POWER_MONITOR", 9007, "[1,1,99,9]", "VB"),
+        ] {
+            sqlx::query("INSERT INTO telemetry VALUES (?, ?, ?, ?, ?, '[]', ?)")
+                .bind(id)
+                .bind(10000_i64 + id)
+                .bind(source)
+                .bind(kind)
+                .bind(values)
+                .bind(sender)
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+        db.close().await;
+        export_recording_csv(db_path.to_str().unwrap(), &csv_path, &LoadcellCalibrationFile::default())
+            .await
+            .unwrap();
+        let csv = std::fs::read_to_string(&csv_path).unwrap();
+        let header: Vec<&str> = csv.lines().next().unwrap().split(',').collect();
+        assert_eq!(header[17..], ["DAQ Input Voltage (V)", "DAQ Input Current (A)"]);
+        let rows: Vec<Vec<&str>> = csv.lines().skip(1).map(|line| line.split(',').collect()).collect();
+        assert!(rows.iter().all(|row| row.len() == 19), "{csv}");
+        let data = &rows[2..];
+        assert_eq!(data.len(), 4, "one row per KG1000 and per DAQ supply sample");
+        assert_eq!([data[0][3], data[0][4], data[0][17]], ["9000", "0.5", ""]);
+        assert_eq!([data[1][1], data[1][3], data[1][4]], ["", "9002", ""]);
+        assert_eq!(data[1][17..], ["14.2", "0.5"]);
+        assert_eq!([data[2][3], data[2][4]], ["9004", "0.5"]);
+        assert_eq!([data[3][3], data[3][17], data[3][18]], ["9006", "11.1", ""]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

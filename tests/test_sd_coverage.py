@@ -1,7 +1,11 @@
 import test_recording_sd_import as fixture
 ROOT,sd=fixture.ROOT,fixture.sd
+import csv
 import json
+from pathlib import Path
 import sqlite3
+import struct
+import subprocess
 import unittest
 
 # Same namespace composition as the actual embedded Python HTTP worker.
@@ -93,5 +97,147 @@ class CoverageTests(unittest.TestCase):
         f32=lambda x:struct.unpack('<f',struct.pack('<f',x))[0]
         for raw in (0.0122373,0.19427338,-0.0015,1e-7):
             self.assertEqual(sd.legacy_raw_to_volts(raw),f32(f32(raw)*16000/921))
+
+
+def _daq_checkout():
+    """A DAQ-Board checkout whose network boxcar is daq_bin_average_add."""
+    for parent in Path(__file__).resolve().parents:
+        header=parent/'DAQ-Board/Core/Inc/daq_downsample.h'
+        if header.is_file() and 'daq_bin_average_add' in header.read_text():
+            return parent/'DAQ-Board'
+    return None
+
+
+HEADER=','.join(sd.FIELDS)+'\r\n'
+CALIBRATION='# calibration,kg1000_slope=2.00000000e+00,loadcell_input=adc_volts,loadcell_boxcar_ms=4\r\n'
+BASE_UTC=1800000000000
+
+
+def f32(value):
+    return struct.unpack('<f',struct.pack('<f',value))[0]
+
+
+class LoadcellBoxcarTests(unittest.TestCase):
+    """SD backfill of KG1000/KG50 from the DAQ's raw records (profile daq-20261117)."""
+    row=fixture.RecoveryTests.row
+    tearDown=fixture.RecoveryTests.tearDown
+    def setUp(self):
+        fixture.RecoveryTests.setUp(self)
+        self.db.execute('DELETE FROM telemetry');self.db.commit()
+    def profile_manifest(self,selected=('kg1000_v','kg50_v')):
+        schema={'types':[{'name':kind,'element':{'kind':'Static','data_type':'Float32','count':count}}
+                         for kind,count in [('KG1000',1),('KG50',1),('DAQ_POWER_MONITOR',4),('LOADCELL_WEIGHT_KG',1)]]}
+        return {'board_id':'DAQ-serial-1','boot_id':'boot1','stream_id':'raw','launch_session':'fire-1',
+            'mapping_profile':'daq-20261117','firmware_head':sd.DAQ_SD_HEAD,'selected_sensors':list(selected),
+            'config':{'schema':schema},'sensor_types':{},'assignment':{'sender_id':'DAQ','boot_and_session_verified':True,
+                'units_axes_calibration_verified':True,'start_utc_ms':BASE_UTC-10000,'end_utc_ms':BASE_UTC+600000,'max_gap_ms':20}}
+    def write(self,name,lines):
+        path=Path(self.temp.name)/name
+        path.write_bytes((HEADER+CALIBRATION+''.join(lines)).encode())
+        return path
+    def resolved(self):
+        return [(t,kind,json.loads(v),json.loads(p)) for t,kind,v,p in self.db.execute(
+            'SELECT timestamp_ms,data_type,values_json,provenance_json FROM sd_replay_telemetry ORDER BY id')]
+
+    def test_resolver_matches_the_daq_boxcar_bit_for_bit(self):
+        daq=_daq_checkout()
+        if daq is None:
+            self.skipTest('No DAQ-Board checkout with daq_bin_average_add next to this GroundStation checkout')
+        # Production DAQ code: daq_bin_average_add (drain's KG1000/KG50 boxcar,
+        # restarting KG50 when its input changes) and the SD raw formatter.
+        program=r"""
+#include "daq_downsample.h"
+#include "sd_raw_record_format.h"
+#include <stdio.h>
+#include <string.h>
+int main(void){
+ daq_bin_average_t kg1000={0},kg50={0};unsigned kg50_channel=1;
+ sd_raw_format_cache_t cache={0};char line[256];uint32_t state=12345,seq=0;uint64_t t_us=0;
+ for(unsigned i=0;i<6000;i++){
+  state^=state<<13;state^=state>>17;state^=state<<5;
+  t_us+=150+(state%80);                       /* irregular ~5.2 kHz conversions */
+  const uint64_t ms=1000000+t_us/1000;
+  const unsigned channel=(i&1)?(i>=3000&&i<4500?9:1):0;  /* P6 selected mid-run */
+  const int32_t code=(int32_t)(state>>8)-8388608;
+  const float volts=(float)code*2.4f/8388608.0f/(channel==9?16.0f:1.0f);
+  const char*name=channel==0?"kg1000_v":channel==1?"kg50_v":"kg50_p6_v";
+  sd_format_csv_raw_record(line,sizeof line,1800000000000ULL+(ms-1000000),ms,name,code,volts,volts*2.0f,25.0f,7,++seq,&cache);
+  fputs(line,stdout);
+  float out;uint64_t at;uint32_t bits;
+  if(channel==0){
+   if(daq_bin_average_add(&kg1000,volts,ms,4,&out,&at)){memcpy(&bits,&out,4);printf("#KG1000,%llu,%u\n",(unsigned long long)at,bits);}
+  }else{
+   if(channel!=kg50_channel){memset(&kg50,0,sizeof kg50);kg50_channel=channel;}
+   if(daq_bin_average_add(&kg50,volts,ms,4,&out,&at)){memcpy(&bits,&out,4);printf("#KG50,%llu,%u\n",(unsigned long long)at,bits);}
+  }
+ }
+}
+"""
+        binary=Path(self.temp.name)/'daq-boxcar'
+        subprocess.run(['cc','-std=c11','-O2','-I',str(daq/'Core/Inc'),'-x','c','-','-o',str(binary)],input=program.encode(),check=True)
+        output=[line.rstrip('\r') for line in subprocess.check_output([str(binary)]).decode().split('\n') if line]
+        daq_bins={}
+        for mark in (line for line in output if line.startswith('#')):
+            kind,uptime,bits=mark[1:].split(',')
+            daq_bins.setdefault(kind,[]).append((BASE_UTC+int(uptime)-1000000,int(bits)))
+        csv_rows=''.join(line+'\r\n' for line in output if not line.startswith('#'))
+        sd.import_csv(self.db,self.write('fire.csv',[csv_rows]),self.profile_manifest())
+        sd.resolve_recording(self.db)
+        resolved={}
+        for t,kind,values,provenance in self.resolved():
+            self.assertEqual(provenance['origin'],'sd')
+            self.assertEqual(provenance['mapping']['derived'],'boxcar')
+            resolved.setdefault(kind,[]).append((t,struct.unpack('<I',struct.pack('<f',values[0]))[0]))
+        self.assertGreater(len(daq_bins['KG1000']),250)
+        self.assertGreater(len(daq_bins['KG50']),250)
+        # Every bin the DAQ closed, value bits and the time of its last record.
+        self.assertEqual(resolved['KG1000'],daq_bins['KG1000'])
+        self.assertEqual(resolved['KG50'],daq_bins['KG50'])
+
+    def test_boxcar_bins_reset_on_input_switch_and_pair_the_supply(self):
+        rows=[]
+        def raw(name,uptime,volts,calibrated=None,seq=[0]):
+            seq[0]+=1
+            return self.row(sensor=name,timestamp_ms=str(BASE_UTC+uptime),monotonic_ms=str(uptime),uptime_ticks=str(uptime),
+                value='',raw_value=repr(volts),calibrated_value=repr(volts if calibrated is None else calibrated),record_sequence=str(seq[0]))
+        for uptime,volts in [(100,0.25),(101,0.5),(103,0.75),(104,1.0),(108,2.0)]:
+            rows.append(raw('kg1000_v',uptime,volts))
+        rows.append(raw('kg50_v',100,0.1));rows.append(raw('kg50_v',101,0.3))
+        rows.append(raw('kg50_p6_v',102,-0.002));rows.append(raw('kg50_p6_v',104,-0.004))  # switch drops the AMP2 partial bin
+        rows.append(raw('kg50_p6_v',108,-0.006))
+        rows.append(raw('input_voltage_v',105,1.29,14.2));rows.append(raw('input_current_a',105,0.24,0.5))
+        rows.append(raw('input_voltage_v',109,1.01,11.1));rows.append(raw('input_current_a',109,0.24,0.5))
+        path=Path(self.temp.name)/'mix.csv'
+        with path.open('w',newline='') as out:
+            out.write(HEADER+CALIBRATION);csv.writer(out,lineterminator='\r\n').writerows(rows)
+        sd.import_csv(self.db,path,self.profile_manifest(('kg1000_v','kg50_v','input_supply')))
+        summary=sd.resolve_recording(self.db)
+        got={(kind,t):(values,p) for t,kind,values,p in self.resolved()}
+        mean=lambda *v:f32(sum(f32(x) for x in v)/len(v))
+        self.assertEqual(got[('KG1000',BASE_UTC+103)][0],[mean(0.25,0.5,0.75)])
+        self.assertEqual(got[('KG1000',BASE_UTC+103)][1]['mapping']['records'],3)
+        self.assertEqual(got[('KG1000',BASE_UTC+104)][0],[1.0])
+        self.assertNotIn(('KG1000',BASE_UTC+108),got,'the last bin is open at the end of the file')
+        self.assertNotIn(('KG50',BASE_UTC+101),got,'AMP2 partial bin dropped at the input switch')
+        self.assertEqual(got[('KG50',BASE_UTC+102)][0],[f32(-0.002)])
+        self.assertEqual(got[('KG50',BASE_UTC+104)][0],[f32(-0.004)])
+        self.assertEqual(got[('KG50',BASE_UTC+104)][1]['mapping']['source_sensor'],'kg50_p6_v')
+        self.assertEqual(got[('DAQ_POWER_MONITOR',BASE_UTC+105)][0],[1.29,0.24,14.2,0.5])
+        self.assertEqual(got[('DAQ_POWER_MONITOR',BASE_UTC+109)][0],[1.01,0.24,11.1,0.5])
+        self.assertEqual(got[('DAQ_POWER_MONITOR',BASE_UTC+105)][1]['mapping']['derived'],'pair')
+        self.assertEqual(summary['unresolved_samples'],0)
+
+    def test_new_names_do_not_resolve_under_the_legacy_profile_and_vice_versa(self):
+        legacy={**self.profile_manifest(),'mapping_profile':'daq-20261101','firmware_head':sd.DAQ_HEAD,'selected_sensors':['kg1000_v']}
+        with self.assertRaises(ValueError):sd._resolution_manifest(legacy)
+        with self.assertRaises(ValueError):sd._resolution_manifest(self.profile_manifest(('kg1000_network',)))
+        with self.assertRaises(ValueError):sd._resolution_manifest({**self.profile_manifest(),'firmware_head':sd.DAQ_HEAD})
+
+    def test_file_boxcar_width_is_read_from_the_calibration_line(self):
+        self.assertEqual(sd._boxcar_ms([{'fields':['# calibration','kg1000_slope=1','loadcell_boxcar_ms=10']}]),10)
+        self.assertEqual(sd._boxcar_ms([{'fields':['# calibration','kg1000_slope=1']}]),sd.DAQ_BOXCAR_MS)
+        with self.assertRaises(ValueError):
+            sd._boxcar_ms([{'fields':['# calibration','loadcell_boxcar_ms=4']},{'fields':['# calibration','loadcell_boxcar_ms=5']}])
+
 
 if __name__=='__main__':unittest.main()
