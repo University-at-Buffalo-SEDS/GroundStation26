@@ -104,6 +104,30 @@ async fn stepper_retraction_estimate_has_no_countdown() {
 }
 
 #[tokio::test]
+async fn stepper_retracted_report_at_move_start_keeps_the_retraction_running() {
+    let state = crate::state::tests::test_app_state().await;
+    sent(&state, Mode::Stepper, 5_000);
+    // The stepper drive reports retracted when its move starts.
+    state.set_umbilical_valve_state(KEY, true);
+    let p = progress(&state).unwrap();
+    assert_eq!((p.state, p.confirmed, p.remaining_ms), (S::Running, false, None));
+    // An AUX retraction reports retracted only when its move ends.
+    sent(&state, Mode::Auxiliary, 5_000);
+    assert_eq!(progress(&state).unwrap().state, S::Completed);
+}
+
+#[tokio::test]
+async fn stepper_retraction_completes_on_the_retracted_report_after_its_move_time() {
+    let state = crate::state::tests::test_app_state().await;
+    sent(&state, Mode::Stepper, 60_000);
+    assert_eq!(progress(&state).unwrap().state, S::Running);
+    sent(&state, Mode::Stepper, u64::from(STEPPER_RETRACT_MOVE_MS) + 1_000);
+    assert_eq!(progress(&state).unwrap().state, S::Unconfirmed);
+    state.set_umbilical_valve_state(KEY, true);
+    assert_eq!(progress(&state).unwrap().state, S::Completed);
+}
+
+#[tokio::test]
 async fn estimate_turns_unconfirmed_after_the_move_and_completed_on_a_retracted_report() {
     let state = crate::state::tests::test_app_state().await;
     sent(&state, Mode::Auxiliary, 46_000);

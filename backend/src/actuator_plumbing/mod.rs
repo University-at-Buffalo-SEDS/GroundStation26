@@ -797,6 +797,11 @@ const RETRACT_FAILURE_SHOWN_MS: u128 = 60_000;
 /// FILL_DURATION_MS). A retraction the station sent with no actuator motion
 /// report is shown running for this long, then unconfirmed.
 const RETRACT_MOVE_MS: u32 = 45_000;
+/// The stepper (main) drive's retraction move: PLUMBING_RETRACT_STEPS
+/// (200000 x 100) at PLUMBING_RETRACT_STEP_PERIOD_US (30 us). The actuator
+/// reports the plumbing retracted when this move starts, so that report
+/// does not end a stepper retraction the station sent within this time.
+const STEPPER_RETRACT_MOVE_MS: u32 = 600_000;
 
 /// The QD control's progress: starting (being sent), running (confirmed by
 /// the actuator's motion status, or estimated from the station's own send
@@ -862,12 +867,20 @@ pub(crate) fn retract_progress(state: &AppState) -> Option<crate::sequences::Con
             _ => {}
         }
     }
-    if retracted {
+    let estimate = sent.map(|sent| {
+        let elapsed = sent.at.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+        let stepper = sent.mode == Mode::Stepper as u8;
+        (sent, elapsed, if stepper { STEPPER_RETRACT_MOVE_MS } else { RETRACT_MOVE_MS })
+    });
+    // The stepper drive's retracted report comes when its move starts, so it
+    // ends only a stepper retraction whose move time has passed.
+    let early_report = estimate
+        .is_some_and(|(sent, elapsed, _)| sent.mode == Mode::Stepper as u8 && elapsed < STEPPER_RETRACT_MOVE_MS);
+    if retracted && !early_report {
         return make(S::Completed, true, Some(0), None);
     }
-    if let Some(sent) = sent {
-        let elapsed = sent.at.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
-        if elapsed < RETRACT_MOVE_MS {
+    if let Some((sent, elapsed, move_ms)) = estimate {
+        if elapsed < move_ms {
             let remaining = (sent.mode == Mode::Auxiliary as u8)
                 .then(|| RETRACT_MOVE_MS - elapsed);
             return make(S::Running, false, remaining, Some(
