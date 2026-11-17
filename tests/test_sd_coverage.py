@@ -227,6 +227,32 @@ int main(void){
         self.assertEqual(got[('DAQ_POWER_MONITOR',BASE_UTC+105)][1]['mapping']['derived'],'pair')
         self.assertEqual(summary['unresolved_samples'],0)
 
+    def test_files_with_and_without_the_removed_kg1000_window_input_row_resolve(self):
+        # DAQ firmware before DAQ_SD_HEAD also wrote kg1000_window_input_v, a
+        # scalar copy of kg1000_window_v; current files no longer contain it.
+        def rows(with_input):
+            out=[]
+            for i,(uptime,volts) in enumerate([(100,0.25),(101,0.5),(104,1.0),(108,2.0)]):
+                out.append(self.row(sensor='kg1000_v',timestamp_ms=str(BASE_UTC+uptime),monotonic_ms=str(uptime),
+                    uptime_ticks=str(uptime),value='',raw_value=repr(volts),calibrated_value=repr(volts),record_sequence=str(2*i+1)))
+                for name in ('kg1000_window_v',)+(('kg1000_window_input_v',) if with_input else ()):
+                    out.append(self.row(sensor=name,timestamp_ms=str(BASE_UTC+uptime),monotonic_ms=str(uptime),
+                        uptime_ticks=str(uptime),value=repr(volts),raw_value='',calibrated_value='',record_sequence=str(2*i+2)))
+            return out
+        results={}
+        for head,with_input in ((sd.DAQ_SD_HEAD_WITH_WINDOW_INPUT,True),(sd.DAQ_SD_HEAD,False)):
+            path=Path(self.temp.name)/f'{head[:7]}.csv'
+            with path.open('w',newline='') as out:
+                out.write(HEADER+CALIBRATION);csv.writer(out,lineterminator='\r\n').writerows(rows(with_input))
+            sd.import_csv(self.db,path,{**self.profile_manifest(('kg1000_v',)),'firmware_head':head,'boot_id':head})
+            sd.resolve_recording(self.db)
+            got=[(t,v,p['mapping']['source_evidence']) for t,kind,v,p in self.resolved() if kind=='KG1000' and p['mapping']['source_evidence']==head]
+            self.assertTrue(got,head)
+            results[head]=[(t,v) for t,v,_ in got]
+        self.assertEqual(results[sd.DAQ_SD_HEAD_WITH_WINDOW_INPUT],results[sd.DAQ_SD_HEAD])
+        self.assertNotEqual(sd.DAQ_SD_HEAD,sd.DAQ_SD_HEAD_WITH_WINDOW_INPUT)
+        with self.assertRaises(ValueError):sd._resolution_manifest({**self.profile_manifest(),'firmware_head':'0'*40})
+
     def test_new_names_do_not_resolve_under_the_legacy_profile_and_vice_versa(self):
         legacy={**self.profile_manifest(),'mapping_profile':'daq-20261101','firmware_head':sd.DAQ_HEAD,'selected_sensors':['kg1000_v']}
         with self.assertRaises(ValueError):sd._resolution_manifest(legacy)

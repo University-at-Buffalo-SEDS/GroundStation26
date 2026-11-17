@@ -9,7 +9,11 @@ import struct
 
 FC_HEAD='ec188c6daac84e3c957f57ca95d872953cbda588'
 DAQ_HEAD='ef3702d87071f204e5ccb9a124b739af82538ac2'
-DAQ_SD_HEAD='55fe7a811b74001ea2e9db07de24f57b97feb176'
+DAQ_SD_HEAD='eca3d4ec49267feee4fa2a058ecadc5bb132c8dc'
+# Earlier DAQ firmware with the same raw-record format that also wrote the
+# scalar row kg1000_window_input_v (always equal to kg1000_window_v; removed).
+# Its files still import under the same profile; no mapping reads that row.
+DAQ_SD_HEAD_WITH_WINDOW_INPUT='55fe7a811b74001ea2e9db07de24f57b97feb176'
 # field, element reordering, target type, units. BARO existing summary is alt/prs/tmp;
 # raw barometer_sample is pressure/temperature/altitude. These must not be swapped.
 PROFILES={
@@ -36,7 +40,7 @@ PROFILES={
  # KG1000/KG50 are rebuilt from those records with the DAQ's own boxcar, so
  # SD backfill equals what the station would have received. Selections are
  # mapping names; 'sensors' lists the SD rows each one reads.
- 'daq-20261117': {'head':DAQ_SD_HEAD,'mappings':{
+ 'daq-20261117': {'head':DAQ_SD_HEAD,'heads':(DAQ_SD_HEAD,DAQ_SD_HEAD_WITH_WINDOW_INPUT),'mappings':{
   'kg1000_v':('raw_value',[0],'KG1000',['V'],{'boxcar':True,'sensors':('kg1000_v',)}),
   # The selected KG50 input: AMP2 (CH1) or P6. The DAQ restarts the boxcar
   # when the selection changes, and so does this reader.
@@ -138,7 +142,7 @@ def canonical_utc(value):
 def _resolution_manifest(manifest):
     assignment=manifest.get('assignment',{})
     profile=PROFILES.get(manifest.get('mapping_profile'))
-    if profile is None or manifest.get('firmware_head')!=profile['head']:
+    if profile is None or manifest.get('firmware_head') not in profile.get('heads',(profile['head'],)):
         raise ValueError('A supported versioned firmware mapping and exact source identity are required')
     if not isinstance(assignment,dict) or assignment.get('boot_and_session_verified') is not True:
         raise ValueError('Explicit verified board boot/session assignment required')
@@ -250,7 +254,7 @@ def resolve_recording(db,max_database_bytes=MAX_DATABASE_BYTES):
                 provenance.update(origin='sd',sd_sample_id=sample['sample_id'],received_timestamp_ms=None,
                     source_timestamp_ms=int(sample['fields']['timestamp_ms']),coverage_segment_id=segment_id,
                     mapping={'profile':manifest['mapping_profile'],'sensor':name,'field':field,'indices':indices,
-                             'data_type':kind,'units':['V' if u=='sensor_raw' else u for u in units],'source_evidence':profile['head']})
+                             'data_type':kind,'units':['V' if u=='sensor_raw' else u for u in units],'source_evidence':manifest['firmware_head']})
                 if 'sensor_raw' in units:provenance['mapping']['converted_from']={'units':'legacy_raw','volts_per_raw':'16000/921'}
                 if extra:provenance['mapping'].update(extra)
                 processed+=1
