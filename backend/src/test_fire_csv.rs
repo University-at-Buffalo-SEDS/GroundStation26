@@ -462,8 +462,10 @@ mod tests {
         let header: Vec<&str> = csv.lines().next().unwrap().split(',').collect();
         assert_eq!(header[17..], ["DAQ Input Voltage (V)", "DAQ Input Current (A)"]);
         let rows: Vec<Vec<&str>> = csv.lines().skip(1).map(|line| line.split(',').collect()).collect();
-        assert!(rows.iter().all(|row| row.len() == 19), "{csv}");
+        // The two CALIBRATION rows quote formulas that contain commas, so only
+        // the data rows split into exactly one field per column.
         let data = &rows[2..];
+        assert!(data.iter().all(|row| row.len() == 19), "{csv}");
         assert_eq!(data.len(), 4, "one row per KG1000 and per DAQ supply sample");
         assert_eq!([data[0][3], data[0][4], data[0][17]], ["9000", "0.5", ""]);
         assert_eq!([data[1][1], data[1][3], data[1][4]], ["", "9002", ""]);
