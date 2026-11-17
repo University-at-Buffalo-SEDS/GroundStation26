@@ -162,7 +162,9 @@ pub async fn export_recording_csv(
                     &row.get::<String, _>("sender_id"),
                     row.get("timestamp_ms"),
                 );
+                let sender: String = row.get("sender_id");
                 let calibrated = first_value
+                    .filter(|raw| !railed(calibration, &filters, &sender, "KG50", row.get("timestamp_ms"), *raw))
                     .and_then(|raw| {
                         crate::loadcell::temperature_corrected_raw(
                             calibration,
@@ -210,22 +212,14 @@ pub async fn export_recording_csv(
                     &row.get::<String, _>("sender_id"),
                     row.get("timestamp_ms"),
                 );
-                let calibrated = crate::loadcell::temperature_corrected_raw(
-                    calibration,
-                    "KG1000",
-                    raw_loadcell,
-                    temperature,
-                )
-                .map(|raw| {
-                    filters.filter(
-                        calibration,
-                        &row.get::<String, _>("sender_id"),
-                        "KG1000",
-                        row.get("timestamp_ms"),
-                        raw,
-                    )
-                })
-                .and_then(|raw| calibrated_loadcell(calibration, raw));
+                let sender: String = row.get("sender_id");
+                let calibrated = Some(raw_loadcell)
+                    .filter(|raw| !railed(calibration, &filters, &sender, "KG1000", row.get("timestamp_ms"), *raw))
+                    .and_then(|raw| {
+                        crate::loadcell::temperature_corrected_raw(calibration, "KG1000", raw, temperature)
+                    })
+                    .map(|raw| filters.filter(calibration, &sender, "KG1000", row.get("timestamp_ms"), raw))
+                    .and_then(|raw| calibrated_loadcell(calibration, raw));
                 let crc = crc16_ccitt_false(&parse_payload_json(&payload_json));
                 writeln!(
                     writer,
@@ -264,6 +258,25 @@ fn chamber_packet_key(row: &sqlx::sqlite::SqliteRow) -> (String, i64, Option<i64
         row.get("original_source_timestamp_ms"),
         row.get("payload_json"),
     )
+}
+
+/// A DAQ load-cell sample at an ADC or amplifier rail carries no load
+/// information: the export keeps its raw value and leaves its weight empty,
+/// like the live LOADCELL_WEIGHT_KG, and resets the smoothing filter.
+fn railed(
+    calibration: &LoadcellCalibrationFile,
+    filters: &crate::loadcell_zero::Service,
+    sender: &str,
+    sensor: &str,
+    timestamp_ms: i64,
+    raw: f32,
+) -> bool {
+    let railed = crate::loadcell::daq_rails_apply()
+        && crate::loadcell::loadcell_raw_at_rail(calibration.kg50_input, sensor, raw);
+    if railed {
+        let _ = filters.filter(calibration, sender, sensor, timestamp_ms, f32::NAN);
+    }
+    railed
 }
 
 fn calibrated_loadcell(calibration: &LoadcellCalibrationFile, raw_value: f32) -> Option<f32> {
@@ -330,7 +343,8 @@ mod tests {
             .unwrap();
         sqlx::query("CREATE TABLE telemetry (id INTEGER PRIMARY KEY, timestamp_ms INTEGER, source_timestamp_ms INTEGER, data_type TEXT, values_json TEXT, payload_json TEXT, sender_id TEXT)")
             .execute(&db).await.unwrap();
-        for (i, raw) in [2.0, 3.0].iter().enumerate() {
+        // In-range DAQ raw values (a raw beyond the ADC rail exports no weight).
+        for (i, raw) in [0.0625, 0.09375].iter().enumerate() {
             sqlx::query("INSERT INTO telemetry VALUES (?, ?, ?, 'KG50', ?, '[]', 'DAQ')")
                 .bind(i as i64)
                 .bind(10000_i64 + i as i64)
@@ -346,7 +360,7 @@ mod tests {
             "kg50".into(),
             crate::loadcell::GenericCalibrationChannel {
                 linear: crate::loadcell::ChannelLinear {
-                    m: Some(2.0),
+                    m: Some(32.0),
                     b: Some(1.0),
                 },
                 ..Default::default()
@@ -366,11 +380,83 @@ mod tests {
         assert_eq!(samples[0][15..], ["", ""]);
         assert_eq!(samples[1][15..], ["", ""]);
         assert_eq!(samples[0][3], "9000");
-        assert_eq!(samples[0][12..14], ["2", "5"]);
+        assert_eq!(samples[0][12..14], ["0.0625", "3"]);
         assert_eq!(samples[0][14], ""); // No invented ADC temperature.
         assert_eq!(samples[1][3], "9001");
-        assert_eq!(samples[1][12..14], ["3", "7"]);
+        assert_eq!(samples[1][12..14], ["0.09375", "4"]);
         assert_eq!(samples[0][4], ""); // No fabricated 1000 kg readings.
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A load-cell sample at the ADC clip or the KG1000 amplifier floor (the
+    /// 2026-11-16 test fire: raw 0.19427338 read as 1726 kg, raw 0.0015 as
+    /// about -100 kg) keeps its raw value and exports an empty weight.
+    #[tokio::test]
+    async fn railed_loadcell_samples_export_raw_without_a_weight() {
+        crate::mode_suite!(TestFire);
+        let dir = std::env::temp_dir().join(format!(
+            "gs-railed-csv-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("recording.db");
+        let csv_path = dir.join("recording.csv");
+        let db = SqlitePool::connect(&format!("sqlite://{}?mode=rwc", db_path.display()))
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE telemetry (id INTEGER PRIMARY KEY, timestamp_ms INTEGER, source_timestamp_ms INTEGER, data_type TEXT, values_json TEXT, payload_json TEXT, sender_id TEXT)")
+            .execute(&db).await.unwrap();
+        let rows = [
+            ("KG1000", 0.0625),
+            ("KG1000", 0.19427338),
+            ("KG1000", 0.0015),
+            ("KG1000", 0.0625),
+            ("KG50", 0.0625),
+            ("KG50", 0.2109375),
+        ];
+        for (i, (kind, raw)) in rows.iter().enumerate() {
+            sqlx::query("INSERT INTO telemetry VALUES (?, ?, ?, ?, ?, '[]', 'DAQ')")
+                .bind(i as i64)
+                .bind(10000_i64 + i as i64)
+                .bind(9000_i64 + i as i64)
+                .bind(*kind)
+                .bind(format!("[{raw}]"))
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+        db.close().await;
+        let mut cfg = LoadcellCalibrationFile::default();
+        cfg.ch1 = crate::loadcell::ChannelLinear { m: Some(1000.0), b: Some(0.0) };
+        cfg.extra_channels.insert(
+            "kg50".into(),
+            crate::loadcell::GenericCalibrationChannel {
+                linear: crate::loadcell::ChannelLinear { m: Some(32.0), b: Some(1.0) },
+                ..Default::default()
+            },
+        );
+        export_recording_csv(db_path.to_str().unwrap(), &csv_path, &cfg)
+            .await
+            .unwrap();
+        let csv = std::fs::read_to_string(&csv_path).unwrap();
+        let samples: Vec<Vec<&str>> = csv
+            .lines()
+            .skip(3)
+            .map(|line| line.split(',').collect())
+            .collect();
+        assert_eq!(samples.len(), 6);
+        // KG1000: column 4 raw, 8 calibrated weight, 10 thrust.
+        assert_eq!([samples[0][4], samples[0][8], samples[0][10]], ["0.0625", "62.5", "62.5"]);
+        assert_eq!([samples[1][4], samples[1][8], samples[1][10]], ["0.19427338", "", ""], "ADC clip");
+        assert_eq!([samples[2][4], samples[2][8], samples[2][10]], ["0.0015", "", ""], "amplifier floor");
+        assert_eq!([samples[3][4], samples[3][8], samples[3][10]], ["0.0625", "62.5", "62.5"]);
+        // KG50: column 12 raw, 13 weight.
+        assert_eq!(samples[4][12..14], ["0.0625", "3"]);
+        assert_eq!(samples[5][12..14], ["0.2109375", ""], "KG50 at the ADC clip");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
