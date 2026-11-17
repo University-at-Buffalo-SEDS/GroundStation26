@@ -75,6 +75,16 @@ impl Item {
             Self::AbFillDrive => "Fill-line drive selection",
         }
     }
+    /// Pushes before falling back to one a minute. A drive push is a
+    /// tracked change that re-sends itself until the actuator confirms it
+    /// (actuator_plumbing::set_resend), so it is the drive's only quick
+    /// attempt: quick re-pushes on top would multiply its sends.
+    fn quick_attempts(self) -> u32 {
+        match self {
+            Self::AbFillDrive => 1,
+            Self::DaqCalibration | Self::DaqKg50Input => MAX_QUICK_ATTEMPTS,
+        }
+    }
     /// Time to wait for the board's readback after a push.
     fn settle(self) -> Duration {
         match self {
@@ -172,10 +182,14 @@ impl ItemSync {
     ) -> (Decision, Events) {
         let mut events = Events::default();
         if boot.is_some() && boot != self.boot {
-            // A new boot (or first contact) starts a fresh resync.
+            // A new boot starts a fresh resync. First contact keeps what was
+            // already counted (a drive change that gave up before the
+            // board's boot was first seen).
+            if self.boot.is_some() {
+                self.attempts = 0;
+                self.last_push = None;
+            }
             self.boot = boot;
-            self.attempts = 0;
-            self.last_push = None;
         }
         let was_conflict = self.conflict_identity;
         self.conflict_identity = None;
@@ -233,15 +247,23 @@ impl ItemSync {
                     self.message = format!("Re-applying the station's value: {why}; waiting for the board's readback.");
                     return (Decision::None, events);
                 }
-                if self.attempts >= MAX_QUICK_ATTEMPTS && since.is_some_and(|since| since < SLOW_RETRY) {
+                let quick = item.quick_attempts();
+                if self.attempts >= quick && since.is_some_and(|since| since < SLOW_RETRY) {
                     // Announced once per boot, not on every slow retry.
-                    events.gave_up = self.phase != Phase::OutOfSync && self.attempts == MAX_QUICK_ATTEMPTS;
+                    events.gave_up = self.phase != Phase::OutOfSync && self.attempts == quick;
                     self.phase = Phase::OutOfSync;
-                    self.message = format!(
-                        "Config out of sync: {why}, and the board did not take the station's value after {} attempts. \
-                         The station retries once a minute.",
-                        self.attempts
-                    );
+                    self.message = if item == Item::AbFillDrive {
+                        format!(
+                            "Config out of sync: {why}, and the actuator did not confirm the station's drive after \
+                             its re-sends. The station retries once a minute."
+                        )
+                    } else {
+                        format!(
+                            "Config out of sync: {why}, and the board did not take the station's value after {} attempts. \
+                             The station retries once a minute.",
+                            self.attempts
+                        )
+                    };
                     return (Decision::None, events);
                 }
                 self.attempts = self.attempts.saturating_add(1);
@@ -252,6 +274,17 @@ impl ItemSync {
                 (Decision::Push, events)
             }
         }
+    }
+}
+
+impl ItemSync {
+    /// A tracked drive change gave up at `at` without the actuator
+    /// confirming it: that was this item's quick attempt, so the next push
+    /// waits for the once-a-minute retry.
+    pub(crate) fn note_gave_up(&mut self, item: Item, at: Instant) {
+        self.attempts = self.attempts.max(item.quick_attempts());
+        self.last_push = Some(at);
+        self.unverified = true;
     }
 }
 
@@ -536,6 +569,13 @@ fn ab_observed(state: &AppState) -> (Option<u64>, Observed) {
 pub(crate) fn tick(state: &Arc<AppState>, now: Instant) {
     if crate::rrls::is_rrls() || state.topology_router.get().is_none() {
         return;
+    }
+    // Follow a drive change first (check, re-send or give up), so the
+    // drive item below sees its current state.
+    crate::actuator_plumbing::service_drive_set(state, now);
+    if crate::actuator_plumbing::take_drive_set_give_up(state) {
+        let mut inner = state.board_config_sync.inner.lock().unwrap();
+        inner.items.entry(Item::AbFillDrive).or_default().note_gave_up(Item::AbFillDrive, now);
     }
     let report = state.board_config_sync.inner.lock().unwrap().daq;
     let (daq_boot, daq, _) = daq_observed(state, report, now);

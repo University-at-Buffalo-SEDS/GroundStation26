@@ -8,6 +8,9 @@ mod refresh_tests;
 mod progress_tests;
 mod motion_journal;
 mod motion_wire;
+mod set_resend;
+#[cfg(test)]
+mod set_resend_tests;
 mod wire;
 
 use crate::{
@@ -34,6 +37,9 @@ use std::{
     time::Instant,
 };
 use wire::{Mode, Request, Status};
+pub(crate) use set_resend::{
+    note_drive_stream_retired, service as service_drive_set, take_give_up as take_drive_set_give_up,
+};
 pub(crate) use wire::setting_identity;
 
 const REQUEST_TYPE: &str = "AB_FILL_DRIVE_SETTINGS";
@@ -196,6 +202,8 @@ struct Inner {
     retract_failure: Option<RetractFailure>,
     /// When this station put its latest retraction on the network.
     retract_sent: Option<RetractSent>,
+    /// The latest drive change, followed until the actuator confirms it.
+    set_track: Option<set_resend::SetTrack>,
 }
 #[derive(Clone, Copy)]
 struct RetractSent {
@@ -266,6 +274,7 @@ impl Default for Runtime {
                 message: "Query the actuator for its saved drive selection.".into(),
                 retract_failure: None,
                 retract_sent: None,
+                set_track: None,
             }),
         }
     }
@@ -707,6 +716,7 @@ fn view(state: &AppState, commands: bool) -> Value {
         "retraction_interlock":retraction,
         "retraction_history_fault":history_fault,
         "motion":motion_view(state,&inner),
+        "apply":set_resend::view(&inner),
         "settings_inflight":inner.settings_busy,"message":inner.storage_error.as_ref().unwrap_or(&inner.message)})
 }
 
@@ -718,7 +728,10 @@ pub(crate) fn request_drive_query(state: &AppState) -> Result<(), String> {
     }
     {
         let inner = state.plumbing_drive.inner.lock().unwrap();
+        // A drive SET awaiting its reply pauses the query: that reply is the
+        // readback (set_resend).
         if inner.settings_busy
+            || inner.set_track.as_ref().is_some_and(|track| track.in_flight())
             || inner.requests.back().is_some_and(|context| {
                 context.sent.age().is_some_and(|age| {
                     age < 1_000 || (!context.complete && age <= REQUEST_TTL)
@@ -762,6 +775,11 @@ pub(crate) fn request_motion_query(state: &AppState) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     {
         let mut inner = state.plumbing_drive.inner.lock().unwrap();
+        // It shares the drive SET's Ordered stream; a drive change happens
+        // only with the fill drive idle (set_resend).
+        if inner.set_track.as_ref().is_some_and(|track| track.in_flight()) {
+            return Ok(());
+        }
         if inner
             .motion_queries
             .back()
@@ -1434,21 +1452,30 @@ pub(crate) fn receive_status(state: &AppState, packet: &Packet) {
     {
         return;
     }
-    if setting.is_some() && inner.pending_setting == Some(value.nonce) {
-        inner.pending_setting = None;
+    if setting.is_some() && set_resend::superseded_send(&inner, &value) {
+        return;
     }
-    // A fresh QUERY challenge can reconcile a lost SET reply or a GS restart.
-    // Matching persisted board value is still distinct from delivery ACK.
-    if setting.is_none()
-        && desired_revision == inner.desired.revision
-        && value.ready()
-        && value.mode.map(|mode| mode as u8) == Some(inner.desired.mode)
-    {
-        inner.pending_setting = None;
+    let refusal = (value.result != 0)
+        .then(|| crate::ab_command_gate::recent_drive_refusal(state, Instant::now()))
+        .flatten();
+    let tracked = inner.set_track.as_ref().is_some_and(|track| track.active());
+    if !tracked {
+        if setting.is_some() && inner.pending_setting == Some(value.nonce) {
+            inner.pending_setting = None;
+        }
+        // A fresh QUERY challenge can reconcile a lost SET reply or a GS restart.
+        // Matching persisted board value is still distinct from delivery ACK.
+        if setting.is_none()
+            && desired_revision == inner.desired.revision
+            && value.ready()
+            && value.mode.map(|mode| mode as u8) == Some(inner.desired.mode)
+        {
+            inner.pending_setting = None;
+        }
     }
     inner.message = if value.result == 0 {
         "Actual actuator readback received; physical position is not verified.".into()
-    } else if let Some(reason) = crate::ab_command_gate::recent_drive_refusal(state, Instant::now()) {
+    } else if let Some(reason) = refusal.as_ref() {
         format!("Actuator drive operation returned {}: refused by AB because {reason}.", value.result_name())
     } else {
         format!("Actuator drive operation returned {}.", value.result_name())
@@ -1458,6 +1485,19 @@ pub(crate) fn receive_status(state: &AppState, packet: &Packet) {
         after,
         recovery_generation,
     });
+    // A tracked drive change is confirmed only by readback of its own
+    // request identity; until then the panel keeps showing its progress.
+    let notice = if tracked {
+        let notice = set_resend::on_reply(&mut inner, setting.is_some(), &value, refusal);
+        if let Some(track) = inner.set_track.as_ref().filter(|track| track.active()) {
+            inner.message = set_resend::applying_message(track);
+        }
+        notice
+    } else {
+        None
+    };
+    drop(inner);
+    set_resend::raise(state, notice);
 }
 
 /// The AB reported why it refused a drive change (ab_command_gate); the
@@ -1510,6 +1550,16 @@ fn queue_prepared_request(
     prepared: PreparedRequest,
     nonwaiting: bool,
 ) -> Result<(), String> {
+    queue_prepared(state, prepared, nonwaiting, false)
+}
+/// `check`: a tracked drive change's own check query, outside the
+/// background query budget.
+fn queue_prepared(
+    state: &AppState,
+    prepared: PreparedRequest,
+    nonwaiting: bool,
+    check: bool,
+) -> Result<(), String> {
     let PreparedRequest {
         request,
         packet,
@@ -1519,12 +1569,15 @@ fn queue_prepared_request(
         .topology_router
         .get()
         .ok_or("Telemetry router unavailable")?;
+    let previous_pending;
     {
         let mut inner = state.plumbing_drive.inner.lock().unwrap();
         // Serialize the shared UI/background read-only budget with insertion.
         // SET admission is unchanged; only an answered query permits the next
         // one-second refresh before its original five-second timeout.
-        if request.mode.is_none() && (inner.settings_busy || inner.requests.back().is_some_and(|context| {
+        if request.mode.is_none() && !check && (inner.settings_busy
+            || inner.set_track.as_ref().is_some_and(|track| track.in_flight())
+            || inner.requests.back().is_some_and(|context| {
             context.sent.age().is_some_and(|age| age < 1_000 || (!context.complete && age <= REQUEST_TTL))
         })) {
             return Ok(());
@@ -1547,6 +1600,7 @@ fn queue_prepared_request(
             recovery_generation: crate::gse::automatic_generation(state),
             desired_revision,
         });
+        previous_pending = inner.pending_setting;
         if request.mode.is_some() {
             inner.pending_setting = Some(request.nonce);
         }
@@ -1567,13 +1621,14 @@ fn queue_prepared_request(
         crate::board_config_sync::note_ab_drive_source(source_ms);
     }
     if let Err(error) = admission {
-        state
-            .plumbing_drive
-            .inner
-            .lock()
-            .unwrap()
-            .requests
-            .retain(|c| c.request.nonce != request.nonce);
+        {
+            let mut inner = state.plumbing_drive.inner.lock().unwrap();
+            inner.requests.retain(|c| c.request.nonce != request.nonce);
+            // A SET that never left is not pending.
+            if inner.pending_setting == Some(request.nonce) {
+                inner.pending_setting = previous_pending;
+            }
+        }
         if crate::core_busy::is_core_busy(&error) {
             return Err(DRIVE_CORE_BUSY.into());
         }
@@ -1741,6 +1796,12 @@ fn apply_settings(
         if inner.desired.revision != body.expected_revision {
             return Err(fail("Saved drive changed; query again."));
         }
+        // The same change asked again while it is being applied: the
+        // tracked one is re-sent as needed under the same revision.
+        if let Some(message) = set_resend::already_applying(&inner, mode) {
+            inner.message = message;
+            return Ok(false);
+        }
         let observed = inner
             .observed
             .as_ref()
@@ -1887,18 +1948,16 @@ fn apply_settings(
             "Desired drive saved, but its original request expired before admission. Query and explicitly retry.",
         ));
     }
-    let prepared = prepare_request(
-        state,
-        Request {
-            mode: Some(mode),
-            nonce,
-            generation: expected,
-            epoch: body.expected_epoch,
-            issuer: state.plumbing_drive.issuer,
-        },
-        origin,
-    )
-    .map_err(|message| (StatusCode::SERVICE_UNAVAILABLE, message))?;
+    let request = Request {
+        mode: Some(mode),
+        nonce,
+        generation: expected,
+        epoch: body.expected_epoch,
+        issuer: state.plumbing_drive.issuer,
+    };
+    let prepared = prepare_request(state, request, origin)
+        .map_err(|message| (StatusCode::SERVICE_UNAVAILABLE, message))?;
+    let retired = set_resend::retired_count(state);
     // A held SDK core admitted nothing: the same prepared SET (same nonce
     // and timestamp) is offered again, briefly, with admission re-run.
     crate::core_busy::retry_blocking(
@@ -1920,6 +1979,21 @@ fn apply_settings(
         },
         |error| error.0 == StatusCode::SERVICE_UNAVAILABLE && error.1 == DRIVE_CORE_BUSY,
     )
+    .inspect(|_| {
+        let mut inner = state.plumbing_drive.inner.lock().unwrap();
+        let notice = set_resend::begin(
+            state,
+            &mut inner,
+            set_resend::SetOrigin::Operator,
+            &request,
+            body.release_stepper,
+            origin.ms.max(0) as u64,
+            retired,
+            Instant::now(),
+        );
+        drop(inner);
+        set_resend::raise(state, notice);
+    })
 }
 
 /// Legacy firmware retains its existing behavior until an explicit selection.
@@ -2005,27 +2079,20 @@ pub(crate) fn mode_label(mode: u8) -> &'static str {
 /// idle stepper's holding torque (the operator approved that release when
 /// saving auxiliary; a wiped or defaulted actuator energizes it at boot).
 pub(crate) fn resync_block_reason(state: &AppState) -> Option<String> {
-    if crate::rrls::is_rrls() || !primary(state) {
-        return Some("Only the primary GroundStation re-applies drive settings.".into());
-    }
-    if !configuration_state(state) {
-        return Some(format!(
-            "Deferred: drive settings change only in Startup or Idle (station is in {:?}).",
-            state.local_flight_state_snapshot()
-        ));
-    }
-    if state.plumbing_drive.motion_journal.pending() || retract_motion_active(state) {
-        return Some("Deferred: a retraction is in progress.".into());
-    }
-    if crate::gse::manual_stop_pending(state) {
-        return Some("Deferred: a manual Stop is pending.".into());
+    change_block_reason(state, None, false, false)
+}
+
+/// The drive-change gates for a resync (`mode` None: the saved drive) or a
+/// re-send of a tracked change (`own`: its own pending SET does not block
+/// it; `release`: the operator approved releasing the stepper's holding
+/// torque for it).
+fn change_block_reason(state: &AppState, mode: Option<Mode>, release: bool, own: bool) -> Option<String> {
+    if let Some(reason) = change_state_block(state) {
+        return Some(reason);
     }
     let proof = crate::board_recovery::actuator_configuration_proof(state);
     let inner = state.plumbing_drive.inner.lock().unwrap();
-    if inner.storage_error.is_some() {
-        return Some("Saved drive settings require repair.".into());
-    }
-    if inner.settings_busy || inner.pending_setting.is_some() {
+    if inner.settings_busy || (!own && inner.pending_setting.is_some()) {
         return Some("A drive change is already in progress.".into());
     }
     let Some(row) = inner.observed.as_ref().filter(|row| fresh(state, row)) else {
@@ -2041,15 +2108,39 @@ pub(crate) fn resync_block_reason(state: &AppState) -> Option<String> {
     if proof.boot != current.generation || proof.epoch != current.epoch {
         return Some("Waiting for matching actuator state and drive readback.".into());
     }
-    let Some(mode) = Mode::decode(inner.desired.mode) else {
+    let Some(mode) = mode.or_else(|| Mode::decode(inner.desired.mode)) else {
         return Some("Saved drive selection is unsupported.".into());
     };
     if !mode.supported(current.capabilities) {
         return Some("The saved drive is unavailable on this actuator.".into());
     }
-    let release = mode == Mode::Auxiliary && current.mode == Some(Mode::Stepper);
+    let release = mode == Mode::Auxiliary
+        && current.mode != Some(Mode::Auxiliary)
+        && (release || current.mode == Some(Mode::Stepper));
     if proof.outputs & !16 != 0 || (proof.outputs & 16 != 0 && !release) {
         return Some("Deferred: actuator outputs are on.".into());
+    }
+    None
+}
+/// The station-side drive-change gates that need no actuator readback.
+fn change_state_block(state: &AppState) -> Option<String> {
+    if crate::rrls::is_rrls() || !primary(state) {
+        return Some("Only the primary GroundStation re-applies drive settings.".into());
+    }
+    if !configuration_state(state) {
+        return Some(format!(
+            "Deferred: drive settings change only in Startup or Idle (station is in {:?}).",
+            state.local_flight_state_snapshot()
+        ));
+    }
+    if state.plumbing_drive.motion_journal.pending() || retract_motion_active(state) {
+        return Some("Deferred: a retraction is in progress.".into());
+    }
+    if crate::gse::manual_stop_pending(state) {
+        return Some("Deferred: a manual Stop is pending.".into());
+    }
+    if state.plumbing_drive.inner.lock().unwrap().storage_error.is_some() {
+        return Some("Saved drive settings require repair.".into());
     }
     None
 }
@@ -2057,54 +2148,10 @@ pub(crate) fn resync_block_reason(state: &AppState) -> Option<String> {
 /// Re-applies the station's saved drive to an actuator that lost it (reflash,
 /// wiped or defaulted storage) or holds an older station write. Keeps the
 /// saved revision; records this request time as the selection's source, as
-/// the actuator does. Confirmation is the next correlated readback.
+/// the actuator does. The change is then followed (set_resend) until the
+/// actuator's readback confirms it.
 pub(crate) fn resync_drive(state: &AppState) -> Result<(), String> {
-    let generation = crate::gse::capture_operator_origin(state).ok_or("Operator admission is closed.")?;
-    let admission = crate::gse::plumbing_admission_ticket(state);
-    let router = state.topology_router.get().ok_or("Telemetry router unavailable")?;
-    let origin = crate::system_clock::required_control_network_stamp(router)
-        .map_err(|_| "Network UTC is required before re-applying the drive.")?;
-    let _settings = state.plumbing_drive.settings_gate.lock().unwrap();
-    if let Some(reason) = resync_block_reason(state) {
-        return Err(reason);
-    }
-    let _owner = crate::gse::claim_plumbing_settings_dispatch(state, generation)
-        .ok_or("Drive resync cancelled by recovery.")?;
-    let _busy = SettingsBusy(&state.plumbing_drive);
-    crate::gse::with_plumbing_admission(state, admission, || ()).map_err(str::to_owned)?;
-    let (desired, expected) = {
-        let inner = state.plumbing_drive.inner.lock().unwrap();
-        let row = inner.observed.as_ref().filter(|row| fresh(state, row)).ok_or("Actuator readback expired.")?;
-        if origin <= inner.desired.source() || origin <= inner.last_motion() {
-            return Err("Resync request predates the saved selection.".into());
-        }
-        (Desired { source_ms: origin.ms as u64, source_epoch: origin.epoch, ..inner.desired }, (row.value.generation, row.value.epoch))
-    };
-    let mode = Mode::decode(desired.mode).ok_or("Saved drive selection is unsupported.")?;
-    let nonce = rand::random::<u64>().max(1);
-    if let Err(message) = desired.save(&state.plumbing_drive.path, nonce) {
-        let mut inner = state.plumbing_drive.inner.lock().unwrap();
-        inner.durable = false;
-        inner.storage_error = Some(message.clone());
-        return Err(message);
-    }
-    {
-        let mut inner = state.plumbing_drive.inner.lock().unwrap();
-        inner.desired = desired;
-        inner.durable = true;
-        inner.message = "Re-applying the station's saved drive to the actuator; confirmation is pending.".into();
-    }
-    let prepared = prepare_request(
-        state,
-        Request { mode: Some(mode), nonce, generation: expected.0, epoch: expected.1, issuer: state.plumbing_drive.issuer },
-        origin,
-    )?;
-    crate::gse::with_plumbing_admission(state, admission, || {
-        queue_prepared_request(state, prepared, true).map(|()| {
-            state.last_command_ms.lock().unwrap().remove("dedup:RetractPlumbing");
-        })
-    })
-    .map_err(str::to_owned)?
+    set_resend::send_set(state, set_resend::SendKind::Resync, Instant::now())
 }
 
 /// Operator conflict resolution "keep the actuator's drive": the station

@@ -5465,6 +5465,12 @@ impl OrderedExhaustion {
             if gone.is_empty() || gone.iter().any(|(_, ty, _)| *ty == recovery_request) {
                 crate::board_recovery::abort_confirm::note_query_stream_retired();
             }
+            // A drive SET queued behind a retired AB_FILL_DRIVE_SETTINGS head
+            // was dropped with it: the tracked change checks and re-sends.
+            let drive_settings = crate::telemetry_schema::data_type("AB_FILL_DRIVE_SETTINGS");
+            if gone.is_empty() || gone.iter().any(|(_, ty, _)| *ty == drive_settings) {
+                crate::actuator_plumbing::note_drive_stream_retired(router);
+            }
             flight_state_gone = gone.iter().filter(|(_, ty, _)| *ty == flight_state).map(|(id, _, owners)| (*id, owners.clone())).collect();
             gone.iter().filter(|(_, ty, _)| *ty == flight_state).map(|(id, _, _)| *id).collect::<Vec<_>>()
         };

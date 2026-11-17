@@ -17,7 +17,7 @@ struct Hook {
     fail: bool,
 }
 static HOOK: OnceLock<(Mutex<Option<Hook>>, Condvar)> = OnceLock::new();
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(super) static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 pub(super) fn save_hook(path: &Path, after: bool) -> Result<(), String> {
     let (lock, cv) = HOOK.get_or_init(|| (Mutex::new(None), Condvar::new()));
     let mut hook = lock.lock().unwrap();
@@ -185,7 +185,7 @@ pub(crate) struct Fixture {
     host_worker_running: bool,
     worker_wall: Arc<Mutex<Option<std::time::Instant>>>,
     pub(crate) mode: u8,
-    result: u8,
+    pub(crate) result: u8,
     pub(crate) outputs: u32,
     board_state: FlightState,
     pub(crate) board_boot: u64,
@@ -194,6 +194,20 @@ pub(crate) struct Fixture {
     pub(crate) drive_id: u16,
     /// SETs the fake actuator applied.
     pub(crate) sets: u32,
+    /// Frames from the station to the actuator are lost (no receipt).
+    pub(crate) link_down: bool,
+    /// Drive replies the fake actuator drops (handled, never sent back).
+    pub(crate) drop_drive_replies: u32,
+    /// Drive SETs the fake actuator receives but handles only on
+    /// `release_held_sets`, as a late copy.
+    pub(crate) hold_sets: bool,
+    held_sets: Vec<Packet>,
+    /// The fake actuator refuses a SET stamped at or before its saved
+    /// selection's request time as stale (result 4), as the firmware does.
+    drive_source: u64,
+    /// Serve the station with its production router worker pass (which
+    /// reports a retired Ordered stream) instead of a bare queue pass.
+    pub(crate) worker: Option<crate::telemetry_task::RouterServiceForTest>,
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -375,6 +389,12 @@ impl Fixture {
             motion: None,
             drive_id: 0,
             sets: 0,
+            link_down: false,
+            drop_drive_replies: 0,
+            hold_sets: false,
+            held_sets: Vec::new(),
+            drive_source: 0,
+            worker: None,
         }
     }
     async fn request(
@@ -445,16 +465,61 @@ impl Fixture {
                 self.clock.fetch_add(1, Ordering::Relaxed);
             }
             if !self.host_worker_running {
-                self.host.process_all_queues_with_timeout(0).unwrap();
+                match self.worker.as_mut() {
+                    Some(worker) => worker.pump(&self.host),
+                    None => self.host.process_all_queues_with_timeout(0).unwrap(),
+                }
             }
             for bytes in std::mem::take(&mut *self.outgoing.lock().unwrap()) {
+                if self.link_down {
+                    continue;
+                }
                 self.board
                     .rx_packed_from_side(&bytes, self.board_side)
                     .unwrap();
             }
             self.board.process_all_queues_with_timeout(0).unwrap();
-            let captured = self.requests.lock().unwrap().clone();
-            for packet in &captured[self.handled..] {
+            let mut captured = self.requests.lock().unwrap()[self.handled..].to_vec();
+            self.handled += captured.len();
+            if self.hold_sets {
+                let (held, rest): (Vec<Packet>, Vec<Packet>) = captured.into_iter().partition(|packet| {
+                    packet.data_type() == crate::telemetry_schema::data_type(REQUEST_TYPE)
+                        && packet.payload()[0] == 1
+                        && packet.payload()[1] == 1
+                });
+                self.held_sets.extend(held);
+                captured = rest;
+            }
+            self.answer(&captured);
+            for bytes in std::mem::take(&mut *self.incoming.lock().unwrap()) {
+                self.host
+                    .rx_packed_from_side(&bytes, self.host_side)
+                    .unwrap();
+            }
+        }
+    }
+    /// The fake actuator handles the SETs it held back, late.
+    pub(crate) fn release_held_sets(&mut self) {
+        let held = std::mem::take(&mut self.held_sets);
+        self.answer(&held);
+        self.pump();
+    }
+    /// Move both routers' clocks (the SDK's retry timers) forward.
+    pub(crate) fn advance_ms(&self, ms: u64) {
+        self.clock.fetch_add(ms, Ordering::Relaxed);
+    }
+    /// Drive requests the fake actuator received: (queries, SETs).
+    pub(crate) fn drive_requests(&self) -> (usize, usize) {
+        let requests = self.requests.lock().unwrap();
+        let drive = requests.iter().filter(|p| {
+            p.data_type() == crate::telemetry_schema::data_type(REQUEST_TYPE) && p.payload()[0] == 1
+        });
+        let sets = drive.clone().filter(|p| p.payload()[1] == 1).count();
+        (drive.count() - sets, sets)
+    }
+    fn answer(&mut self, captured: &[Packet]) {
+        {
+            for packet in captured {
                 let p = packet.payload();
                 let recovery = packet.data_type()
                     == crate::telemetry_schema::data_type("BOARD_RECOVERY_REQUEST");
@@ -493,17 +558,24 @@ impl Fixture {
                     bytes[32..40].copy_from_slice(&p[24..32]);
                     "BOARD_STATE_STATUS"
                 } else {
-                    if p[1] == 1 {
+                    bytes[1] = self.result;
+                    if p[1] == 1 && packet.timestamp() <= self.drive_source {
+                        bytes[1] = 4;
+                    } else if p[1] == 1 {
                         self.mode = p[2];
                         self.outputs = 0;
                         self.drive_id = super::wire::setting_identity(packet.timestamp());
+                        self.drive_source = packet.timestamp();
                         self.sets += 1;
                     }
-                    bytes[1] = self.result;
                     bytes[2] = self.mode;
                     bytes[3] = 5;
                     bytes[34..36].copy_from_slice(&self.drive_id.to_le_bytes());
                     bytes[24..32].copy_from_slice(&p[24..32]);
+                    if self.drop_drive_replies > 0 {
+                        self.drop_drive_replies -= 1;
+                        continue;
+                    }
                     STATUS_TYPE
                 };
                 self.board
@@ -517,12 +589,6 @@ impl Fixture {
                         )
                         .unwrap(),
                     )
-                    .unwrap();
-            }
-            self.handled = captured.len();
-            for bytes in std::mem::take(&mut *self.incoming.lock().unwrap()) {
-                self.host
-                    .rx_packed_from_side(&bytes, self.host_side)
                     .unwrap();
             }
         }
@@ -578,7 +644,7 @@ impl Fixture {
     pub(crate) fn body(&self, mode: &str, release: bool) -> Value {
         json!({"mode":mode,"expected_generation":"000000000000002a","expected_epoch":1,"backend_instance":format!("{:016x}",self.state.plumbing_drive.issuer),"expected_revision":self.state.plumbing_drive.inner.lock().unwrap().desired.revision,"expected_reset_epoch":format!("{:016x}",crate::gse::automatic_generation(&self.state)),"release_stepper":release})
     }
-    fn sets(&self) -> Vec<Packet> {
+    pub(super) fn sets(&self) -> Vec<Packet> {
         self.requests
             .lock()
             .unwrap()

@@ -127,39 +127,72 @@ fn an_unknown_board_value_is_a_conflict_until_the_operator_chooses_to_overwrite(
     assert_eq!(decision, Decision::Push);
 }
 
+/// DAQ calibration gets three quick pushes. The drive gets one: each drive
+/// push is a tracked change that re-sends itself until the actuator
+/// confirms it (actuator_plumbing::set_resend), so quick re-pushes on top
+/// would multiply its sends. Both then retry once a minute.
 #[test]
 fn a_board_that_never_takes_the_value_is_out_of_sync_and_retried_slowly_and_a_reboot_restarts() {
-    let mut sync = ItemSync::default();
-    let t = Instant::now();
-    let mut pushes = Vec::new();
-    let mut gave_up = 0;
-    for second in 0..200u64 {
-        let (decision, events) = sync.step(
-            Item::AbFillDrive,
-            t + Duration::from_secs(second),
-            Some(1),
+    for (item, quick) in [(Item::DaqCalibration, &[0u64, 12, 24][..]), (Item::AbFillDrive, &[0u64][..])] {
+        let mut sync = ItemSync::default();
+        let t = Instant::now();
+        let mut pushes = Vec::new();
+        let mut gave_up = 0;
+        for second in 0..200u64 {
+            let (decision, events) = sync.step(
+                item,
+                t + Duration::from_secs(second),
+                Some(1),
+                mismatch(Class::Default, 0),
+                Ok(()),
+                None,
+            );
+            if decision == Decision::Push {
+                pushes.push(second);
+            }
+            gave_up += u32::from(events.gave_up);
+        }
+        assert_eq!(&pushes[..quick.len()], quick, "{item:?}");
+        assert!(pushes.len() <= quick.len() + 3, "{item:?} {pushes:?}");
+        assert!(
+            pushes.windows(2).skip(quick.len() - 1).all(|w| w[1] - w[0] >= 60),
+            "{item:?} {pushes:?}"
+        );
+        assert_eq!(gave_up, 1, "{item:?}");
+        let (decision, _) = sync.step(
+            item,
+            t + Duration::from_secs(201),
+            Some(2),
             mismatch(Class::Default, 0),
             Ok(()),
             None,
         );
+        assert_eq!(decision, Decision::Push, "a new boot gets quick attempts again");
+    }
+}
+
+/// A tracked drive change that gave up was the drive's quick attempt: the
+/// resync does not push again at once on top of it, only once a minute.
+#[test]
+fn a_drive_change_that_gave_up_is_followed_only_by_the_slow_retry() {
+    let mut sync = ItemSync::default();
+    let t = Instant::now();
+    let at = |second: u64| t + Duration::from_secs(second);
+    sync.step(Item::AbFillDrive, at(0), Some(1), Observed::Match, Ok(()), None);
+    sync.note_gave_up(Item::AbFillDrive, at(1));
+    let mut pushes = Vec::new();
+    let mut gave_up = 0;
+    for second in 2..130u64 {
+        let (decision, events) =
+            sync.step(Item::AbFillDrive, at(second), Some(1), mismatch(Class::Known, 7), Ok(()), None);
         if decision == Decision::Push {
             pushes.push(second);
         }
         gave_up += u32::from(events.gave_up);
     }
-    assert_eq!(&pushes[..3], &[0, 4, 8]);
-    assert!(pushes.len() <= 6, "{pushes:?}");
-    assert!(pushes.windows(2).skip(2).all(|w| w[1] - w[0] >= 60), "{pushes:?}");
-    assert_eq!(gave_up, 1);
-    let (decision, _) = sync.step(
-        Item::AbFillDrive,
-        t + Duration::from_secs(201),
-        Some(2),
-        mismatch(Class::Default, 0),
-        Ok(()),
-        None,
-    );
-    assert_eq!(decision, Decision::Push, "a new boot gets quick attempts again");
+    assert_eq!(pushes, [61, 121]);
+    assert_eq!(gave_up, 1, "announced once");
+    assert!(sync.message.contains("once a minute"), "{}", sync.message);
 }
 
 #[tokio::test]
