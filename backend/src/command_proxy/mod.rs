@@ -57,6 +57,10 @@ pub(crate) const OBSERVE_REFRESH_MS: u64 = 10_000;
 const REFRESH_STALE_MS: u64 = 10_000;
 const REFRESH_STALE_PERIOD_MS: u64 = 5_000;
 const REFRESH_REPLY_MS: u64 = 1_500;
+/// How long a queued HOST_CONTROL frame (query, request copy or the
+/// primary's reply) may wait for the radio: the RRLS's own reply window.
+/// Later, the RRLS has re-asked with a fresh nonce.
+pub(crate) const HOST_CONTROL_REPLY_MS: u64 = REFRESH_REPLY_MS;
 const REFRESH_RETRIES: u8 = 3;
 fn refresh_retry_delay() -> u64 {
     REFRESH_REPLY_MS + 200 + rand::random::<u64>() % 501
@@ -880,6 +884,50 @@ mod tests {
         assert!(rr.receive(&r, late, Mode::Normal, &result).is_err(), "result for another request");
         // Within the normal window replies keep their existing behaviour.
         assert!(matches!(rr.receive(&r, rview, Mode::Normal, &result).unwrap(), Received::Result { .. }));
+    }
+    /// Bench 2026-11-17 (relay mode): repeated underglow toggles from the RRLS
+    /// reached the boards, yet each ended "outcome unknown ... Primary
+    /// response was not confirmed". The primary queued its signed result as a
+    /// HOST_CONTROL frame, wrote that lane only once no SDK control was queued
+    /// (1.4-3 s in the fullnet), and the frame expired after 250 ms, so the
+    /// RRLS never heard the result inside its LATE_REPLY_WINDOW. Through both
+    /// meshes: the result waits out a busy lane and still confirms.
+    #[test]
+    fn a_relayed_command_result_survives_a_busy_primary_lane_and_confirms() {
+        use crate::rrls::{Mesh, Role as MeshRole};
+        let (_root, p, r, mut primary, mut rr, pview, rview) = connected();
+        let mut primary_mesh = Mesh::new(MeshRole::Primary, 1);
+        let mut rrls_mesh = Mesh::new(MeshRole::Rrls, 2);
+        rr.query = None;
+        let request = rr
+            .request(&r, rview, Mode::Hitl, [9; 16], "operator".into(), Operation::Command("ToggleAvBayUnderglow".into()))
+            .unwrap();
+        // RRLS -> primary.
+        assert!(rrls_mesh.queue_command_proxy(&request, 0));
+        let tx = rrls_mesh.begin_transmission(0).unwrap();
+        let wire = tx.frame().bytes.clone();
+        rrls_mesh.finish_transmission(tx, true);
+        primary_mesh.incoming(true, &wire, 100);
+        let bytes = primary_mesh.take_command_proxy().unwrap();
+        let Received::Execute(work) = primary.receive(&p, pview, Mode::Hitl, &bytes).unwrap() else {
+            panic!("execute")
+        };
+        let result = primary.finish(&p, work, Outcome::Queued).unwrap();
+        // The primary queues its result; SDK receipts hold its lane for 1 s.
+        assert!(primary_mesh.queue_command_proxy(&result, 200));
+        let tx = primary_mesh
+            .begin_transmission(1_200)
+            .expect("the result is still owed after a 1 s busy lane");
+        let wire = tx.frame().bytes.clone();
+        primary_mesh.finish_transmission(tx, true);
+        // Primary -> RRLS: the RRLS gets its signed result.
+        rrls_mesh.incoming(true, &wire, 1_300);
+        let bytes = rrls_mesh.take_command_proxy().unwrap();
+        let late = Transport { sequence: rview.sequence + 3, ..rview };
+        assert!(matches!(
+            rr.receive(&r, late, Mode::Normal, &bytes).unwrap(),
+            Received::Result { outcome: Outcome::Queued, .. }
+        ));
     }
     /// Bench 2026-11-10: the RRLS re-sent its unanswered query each period and
     /// the primary answered every copy; each later copy of the accepted answer

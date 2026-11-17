@@ -199,8 +199,9 @@ fn station_answered_request(payload: &[u8]) -> bool {
             .is_some_and(crate::network_variables::station_serves)
 }
 
-/// Period of the primary's owed settings turn (one framing offer or mode
-/// reply, at most 92 B, so at most 92 B/s of the 256 B/s settings allowance).
+/// Period of the primary's owed settings turn: one framing offer or mode
+/// reply (at most 92 B, so at most 92 B/s of the 256 B/s settings allowance),
+/// else one HOST_CONTROL reply to an RRLS query (about 240 B, one per query).
 const SETTINGS_TURN_MS: u64 = 1_000;
 
 fn is_delivery_receipt(payload: &[u8]) -> bool {
@@ -4293,10 +4294,12 @@ pub(super) fn spawn_comms_worker_threads(
                     }
                     // A primary whose receipt lane never empties never passes
                     // background admission, so its settings framing offer and
-                    // station-mode reply starved (RRLS commands unavailable).
-                    // One such frame is owed every SETTINGS_TURN_MS while no
-                    // control is pending: receipts wait at most one settings
-                    // quantum (92 B) per turn, and control is never preempted.
+                    // station-mode reply starved (RRLS commands unavailable),
+                    // and so did its HOST_CONTROL replies (rrls_idle: 12 of 28
+                    // written). One such frame is owed every SETTINGS_TURN_MS
+                    // while no control is pending: receipts wait at most one
+                    // settings quantum (92 B) or one reply per turn, and
+                    // control is never preempted.
                     if !retained_protocol_turn
                         && !failed_writes.blocked()
                         && last_owed_settings_turn

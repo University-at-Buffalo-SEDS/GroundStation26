@@ -1388,6 +1388,10 @@ impl Mesh {
                 VOICE_EXPIRY_MS
             } else if q.independent_discovery() {
                 3_000
+            } else if q.frame.bytes.get(3) == Some(&HOST_CONTROL) {
+                // Sent once, never re-sent every 250 ms like a relayed uplink
+                // control: it lives as long as the RRLS waits for a reply.
+                crate::command_proxy::HOST_CONTROL_REPLY_MS
             } else if q.priority == 255 || q.frame.bytes.get(3) == Some(&DOWN_DATA) {
                 // Retain sparse reports through bounded sensor bursts. Relayed
                 // downlink reliable state and receipts (board readbacks,
@@ -1648,8 +1652,9 @@ impl Mesh {
     }
     /// The primary's owed settings turn (see radio_io SETTINGS_TURN_MS): one
     /// relay budget frame (the RRLS's grant), else one settings framing offer,
-    /// else one station-mode reply, even while protected Mesh frames such as
-    /// HEALTH wait for the normal path. Nothing else.
+    /// else one station-mode reply, else one HOST_CONTROL reply to the RRLS,
+    /// even while protected Mesh frames such as HEALTH wait for the normal
+    /// path. Nothing else.
     pub(crate) fn begin_owed_settings_transmission(&mut self, now: u64) -> Option<Transmission> {
         if self.role != Role::Primary {
             return None;
@@ -1660,6 +1665,7 @@ impl Mesh {
             && let Some(settings) = self
                 .begin_framing_offer_transmission(now, 0)
                 .or_else(|| self.begin_mode_reply(now, true))
+                .or_else(|| self.begin_owed_host_control(now))
         {
             self.owed_turn_was_budget = false;
             return Some(settings);
@@ -1671,6 +1677,44 @@ impl Mesh {
         self.owed_turn_was_budget = false;
         self.begin_framing_offer_transmission(now, 0)
             .or_else(|| self.begin_mode_reply(now, true))
+            .or_else(|| self.begin_owed_host_control(now))
+    }
+    /// The primary's queued HOST_CONTROL reply, in the owed turn: written
+    /// only when no SDK control is queued, the lane otherwise waited 1.4-3 s
+    /// in idle (rrls_idle I4) while the RRLS waits REFRESH_REPLY_MS.
+    fn begin_owed_host_control(&mut self, now: u64) -> Option<Transmission> {
+        if self.role != Role::Primary || self.active_transmission.is_some() {
+            return None;
+        }
+        let index = self
+            .queue
+            .iter()
+            .enumerate()
+            .find(|(index, q)| {
+                q.frame.bytes.get(3) == Some(&HOST_CONTROL) && self.dependency_ready(*index)
+            })
+            .map(|(index, _)| index)?;
+        if self.queued_expired(&self.queue[index], now) {
+            let expired = self.queue.remove(index).unwrap();
+            self.bytes -= expired.frame.bytes.len();
+            self.dropped += 1;
+            return None;
+        }
+        let id = self.next_transmission.checked_add(1)?;
+        let queued = self.queue.remove(index).unwrap();
+        self.next_transmission = id;
+        self.active_transmission = Some(id);
+        self.active_frame_count = 1;
+        self.active_recovery_control = queued.recovery_control();
+        self.active_fair_delta_bytes = 0;
+        self.active_survives_clear = true;
+        Some(Transmission {
+            queued,
+            follower: None,
+            id,
+            physical: None,
+            settings_action: None,
+        })
     }
     fn begin_mode_reply(&mut self, now: u64, owed: bool) -> Option<Transmission> {
         self.observe_settings_framing(now);
@@ -2218,6 +2262,15 @@ impl Mesh {
         })
     }
     pub(crate) fn queue_command_proxy(&mut self, payload: &[u8], now: u64) -> bool {
+        // An expired HOST_CONTROL left in the queue (expiry is applied when a
+        // frame is selected) must not refuse the next one.
+        if let Some(index) = self.queue.iter().position(|queued| {
+            queued.frame.bytes.get(3) == Some(&HOST_CONTROL) && self.queued_expired(queued, now)
+        }) {
+            let old = self.queue.remove(index).unwrap();
+            self.bytes -= old.frame.bytes.len();
+            self.dropped += 1;
+        }
         if payload.len() > crate::command_proxy::MAX_WIRE
             || crate::command_proxy::wire_boundary(payload).is_none()
             || self.queue.len() + usize::from(self.active_frame_count) >= MAX_FRAMES
@@ -3069,6 +3122,65 @@ mod tests {
         assert!(mesh.take_command_proxy().is_some());
         assert!(mesh.queue_command_proxy(&payload, 3));
         assert!(!mesh.queue_command_proxy(&vec![0; 257], 3));
+    }
+    fn host_control_payload(tag: u8) -> Vec<u8> {
+        let mut payload = vec![tag; 132];
+        payload[..4].copy_from_slice(b"CP\x01\x00");
+        payload
+    }
+    /// rrls_idle fullnet I4: the primary queued 28 signed replies and wrote 12.
+    /// It writes this lane only when no SDK control is queued, which in idle
+    /// often took 1.4-3 s, and a reply expired after the 250 ms meant for
+    /// relayed uplink controls (re-sent every 250 ms). Nothing re-sends a
+    /// reply: it lives as long as the RRLS waits for it (REFRESH_REPLY_MS).
+    #[test]
+    fn a_host_control_reply_waits_out_a_busy_lane_for_the_rrls_reply_window() {
+        let mut mesh = Mesh::new(Role::Primary, 1);
+        assert!(mesh.queue_command_proxy(&host_control_payload(1), 0));
+        let reply = mesh.begin_transmission(1_000).expect("reply still owed after 1 s");
+        assert_eq!(reply.frame().bytes, encode(HOST_CONTROL, &host_control_payload(1)));
+        mesh.finish_transmission(reply, true);
+        assert!(mesh.queue_command_proxy(&host_control_payload(2), 2_000));
+        assert!(mesh.begin_transmission(3_501).is_none(), "the RRLS has re-asked by now");
+        assert_eq!(mesh.bytes, 0);
+    }
+    /// An expired reply still queued must not refuse the next one: the worker
+    /// writes one at a time and only once no HOST_CONTROL is queued.
+    #[test]
+    fn an_expired_host_control_does_not_block_the_next() {
+        let mut mesh = Mesh::new(Role::Primary, 1);
+        assert!(mesh.queue_command_proxy(&host_control_payload(1), 0));
+        assert!(!mesh.queue_command_proxy(&host_control_payload(2), 1_500));
+        assert!(mesh.queue_command_proxy(&host_control_payload(2), 1_501));
+        let reply = mesh.begin_transmission(1_501).unwrap();
+        assert_eq!(reply.frame().bytes, encode(HOST_CONTROL, &host_control_payload(2)));
+        mesh.finish_transmission(reply, true);
+        assert_eq!(mesh.bytes, 0);
+        assert!(mesh.queue.is_empty());
+    }
+    /// The owed settings turn (radio_io SETTINGS_TURN_MS) also carries a queued
+    /// HOST_CONTROL reply, after any framing offer or mode reply: the receipt
+    /// stream that starved those starved the RRLS's replies too.
+    #[test]
+    fn the_owed_settings_turn_carries_a_host_control_reply() {
+        let mut mesh = Mesh::new(Role::Primary, 1);
+        assert!(mesh.begin_owed_settings_transmission(0).is_none());
+        assert!(mesh.queue_command_proxy(&host_control_payload(1), 0));
+        let reply = mesh.begin_owed_settings_transmission(900).expect("owed turn takes the reply");
+        assert_eq!(reply.frame().bytes, encode(HOST_CONTROL, &host_control_payload(1)));
+        assert!(mesh.finish_transmission(reply, false).is_none());
+        let retry = mesh.begin_owed_settings_transmission(1_000).expect("refused write is kept");
+        mesh.finish_transmission(retry, true);
+        assert_eq!(mesh.bytes, 0);
+        // Expired: dropped, not written.
+        assert!(mesh.queue_command_proxy(&host_control_payload(2), 2_000));
+        assert!(mesh.begin_owed_settings_transmission(3_501).is_none());
+        assert!(mesh.queue.is_empty());
+        assert_eq!(mesh.bytes, 0);
+        // The RRLS's own lane is not the primary's owed turn.
+        let mut rrls = Mesh::new(Role::Rrls, 2);
+        assert!(rrls.queue_command_proxy(&host_control_payload(1), 0));
+        assert!(rrls.begin_owed_settings_transmission(0).is_none());
     }
     #[test]
     fn receipt_boundary_metadata_survives_downlink_wrapping_and_priority_cap() {
