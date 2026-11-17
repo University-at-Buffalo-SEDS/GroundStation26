@@ -652,6 +652,7 @@ pub(super) fn prepare_derived_loadcell_rows(
         sensor: calibration_sensor_id,
         timestamp_ms: sample.ts_ms,
         source_timestamp_ms: sample.source_timestamp_ms,
+        source_epoch: sample.receipt.source_epoch,
         received_network_ms: sample.receipt.network_ms,
         // A zero/noise capture must reject clipped samples, never average them.
         raw: if railed { f32::NAN } else { sample.raw_value },

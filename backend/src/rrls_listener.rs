@@ -57,15 +57,23 @@ fn display_type(name: &str) -> bool {
     ) && !name.ends_with("_COMMAND")
 }
 
-/// Newest (timestamp, packet id) shown per (sender, type).
+/// Newest ((epoch, timestamp), packet id) shown per (sender, type).
 #[derive(Default)]
 pub(crate) struct Latest {
-    shown: HashMap<(String, u32), (u64, u64)>,
+    shown: HashMap<(String, u32), (crate::network_stamp::Stamp, u64)>,
 }
 impl Latest {
     /// True when `packet` is newer than everything shown for its sender and
-    /// type; a retransmission (same id) or an older frame is refused.
-    pub(crate) fn admit(&mut self, sender: &str, ty: u32, timestamp: u64, id: u64) -> bool {
+    /// type by (epoch, timestamp), so a frame stamped after a network clock
+    /// step back is newer; a retransmission (same id) or an older frame is
+    /// refused.
+    pub(crate) fn admit(
+        &mut self,
+        sender: &str,
+        ty: u32,
+        timestamp: crate::network_stamp::Stamp,
+        id: u64,
+    ) -> bool {
         match self.shown.get(&(sender.to_owned(), ty)) {
             Some(&(last, last_id)) if timestamp < last || (timestamp == last && id == last_id) => {
                 false
@@ -92,7 +100,7 @@ fn ingest(state: &Arc<AppState>, latest: &Mutex<Latest>, packet: &Packet) {
     if !latest.lock().unwrap().admit(
         packet.sender(),
         packet.data_type().as_u32(),
-        packet.timestamp(),
+        crate::network_stamp::Stamp::of(packet),
         packet.packet_id(),
     ) {
         return;
@@ -161,12 +169,15 @@ mod tests {
     #[test]
     fn newest_per_sender_and_type_only() {
         let mut latest = Latest::default();
-        assert!(latest.admit("PB", 1, 1000, 7));
-        assert!(!latest.admit("PB", 1, 1000, 7), "a retransmission is shown once");
-        assert!(!latest.admit("PB", 1, 999, 8), "an older frame never overwrites a newer one");
-        assert!(latest.admit("PB", 1, 1001, 9));
-        assert!(latest.admit("FC", 1, 10, 1), "per sender");
-        assert!(latest.admit("PB", 2, 10, 2), "per type");
+        use crate::network_stamp::Stamp;
+        assert!(latest.admit("PB", 1, Stamp::raw(1000), 7));
+        assert!(!latest.admit("PB", 1, Stamp::raw(1000), 7), "a retransmission is shown once");
+        assert!(!latest.admit("PB", 1, Stamp::raw(999), 8), "an older frame never overwrites a newer one");
+        assert!(latest.admit("PB", 1, Stamp::raw(1001), 9));
+        assert!(latest.admit("FC", 1, Stamp::raw(10), 1), "per sender");
+        assert!(latest.admit("PB", 2, Stamp::raw(10), 2), "per type");
+        assert!(latest.admit("PB", 1, Stamp::new(1, 1), 10), "a newer epoch after a step back");
+        assert!(!latest.admit("PB", 1, Stamp::raw(1002), 11), "a pre-step copy stays older");
     }
 
     #[test]

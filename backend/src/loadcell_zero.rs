@@ -231,6 +231,9 @@ pub struct SourceSample<'a> {
     pub sensor: &'a str,
     pub timestamp_ms: i64,
     pub source_timestamp_ms: Option<i64>,
+    /// Time-base epoch of `source_timestamp_ms`: sources order by
+    /// (epoch, timestamp).
+    pub source_epoch: u16,
     pub received_network_ms: i64,
     pub raw: f32,
     pub temperature: Option<f32>,
@@ -240,7 +243,7 @@ struct Session {
     tx: SyncSender<Sample>,
     stop: Arc<AtomicBool>,
     dropped: Arc<AtomicU64>,
-    last_source_ms: Option<i64>,
+    last_source_ms: Option<crate::network_stamp::Stamp>,
 }
 #[derive(Default)]
 pub struct Service {
@@ -451,6 +454,7 @@ impl Service {
                 sensor,
                 timestamp_ms,
                 source_timestamp_ms: None,
+                source_epoch: 0,
                 received_network_ms: timestamp_ms,
                 raw,
                 temperature,
@@ -473,7 +477,9 @@ impl Service {
         let source_valid = !require_source
             || sample.source_timestamp_ms.is_some_and(|source| {
                 source >= 0
-                    && s.last_source_ms.is_none_or(|last| source > last)
+                    && s.last_source_ms.is_none_or(|last| {
+                        crate::network_stamp::Stamp::new(sample.source_epoch, source) > last
+                    })
                     && if source >= 1_577_836_800_000
                         && sample.received_network_ms >= 1_577_836_800_000
                     {
@@ -504,7 +510,9 @@ impl Service {
         } else if require_source {
             // Only accepted source observations advance this capture. Replays,
             // stale inputs and queue refusals cannot refresh its provenance.
-            s.last_source_ms = sample.source_timestamp_ms;
+            s.last_source_ms = sample
+                .source_timestamp_ms
+                .map(|ms| crate::network_stamp::Stamp::new(sample.source_epoch, ms));
         }
     }
     pub fn apply(
@@ -797,6 +805,7 @@ mod source_provenance_tests {
             sensor: "KG1000",
             timestamp_ms: receipt,
             source_timestamp_ms: source,
+            source_epoch: 0,
             received_network_ms: network,
             raw: 0.2,
             temperature: Some(20.),
