@@ -3251,6 +3251,10 @@ pub(crate) mod command_dispatch_tests {
     // Receipt notification is test-only and scoped to one real socket state.
     type ScopedCommandReceipt = std::sync::Mutex<Option<(usize, Arc<tokio::sync::Notify>)>>;
     static WS_COMMAND_RECEIVED: std::sync::OnceLock<ScopedCommandReceipt> = std::sync::OnceLock::new();
+    /// The receipt slot holds one test's socket state: tests that use it run
+    /// one at a time, or a concurrent one replaces the other's slot and its
+    /// receipt wait times out.
+    static WS_COMMAND_RECEIPT_USER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     pub(super) fn notify_ws_command_received(state: &Arc<AppState>) {
         let guard = WS_COMMAND_RECEIVED
@@ -3568,6 +3572,7 @@ pub(crate) mod command_dispatch_tests {
     }
     #[tokio::test]
     async fn shutdown_ingress_held_ws_auth_finishes_existing_manual_stop_but_drops_late_frame() {
+        let _receipt_slot = WS_COMMAND_RECEIPT_USER.lock().await;
         let (_root, state, mut commands, _headers) = preauth_fixture().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -3667,6 +3672,7 @@ pub(crate) mod command_dispatch_tests {
 
     #[tokio::test]
     async fn preauth_websocket_frame_retains_origin_and_stop_is_independent() {
+        let _receipt_slot = WS_COMMAND_RECEIPT_USER.lock().await;
         use futures::SinkExt;
         let (_root, state, mut rx, _headers) = preauth_fixture().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
