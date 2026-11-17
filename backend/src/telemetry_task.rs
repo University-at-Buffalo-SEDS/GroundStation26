@@ -2805,6 +2805,7 @@ async fn handle_packet_inner(
                 }
                 if crate::types::canonical_sender_id(sender_id.trim()) == "FC" {
                     crate::network_variables::observe_fc_health_outputs(&words);
+                    crate::fc_estimator::observe_health(state, &words, Some(pkt.timestamp()));
                 }
                 if crate::types::canonical_sender_id(sender_id.trim()) == "AB" {
                     crate::ab_command_gate::observe(state, &words);
@@ -6379,6 +6380,7 @@ mod tests {
             launch_indicator_latched: Arc::new(AtomicBool::new(false)),
             abort_indicator_latched: Arc::new(AtomicBool::new(false)),
             fc_phase: Default::default(),
+            fc_estimator: Default::default(),
             hitl_button_interlock_enabled: Arc::new(AtomicBool::new(false)),
             hitl_launch_interlock_enabled: Arc::new(AtomicBool::new(false)),
             hitl_safety_interlocks: crate::state::default_hitl_safety_interlocks(),

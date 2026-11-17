@@ -365,6 +365,8 @@ pub struct AppState {
     pub abort_indicator_latched: Arc<AtomicBool>,
     /// The FC's detailed phase from its own state report (shown beside "In flight").
     pub fc_phase: Arc<crate::fc_phase::Tracker>,
+    /// The FC's Kalman filter status from its BOARD_HEALTH (fc_estimator).
+    pub fc_estimator: Arc<crate::fc_estimator::Tracker>,
 
     pub hitl_button_interlock_enabled: Arc<AtomicBool>,
 
@@ -1010,7 +1012,7 @@ impl AppState {
         self.set_launch_clock_admitted(next, claim);
     }
 
-    fn layout_expected_boards(&self) -> std::collections::HashSet<Board> {
+    pub(crate) fn layout_expected_boards(&self) -> std::collections::HashSet<Board> {
         let configured = crate::layout::load_layout()
             .ok()
             .map(|layout| {
@@ -4550,6 +4552,7 @@ pub(crate) mod tests {
             launch_indicator_latched: Arc::new(AtomicBool::new(false)),
             abort_indicator_latched: Arc::new(AtomicBool::new(false)),
             fc_phase: Default::default(),
+            fc_estimator: Default::default(),
             hitl_button_interlock_enabled: Arc::new(AtomicBool::new(false)),
             hitl_launch_interlock_enabled: Arc::new(AtomicBool::new(false)),
             hitl_safety_interlocks: default_hitl_safety_interlocks(),

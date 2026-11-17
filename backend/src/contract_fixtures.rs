@@ -610,6 +610,28 @@ async fn board_abort_hitl(out: &mut Fixtures) {
     out.add("board-abort/status-hitl", value);
 }
 
+/// The FC's Kalman filter status: the `FcEstimator` frame after the filter
+/// started at T+0.3 s, and `/api/fc_estimator` before any FC report.
+async fn fc_estimator(app: &axum::Router, out: &mut Fixtures) {
+    use crate::fc_estimator::{Context, TAG, Tracker};
+    let tracker = Tracker::default();
+    let launch = std::time::Instant::now();
+    let flight = Context { launched: true, expected: true };
+    tracker.tick(launch, flight);
+    let mut words = [0u32; 24];
+    words[0] = 1;
+    words[2] = 11_301;
+    words[4] = 1000;
+    words[13] = (TAG << 24) | (3 << 20) | 62;
+    words[15] = 11_051;
+    tracker.observe(&words, launch + Duration::from_millis(550), Some(T0 as u64 + 1_250), flight);
+    let status = tracker.status(launch + Duration::from_millis(2_550));
+    out.add("websocket/fc-estimator", serde_json::to_value(WsOutMsg::FcEstimator(status)).unwrap());
+    let mut value = get_ok(app, "/api/fc_estimator", Some("viewer")).await;
+    pin_fields(&mut value, &["report_age_ms", "running_for_ms"]);
+    out.add("fc-estimator/get", value);
+}
+
 /// `POST /api/gse/self-test-confirmation`: the isolation checkbox's request as
 /// the station decodes it (the UI checks that it sends exactly this), and the
 /// station's reply.
@@ -645,6 +667,7 @@ async fn contract_fixtures_match_the_backend() {
     radio_modem(&app, &mut out).await;
     rrls_status(&app, &mut out).await;
     auth(&app, &mut out).await;
+    fc_estimator(&app, &mut out).await;
     drop(_mode);
     board_abort_hitl(&mut out).await;
     self_test_confirmation(&mut out).await;

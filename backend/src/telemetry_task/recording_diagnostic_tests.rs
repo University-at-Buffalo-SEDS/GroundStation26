@@ -116,3 +116,55 @@ async fn ab_board_health_refusal_raises_one_operator_notice() {
     assert_eq!(view["message"], drive);
     crate::ab_command_gate::forget(&state);
 }
+
+// The FC's Kalman filter status (BOARD_HEALTH words 13/15) through the actual
+// ingress: after Launch its start raises the operator notification, the
+// status reaches the API/WebSocket view, and the change is recorded. A
+// listening RRLS (not the primary role) decodes the same broadcast report.
+#[tokio::test]
+async fn fc_estimator_start_after_launch_is_notified_shown_and_recorded() {
+    for primary in [true, false] {
+        let (db_tx, mut db_rx) = mpsc::channel(64);
+        let state = test_app_state(db_tx.clone()).await;
+        state.set_preexisting_flight_state_for_test(FlightState::Launch);
+        crate::fc_estimator::tick(&state);
+        let packet = |phase: u32, cycles: u32, start: u32, uptime: u32, stamp: u64| {
+            let mut words = [0u32; 24];
+            words[0] = 1;
+            words[2] = uptime;
+            words[4] = 1000;
+            words[13] = (crate::fc_estimator::TAG << 24) | (phase << 20) | cycles;
+            words[15] = start;
+            let bytes: Vec<u8> = words.iter().flat_map(|v| v.to_le_bytes()).collect();
+            Packet::new(crate::telemetry_schema::data_type("BOARD_HEALTH"),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")], "FC", stamp, bytes.into()).unwrap()
+        };
+        let overflow = test_db_overflow();
+        let run = |pkt| handle_packet_inner(&state, &db_tx, &overflow, pkt, primary, None,
+            crate::gse::automatic_generation(&state));
+        assert!(run(packet(1, 0, 0, 50_000, 7_000)).await.is_empty());
+        run(packet(2, 12, 50_001, 50_251, 7_250)).await;
+        let running: Vec<_> = state.notifications_snapshot().into_iter()
+            .filter(|n| n.message.starts_with("FC flight estimator running (Kalman filter started at T+")).collect();
+        assert_eq!(running.len(), 1, "primary={primary}: {:?}", state.notifications_snapshot());
+        let status = state.fc_estimator.snapshot();
+        assert_eq!(status.phase, Some(crate::fc_estimator::Phase::Running), "primary={primary}");
+        assert_eq!(status.started_network_ms, Some(7_000));
+        assert!(status.launch_seen);
+        if crate::station_mode::local_mode() != crate::station_mode::Mode::TestFire {
+            assert_eq!(status.state, "running");
+        }
+        let mut recorded = Vec::new();
+        while let Ok(item) = db_rx.try_recv() {
+            if let DbQueueItem::Write(crate::telemetry_db::DbWrite::Telemetry { data_type, payload_json, .. }) = item
+                && data_type == "GS_FC_ESTIMATOR"
+            {
+                recorded.push(serde_json::from_str::<serde_json::Value>(&payload_json).unwrap());
+            }
+        }
+        assert!(recorded.iter().any(|row| row["phase"] == "running"), "primary={primary}: {recorded:?}");
+        let api = serde_json::to_value(crate::web::WsOutMsg::FcEstimator(status)).unwrap();
+        assert_eq!(api["ty"], "FcEstimator");
+        assert_eq!(api["data"]["phase"], "running");
+    }
+}

@@ -495,6 +495,7 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .route("/flightstate", get(get_flight_state))
         .route("/api/mission_phase", get(get_mission_phase))
         .route("/api/flight_maxima", get(get_flight_maxima))
+        .route("/api/fc_estimator", get(get_fc_estimator))
         .route("/api/gps", get(get_gps))
         .route("/api/antenna/status", get(get_antenna_status))
         .route(
@@ -633,6 +634,8 @@ pub enum WsOutMsg {
     FlightState(FlightStateWire),
     MissionPhase(crate::mission_phase::MissionPhaseMsg),
     FlightMaxima(crate::flight_maxima::FlightMaxima),
+    /// The FC's Kalman filter status (`fc_estimator`).
+    FcEstimator(crate::fc_estimator::Status),
     LaunchClock(LaunchClockMsg),
     Error(ErrorMsg),
     AlertAckState(AlertAckStateMsg),
@@ -1876,6 +1879,21 @@ async fn get_mission_phase(
     (
         [(axum::http::header::CACHE_CONTROL, "no-store")],
         Json(crate::mission_phase::refresh(&state)),
+    )
+        .into_response()
+}
+
+/// The FC's Kalman filter status (fc_estimator::Status).
+async fn get_fc_estimator(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(state.fc_estimator.status(std::time::Instant::now())),
     )
         .into_response()
 }
@@ -5240,6 +5258,7 @@ async fn handle_ws(
     let mut alert_conditions_rx=state.alert_conditions.tx.subscribe();
     let mut mission_phase_rx = crate::mission_phase::subscribe();
     let mut flight_maxima_rx = crate::flight_maxima::subscribe();
+    let mut fc_estimator_rx = state.fc_estimator.subscribe();
     let mut station_mode_rx = crate::runtime_mode::subscribe();
     station_mode_rx.borrow_and_update();
 
@@ -5303,6 +5322,15 @@ async fn handle_ws(
         )))
         .unwrap_or_default();
         if ws_out_tx.send(initial_flight_state).await.is_err() {
+            return;
+        }
+        let initial_estimator = state_for_send.fc_estimator.status(std::time::Instant::now());
+        fc_estimator_rx.borrow_and_update();
+        if ws_out_tx
+            .send(serde_json::to_string(&WsOutMsg::FcEstimator(initial_estimator)).unwrap_or_default())
+            .await
+            .is_err()
+        {
             return;
         }
         let initial_maxima = flight_maxima_rx.borrow_and_update().clone();
@@ -5486,6 +5514,16 @@ async fn handle_ws(
                     }
                     let maxima = flight_maxima_rx.borrow_and_update().clone();
                     let text = serde_json::to_string(&WsOutMsg::FlightMaxima(maxima)).unwrap_or_default();
+                    if ws_out_tx.send(text).await.is_err() {
+                        break;
+                    }
+                }
+                changed = fc_estimator_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let status = fc_estimator_rx.borrow_and_update().clone();
+                    let text = serde_json::to_string(&WsOutMsg::FcEstimator(status)).unwrap_or_default();
                     if ws_out_tx.send(text).await.is_err() {
                         break;
                     }

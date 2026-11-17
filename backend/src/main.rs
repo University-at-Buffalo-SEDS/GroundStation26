@@ -81,6 +81,7 @@ mod media;
 mod media_runtime;
 mod mission_phase;
 mod fc_phase;
+mod fc_estimator;
 mod valve_report_health;
 mod mission_sync;
 mod fc_command_gate;
@@ -1708,6 +1709,7 @@ async fn main() -> anyhow::Result<()> {
         launch_indicator_latched: Arc::new(AtomicBool::new(false)),
         abort_indicator_latched: Arc::new(AtomicBool::new(false)),
         fc_phase: Default::default(),
+        fc_estimator: Default::default(),
         hitl_button_interlock_enabled: Arc::new(AtomicBool::new(false)),
         hitl_launch_interlock_enabled: Arc::new(AtomicBool::new(false)),
         hitl_safety_interlocks: state::default_hitl_safety_interlocks(),

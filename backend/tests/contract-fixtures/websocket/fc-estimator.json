@@ -1,0 +1,18 @@
+{
+  "data": {
+    "cycles": 62,
+    "expected": true,
+    "label": "FC estimator: running (converged)",
+    "launch_seen": true,
+    "phase": "converged",
+    "rate_hz": null,
+    "report_age_ms": 2000,
+    "running_for_ms": 2250,
+    "stalled": false,
+    "started_network_ms": 1767225601000,
+    "started_t_plus_ms": 300,
+    "state": "running",
+    "warning": null
+  },
+  "ty": "FcEstimator"
+}

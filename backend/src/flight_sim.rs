@@ -327,6 +327,9 @@ struct FlightSimState {
     saw_dump_open_after_n2: bool,
     saw_dump_closed_after_n2: bool,
     nitrous_fill_started_ms: Option<u64>,
+    /// When the modeled FC Kalman filter started (Launch), for its
+    /// BOARD_HEALTH estimator words (crate::fc_estimator).
+    estimator_started_ms: Option<u64>,
     queued: VecDeque<QueuedPacket>,
 }
 
@@ -393,6 +396,7 @@ impl FlightSimState {
             saw_dump_open_after_n2: false,
             saw_dump_closed_after_n2: false,
             nitrous_fill_started_ms: None,
+            estimator_started_ms: None,
             queued: VecDeque::new(),
         }
     }
@@ -435,6 +439,43 @@ impl FlightSimState {
             self.nitrous_fill_started_ms = None;
         }
         self.queue_flight_state(now_ms);
+        // The FC starts its Kalman filter on Launch and reports it at once.
+        let launched = (FlightState::Launch as u8..=FlightState::Recovery as u8).contains(&(fs as u8))
+            || fs == FlightState::InFlight;
+        if !launched {
+            self.estimator_started_ms = None;
+        } else if self.estimator_started_ms.is_none() {
+            self.estimator_started_ms = Some(now_ms);
+            self.queue_fc_estimator_health(now_ms);
+        }
+    }
+
+    /// FC BOARD_HEALTH with the estimator words (FlightComputer26
+    /// fc_estimator_status.h): running at 50 Hz from Launch, converged after
+    /// 64 cycles. Only once the filter has started.
+    fn queue_fc_estimator_health(&mut self, now_ms: u64) {
+        let Some(start) = self.estimator_started_ms else {
+            return;
+        };
+        let cycles = (now_ms.saturating_sub(start) / 20) as u32 + 1;
+        let phase: u32 = if cycles >= 64 { 3 } else { 2 };
+        let mut words = [0u32; 24];
+        words[0] = 1;
+        words[2] = now_ms as u32;
+        words[3] = (now_ms >> 32) as u32;
+        words[4] = 1000;
+        words[13] = (crate::fc_estimator::TAG << 24) | (phase << 20) | (cycles & 0xF_FFFF);
+        words[15] = start as u32 | 1;
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        if let Ok(pkt) = Packet::new(
+            crate::telemetry_schema::data_type("BOARD_HEALTH"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+            Board::FlightComputer.sender_id(),
+            now_ms,
+            Arc::from(bytes),
+        ) {
+            self.queued.push_back(QueuedPacket { packet: pkt, origin: None });
+        }
     }
 
     fn queue_flight_state(&mut self, now_ms: u64) {
@@ -541,6 +582,7 @@ impl FlightSimState {
     }
 
     fn queue_housekeeping(&mut self, now_ms: u64) {
+        self.queue_fc_estimator_health(now_ms);
         let valve_board_online = !valve_board_disconnected_for_state(self.flight_state);
         for board in Board::ALL {
             if *board == Board::ValveBoard && !valve_board_online {
@@ -1818,6 +1860,39 @@ impl AutomaticPhaseGuard<'_> {
 #[cfg(test)]
 mod tests {
     use crate::board_recovery::ReadyIgnitionFixture;
+    /// The modeled FC reports its Kalman filter from Launch on, so a
+    /// simulated flight shows it running instead of warning it never started.
+    #[test]
+    fn the_modeled_fc_reports_its_kalman_filter_from_launch() {
+        use crate::types::FlightState as F;
+        let estimator = |sim: &super::FlightSimState| {
+            sim.queued.iter().filter(|pkt| {
+                pkt.data_type() == crate::telemetry_schema::data_type("BOARD_HEALTH") && pkt.sender() == "FC"
+            }).map(|pkt| {
+                let words: Vec<u32> = pkt.payload().chunks(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+                crate::fc_estimator::decode(&words).expect("estimator words")
+            }).collect::<Vec<_>>()
+        };
+        let mut sim = super::FlightSimState::new();
+        sim.flight_state = F::Armed;
+        sim.queue_housekeeping(1_000);
+        assert!(estimator(&sim).is_empty(), "nothing before Launch");
+        sim.queued.clear();
+        sim.set_flight_state(F::Launch, 5_000);
+        let started = estimator(&sim);
+        assert_eq!(started.len(), 1, "reported at once");
+        assert_eq!((started[0].phase, started[0].start_tick), (crate::fc_estimator::Phase::Running, Some(5_001)));
+        sim.queued.clear();
+        sim.set_flight_state(F::Ascent, 6_000);
+        sim.queue_housekeeping(7_000);
+        let later = estimator(&sim);
+        assert_eq!(later.len(), 1, "one start per flight");
+        assert_eq!((later[0].phase, later[0].cycles, later[0].start_tick), (crate::fc_estimator::Phase::Converged, 101, Some(5_001)));
+        sim.queued.clear();
+        sim.set_flight_state(F::Aborted, 8_000);
+        sim.queue_housekeeping(9_000);
+        assert!(estimator(&sim).is_empty());
+    }
     async fn ready_launch_fixture()->ReadyIgnitionFixture {
         crate::board_recovery::ready_ignition_fixture_for_test().await
     }

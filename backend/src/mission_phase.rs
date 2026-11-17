@@ -501,10 +501,12 @@ pub async fn service(
             _ = tick.tick() => {
                 refresh(&state);
                 crate::flight_maxima::tick(&state);
+                crate::fc_estimator::tick(&state);
             }
             changed = flight_state_rx.recv() => match changed {
                 Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                     refresh(&state);
+                    crate::fc_estimator::tick(&state);
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             },
