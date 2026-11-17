@@ -23,7 +23,7 @@ rcgen = "0.14.10"
 tokio.workspace = true
 serde_json.workspace = true
 rppal = { git = "https://gitlab.rylanswebsite.com/rylan-meilutis/rppal.git", branch = "main", optional = true }
-SEDSnet = { git = "https://github.com/Rylan-Meilutis/SEDSnet.git", branch = "dev", version = "6" }
+SEDSnet = { git = "https://github.com/Rylan-Meilutis/SEDSnet.git", branch = "timesync-core-6.0", version = "6" }
 
 sqlx = { version = "0.9.0", features = ["runtime-tokio", "tls-rustls-ring", "sqlite"] }
 
@@ -52,4 +52,4 @@ tower = { version = "0.5.3", features = ["util"] }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake"] }
 
 [build-dependencies]
-SEDSnet = { git = "https://github.com/Rylan-Meilutis/SEDSnet.git", branch = "dev", version = "6", default-features = false, features = ["std"] }
+SEDSnet = { git = "https://github.com/Rylan-Meilutis/SEDSnet.git", branch = "timesync-core-6.0", version = "6", default-features = false, features = ["std"] }
