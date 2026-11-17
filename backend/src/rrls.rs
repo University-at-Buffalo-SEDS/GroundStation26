@@ -2874,6 +2874,11 @@ impl Mesh {
                     })
                 }
                 (Role::Rrls, UP_DATA | UP_COMMAND) => {
+                    // The primary's network-variable writes pass here while
+                    // relaying: show them on this RRLS at once.
+                    if kind == UP_DATA && !self.takeover {
+                        crate::primary_mirror::relayed_outputs::observe_frame(data);
+                    }
                     let priority = if kind == UP_COMMAND {
                         254
                     } else {
@@ -2939,6 +2944,9 @@ impl Mesh {
                 // to the primary, which this station's router never delivers.
                 if !command && !self.takeover {
                     crate::rrls_listener::observe(payload);
+                    // Owners' ACKs of the primary's variable writes (relay)
+                    // and the writes themselves (heard while listening).
+                    crate::primary_mirror::relayed_outputs::observe_frame(payload);
                 }
             }
             if self.role == Role::Rrls && self.active(now) {

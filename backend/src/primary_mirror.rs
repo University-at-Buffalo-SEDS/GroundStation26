@@ -22,6 +22,7 @@ const NETVAR_LEN: usize = 89;
 /// requested, confirmed (the network carries the request) and readback seen.
 const NETVAR_OUTPUTS: [&str; 2] = ["ToggleAvBayUnderglow", "ToggleFlightBuzzer"];
 const UNKNOWN: u16 = u16::MAX;
+pub(crate) mod relayed_outputs;
 const SOURCE_FRESH_MS: u64 = 1500;
 /// The RRLS follows the primary's action enable (key, software buttons and
 /// per-command enables) for this long: two observation refreshes plus one
@@ -559,12 +560,17 @@ pub fn invalidate_control_observation(state: &AppState) {
     cache().lock().unwrap().remove(&owner(state));
 }
 fn with_received<T>(state: &AppState, f: impl FnOnce(&Observation, u64) -> T) -> Option<T> {
+    with_received_at(state, |r, elapsed, _| f(r, elapsed))
+}
+/// As `with_received`, with the instant the observation was accepted.
+fn with_received_at<T>(state: &AppState, f: impl FnOnce(&Observation, u64, Instant) -> T) -> Option<T> {
     let guard = cache().lock().unwrap();
     let r = guard.get(&owner(state))?;
     Some(f(
         &r.observation,
         r.transit_ms
             .saturating_add(r.at.elapsed().as_millis().min(u64::MAX as u128) as u64),
+        r.at,
     ))
 }
 pub(crate) fn legacy_observation(bytes: &[u8]) -> Vec<u8> {
@@ -695,7 +701,7 @@ pub(crate) fn retraction_presentation(
 /// Presentation policy only. The primary still performs every permission/interlock check.
 pub fn action_policy(state: &AppState) -> Option<ActionPolicyMsg> {
     let launch_provenance = launch_provenance_current(state);
-    with_received(state, |r, elapsed| {
+    with_received_at(state, |r, elapsed, received_at| {
         let fresh = elapsed <= POLICY_FRESH_MS;
         ActionPolicyMsg {
             local_phase_controls: false,
@@ -730,12 +736,16 @@ pub fn action_policy(state: &AppState) -> Option<ActionPolicyMsg> {
                             .and_then(|index| valve_observation(r, index, elapsed)),
                     };
                     // Underglow and buzzer: the primary's own request and
-                    // network confirmation, as fresh as the action enables.
-                    let netvar = NETVAR_OUTPUTS
-                        .iter()
-                        .position(|cmd| cmd == name)
-                        .zip(r.netvar.filter(|_| fresh))
-                        .map(|(index, byte)| netvar_view(byte, index));
+                    // network confirmation, as fresh as the action enables,
+                    // updated by the writes and readbacks the RRLS relays or
+                    // hears after it (relayed_outputs).
+                    let netvar = NETVAR_OUTPUTS.iter().position(|cmd| cmd == name).and_then(|index| {
+                        relayed_outputs::view(
+                            index,
+                            r.netvar.filter(|_| fresh).map(|byte| netvar_view(byte, index)),
+                            received_at,
+                        )
+                    });
                     let actuated = match netvar {
                         Some(view) => view.confirmed,
                         None => actuated,
@@ -1190,6 +1200,8 @@ mod tests {
     }
     #[tokio::test]
     async fn rrls_rows_show_the_primarys_network_variable_state() {
+        let _serial = relayed_outputs::TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        relayed_outputs::reset_for_test();
         let state = crate::state::tests::test_app_state().await;
         let mut value = example();
         value.enabled = u64::MAX;
@@ -1218,6 +1230,81 @@ mod tests {
         assert!(accept_control_observation(&state, &value.encode(), POLICY_FRESH_MS + 100));
         let policy = action_policy(&state).unwrap();
         assert_eq!(row(&policy, "ToggleAvBayUnderglow"), (None, None, None));
+    }
+    fn relayed(ty: &str, endpoint: &str, sender: &str, timestamp: u64, payload: Vec<u8>) -> sedsnet::packet::Packet {
+        crate::telemetry_schema::initialize().unwrap();
+        sedsnet::packet::Packet::new(
+            crate::telemetry_schema::data_type(ty),
+            &[crate::telemetry_schema::endpoint(endpoint)],
+            sender,
+            timestamp,
+            payload.into(),
+        )
+        .unwrap()
+    }
+    fn ack(sender: &str, timestamp: u64, id: u64) -> sedsnet::packet::Packet {
+        sedsnet::packet::Packet::new(
+            sedsnet::config::DataType::ReliableAck,
+            &[sedsnet::config::DataEndpoint::TelemetryError],
+            sender,
+            timestamp,
+            id.to_le_bytes().to_vec().into(),
+        )
+        .unwrap()
+    }
+    /// Bench 2026-11-17 (relay mode): after an underglow toggle the RRLS kept
+    /// "requested Off, confirmed" for 15-20 s while the lights had changed. A
+    /// relaying RRLS sends no observe refresh, so the primary's view reached it
+    /// only with a later exchange. The write and the readback it relays now
+    /// update the rows as they pass, and a newer observation still wins.
+    #[tokio::test]
+    async fn a_relaying_rrls_shows_a_toggle_from_the_frames_it_relays() {
+        let _serial = relayed_outputs::TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        relayed_outputs::reset_for_test();
+        let state = crate::state::tests::test_app_state().await;
+        let mut value = example();
+        value.enabled = u64::MAX;
+        value.board_guard = Some((0, 0, 0, [UNKNOWN; 7]));
+        value.launch_revision = Some(8);
+        value.safety = Some((0b111101, 4, 45));
+        value.board_proof_policy = Some(true);
+        let row = |cmd: &str| {
+            let policy = action_policy(&state).unwrap();
+            let c = policy.controls.iter().find(|c| c.cmd == cmd).unwrap();
+            (c.requested, c.actuated)
+        };
+        // The primary's last observation: underglow Off, confirmed.
+        value.netvar = Some(0b000_110);
+        assert!(accept_control_observation(&state, &value.encode(), 10));
+        assert_eq!(row("ToggleAvBayUnderglow"), (Some(false), Some(false)));
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let gs = crate::types::Board::GroundStation.sender_id();
+        // The primary's write On crosses the relay: requested On, unconfirmed.
+        let on = relayed("AV_BAY_UNDERGLOW", "AV_BAY_UNDERGLOW_OWNER", gs, 1_000, vec![1]);
+        relayed_outputs::observe_packet_for_test(&on, std::time::Instant::now());
+        assert_eq!(row("ToggleAvBayUnderglow"), (Some(true), None));
+        // The FC's BOARD_HEALTH readback On: confirmed.
+        relayed_outputs::readback_for_test(0, true, std::time::Instant::now());
+        assert_eq!(row("ToggleAvBayUnderglow"), (Some(true), Some(true)));
+        // Off: the owner's acknowledgement of the write is its readback.
+        let off = relayed("AV_BAY_UNDERGLOW", "AV_BAY_UNDERGLOW_OWNER", gs, 2_000, vec![0]);
+        relayed_outputs::observe_packet_for_test(&off, std::time::Instant::now());
+        assert_eq!(row("ToggleAvBayUnderglow"), (Some(false), None));
+        let receipt = ack("RF", 2_001, off.packet_id());
+        relayed_outputs::observe_packet_for_test(&receipt, std::time::Instant::now());
+        assert_eq!(row("ToggleAvBayUnderglow"), (Some(false), Some(false)));
+        // A buzzer acknowledgement is not a readback.
+        let buzz = relayed("FLIGHT_BUZZER", "FLIGHT_CONTROLLER", gs, 3_000, vec![1]);
+        relayed_outputs::observe_packet_for_test(&buzz, std::time::Instant::now());
+        let receipt = ack("FC", 3_001, buzz.packet_id());
+        relayed_outputs::observe_packet_for_test(&receipt, std::time::Instant::now());
+        assert_eq!(row("ToggleFlightBuzzer"), (Some(true), None));
+        // A newer observation from the primary wins over older relayed frames.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        value.netvar = Some(0b000_111);
+        assert!(accept_control_observation(&state, &value.encode(), 10));
+        assert_eq!(row("ToggleAvBayUnderglow"), (Some(true), Some(true)));
+        relayed_outputs::reset_for_test();
     }
     #[tokio::test]
     async fn delayed_source_reports_expire_without_confirming_command_intent() {

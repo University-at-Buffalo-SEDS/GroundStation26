@@ -745,6 +745,7 @@ pub(crate) fn network_output_view(output: NetworkOutput) -> NetworkOutputView {
 /// Record an inbound network update of a cosmetic variable, from any sender
 /// (a board, a relay or another station). This is the variable's readback.
 fn record_network_value(output: NetworkOutput, packet: &Packet) {
+    crate::primary_mirror::relayed_outputs::observe_inbound(packet);
     let Some(&byte) = packet.payload().first() else {
         return;
     };
@@ -782,6 +783,7 @@ pub(crate) fn fc_outputs_from_health(words: &[u32]) -> [Option<bool>; 2] {
 pub(crate) fn observe_fc_health_outputs(words: &[u32]) {
     for (output, value) in NetworkOutput::ALL.into_iter().zip(fc_outputs_from_health(words)) {
         if let Some(value) = value {
+            crate::primary_mirror::relayed_outputs::observe_readback(output.index(), value);
             record_readback(output, value);
         }
     }

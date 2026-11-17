@@ -1783,6 +1783,11 @@ pub async fn telemetry_task(
                 }
                 _ = handle_interval.tick() => {
                     crate::operator_command_resend::service(&state, &router);
+                    // A relaying or listening RRLS: a write or readback it
+                    // passed on changed the underglow/buzzer rows.
+                    if crate::primary_mirror::relayed_outputs::take_changed() {
+                        state.broadcast_action_policy_snapshot();
+                    }
                     if crate::network_variables::reconcile_network_outputs_for_state(&state, &router) {
                         sequences::refresh_action_policy_now(&state);
                         state.broadcast_action_policy_snapshot();
