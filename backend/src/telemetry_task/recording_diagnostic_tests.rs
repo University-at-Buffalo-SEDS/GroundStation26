@@ -79,3 +79,40 @@ async fn fc_board_health_refusal_bits_raise_one_operator_notice() {
     assert_eq!(refusing(&state), 1);
     crate::fc_command_gate::forget(&state);
 }
+
+// An AB that refuses an operator command says why in BOARD_HEALTH words
+// 16..18; the operator gets one notice through the actual ingress, and a
+// refused drive change also shows on the fill-drive panel.
+#[tokio::test]
+async fn ab_board_health_refusal_raises_one_operator_notice() {
+    let (db_tx, _db_rx) = mpsc::channel(32);
+    let state = test_app_state(db_tx.clone()).await;
+    crate::ab_command_gate::forget(&state);
+    let packet = |sender: &str, words: [u32; 24], stamp: u64| {
+        let bytes: Vec<u8> = words.iter().flat_map(|v| v.to_le_bytes()).collect();
+        Packet::new(
+            crate::telemetry_schema::data_type("BOARD_HEALTH"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+            sender, stamp, bytes.into(),
+        ).unwrap()
+    };
+    let count = |state: &AppState, prefix: &str| state.notifications_snapshot().iter()
+        .filter(|n| n.message.starts_with(prefix))
+        .count();
+    let qd = "QD retract: refused by AB because the selected fill drive does not support it";
+    let words = crate::ab_command_gate::health_words;
+    handle_packet(&state, &db_tx, &test_db_overflow(), packet("AB", words(5_000, 0, 0, 0, 0), 1_000)).await;
+    assert_eq!(count(&state, "QD retract"), 0, "no refusal since boot");
+    handle_packet(&state, &db_tx, &test_db_overflow(), packet("AB", words(6_000, 1, 8, 3, 0), 2_000)).await;
+    handle_packet(&state, &db_tx, &test_db_overflow(), packet("AB", words(11_000, 1, 8, 3, 5_000), 7_000)).await;
+    assert_eq!(count(&state, qd), 1, "{:?}", state.notifications_snapshot());
+    // The same words from another board never read as an AB refusal.
+    handle_packet(&state, &db_tx, &test_db_overflow(), packet("VB", words(12_000, 2, 8, 3, 0), 8_000)).await;
+    assert_eq!(count(&state, qd), 1);
+    handle_packet(&state, &db_tx, &test_db_overflow(), packet("AB", words(12_500, 2, 0x42, 5, 0), 8_500)).await;
+    let drive = "Fill drive change to Auxiliary: refused by AB because a fill-drive motion or drive change is still in progress.";
+    assert_eq!(count(&state, drive), 1, "{:?}", state.notifications_snapshot());
+    let view = crate::actuator_plumbing::view_for_test(&state);
+    assert_eq!(view["message"], drive);
+    crate::ab_command_gate::forget(&state);
+}

@@ -1241,6 +1241,8 @@ pub(crate) fn receive_status(state: &AppState, packet: &Packet) {
     }
     inner.message = if value.result == 0 {
         "Actual actuator readback received; physical position is not verified.".into()
+    } else if let Some(reason) = crate::ab_command_gate::recent_drive_refusal(state, Instant::now()) {
+        format!("Actuator drive operation returned {}: refused by AB because {reason}.", value.result_name())
     } else {
         format!("Actuator drive operation returned {}.", value.result_name())
     };
@@ -1249,6 +1251,16 @@ pub(crate) fn receive_status(state: &AppState, packet: &Packet) {
         after,
         recovery_generation,
     });
+}
+
+/// The AB reported why it refused a drive change (ab_command_gate); the
+/// drive panel shows it as the latest result.
+pub(crate) fn note_board_refusal(state: &AppState, message: String) {
+    state.plumbing_drive.inner.lock().unwrap().message = message;
+}
+#[cfg(test)]
+pub(crate) fn view_for_test(state: &AppState) -> Value {
+    view(state, true)
 }
 
 #[derive(Clone)]

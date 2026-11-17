@@ -2800,6 +2800,9 @@ async fn handle_packet_inner(
                 if crate::types::canonical_sender_id(sender_id.trim()) == "FC" {
                     crate::network_variables::observe_fc_health_outputs(&words);
                 }
+                if crate::types::canonical_sender_id(sender_id.trim()) == "AB" {
+                    crate::ab_command_gate::observe(state, &words);
+                }
             }
         }
         return Vec::new();
