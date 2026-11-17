@@ -844,6 +844,7 @@ pub(crate) fn routes() -> axum::Router<Arc<AppState>> {
         .route("/api/board-recovery/prepare", post(coordinator::prepare))
         .route("/api/board-recovery/confirm", post(coordinator::confirm))
         .route("/api/board-recovery/finish-without-absent", post(coordinator::finish_without_absent))
+        .route(coordinator::station_recover::PATH, post(coordinator::station_recover::recover_station))
 }
 #[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 fn primary_only() -> Result<(), Response> {
@@ -1223,6 +1224,11 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
         else if !state.launch_history.lock().unwrap().recovery_available() { Some("Launch history storage is unavailable, so a reset cannot be recorded.".into()) }
         else if state.board_recovery.coordinator.busy() { Some("Another recovery is in progress.".into()) }
         else { coordinator::fc_reset_host_block_reason(&state, true) };
+    // Recover station: the station-level part (authority) first, then its own checks.
+    let station_recovery_blocked: Option<String> = if !coordinator::station_recover::latched(&state) { coordinator::station_recover::block_reason(&state, false) }
+        else if !primary { Some("Only the primary ground station can recover the station.".into()) }
+        else if principal.anonymous || !principal.permissions.send_commands { Some("Sign in with an account that can send commands to recover the station.".into()) }
+        else { coordinator::station_recover::block_reason(&state, true) };
     let drogue_seen = crate::recovery_events::already_deployed(&state, crate::recovery_events::Deployment::Drogue);
     let boards=BOARDS.iter().enumerate().map(|(at,&board)| {
         // A pending target that a fresh verified readback shows healthy no
@@ -1330,6 +1336,7 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: Head
         "resync_target_state":resync_target_state,"resync_target_label":resync_target_state.map(phase_label),
         "reset_startup_policy":reset_startup_policy,
         "confirmation":confirmation,"host_recovery":host_pending.map(|pending|json!({"unsatisfied":board_names(pending_blocking.unsatisfied & 0x7f),"absent":board_names(pending_blocking.unsatisfied & pending_blocking.absent),"pending":!pending.published,"verified":pending.verified,"publication_acknowledged":pending.published,"targets":pending.targets.iter().map(|target|target.board.as_str()).collect::<Vec<_>>()})),
+        "station_recovery":{"latched":coordinator::station_recover::latched(&state),"available":station_recovery_blocked.is_none(),"blocked_reason":station_recovery_blocked,"target_state_label":crate::mission_phase::detailed_label(coordinator::station_recover::target_state())},
         "rejected_statuses":rejected_statuses,"last_rejection":last_rejection,
         "mode_capability":{"current":current,"build_mode":build,"supported_modes":["normal","hitl","test_fire","testing"],"runtime_switch_supported":true,"requires_restart":[],"message":"One backend holds every mode; it switches in process from Station mode settings while the station is idle. Only a Simulation change restarts the backend."},"boards":boards,"operation":state.board_recovery.coordinator.operation()})).into_response()
 }

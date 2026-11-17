@@ -546,6 +546,27 @@ fn launch_lock_release_is_refused_while_a_recovery_is_unfinished() {
 }
 
 #[test]
+fn station_recovery_is_journaled_bounded_and_restored() {
+    let path = path();
+    let mut state = Store::open(path.clone(), false, None, 10_000, 0).unwrap();
+    for i in 0..(STATION_RECOVERY_LIMIT as u64 + 2) {
+        state.record_station_recovery(StationRecovery {
+            utc_ms: i, actor: "operator".into(), from_state: Some("Aborted".into()), to_state: Some("Startup".into()),
+        }).unwrap();
+    }
+    wait(&state);
+    let restored = Store::open(path.clone(), false, None, 11_000, 0).unwrap();
+    let records = restored.station_recoveries();
+    assert_eq!(records.len(), STATION_RECOVERY_LIMIT);
+    assert_eq!(records.last().unwrap().utc_ms, STATION_RECOVERY_LIMIT as u64 + 1);
+    // Evidence only: it never closes recovery or locks Launch.
+    assert_eq!(restored.restored_recovery_barrier().0, 0);
+    assert!(restored.recovery_available());
+    assert!(!restored.launch_locked());
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn recovery_waiver_is_journaled_bounded_and_restored() {
     let path = path();
     let mut state = Store::open(path.clone(), false, None, 10_000, 0).unwrap();

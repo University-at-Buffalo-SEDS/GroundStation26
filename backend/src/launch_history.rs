@@ -346,6 +346,10 @@ struct Disk {
     /// boards that were absent from the network (newest last, bounded).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     recovery_waivers: Vec<RecoveryWaiver>,
+    /// Operator Recover station actions: the station's own Abort latch
+    /// cleared without resetting any board (newest last, bounded).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    station_recoveries: Vec<StationRecovery>,
 }
 /// One explicit "finish recovery without absent boards" decision.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -356,6 +360,20 @@ pub(crate) struct RecoveryWaiver {
     pub boards: Vec<String>,
 }
 const RECOVERY_WAIVER_LIMIT: usize = 32;
+/// One operator Recover station: who, when, and the station state it left
+/// (None when only the latch was set and the station was already in Startup
+/// or Idle) and entered.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StationRecovery {
+    pub utc_ms: u64,
+    pub actor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_state: Option<String>,
+}
+const STATION_RECOVERY_LIMIT: usize = 32;
 
 fn is_zero_manual_ceiling(value: &u64) -> bool {
     *value == 0
@@ -509,6 +527,7 @@ impl Store {
                 awaiting_new_launch: false,
                 new_cycle_confirmed: false,
                 recovery_waivers: Vec::new(),
+                station_recoveries: Vec::new(),
             }
         };
         ensure!(
@@ -586,6 +605,7 @@ impl Store {
                 awaiting_new_launch: false,
                 new_cycle_confirmed: false,
                 recovery_waivers: Vec::new(),
+                station_recoveries: Vec::new(),
             },
             observer: false,
             synchronized: true,
@@ -1121,6 +1141,23 @@ impl Store {
         self.last_write = writer.enqueue(next.clone())?;
         self.data = next;
         Ok(())
+    }
+    /// Journal an operator's Recover station. Evidence only: the station's
+    /// own state is kept by the FLIGHT_STATE network variable it publishes.
+    pub(crate) fn record_station_recovery(&mut self, record: StationRecovery) -> Result<()> {
+        ensure!(!self.observer && self.error.is_none(), "Journal unavailable");
+        let writer = self.writer.clone().context("A journal writer is required")?;
+        let mut next = self.data.clone();
+        next.station_recoveries.push(record);
+        let excess = next.station_recoveries.len().saturating_sub(STATION_RECOVERY_LIMIT);
+        next.station_recoveries.drain(..excess);
+        self.last_write = writer.enqueue(next.clone())?;
+        self.data = next;
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn station_recoveries(&self) -> &[StationRecovery] {
+        &self.data.station_recoveries
     }
     #[cfg(test)]
     pub(crate) fn recovery_waivers(&self) -> &[RecoveryWaiver] {

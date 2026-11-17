@@ -446,5 +446,11 @@
   "reset_startup_policy": null,
   "resync_target_label": "Startup",
   "resync_target_state": 0,
+  "station_recovery": {
+    "available": false,
+    "blocked_reason": "The station Abort is not latched; there is nothing to recover.",
+    "latched": false,
+    "target_state_label": "Startup"
+  },
   "version": 1
 }

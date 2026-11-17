@@ -366,6 +366,19 @@ const STOP: &[Spec] = &[
         config_keys: &[],
     },
     Spec {
+        id: "recover-station",
+        title: "Recover station",
+        summary: "Recover station clears the station's own operator-Abort latch without resetting any board, and returns an Aborted station to Startup (Idle in HITL), once every board has been recovered on its own. Nothing is sent to any board except the station's own FLIGHT_STATE.",
+        details: &[
+            "Refused while any board this mode uses that is on the network still reports Abort, or its latest recovery readback shows Abort or is not fresh, healthy, in Startup or Idle with safe outputs. A board off the network, or one the mode does not use, does not hold it.",
+            "Refused while an Actuator or Valve Board still reads back Launch (its launch latch needs Reset all boards), while a board recovery is being prepared or running or is unfinished, while the GSE automatic abort is latched (Clear GSE abort first), while a sequence or cold flow runs, and while an Abort, valve, actuator or flight command is still owed to a board.",
+            "An Abort or a Stop arriving while it is checked makes it refuse; one arriving after it latches again. The action is recorded in the launch journal under the operator's name; the published FLIGHT_STATE is what a restart restores.",
+        ],
+        modes: ALL,
+        enforced_in: &["backend/src/board_recovery/station_recover.rs:block_reason", "backend/src/gse.rs:commit_station_recovery"],
+        config_keys: &[],
+    },
+    Spec {
         id: "board-resync",
         title: "Resync a board",
         summary: "Resync sets one Actuator or Valve Board's state machine, phase and recovery epoch to the station's current phase. To a fill phase, Armed or (after landing) Landed no outputs move: it never commands, replays or restores valves, servos, supplies, igniter or stepper. To Startup or Idle (not in test fire) it brings the board back from any state, including Launch, without an Abort first: the board stops its own launch sequence and drives every output to its safe state (igniter and supplies off, valves safe, stepper asleep) before it changes state. To a fill phase, Armed or Landed the station refuses unless the board's outputs already read safe; to Startup or Idle the outputs need only read back valid and consistent, because the board drives them safe itself. Either way the station must not be Aborted, no tank overpressure may be latched, no operator work may be pending, and the fresh query and confirmation ticket bind the request.",

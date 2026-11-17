@@ -742,6 +742,7 @@ fn apply_runtime_layout_overrides(layout: &mut LayoutConfig) {
         ("ToggleFlightBuzzer", "Flight Buzzer"),
         ("ResetTClock", "Reset T-clock"),
         ("ResetFlightState", "Reset flight state to Idle"),
+        ("RecoverStation", "Recover station"),
     ] {
         if cmd == "ResetFlightState" && mode != crate::station_mode::Mode::Hitl {
             continue;
@@ -979,7 +980,7 @@ mod tests {
             names.extend(crate::types::client_command_names(mode));
         }
         names.extend(GSE_SEQUENCE_ACTIONS.iter().map(|(cmd, _)| *cmd));
-        names.extend(["ResetSim", "AutoColdFlow", "ResetFlightState", "ResetTClock"]);
+        names.extend(["ResetSim", "AutoColdFlow", "ResetFlightState", "ResetTClock", "RecoverStation"]);
         for name in &names {
             assert!(control_section(name).is_some(), "{name} has no Actions-tab section");
         }

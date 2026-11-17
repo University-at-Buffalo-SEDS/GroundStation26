@@ -425,6 +425,7 @@ fn rrls_takeover_policy(local: ActionPolicyMsg) -> ActionPolicyMsg {
         local_phase_controls: false,
         local_phase_controls_reason: Some("Phase steps require the primary GroundStation connection.".into()),
         launch_zero: None,
+        station_recovery: None,
         key_enabled: true,
         software_buttons_enabled: true,
         controls: local.controls,
@@ -1825,6 +1826,20 @@ impl AppState {
         let previous_state = *slot;
         *slot = next_state;
         drop(slot);
+        self.observe_local_flight_state_change(previous_state, next_state, clock_claim, publish_managed);
+    }
+
+    /// Everything a local flight-state change publishes after the RAM state
+    /// moved: the simulator, the managed FLIGHT_STATE, the dashboard, the
+    /// T-clock and the recording. `set_local_flight_state` and Recover station
+    /// (which moves the RAM state under its own guards) share it.
+    pub(crate) fn observe_local_flight_state_change(
+        &self,
+        previous_state: FlightState,
+        next_state: FlightState,
+        clock_claim: Option<&crate::gse::OperatorDispatchClaim>,
+        publish_managed: bool,
+    ) {
         if next_state == FlightState::Launch
             && matches!(
                 previous_state,
@@ -2133,6 +2148,7 @@ impl AppState {
             crate::operator_phase::project(self,&mut local);
             crate::operator_phase::project_reset_flight_state(self, &mut local);
             local.launch_zero = crate::auto_zero::before_launch::status(self);
+            local.station_recovery = crate::board_recovery::coordinator::station_recover::policy_view(self);
             if self.operator_queue.fill_launch_active() {
                 for control in &mut local.controls {
                     if crate::sequences::is_fill_system_control(&control.cmd) {
@@ -2157,6 +2173,7 @@ impl AppState {
                 local_phase_controls: false,
                 local_phase_controls_reason: None,
                 launch_zero: None,
+                station_recovery: None,
                 key_enabled: false,
                 software_buttons_enabled: false,
                 controls: Vec::new(),

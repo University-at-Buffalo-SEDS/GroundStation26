@@ -4590,11 +4590,13 @@ pub(crate) fn manual_stop_pending(state: &AppState) -> bool {
 }
 // Safety catalog (About safety): manual-stop. Keep backend/src/safety_catalog_rules.rs in step.
 /// While the operator Abort is latched, `queue_controller_*` sends only the
-/// abort-safe directions and drops every other fill-side output. Only Reset
-/// all boards clears the latch; recovering boards one at a time does not.
+/// abort-safe directions and drops every other fill-side output. Reset all
+/// boards clears the latch, and so does Recover station once every board has
+/// been recovered; recovering boards one at a time alone does not.
 pub(crate) const ABORT_LATCH_OUTPUT_REFUSAL: &str = "The station Abort is still latched. \
-Recovering boards does not clear it; Reset all boards does. Until then the station sends only \
-the safe direction (open Vent or Dump; close Pilot, Nitrogen or Nitrous; Igniter off).";
+Recovering boards does not clear it: use Recover station once every board is recovered, or \
+Reset all boards. Until then the station sends only the safe direction (open Vent or Dump; \
+close Pilot, Nitrogen or Nitrous; Igniter off).";
 /// Why an operator fill-side output press would be dropped by the latched
 /// station Abort, so the policy and /api/command refuse it with the reason
 /// instead of answering "ok" and dropping it at send time. This reports the
@@ -6100,6 +6102,101 @@ pub(crate) fn accept_observed_abort(state: &AppState, automatic: bool, generatio
     state.launch_mode_gate.clear_sent();
     state.set_abort_indicator_latched(true);
     true
+}
+
+/// Host work that keeps Recover station refused, from RAM only and without
+/// waiting on the GSE owner (the action policy asks this too). The GSE's own
+/// automatic-abort claim must be cleared first: outside HITL it restores the
+/// station Aborted on restart.
+pub(crate) fn station_recovery_work_block_reason(state: &AppState) -> Option<String> {
+    {
+        let Ok(rt) = state.gse.try_lock() else {
+            return Some("The GSE runtime is busy; try again in a moment.".into());
+        };
+        if engine_blocks_operator_reset(&rt) {
+            return Some("A GSE sequence is running; pause or cancel it first.".into());
+        }
+        if cold_flow::runtime_active(&rt) {
+            return Some("Cold flow is running; stop it first.".into());
+        }
+        if !crate::runtime_mode::is_hitl() {
+            if rt.automatic_abort_in_flight || rt.operational.running {
+                return Some("An operation or automatic abort is still running.".into());
+            }
+            if rt.operational.saved.automatic_abort_claimed {
+                return Some("The GSE automatic abort is still latched; use Clear GSE abort first.".into());
+            }
+        }
+    }
+    if state.manual_abort_intent.pending_epoch().is_some() || state.deferred_abort.manual_pending() {
+        return Some("A manual Abort is still being delivered.".into());
+    }
+    None
+}
+/// What an admitted Recover station saw before it was checked, so the RAM
+/// commit can refuse if an Abort or a reset arrived in between.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StationRecoveryBasis {
+    pub(crate) generation: u64,
+    pub(crate) manual_epoch: u64,
+    pub(crate) observed_manual_epoch: u64,
+    pub(crate) abort_revision: u64,
+}
+impl StationRecoveryBasis {
+    pub(crate) fn capture(state: &AppState) -> Self {
+        Self {
+            generation: automatic_generation(state),
+            manual_epoch: state.manual_abort_intent.epoch(),
+            observed_manual_epoch: state.deferred_abort.manual_epoch(),
+            abort_revision: state.board_abort.abort_revision(),
+        }
+    }
+}
+/// Recover station's RAM commit: clear the station's own Abort latch and, when
+/// the station is Aborted, move it to `next` (Startup, or Idle in HITL). Only
+/// bounded RAM changes under the dispatch gate and the Stop owners, the same
+/// order as a local Stop's commit, so a Stop or a board Abort either lands
+/// before this (and it refuses) or after it (and latches again). Nothing is
+/// sent to any board here. Returns the state it left (None: only the latch
+/// was cleared, the station was already in Startup or Idle).
+// Safety catalog (About safety): recover-station. Keep backend/src/safety_catalog_rules.rs in step.
+pub(crate) fn commit_station_recovery(
+    state: &AppState,
+    basis: StationRecoveryBasis,
+    next: FlightState,
+) -> Result<Option<FlightState>, &'static str> {
+    let _dispatch = dispatch_gate();
+    if state.shutdown_requested.load(std::sync::atomic::Ordering::Acquire) {
+        return Err("The ground station is shutting down.");
+    }
+    if state.operator_admission_barrier.load(std::sync::atomic::Ordering::Acquire) != 0
+        || basis.generation != automatic_generation(state)
+    {
+        return Err("A board recovery or reset started; check the station and try again.");
+    }
+    if state.board_abort.abort_revision() != basis.abort_revision {
+        return Err("A board reported Abort while this was being checked; recover it first.");
+    }
+    state
+        .manual_abort_intent
+        .admit_if_unchanged(basis.manual_epoch, || {
+            state.deferred_abort.admit_if_no_manual_since(basis.observed_manual_epoch, || {
+                let mut current = state.state.lock().unwrap();
+                let previous = *current;
+                let moved = match previous {
+                    FlightState::Aborted => {
+                        *current = next;
+                        Some(previous)
+                    }
+                    FlightState::Startup | FlightState::Idle => None,
+                    _ => return Err("The station left Aborted, Startup or Idle; check it and try again."),
+                };
+                state.set_abort_indicator_latched(false);
+                Ok(moved)
+            })
+        })
+        .flatten()
+        .ok_or("A Stop or Abort arrived while this was being checked; the station stays aborted.")?
 }
 
 #[cfg(test)]

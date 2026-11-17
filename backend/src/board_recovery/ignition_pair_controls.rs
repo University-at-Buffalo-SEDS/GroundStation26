@@ -196,6 +196,7 @@ async fn ignition_pair_policy_disables_sequence_without_disabling_manual_off_cat
         local_phase_controls: false,
         local_phase_controls_reason: None,
         launch_zero: None,
+        station_recovery: None,
         key_enabled: true,
         software_buttons_enabled: true,
         controls: [

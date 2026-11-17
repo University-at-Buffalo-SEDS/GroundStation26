@@ -25,6 +25,8 @@ const _: () = assert!(POLL.as_millis() * super::exchange::POLL_BUDGET as u128 > 
 fn network_wait(base: Duration) -> Duration {
     crate::sim_freshness::wall(base)
 }
+#[path = "station_recover.rs"]
+pub(crate) mod station_recover;
 #[cfg(test)]
 #[path = "coordinator_c_board_tests.rs"]
 mod c_board_ordering_tests;

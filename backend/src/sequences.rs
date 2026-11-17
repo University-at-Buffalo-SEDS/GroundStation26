@@ -83,6 +83,17 @@ pub struct ControlProgress {
     pub message: Option<String>,
 }
 
+/// Recover station in the action policy: present only while the station's own
+/// Abort latch is set. `disabled_reason` is None when it may run now.
+/// Presentation only; the request checks everything again.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StationRecoveryView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
+    /// Where an Aborted station goes: Startup, or Idle in HITL.
+    pub target_state_label: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActionPolicyMsg {
     #[serde(default)]
@@ -92,6 +103,9 @@ pub struct ActionPolicyMsg {
     /// A Launch press held behind the opt-in loadcell zero. Presentation only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_zero: Option<crate::auto_zero::before_launch::Status>,
+    /// Recover station (the "RecoverStation" Actions entry); see StationRecoveryView.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub station_recovery: Option<StationRecoveryView>,
     pub key_enabled: bool,
     pub software_buttons_enabled: bool,
     pub controls: Vec<ActionControl>,
@@ -1359,7 +1373,9 @@ pub(crate) fn control_section(cmd: &str) -> Option<ControlSection> {
         | "AbortAfter100" | "AbortAfter40" | "AbortAfter250" | "ReinitAfter15"
         | "ReinitAfter30" | "ReinitAfter50" => FlightComputer,
         "ToggleAvBayUnderglow" | "ToggleFlightBuzzer" => AvBay,
-        "ResetFlightState" => Recovery,
+        // RecoverStation is an HTTP action (board_recovery::coordinator::station_recover),
+        // listed in the Actions tab beside the other recovery controls.
+        "ResetFlightState" | "RecoverStation" => Recovery,
         "StartWritingNow" | "StartWritingLastTwoMinutes" | "PauseWritingDb" | "StopWritingDb" => {
             DaqRecording
         }
@@ -1407,6 +1423,7 @@ pub fn default_action_policy() -> ActionPolicyMsg {
             local_phase_controls: false,
             local_phase_controls_reason: None,
             launch_zero: None,
+            station_recovery: None,
             key_enabled: true,
             software_buttons_enabled: true,
             controls,
@@ -1455,6 +1472,7 @@ fn policy_with_overrides(
         local_phase_controls: false,
         local_phase_controls_reason: None,
         launch_zero: None,
+        station_recovery: None,
         key_enabled,
         software_buttons_enabled,
         controls,
@@ -2495,6 +2513,7 @@ fn hitl_action_policy(valves: ValveSnapshot) -> ActionPolicyMsg {
         local_phase_controls: false,
         local_phase_controls_reason: None,
         launch_zero: None,
+        station_recovery: None,
         key_enabled: true,
         software_buttons_enabled: true,
         controls,
