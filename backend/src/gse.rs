@@ -1,4 +1,5 @@
 use crate::rocket_commands::{ActuatorBoardCommands, ValveBoardCommands};
+pub(crate) mod auto_vent;
 pub(crate) mod cold_flow;
 pub(crate) mod overpressure;
 #[cfg(test)]
@@ -215,6 +216,7 @@ pub struct Runtime {
     effects_queued: bool,
     automatic_abort_in_flight: bool,
     overpressure: overpressure::Monitor,
+    auto_vent: auto_vent::Monitor,
 }
 impl Default for Runtime {
     fn default() -> Self {
@@ -259,6 +261,7 @@ impl Default for Runtime {
             effects_queued: false,
             automatic_abort_in_flight: false,
             overpressure: Default::default(),
+            auto_vent: Default::default(),
         }
     }
 }
@@ -2508,6 +2511,7 @@ fn status_value(state: &Arc<AppState>) -> Option<serde_json::Value> {
         .connected_for(crate::types::Board::ValveBoard.sender_id(), std::time::Instant::now())
         .is_some();
     overpressure::decorate_status(&state.gse.lock().unwrap(), vb_connected, &mut response);
+    auto_vent::decorate_status(&state.gse.lock().unwrap(), &mut response);
     response["valve_reports"] = serde_json::to_value(crate::valve_report_health::status(&state))
         .expect("valve report health serializable");
     response["sequence_progress"]=progress::envelope(&state);

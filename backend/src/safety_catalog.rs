@@ -277,7 +277,7 @@ mod tests {
             "automatic-abort", "no-automatic-abort-after-launch", "manual-stop", "reset-all-boards", "board-resync",
             "ignition-pair", "hitl-interlocks", "key-interlock", "plumbing-retraction", "checklists",
             "valve-freshness", "supply-interlock", "fill-limits", "qd-settle", "igniter-sense",
-            "stale-data", "connectivity-loss", "mission-phases", "fc-owns-landing", "board-heartbeat-abort", "board-vb-overpressure", "board-abort-latch", "board-fc-vigilant",
+            "stale-data", "connectivity-loss", "mission-phases", "fc-owns-landing", "board-heartbeat-abort", "board-vb-post-launch-vent", "board-vb-overpressure", "board-abort-latch", "board-fc-vigilant",
         ] {
             assert!(ids.contains(required), "missing safety rule {required}");
         }

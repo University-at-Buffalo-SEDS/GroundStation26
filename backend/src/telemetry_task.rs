@@ -2823,6 +2823,10 @@ async fn handle_packet_inner(
         if let Ok(msg) = pkt.data_as_string() {
             if sender_id != Board::ValveBoard.sender_id() {
                 emit_warning(state, msg.to_string());
+            } else if let Some(shown) = crate::gse::auto_vent::board_warning(state, &msg) {
+                if let Some(shown) = shown {
+                    emit_warning(state, shown);
+                }
             } else if let Some(shown) = crate::gse::overpressure::board_warning(state, &msg) {
                 emit_warning(state, shown);
             }
