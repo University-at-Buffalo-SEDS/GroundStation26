@@ -2763,6 +2763,20 @@ async fn handle_packet_inner(
         return Vec::new();
     }
 
+    if pkt.data_type() == crate::telemetry_schema::data_type("DAQ_DAC_STATUS") {
+        let accepted = state.network_health.lock().unwrap().observe_dac_status(
+            &sender_id,
+            pkt.payload(),
+            std::time::Instant::now(),
+            get_current_timestamp_ms(),
+        );
+        if accepted {
+            crate::daq_dac::observe_status(state, pkt.payload(), crate::network_stamp::Stamp::of(&pkt));
+            recording_diagnostics::raw_health(state, db_tx, &pkt, &sender_id);
+        }
+        return Vec::new();
+    }
+
     if pkt.data_type() == crate::telemetry_schema::data_type("BOARD_HEALTH") {
         if let Ok(words) = pkt.data_as_u32() {
             let accepted = state.network_health.lock().unwrap().observe_diagnostics_with_source(
@@ -3143,6 +3157,13 @@ async fn handle_packet_inner(
     }
 
     if let Some(values_vec) = telemetry_f32_values(&pkt) {
+        crate::daq_dac::observe_values(
+            state,
+            &sender_id,
+            pkt.data_type(),
+            crate::network_stamp::Stamp::of(&pkt),
+            &values_vec,
+        );
         let rows = telemetry_rows_from_packet_values(state, &pkt, &sender_id, values_vec);
         let live_receipt = crate::gse::ValveReceipt {
             network_ms: crate::network_stamp::receipt_ms_for_packet(
@@ -6371,6 +6392,7 @@ mod tests {
             topology_router: Arc::new(OnceLock::new()),
             kg50_input_sync: Default::default(),
             board_config_sync: Default::default(),
+            daq_dac: Default::default(),
             auth: Arc::new(AuthManager::new(PathBuf::from(
                 "/tmp/groundstation-test-users.json",
             ))),

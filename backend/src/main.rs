@@ -5,6 +5,7 @@ mod sequence_access;
 mod panel_control;
 mod daq_launch_log;
 mod daq_input_health;
+mod daq_dac;
 mod daq_sd;
 mod radio_voice;
 mod recording_replay;
@@ -1728,6 +1729,7 @@ async fn main() -> anyhow::Result<()> {
         topology_router: Arc::new(std::sync::OnceLock::new()),
         kg50_input_sync: Default::default(),
         board_config_sync: Default::default(),
+        daq_dac: Default::default(),
         auth,
     });
     // The RFD modem check may enter command mode only outside flight and
@@ -2530,6 +2532,10 @@ async fn main() -> anyhow::Result<()> {
         state.shutdown_subscribe(),
     ));
     let _board_config_sync = tokio::spawn(crate::board_config_sync::service(
+        state.clone(),
+        state.shutdown_subscribe(),
+    ));
+    let _daq_dac = tokio::spawn(crate::daq_dac::service(
         state.clone(),
         state.shutdown_subscribe(),
     ));

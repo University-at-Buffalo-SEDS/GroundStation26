@@ -19,6 +19,7 @@ struct Record {
     diagnostic_header_utc: Option<u64>,
     sd_status: Option<(crate::daq_sd::SdStatus, Instant)>,
     input_health: Option<(crate::daq_input_health::Report, Instant)>,
+    dac_status: Option<(crate::daq_dac::Status, Instant)>,
     launch_log: Option<(crate::daq_launch_log::Observation, Instant, u64)>,
     first: Instant,
     last: Instant,
@@ -233,6 +234,7 @@ impl Tracker {
                     diagnostic_header_utc: None,
                     sd_status: None,
                     input_health: None,
+                    dac_status: None,
                     launch_log: None,
                     first: now,
                     last: now,
@@ -327,6 +329,31 @@ impl Tracker {
         let report = crate::daq_input_health::Report::decode(words)?;
         self.record("DAQ", now, wall_ms).input_health = Some((report.clone(), now));
         Some(report)
+    }
+
+    pub fn observe_dac_status(
+        &mut self,
+        sender: &str,
+        bytes: &[u8],
+        now: Instant,
+        wall_ms: u64,
+    ) -> bool {
+        if canonical_sender_id(sender.trim()) != "DAQ" {
+            return false;
+        }
+        let Some(status) = crate::daq_dac::Status::decode(bytes) else {
+            return false;
+        };
+        self.record("DAQ", now, wall_ms).dac_status = Some((status, now));
+        true
+    }
+
+    pub(crate) fn daq_dac_status(&self, now: Instant) -> Option<(crate::daq_dac::Status, u64)> {
+        self.boards
+            .get("DAQ")?
+            .dac_status
+            .as_ref()
+            .map(|(status, received)| (*status, elapsed(now, *received)))
     }
 
     pub fn observe_launch_log_status(
@@ -477,7 +504,10 @@ impl Tracker {
                         Some(report)
                     }
                     None if status_without_health
-                        && (r.sd_status.is_some() || r.launch_log.is_some() || r.input_health.is_some()) =>
+                        && (r.sd_status.is_some()
+                            || r.dac_status.is_some()
+                            || r.launch_log.is_some()
+                            || r.input_health.is_some()) =>
                     {
                         Some(BoardDiagnostics::default())
                     }
@@ -489,6 +519,9 @@ impl Tracker {
                     }
                     if let Some((input, received)) = &r.input_health {
                         report.daq_input = Some(input.status(elapsed(now, *received)));
+                    }
+                    if let Some((status, received)) = &r.dac_status {
+                        status.overlay(&mut report, elapsed(now, *received));
                     }
                     if let Some((status, received, initial_age)) = &r.launch_log {
                         report.launch_log = Some(status.project(

@@ -373,6 +373,18 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
             "/api/network-health/daq/sd/retry",
             post(crate::daq_sd::retry),
         )
+        .route("/api/daq/dac", get(crate::daq_dac::get_status))
+        .route("/api/daq/dac/config", post(crate::daq_dac::post_config))
+        .route("/api/daq/dac/disable", post(crate::daq_dac::disable))
+        .route(
+            "/api/daq/dac/validation",
+            get(crate::daq_dac::get_validation).post(crate::daq_dac::post_validation),
+        )
+        .route(
+            "/api/daq/dac/sweep",
+            get(crate::daq_dac::get_sweep).post(crate::daq_dac::post_sweep),
+        )
+        .route("/api/daq/dac/sweep/cancel", post(crate::daq_dac::sweep_cancel))
         .route("/api/rrls/control", get(crate::command_proxy::get_status))
         .route("/api/auto_zero", get(get_auto_zero).post(set_auto_zero))
         .route("/api/auto_zero/launch/cancel", post(cancel_launch_zero))

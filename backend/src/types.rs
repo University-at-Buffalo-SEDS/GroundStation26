@@ -601,6 +601,11 @@ pub struct BoardDiagnostics {
     /// DAQ live input faults (DAQ_INPUT_HEALTH). Missing on older firmware/other boards.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daq_input: Option<DaqInputHealthStatus>,
+    /// DAQ DAC signal generator: any output driven, from DAQ_DAC_STATUS.
+    #[serde(default)]
+    pub dac_active: Option<bool>,
+    #[serde(default)]
+    pub dac_status_received_age_ms: Option<u64>,
     /// RF radio TX queue timing block. Missing on older RF firmware/other boards.
     #[serde(default)]
     pub rf_tx_timing: Option<RfTxTiming>,

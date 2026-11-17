@@ -282,6 +282,8 @@ pub struct AppState {
     pub kg50_input_sync: Arc<crate::kg50_input_sync::Tracker>,
     /// Board config identity readback and resync (board_config_sync).
     pub(crate) board_config_sync: Arc<crate::board_config_sync::Runtime>,
+    /// DAQ DAC signal generator lease, validation and sweep state.
+    pub(crate) daq_dac: Arc<crate::daq_dac::Runtime>,
     pub network_traffic: Arc<Mutex<crate::network_traffic::Sampler>>,
     pub network_health: Arc<Mutex<crate::network_health::Tracker>>,
     pub loadcell_calibration: Arc<Mutex<LoadcellCalibrationFile>>,
@@ -877,6 +879,7 @@ impl AppState {
     pub fn set_abort_indicator_latched(&self, latched: bool) {
         if latched {
             crate::operator_command_resend::note_abort(self);
+            crate::daq_dac::note_abort(self);
         }
         self.abort_indicator_latched
             .store(latched, Ordering::SeqCst);
@@ -4511,6 +4514,7 @@ pub(crate) mod tests {
             loadcell_processing: Arc::new(crate::loadcell_zero::Service::default()),
             kg50_input_sync: Default::default(),
             board_config_sync: Default::default(),
+            daq_dac: Default::default(),
             network_traffic: Arc::new(Mutex::new(crate::network_traffic::Sampler::default())),
             network_health: Arc::new(Mutex::new(crate::network_health::Tracker::default())),
             loadcell_calibration: Arc::new(Mutex::new(loadcell::load_or_default())),

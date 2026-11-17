@@ -122,6 +122,50 @@ mod tests {
     }
 
     #[test]
+    fn daq_dac_types_keep_canonical_ids_and_byte_shapes() {
+        initialize().unwrap();
+        assert_eq!(data_type("DAQ_DAC_COMMAND").as_u32(), 206667655);
+        assert_eq!(data_type("DAQ_DAC_STATUS").as_u32(), 160950952);
+        for (name, endpoint_name, bytes) in [
+            ("DAQ_DAC_COMMAND", "SD_CARD", 32usize),
+            ("DAQ_DAC_STATUS", "GROUND_STATION", 80),
+        ] {
+            for (len, ok) in [(bytes, true), (bytes - 1, false), (bytes + 1, false)] {
+                assert_eq!(
+                    sedsnet::packet::Packet::new(
+                        data_type(name),
+                        &[endpoint(endpoint_name)],
+                        "GS",
+                        1,
+                        vec![0u8; len].into()
+                    )
+                    .is_ok(),
+                    ok,
+                    "{name} {len}"
+                );
+            }
+        }
+        let config: serde_json::Value = serde_json::from_slice(SCHEMA_JSON).unwrap();
+        let find = |name: &str| {
+            config["types"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|ty| ty["name"] == name)
+                .unwrap()
+                .clone()
+        };
+        let command = find("DAQ_DAC_COMMAND");
+        assert_eq!(command["reliable"], "Off");
+        assert_eq!(command["priority"], 200);
+        assert_eq!(command["endpoints"], serde_json::json!(["SD_CARD"]));
+        let status = find("DAQ_DAC_STATUS");
+        assert_eq!(status["reliable"], "Off");
+        assert_eq!(status["priority"], 16);
+        assert_eq!(status["endpoints"], serde_json::json!(["GROUND_STATION"]));
+    }
+
+    #[test]
     fn chamber_wire_roundtrip_is_additive_float_triplet() {
         initialize().unwrap();
         assert_eq!(data_type("DAQ_LOADCELL_CHAMBER"), DataType(259346466));
