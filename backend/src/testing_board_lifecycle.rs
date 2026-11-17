@@ -783,6 +783,7 @@ impl Owner {
             sequence: self.boot_sequence,
         })
     }
+    #[cfg(test)]
     pub(crate) fn report_is_old(&self, origin: ReportOrigin, source: u64) -> bool {
         let stamp = Stamp::new(self.nodes[at(origin.board)].floor_epoch, source.min(i64::MAX as u64) as i64);
         self.report_is_old_at(origin, if source == u64::MAX { Stamp::new(u16::MAX, i64::MAX) } else { stamp })

@@ -37,6 +37,7 @@ impl Stamp {
 
     /// A stamp in epoch 0 (no step seen yet), as every stamp read before
     /// SEDSnet 6 was.
+    #[cfg(test)]
     pub(crate) const fn raw(ms: i64) -> Self {
         Self { epoch: 0, ms }
     }
