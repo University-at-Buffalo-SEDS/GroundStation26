@@ -33,7 +33,7 @@ async fn original_source_owner_cannot_count_twice_after_sdk_duplicate_cache_turn
         &[endpoint],
         "DAQ",
         source_ms,
-        f32_payload(&[0.2]),
+        f32_payload(&[0.02]) // in the DAQ ADC range, not clipped,
     )
     .unwrap();
     let wire = serialize::pack_packet(&original);

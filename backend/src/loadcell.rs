@@ -562,6 +562,82 @@ pub fn selected_kg50_value(
     .filter(|v| v.is_finite())
 }
 
+/// MCP3564R nominal full scale at unity gain: +/-2^23 codes is +/-VREF. Codes
+/// beyond it are over-range. In the 2026-11-16 test fire the KG1000 input sat
+/// at code 0xB40000 (raw 0.19427338, published as 1726 kg), past this limit.
+const DAQ_ADC_FULL_SCALE_CODES: f64 = 8_388_608.0;
+/// DAQ `mcp3564r_code_to_raw_value()`: the historical KG1000/AMP2 raw scale.
+const DAQ_AMPLIFIED_RAW_PER_CODE: f64 = 2.2104 / 16_777_216.0 * 2.0 / 16.0;
+/// DAQ P6 differential input: code * 2.4 V / 2^23 / PGA 16, in volts.
+const DAQ_P6_RAW_PER_CODE: f64 = 2.4 / 8_388_608.0 / 16.0;
+/// KG1000 amplifier output floor. This analog limit cannot be derived from the
+/// ADC: the test fire showed the amplifier stuck at raw 0.0012-0.0021 (zero
+/// load is about 0.0120), which converted to -95 to -105 kg.
+const KG1000_LOW_RAIL_RAW: f32 = 0.0025;
+
+/// Raw limits outside of which a DAQ load-cell input is clipped, for the
+/// sensor and (for KG50) the selected input. `None` for other sensors.
+pub fn loadcell_rail_limits(kg50_input: Kg50Input, sensor: &str) -> Option<(f32, f32)> {
+    let amplified = (DAQ_ADC_FULL_SCALE_CODES * DAQ_AMPLIFIED_RAW_PER_CODE) as f32;
+    match (sensor, kg50_input) {
+        ("KG1000" | "ch1", _) => Some((KG1000_LOW_RAIL_RAW, amplified)),
+        ("KG50" | "kg50", Kg50Input::P6Differential) => {
+            let p6 = (DAQ_ADC_FULL_SCALE_CODES * DAQ_P6_RAW_PER_CODE) as f32;
+            Some((-p6, p6))
+        }
+        ("KG50" | "kg50", Kg50Input::Amp2) => Some((-amplified, amplified)),
+        _ => None,
+    }
+}
+
+/// True when `raw` from a DAQ load cell is at an ADC or amplifier rail, so a
+/// converted weight would be meaningless.
+pub fn loadcell_raw_at_rail(kg50_input: Kg50Input, sensor: &str, raw: f32) -> bool {
+    loadcell_rail_limits(kg50_input, sensor)
+        .is_some_and(|(low, high)| !raw.is_finite() || raw <= low || raw >= high)
+}
+
+/// DAQ rails describe the real ADC scale. FlightSim publishes load-cell "raw"
+/// directly in kg, so rail checks do not apply to it.
+pub fn daq_rails_apply() -> bool {
+    !crate::flight_sim_runtime::enabled()
+}
+
+/// Reject a calibration whose points or zero were captured on a clipped input.
+fn reject_railed_points(cfg: &LoadcellCalibrationFile, channel: &str, sensor: &str) -> Result<(), String> {
+    let Some(entry) = cfg.extra_channels.get(channel).filter(|_| daq_rails_apply()) else {
+        return Ok(());
+    };
+    let railed = |raw: f32| loadcell_raw_at_rail(cfg.kg50_input, sensor, raw);
+    if let Some(zero) = entry.zero_raw.filter(|raw| railed(*raw)) {
+        return Err(format!(
+            "{sensor} zero raw {zero} is at the ADC/amplifier rail; recapture it with the input in range"
+        ));
+    }
+    if let Some(point) = entry.points.iter().find(|point| railed(point.raw)) {
+        return Err(format!(
+            "{sensor} point {} kg has raw {} at the ADC/amplifier rail; recapture it with the input in range",
+            point.expected, point.raw
+        ));
+    }
+    Ok(())
+}
+
+/// Keep only temperature captures that still belong to a saved point or zero.
+fn retain_matching_captures(captures: &mut Vec<TemperatureCapture>, channel: Option<&GenericCalibrationChannel>) {
+    let Some(channel) = channel else {
+        captures.clear();
+        return;
+    };
+    captures.retain(|capture| {
+        (capture.expected.abs() <= 1e-6 && channel.zero_raw.is_some())
+            || channel
+                .points
+                .iter()
+                .any(|point| (point.expected - capture.expected).abs() < 1e-6)
+    });
+}
+
 /// A UI save is explicitly scoped to one calibration channel. Everything else
 /// comes from the authoritative current file, never the client's cached copy.
 #[derive(Debug, Deserialize)]
@@ -606,10 +682,13 @@ pub fn merge_channel_update(
     }
     result.temperature_captures.remove(sensor);
     if let Some(value) = incoming.temperature_captures.get(sensor) {
-        result
-            .temperature_captures
-            .insert(sensor.into(), value.clone());
+        let mut captures = value.clone();
+        retain_matching_captures(&mut captures, result.extra_channels.get(channel));
+        if !captures.is_empty() {
+            result.temperature_captures.insert(sensor.into(), captures);
+        }
     }
+    reject_railed_points(&result, channel, sensor)?;
     // Make the selected authoritative generic channel agree with legacy fields
     // before migration normalization (including explicit zero/fit removal).
     sync_extra_channels_into_legacy(&mut result);
@@ -2256,6 +2335,7 @@ impl HistoryCalibration {
             .first()
             .copied()
             .flatten()
+            .filter(|raw| !(daq_rails_apply() && loadcell_raw_at_rail(self.cfg.kg50_input, sensor, *raw)))
             .and_then(|raw| temperature_corrected_raw(&self.cfg, sensor, raw, temp))
             .map(|raw| {
                 self.processing
@@ -2299,16 +2379,17 @@ mod history_calibration_tests {
     fn history_calibration_uses_current_thermal_fit_and_expires_stale_temperature() {
                 let mut cfg = LoadcellCalibrationFile {
             ch1: ChannelLinear {
-            m: Some(2.),
-            b: Some(1.),
+            m: Some(128.),
+            b: Some(2.),
         },
             ..LoadcellCalibrationFile::default()
         };
+        // Raw values stay inside the DAQ ADC range (exact binary fractions).
         cfg.thermal.insert(
             "KG1000".into(),
             ThermalCalibration {
                 reference_c: 20.,
-                raw_per_c: 0.5,
+                raw_per_c: 0.00390625,
                 points: vec![],
             },
         );
@@ -2322,11 +2403,11 @@ mod history_calibration_tests {
         };
         replay.project(row(100, "DAQ_ADC_TEMPERATURE", Some(22.)));
         assert_eq!(
-            replay.project(row(101, "KG1000", Some(3.)))[1].values,
+            replay.project(row(101, "KG1000", Some(0.03125)))[1].values,
             vec![Some(5.)]
         );
         assert_eq!(
-            replay.project(row(2101, "KG1000", Some(3.)))[1].values,
+            replay.project(row(2101, "KG1000", Some(0.03125)))[1].values,
             vec![None]
         );
         assert_eq!(
@@ -2338,7 +2419,7 @@ mod history_calibration_tests {
     fn history_calibration_replaces_old_weights_from_raw_without_touching_raw() {
                 let cfg = LoadcellCalibrationFile {
             ch1: ChannelLinear {
-            m: Some(2.),
+            m: Some(192.),
             b: Some(1.),
         },
             ..LoadcellCalibrationFile::default()
@@ -2349,7 +2430,7 @@ mod history_calibration_tests {
             timestamp_ms: 100,
             data_type: "KG1000".into(),
             sender_id: "DAQ".into(),
-            values: vec![Some(3.)],
+            values: vec![Some(0.03125)],
         };
         let output = replay.project(raw.clone());
         assert_eq!(output[0].values, raw.values);
@@ -2452,5 +2533,121 @@ mod guarded_save_tests {
         assert_eq!(backups.len(), 1);
         assert_eq!(std::fs::read(backups[0].path()).unwrap(), before);
         assert_eq!(owned_temporary_count(&directory.0), 0);
+    }
+}
+
+#[cfg(test)]
+mod rail_tests {
+    use super::*;
+
+    const CLIP_RAW: f32 = 0.19427338; // DAQ code 0xB40000, test fire 2026-11-16
+
+    fn kg1000_update(points: &[(f32, f32)], zero_raw: Option<f32>, captures: &[f32]) -> CalibrationUpdate {
+        let mut calibration = LoadcellCalibrationFile::default();
+        calibration.extra_channels.insert(
+            "ch1".into(),
+            GenericCalibrationChannel {
+                linear: ChannelLinear { m: Some(9481.619), b: Some(0.0) },
+                zero_raw,
+                points: points
+                    .iter()
+                    .map(|(expected, raw)| CalibrationPoint { expected: *expected, raw: *raw })
+                    .collect(),
+                fit: None,
+            },
+        );
+        calibration.temperature_captures.insert(
+            "KG1000".into(),
+            captures
+                .iter()
+                .map(|expected| TemperatureCapture { expected: *expected, raw: 0.013, temperature_c: Some(21.0) })
+                .collect(),
+        );
+        CalibrationUpdate { channel: "ch1".into(), calibration }
+    }
+
+    #[test]
+    fn rails_cover_the_test_fire_clip_and_low_rail_but_not_real_loads() {
+        let amp2 = Kg50Input::Amp2;
+        assert!(loadcell_raw_at_rail(amp2, "KG1000", CLIP_RAW));
+        assert!(loadcell_raw_at_rail(amp2, "KG1000", 0.0012));
+        assert!(loadcell_raw_at_rail(amp2, "KG1000", 0.0021));
+        assert!(loadcell_raw_at_rail(amp2, "KG1000", f32::NAN));
+        // Zero, and the ~450 kgf thrust spikes, are in range.
+        assert!(!loadcell_raw_at_rail(amp2, "KG1000", 0.01205));
+        assert!(!loadcell_raw_at_rail(amp2, "KG1000", 0.0595));
+        let p6 = Kg50Input::P6Differential;
+        assert!(!loadcell_raw_at_rail(p6, "KG50", 0.0042533));
+        assert!(!loadcell_raw_at_rail(p6, "KG50", -0.0128));
+        assert!(loadcell_raw_at_rail(p6, "KG50", 0.2109375));
+        assert!(loadcell_raw_at_rail(p6, "KG50", -0.2109375));
+        assert!(loadcell_raw_at_rail(amp2, "KG50", CLIP_RAW));
+        assert!(!loadcell_raw_at_rail(amp2, "IADC", 1000.0));
+        let (low, high) = loadcell_rail_limits(amp2, "KG1000").unwrap();
+        assert_eq!(low, 0.0025);
+        assert!((high - 0.13815).abs() < 1e-5);
+    }
+
+    #[test]
+    fn save_rejects_points_or_zero_captured_at_a_rail() {
+        let current = LoadcellCalibrationFile::default();
+        let err = merge_channel_update(&current, &kg1000_update(&[(100.0, CLIP_RAW)], Some(0.01205), &[]))
+            .unwrap_err();
+        assert!(err.contains("rail") && err.contains("100"), "{err}");
+        let err = merge_channel_update(&current, &kg1000_update(&[(100.0, 0.0226)], Some(0.001935), &[]))
+            .unwrap_err();
+        assert!(err.contains("zero") && err.contains("rail"), "{err}");
+        let ok = merge_channel_update(&current, &kg1000_update(&[(100.0, 0.0226)], Some(0.01205), &[]))
+            .unwrap();
+        assert_eq!(ok.extra_channels["ch1"].points.len(), 1);
+        // The P6 differential KG50 scale is not mistaken for a clip.
+        let mut p6 = LoadcellCalibrationFile::default();
+        switch_kg50_input(&mut p6, Kg50Input::P6Differential);
+        let mut update = p6.clone();
+        update.extra_channels.insert(
+            "kg50".into(),
+            GenericCalibrationChannel {
+                zero_raw: Some(0.0040061),
+                points: vec![CalibrationPoint { expected: 5.0, raw: 0.0042256 }],
+                ..Default::default()
+            },
+        );
+        assert!(merge_channel_update(&p6, &CalibrationUpdate { channel: "kg50".into(), calibration: update }).is_ok());
+    }
+
+    #[test]
+    fn save_drops_temperature_captures_without_a_matching_point() {
+        let current = LoadcellCalibrationFile::default();
+        let saved = merge_channel_update(
+            &current,
+            &kg1000_update(&[(100.0, 0.0226)], Some(0.01205), &[0.0, 50.0, 100.0]),
+        )
+        .unwrap();
+        let kept: Vec<f32> = saved.temperature_captures["KG1000"].iter().map(|c| c.expected).collect();
+        assert_eq!(kept, vec![0.0, 100.0]);
+        let saved = merge_channel_update(&current, &kg1000_update(&[(100.0, 0.0226)], None, &[0.0, 50.0]))
+            .unwrap();
+        assert!(!saved.temperature_captures.contains_key("KG1000"));
+    }
+
+    #[test]
+    fn history_replay_withholds_weight_for_railed_raw_and_keeps_raw() {
+        let cfg = LoadcellCalibrationFile {
+            ch1: ChannelLinear { m: Some(9481.619), b: Some(-114.0) },
+            ..LoadcellCalibrationFile::default()
+        };
+        let mut replay = HistoryCalibration::new(cfg, &FillTargetsConfig::default(), FlightState::Startup);
+        let row = |timestamp_ms, value| crate::types::TelemetryRow {
+            timestamp_ms,
+            data_type: "KG1000".into(),
+            sender_id: "DAQ".into(),
+            values: vec![Some(value)],
+        };
+        let out = replay.project(row(100, CLIP_RAW));
+        assert_eq!(out[0].values, vec![Some(CLIP_RAW)]);
+        assert_eq!(out[1].data_type, DERIVED_WEIGHT_DATA_TYPE);
+        assert_eq!(out[1].values, vec![None]);
+        let out = replay.project(row(200, 0.0122373));
+        assert!(out[1].values[0].is_some());
     }
 }

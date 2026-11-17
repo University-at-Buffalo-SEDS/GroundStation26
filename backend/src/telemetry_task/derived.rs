@@ -634,15 +634,51 @@ pub(super) fn prepare_derived_loadcell_rows(
         sample.sender_id,
         sample.ts_ms,
     );
+    // A clipped load-cell input carries no load information. The raw row is
+    // still recorded by the caller; only the converted weight is withheld.
+    let railed = loadcell::daq_rails_apply()
+        && loadcell::loadcell_raw_at_rail(cfg.kg50_input, calibration_sensor_id, sample.raw_value);
+    if let Some(message) = observe_loadcell_rail(
+        calibration_sensor_id,
+        sample.sender_id,
+        railed,
+        sample.ts_ms,
+        sample.raw_value,
+    ) {
+        crate::web::emit_warning(state, message);
+    }
     state.loadcell_processing.observe_source(crate::loadcell_zero::SourceSample {
         sender: sample.sender_id,
         sensor: calibration_sensor_id,
         timestamp_ms: sample.ts_ms,
         source_timestamp_ms: sample.source_timestamp_ms,
         received_network_ms: sample.receipt.network_ms,
-        raw: sample.raw_value,
+        // A zero/noise capture must reject clipped samples, never average them.
+        raw: if railed { f32::NAN } else { sample.raw_value },
         temperature,
     });
+    if railed {
+        let _ = state.loadcell_processing.filter(
+            &cfg,
+            sample.sender_id,
+            calibration_sensor_id,
+            sample.ts_ms,
+            f32::NAN,
+        );
+        let is_fill_source = calibration_sensor_id == fill_source.sensor();
+        if is_fill_source && sample.sender_id == crate::types::Board::DaqBoard.sender_id() {
+            *state.latest_fill_mass_kg.lock().unwrap() = None;
+            state.gse.lock().unwrap().observe_mass(None);
+        }
+        let config_json = serde_json::json!({"calibration":cfg,
+            "fill_targets":fill_targets,"flight_state":format!("{:?}", *state.state.lock().unwrap())})
+        .to_string();
+        return Some(PreparedLoadcellRows {
+            rows: railed_loadcell_rows(calibration_sensor_id, is_fill_source),
+            calibration_sensor_id: calibration_sensor_id.into(),
+            config_json,
+        });
+    }
     let Some(calibrated_value) = loadcell::temperature_corrected_raw(
         &cfg,
         calibration_sensor_id,
@@ -743,6 +779,85 @@ pub(super) fn prepare_derived_loadcell_rows(
         calibration_sensor_id: calibration_sensor_id.into(),
         config_json,
     })
+}
+
+/// Rows published for a clipped load-cell sample: the weight (and fill
+/// percentage, when this sensor drives fill) is explicitly invalid.
+fn railed_loadcell_rows(sensor: &str, is_fill_source: bool) -> Vec<(&'static str, Vec<Option<f32>>)> {
+    let kind = if sensor == loadcell::RAW_LOADCELL_DATA_TYPE_1000KG {
+        loadcell::DERIVED_WEIGHT_DATA_TYPE
+    } else {
+        loadcell::DERIVED_WEIGHT_50_DATA_TYPE
+    };
+    let mut rows = vec![(kind, vec![None])];
+    if is_fill_source {
+        rows.push((loadcell::DERIVED_FILL_PERCENT_DATA_TYPE, vec![None]));
+    }
+    rows
+}
+
+/// Re-alert on a new rail episode no sooner than this after the last alert,
+/// so an input flapping at the rail cannot flood the alert list.
+const LOADCELL_RAIL_ALERT_HOLDOFF_MS: i64 = 30_000;
+
+#[derive(Debug, Default)]
+pub(super) struct LoadcellRailLatch {
+    railed: bool,
+    last_alert_ms: Option<i64>,
+}
+
+impl LoadcellRailLatch {
+    /// True when this sample starts a rail episode that should raise an alert.
+    pub(super) fn observe(&mut self, railed: bool, now_ms: i64) -> bool {
+        if !railed {
+            self.railed = false;
+            return false;
+        }
+        if self.railed {
+            return false;
+        }
+        self.railed = true;
+        let due = self
+            .last_alert_ms
+            .is_none_or(|last| now_ms.saturating_sub(last) >= LOADCELL_RAIL_ALERT_HOLDOFF_MS || now_ms < last);
+        if due {
+            self.last_alert_ms = Some(now_ms);
+        }
+        due
+    }
+}
+
+static LOADCELL_RAIL_LATCHES: OnceLock<Mutex<HashMap<String, LoadcellRailLatch>>> = OnceLock::new();
+
+fn observe_loadcell_rail(
+    sensor: &str,
+    sender: &str,
+    railed: bool,
+    now_ms: i64,
+    raw: f32,
+) -> Option<String> {
+    if !matches!(
+        sensor,
+        loadcell::RAW_LOADCELL_DATA_TYPE_1000KG | loadcell::RAW_LOADCELL_DATA_TYPE_50KG
+    ) {
+        return None;
+    }
+    let mut latches = LOADCELL_RAIL_LATCHES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    let start = latches
+        .entry(format!("{sender}:{sensor}"))
+        .or_default()
+        .observe(railed, now_ms);
+    start.then(|| loadcell_rail_warning(sensor, raw))
+}
+
+pub(super) fn loadcell_rail_warning(sensor: &str, raw: f32) -> String {
+    let label = if sensor == loadcell::RAW_LOADCELL_DATA_TYPE_1000KG { "1000 kg" } else { "50 kg" };
+    format!(
+        "{label} load cell input is at its ADC/amplifier rail (raw {raw}); weight is shown as invalid until it returns to range. Check the load cell wiring and DAQ supply."
+    )
 }
 
 pub(super) async fn emit_derived_loadcell_rows(
@@ -1353,5 +1468,37 @@ mod invalid_analog_tests {
             f32_values_from_payload_bytes(&bytes),
             Some(vec![None, Some(0.0000277), None, None])
         );
+    }
+}
+
+#[cfg(test)]
+mod loadcell_rail_tests {
+    use super::*;
+
+    #[test]
+    fn rail_alert_fires_once_per_episode_with_holdoff() {
+        let mut latch = LoadcellRailLatch::default();
+        assert!(latch.observe(true, 1_000));
+        assert!(!latch.observe(true, 1_100), "continuing episode is not re-alerted");
+        assert!(!latch.observe(false, 1_200));
+        assert!(!latch.observe(true, 1_300), "flapping inside the holdoff stays quiet");
+        assert!(!latch.observe(false, 40_000));
+        assert!(latch.observe(true, 40_100), "a new episode after the holdoff alerts");
+    }
+
+    #[test]
+    fn railed_rows_publish_invalid_weight_and_fill() {
+        assert_eq!(
+            railed_loadcell_rows("KG1000", false),
+            vec![(loadcell::DERIVED_WEIGHT_DATA_TYPE, vec![None])]
+        );
+        assert_eq!(
+            railed_loadcell_rows("KG50", true),
+            vec![
+                (loadcell::DERIVED_WEIGHT_50_DATA_TYPE, vec![None]),
+                (loadcell::DERIVED_FILL_PERCENT_DATA_TYPE, vec![None]),
+            ]
+        );
+        assert!(loadcell_rail_warning("KG1000", 0.19427338).contains("1000 kg"));
     }
 }

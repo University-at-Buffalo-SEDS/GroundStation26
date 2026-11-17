@@ -6595,9 +6595,14 @@ mod tests {
     async fn selected_1000kg_fill_uses_absolute_mass_without_changing_recorded_weight() {
         let (db_tx, _) = mpsc::channel(16);
         let state = test_app_state(db_tx.clone()).await;
-        // This raw==kg numeric oracle owns its calibration; do not inherit a
+        // This numeric oracle owns its calibration; do not inherit a
         // physical installation's saved fit from the stage runtime directory.
-        *state.loadcell_calibration.lock().unwrap() = loadcell::LoadcellCalibrationFile::default();
+        // Raw 0.0625 is inside the DAQ ADC range and converts to exactly -4.25 kg.
+        *state.loadcell_calibration.lock().unwrap() = loadcell::LoadcellCalibrationFile {
+            ch1: loadcell::ChannelLinear { m: Some(-68.0), b: Some(0.0) },
+            ch1_fit: None,
+            ..Default::default()
+        };
         state.loadcell_calibration.lock().unwrap().full_mass_kg = None;
         let mut targets = state.fill_targets_snapshot();
         targets.nitrous.target_mass_kg = 10.; // Original percentage oracle uses a 10 kg target.
@@ -6610,11 +6615,11 @@ mod tests {
             &[crate::telemetry_schema::endpoint("GROUND_STATION")],
             Board::DaqBoard.sender_id(),
             123_400,
-            f32_payload(&[-4.25]),
+            f32_payload(&[0.0625]),
         )
         .unwrap();
         let raw = handle_packet(&state, &db_tx, &overflow, pkt).await;
-        assert_eq!(raw[0].values, vec![Some(-4.25)]);
+        assert_eq!(raw[0].values, vec![Some(0.0625)]);
         assert_eq!(ws.try_recv().unwrap().values, vec![Some(-4.25)]);
         assert_eq!(ws.try_recv().unwrap().values, vec![Some(42.5)]);
         assert_eq!(*state.latest_fill_mass_kg.lock().unwrap(), Some(4.25));
@@ -6629,11 +6634,11 @@ mod tests {
             &[crate::telemetry_schema::endpoint("GROUND_STATION")],
             Board::DaqBoard.sender_id(),
             123_450,
-            f32_payload(&[-4.25]),
+            f32_payload(&[0.0625]),
         )
         .unwrap();
         let raw = handle_packet(&state, &db_tx, &overflow, pkt).await;
-        assert_eq!(raw[0].values, vec![Some(-4.25)]);
+        assert_eq!(raw[0].values, vec![Some(0.0625)]);
         assert_eq!(ws.try_recv().unwrap().values, vec![Some(-4.25)]);
         assert_eq!(ws.try_recv().unwrap().values, vec![Some(53.125)]);
         assert_eq!(*state.latest_fill_mass_kg.lock().unwrap(), Some(4.25));
@@ -6724,8 +6729,8 @@ mod tests {
                 "kg50".into(),
                 loadcell::GenericCalibrationChannel {
                     linear: loadcell::ChannelLinear {
-                        m: Some(2.0),
-                        b: Some(1.0),
+                        m: Some(128.0),
+                        b: Some(1.5),
                     },
                     ..Default::default()
                 },
@@ -6736,12 +6741,12 @@ mod tests {
             &[crate::telemetry_schema::endpoint("GROUND_STATION")],
             Board::DaqBoard.sender_id(),
             456_789,
-            f32_payload(&[4.25]),
+            f32_payload(&[0.0625]),
         )
         .unwrap();
         let rows = handle_packet(&state, &db_tx, &db_overflow, pkt).await;
         assert_eq!(rows[0].data_type, "KG50");
-        assert_eq!(rows[0].values, vec![Some(4.25)]);
+        assert_eq!(rows[0].values, vec![Some(0.0625)]);
         let calibrated = ws_rx.try_recv().unwrap();
         assert_eq!(calibrated.data_type, loadcell::DERIVED_WEIGHT_50_DATA_TYPE);
         assert_eq!(calibrated.values, vec![Some(9.5)]);
@@ -6780,7 +6785,7 @@ mod tests {
                 let metadata: serde_json::Value = serde_json::from_str(&json).unwrap();
                 assert_eq!(
                     metadata["calibration"]["extra_channels"]["kg50"]["linear"]["m"],
-                    2.0
+                    128.0
                 );
                 db.close().await;
             }
@@ -6792,6 +6797,71 @@ mod tests {
                 .iter()
                 .any(|r| r.data_type == loadcell::DERIVED_WEIGHT_50_DATA_TYPE)
         );
+    }
+
+    #[tokio::test]
+    async fn railed_kg1000_records_raw_but_publishes_invalid_weight_and_warns_once() {
+        let (db_tx, mut db_rx) = mpsc::channel(32);
+        let state = test_app_state(db_tx.clone()).await;
+        let db_overflow = test_db_overflow();
+        {
+            let mut cfg = state.loadcell_calibration.lock().unwrap();
+            cfg.ch1 = loadcell::ChannelLinear { m: Some(9481.619), b: Some(0.0) };
+            cfg.ch1_zero_raw = Some(0.0122373);
+        }
+        let mut ws_rx = state.ws_tx.subscribe();
+        let mut warnings_rx = state.warnings_tx.subscribe();
+        // A sender unique to this test keeps the global rail latch independent.
+        let sender = "RAILTEST";
+        let packet = |timestamp, raw: f32| {
+            Packet::new(
+                crate::telemetry_schema::data_type("KG1000"),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                sender,
+                timestamp,
+                f32_payload(&[raw]),
+            )
+            .unwrap()
+        };
+        let rows = handle_packet(&state, &db_tx, &db_overflow, packet(500_000, 0.19427338)).await;
+        assert_eq!(rows[0].data_type, "KG1000");
+        assert_eq!(rows[0].values, vec![Some(0.19427338)]);
+        let mut weights = Vec::new();
+        while let Ok(row) = ws_rx.try_recv() {
+            if row.data_type == loadcell::DERIVED_WEIGHT_DATA_TYPE {
+                weights.push(row.values);
+            }
+        }
+        assert_eq!(weights, vec![vec![None]], "a clipped input must not publish 1726 kg");
+        let mut recorded = Vec::new();
+        while let Ok(item) = db_rx.try_recv() {
+            if let DbQueueItem::Write(DbWrite::Telemetry { data_type, values_json, .. }) = item {
+                recorded.push((data_type, values_json));
+            }
+        }
+        assert!(recorded.iter().any(|(kind, values)| kind == "KG1000" && values.as_deref().is_some_and(|v| v.contains("0.194"))));
+        assert!(
+            recorded
+                .iter()
+                .any(|(kind, values)| kind == loadcell::DERIVED_WEIGHT_DATA_TYPE && values.as_deref() == Some("[null]"))
+        );
+        let warning = tokio::time::timeout(Duration::from_millis(100), warnings_rx.recv())
+            .await
+            .expect("a railed load cell should raise a warning")
+            .unwrap();
+        assert!(warning.message.contains("rail"), "{}", warning.message);
+        handle_packet(&state, &db_tx, &db_overflow, packet(500_100, 0.19427338)).await;
+        assert!(warnings_rx.try_recv().is_err(), "the same episode warns once");
+        // Back in range: a real weight is published again.
+        handle_packet(&state, &db_tx, &db_overflow, packet(500_200, 0.0227373)).await;
+        let mut last = None;
+        while let Ok(row) = ws_rx.try_recv() {
+            if row.data_type == loadcell::DERIVED_WEIGHT_DATA_TYPE {
+                last = Some(row.values);
+            }
+        }
+        let kg = last.unwrap()[0].unwrap();
+        assert!((kg - 100.0).abs() < 0.5, "{kg}");
     }
 
     #[tokio::test]
@@ -7046,7 +7116,8 @@ mod tests {
     async fn kg1000_packet_emits_state_tab_loadcell_rows() {
         let (db_tx, mut db_rx) = mpsc::channel(8);
         let state = test_app_state(db_tx.clone()).await;
-        // This raw==kg numeric oracle owns its calibration; do not inherit a
+        // This raw==kg numeric oracle owns its calibration (raw in the DAQ ADC
+        // range, so it is not treated as clipped); do not inherit a
         // physical installation's saved fit from the stage runtime directory.
         *state.loadcell_calibration.lock().unwrap() = loadcell::LoadcellCalibrationFile::default();
         let db_overflow = test_db_overflow();
@@ -7057,7 +7128,7 @@ mod tests {
             &[crate::telemetry_schema::endpoint("GROUND_STATION")],
             Board::DaqBoard.sender_id(),
             456_789,
-            f32_payload(&[4.25]),
+            f32_payload(&[0.0425]),
         )
         .expect("failed to build KG1000 packet");
 
@@ -7069,7 +7140,7 @@ mod tests {
 
         assert_eq!(row.data_type, loadcell::RAW_LOADCELL_DATA_TYPE_1000KG);
         assert_eq!(row.sender_id, Board::DaqBoard.sender_id());
-        assert_eq!(row.values, vec![Some(4.25)]);
+        assert_eq!(row.values, vec![Some(0.0425)]);
 
         let mut broadcast_rows = Vec::new();
         for _ in 0..1 {
@@ -7090,7 +7161,7 @@ mod tests {
             vec![loadcell::DERIVED_WEIGHT_DATA_TYPE]
         );
         assert_eq!(broadcast_rows[0].sender_id, Board::DaqBoard.sender_id());
-        assert_eq!(broadcast_rows[0].values, vec![Some(4.25)]);
+        assert_eq!(broadcast_rows[0].values, vec![Some(0.0425)]);
         assert_eq!(broadcast_rows[0].timestamp_ms, row.timestamp_ms);
         assert_eq!(*state.latest_fill_mass_kg.lock().unwrap(), None);
 
@@ -7134,7 +7205,7 @@ mod tests {
         let (db_tx, _) = mpsc::channel(16);
         let state = test_app_state(db_tx.clone()).await;
         let calibration = loadcell::LoadcellCalibrationFile {
-            ch1: loadcell::ChannelLinear { m: Some(2.0), b: Some(1.0) },
+            ch1: loadcell::ChannelLinear { m: Some(128.0), b: Some(1.5) },
             ch1_fit: None,
             ..Default::default()
         };
@@ -7147,10 +7218,10 @@ mod tests {
         let packet = Packet::new(
             crate::telemetry_schema::data_type("KG1000"),
             &[crate::telemetry_schema::endpoints::GROUND_STATION],
-            Board::DaqBoard.sender_id(), 456_789, f32_payload(&[4.25]),
+            Board::DaqBoard.sender_id(), 456_789, f32_payload(&[0.0625]),
         ).unwrap();
         let raw = handle_packet(&state, &db_tx, &test_db_overflow(), packet).await;
-        assert_eq!(raw[0].values, vec![Some(4.25)]);
+        assert_eq!(raw[0].values, vec![Some(0.0625)]);
         assert_eq!(ws.try_recv().unwrap().values, vec![Some(9.5)]);
         assert_eq!(ws.try_recv().unwrap().values, vec![Some(95.0)]);
         assert_eq!(*state.latest_fill_mass_kg.lock().unwrap(), Some(9.5));
