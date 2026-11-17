@@ -186,7 +186,8 @@ struct Control {
     /// concurrent per-board exchanges of one operation never see each other's
     /// replies. Indexed by `index(board)`.
     expected: [Option<u64>; 7],
-    boundary: Option<u64>,
+    /// The admitted boundary as a network stamp (epoch, timestamp).
+    boundary: Option<crate::network_stamp::Stamp>,
     inbox: [VecDeque<Packet>; 7],
     /// Prepares whose fresh queries are in flight (`PrepareQueries`).
     preparing: usize,
@@ -211,7 +212,7 @@ struct Target {
 pub(super) struct FirstBinding {
     original: RecoveryIntent,
     uncertain: RecoveryIntent,
-    prior_boundary: u64,
+    prior_boundary: crate::network_stamp::Stamp,
     epoch: u32,
     issuer: u64,
 }
@@ -240,14 +241,14 @@ impl FirstBinding {
         };
         if original.boot() != u64::MAX
             || uncertain.boot() != u64::MAX
-            || original.source_utc_ms > uncertain.source_utc_ms
+            || original.source() > uncertain.source()
         {
             return None;
         }
         Some(Self {
             original,
             uncertain,
-            prior_boundary: pending.origin_utc_ms,
+            prior_boundary: pending.origin(),
             epoch: query.epoch,
             issuer: query.issuer,
         })
@@ -263,8 +264,8 @@ impl FirstBinding {
             && query.value.flags & 0x25 == 0x25
             && query.value.epoch == self.epoch
             && query.value.issuer == self.issuer
-            && boundary.utc() > self.prior_boundary
-            && boundary.utc() > self.uncertain.source_utc_ms
+            && boundary.stamp() > self.prior_boundary
+            && boundary.stamp() > self.uncertain.source()
     }
 }
 pub(super) fn first_uncertainty(
@@ -440,7 +441,12 @@ pub(crate) fn readonly_query_idle(state: &AppState) -> bool {
                     .is_some_and(|value| value["completed"] == false)
         })
 }
-pub(crate) fn retained_boundary(state: &AppState) -> Result<Option<u64>, &'static str> {
+/// The newest retained recovery/manual-Stop mark as a network stamp: a new
+/// boundary must be strictly newer by (epoch, timestamp), so after a network
+/// clock step back a new boundary (in the newer epoch) is newer.
+pub(crate) fn retained_boundary(
+    state: &AppState,
+) -> Result<Option<crate::network_stamp::Stamp>, &'static str> {
     let active = state
         .board_recovery
         .coordinator
@@ -454,7 +460,7 @@ pub(crate) fn retained_boundary(state: &AppState) -> Result<Option<u64>, &'stati
         .map_err(|_| "Recovery journal busy")?;
     let durable = history
         .recovery_pending()
-        .map(|marker| marker.origin_utc_ms);
+        .map(|marker| marker.origin());
     let ceiling = history
         .retained_manual_utc_ceiling()
         .map_err(|_| "Manual UTC journal unavailable")?;
@@ -466,7 +472,7 @@ pub(crate) fn retained_boundary(state: &AppState) -> Result<Option<u64>, &'stati
         .into_iter()
         .chain(durable)
         .chain([ceiling, attempted])
-        .filter(|v| *v != 0)
+        .filter(|v| v.ms != 0)
         .max())
 }
 
@@ -1374,7 +1380,7 @@ pub(super) async fn confirm(
             .topology_router
             .get()
             .and_then(|router| super::exchange::ConfirmBoundary::capture(router).ok())
-            .filter(|boundary| floor.is_none_or(|floor| boundary.utc() > floor))
+            .filter(|boundary| floor.is_none_or(|floor| boundary.stamp() > floor))
     });
     #[cfg(test)]
     tests::notify_confirm_received(&state);
@@ -1506,13 +1512,13 @@ fn admit_confirmation(
         .lock()
         .unwrap()
         .recovery_pending()
-        .map(|marker| marker.origin_utc_ms);
+        .map(|marker| marker.origin());
     if control
         .boundary
         .into_iter()
         .chain(durable_floor)
         .chain([manual_floor])
-        .any(|floor| boundary.utc() <= floor)
+        .any(|floor| boundary.stamp() <= floor)
     {
         return error(
             StatusCode::CONFLICT,
@@ -1533,11 +1539,11 @@ fn admit_confirmation(
     };
     ticket.token.owner = owner;
     ticket.boundary = Some(boundary);
-    control.boundary = Some(boundary.utc());
+    control.boundary = Some(boundary.stamp());
     for target in &mut ticket.targets {
         if let Some(binding) = &target.first_binding
-            && (boundary.utc() <= binding.prior_boundary
-                || boundary.utc() <= binding.uncertain.source_utc_ms)
+            && (boundary.stamp() <= binding.prior_boundary
+                || boundary.stamp() <= binding.uncertain.source())
             {
                 return error(
                     StatusCode::CONFLICT,
@@ -1587,6 +1593,7 @@ fn admit_confirmation(
             source_utc_ms: boundary.utc(),
             backend: ticket.backend.clone(),
             principal_context: ticket.principal.clone(),
+            source_epoch: boundary.stamp().epoch,
         };
         if target.context.boot == u64::MAX && target.original_first.is_none() {
             target.original_first = Some(intent.clone());
@@ -2038,6 +2045,7 @@ async fn exchange(
     };
     if exchange.packet(Stamp::now())?.payload() != intent.body
         || exchange.packet(Stamp::now())?.timestamp() != intent.source_utc_ms
+        || exchange.packet(Stamp::now())?.time_epoch() != intent.source_epoch
     {
         return Err("Prepared SDK request differs from sealed durable intent");
     }
@@ -2753,6 +2761,7 @@ async fn run_inner(
         manual_epoch: ticket.token.manual_epoch,
         observed_manual_epoch: ticket.token.observed_manual_epoch,
         origin_utc_ms: ticket.boundary.ok_or("Confirm boundary unavailable")?.utc(),
+        origin_epoch: ticket.boundary.ok_or("Confirm boundary unavailable")?.stamp().epoch,
         prior_automatic_actions_inhibited: ticket.prior_inhibition,
         targets: ticket
             .targets
@@ -4570,6 +4579,7 @@ mod tests {
                 .unwrap()
                 .retained_manual_utc_ceiling()
                 .unwrap()
+                .ms
                 > 0
         );
         state.manual_abort_intent.request();
@@ -4960,15 +4970,16 @@ mod tests {
                 "fresh dedicated query after ceiling wait"
             );
         }
-        // Live public437 disciplines a backward adjustment. Preserve this fact;
-        // the actual rollback threat here is a restarted router with retained disk.
+        // A backward adjustment of a live router either slews or steps into a
+        // newer epoch: either way its stamps stay newer than the ceiling. The
+        // actual rollback threat here is a restarted router with retained disk.
         router
             .try_set_local_network_time(sedsnet::timesync::PartialNetworkTime::from_unix_ms(
-                key.boundary,
+                key.boundary.ms as u64,
             ))
             .unwrap();
         assert!(
-            crate::system_clock::required_control_network_utc_ms(&router).unwrap() > key.ceiling
+            crate::system_clock::required_control_network_stamp(&router).unwrap() > key.ceiling
         );
         assert!(ticket["ticket"].is_string());
         let journal = std::fs::read(fixture.http.directory.join("clock.json")).unwrap();
@@ -4979,7 +4990,7 @@ mod tests {
                 .await;
         let cold_state = cold.state();
         assert!(
-            crate::system_clock::required_control_network_utc_ms(
+            crate::system_clock::required_control_network_stamp(
                 cold_state.topology_router.get().unwrap()
             )
             .unwrap()

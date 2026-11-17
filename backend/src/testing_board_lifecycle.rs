@@ -1,4 +1,5 @@
 //! Pure-Testing application owners. This is not MCU NVM or a hardware fallback.
+use crate::network_stamp::Stamp;
 use crate::types::Board;
 use ring::rand::{SecureRandom, SystemRandom};
 use sedsnet::{
@@ -216,11 +217,27 @@ pub(crate) fn retired_model_abort_state(board: Board, packet: &Packet) -> bool {
     // decode with identical wire bytes/ID cannot acquire this local lineage.
     // Registry ownership is released before trying the model owner.
     let origin = registered_origin(packet);
-    origin.is_some_and(|origin| crate::flight_sim::model_report_is_old(origin, packet.timestamp()))
+    origin.is_some_and(|origin| crate::flight_sim::model_report_is_old(origin, Stamp::of(packet)))
 }
 
-fn fresh(source: u64, now: u64) -> bool {
-    source != 0 && source != u64::MAX && now.checked_sub(source).is_some_and(|age| age <= FRESH_MS)
+/// Board parity (SEDSnet 6): a station stamp is fresh by its age on the
+/// network clock. A stamp in the station router's current epoch is aged
+/// against the sampled network time `now`; one from another epoch is aged by
+/// the router, which translates it across the steps it remembers.
+fn fresh(source: Stamp, now: u64) -> bool {
+    if source.ms <= 0 || now == 0 || now == u64::MAX {
+        return false;
+    }
+    match crate::telemetry_task::network_time_router() {
+        Some(router) if router.network_time_epoch() != source.epoch => {
+            crate::network_stamp::is_fresh_on(router, source, FRESH_MS, 0)
+        }
+        _ => now.checked_sub(source.ms as u64).is_some_and(|age| age <= FRESH_MS),
+    }
+}
+/// The epoch a station command stamped now carries (the station router's).
+fn station_epoch() -> u16 {
+    crate::telemetry_task::network_time_router().map_or(0, |router| router.network_time_epoch())
 }
 fn new_boot() -> Option<u64> {
     let mut bytes = [0; 8];
@@ -235,11 +252,18 @@ struct Query {
     epoch: u32,
     boot: u64,
     source: u64,
+    source_epoch: u16,
+}
+impl Query {
+    fn stamp(&self) -> Stamp {
+        Stamp::new(self.source_epoch, self.source as i64)
+    }
 }
 #[derive(Clone, Debug)]
 pub(crate) struct Intent {
     wire: [u8; 32],
     pub(crate) source: u64,
+    pub(crate) source_epoch: u16,
     pub(crate) desired: u8,
     epoch: u32,
     boot: u64,
@@ -247,6 +271,11 @@ pub(crate) struct Intent {
     issuer: u64,
     result: u8,
     finished_epoch: Option<u32>,
+}
+impl Intent {
+    pub(crate) fn stamp(&self) -> Stamp {
+        Stamp::new(self.source_epoch, self.source as i64)
+    }
 }
 #[derive(Clone, Debug)]
 struct Node {
@@ -258,6 +287,10 @@ struct Node {
     abort_utc: u64,
     floor: u64,
     attempted: u64,
+    /// Time-base epochs of `floor` and `attempted`: marks order by
+    /// (epoch, timestamp), as the boards' recovery floors do.
+    floor_epoch: u16,
+    attempted_epoch: u16,
     completed: bool,
     completed_epoch: u32,
     launched: bool,
@@ -265,6 +298,14 @@ struct Node {
     query: Option<Query>,
     last: Option<Intent>,
     born: Instant,
+}
+impl Node {
+    fn floor_stamp(&self) -> Stamp {
+        Stamp::new(self.floor_epoch, self.floor.min(i64::MAX as u64) as i64)
+    }
+    fn attempted_stamp(&self) -> Stamp {
+        Stamp::new(self.attempted_epoch, self.attempted.min(i64::MAX as u64) as i64)
+    }
 }
 #[derive(Debug)]
 pub(crate) struct Owner {
@@ -317,6 +358,8 @@ impl Owner {
                 abort_utc: 0,
                 floor: 0,
                 attempted: 0,
+                floor_epoch: 0,
+                attempted_epoch: 0,
                 completed: false,
                 completed_epoch: 0,
                 launched: false,
@@ -330,6 +373,9 @@ impl Owner {
     /// Existing host history is the durability authority. A fresh model identity
     /// cannot erase an unclean/closed/pending host hold or an observed board Abort.
     pub(crate) fn initialize(&mut self, hold_mask: u8, abort_mask: u8, floor: u64) {
+        self.initialize_at(hold_mask, abort_mask, Stamp::new(0, floor.min(i64::MAX as u64) as i64));
+    }
+    fn initialize_at(&mut self, hold_mask: u8, abort_mask: u8, floor: Stamp) {
         if self.initialized {
             return;
         }
@@ -350,15 +396,16 @@ impl Owner {
                     },
                 )
             };
-            node.floor = if floor == u64::MAX { 0 } else { floor };
+            (node.floor, node.floor_epoch) =
+                if floor.ms == i64::MAX { (0, 0) } else { (floor.ms.max(0) as u64, floor.epoch) };
         }
         self.initialized = true;
     }
-    pub(crate) fn initialize_boot(&mut self, hold: u8, actual_abort: u8, unknown: u8, floor: u64) {
+    pub(crate) fn initialize_boot(&mut self, hold: u8, actual_abort: u8, unknown: u8, floor: Stamp) {
         if self.initialized {
             return;
         }
-        self.initialize(hold, actual_abort, floor);
+        self.initialize_at(hold, actual_abort, floor);
         for (i, node) in self.nodes.iter_mut().enumerate() {
             if unknown & (1 << i) != 0 && !node.blocked {
                 node.state = Some(0);
@@ -433,9 +480,13 @@ impl Owner {
     pub(crate) fn blocked(&self, board: Board) -> bool {
         !self.initialized || self.nodes[at(board)].blocked
     }
+    /// A station command stamped `source` in the station's current epoch.
     pub(crate) fn source_allowed(&self, board: Board, source: u64, now: u64) -> bool {
+        self.source_allowed_at(board, Stamp::new(station_epoch(), source.min(i64::MAX as u64) as i64), now)
+    }
+    fn source_allowed_at(&self, board: Board, source: Stamp, now: u64) -> bool {
         let n = &self.nodes[at(board)];
-        self.initialized && !n.blocked && fresh(source, now) && source > n.floor
+        self.initialized && !n.blocked && fresh(source, now) && source > n.floor_stamp()
     }
     pub(crate) fn note_state(&mut self, board: Board, state: u8) {
         let n = &mut self.nodes[at(board)];
@@ -495,6 +546,7 @@ impl Owner {
                 epoch: n.epoch,
                 boot: n.boot,
                 source: packet.timestamp(),
+                source_epoch: packet.time_epoch(),
             });
             return response(if !self.initialized || n.blocked && !n.aborted {
                 7
@@ -511,7 +563,7 @@ impl Owner {
             && old.nonce == nonce
             && old.issuer == issuer
         {
-            if old.wire.as_slice() != p || old.source != packet.timestamp() {
+            if old.wire.as_slice() != p || old.stamp() != Stamp::of(packet) {
                 return response(6);
             }
             let result = if old.finished_epoch.is_some_and(|e| e != n.epoch)
@@ -534,6 +586,7 @@ impl Owner {
         let intent = Intent {
             wire: p.try_into().unwrap(),
             source: packet.timestamp(),
+            source_epoch: packet.time_epoch(),
             desired: p[2],
             epoch,
             boot,
@@ -552,17 +605,17 @@ impl Owner {
         } else if boot != n.boot {
             6
         } else if epoch != n.epoch
-            || !fresh(packet.timestamp(), now)
-            || packet.timestamp() <= n.floor
-            || packet.timestamp() <= n.attempted
+            || !fresh(Stamp::of(packet), now)
+            || Stamp::of(packet) <= n.floor_stamp()
+            || Stamp::of(packet) <= n.attempted_stamp()
             || !n.query.as_ref().is_some_and(|q| {
                 q.boot == boot
                     && q.epoch == epoch
                     && q.issuer == issuer
                     && q.nonce != nonce
-                    && fresh(q.source, now)
-                    && q.source > n.floor
-                    && q.source > n.attempted
+                    && fresh(q.stamp(), now)
+                    && q.stamp() > n.floor_stamp()
+                    && q.stamp() > n.attempted_stamp()
             })
         {
             4
@@ -574,6 +627,7 @@ impl Owner {
             return response(result);
         }
         n.attempted = packet.timestamp();
+        n.attempted_epoch = packet.time_epoch();
         n.blocked = true;
         n.aborted = true;
         n.abort_utc = 0;
@@ -630,7 +684,7 @@ impl Owner {
                 if !producer
                     || n.launched
                     || !n.state.is_some_and(|s| s >= minimum && s < 7)
-                    || !self.source_allowed(board, packet.timestamp(), now)
+                    || !self.source_allowed_at(board, Stamp::of(packet), now)
                 {
                     return Decision::none();
                 }
@@ -641,7 +695,7 @@ impl Owner {
                 && n.completed
                 && packet.timestamp() != 0
                 && packet.timestamp() != u64::MAX
-                && packet.timestamp() < n.floor
+                && Stamp::of(packet) < n.floor_stamp()
             {
                 return Decision::none();
             }
@@ -652,7 +706,7 @@ impl Owner {
             };
         }
         if !station
-            || !self.source_allowed(board, packet.timestamp(), now)
+            || !self.source_allowed_at(board, Stamp::of(packet), now)
             || packet.payload().len() != 1
         {
             return Decision::none();
@@ -730,13 +784,18 @@ impl Owner {
         })
     }
     pub(crate) fn report_is_old(&self, origin: ReportOrigin, source: u64) -> bool {
+        let stamp = Stamp::new(self.nodes[at(origin.board)].floor_epoch, source.min(i64::MAX as u64) as i64);
+        self.report_is_old_at(origin, if source == u64::MAX { Stamp::new(u16::MAX, i64::MAX) } else { stamp })
+    }
+    /// A report stamped `source` predates the completed recovery floor.
+    pub(crate) fn report_is_old_at(&self, origin: ReportOrigin, source: Stamp) -> bool {
         let n = &self.nodes[at(origin.board)];
         self.initialized
             && n.completed
             && n.floor > 0
             && n.floor != u64::MAX
             && self.boot_sequence != 0
-            && (source == 0 || (source != u64::MAX && source < n.floor))
+            && (source.ms == 0 || (source.ms != i64::MAX && source < n.floor_stamp()))
             && (origin.sequence < self.boot_sequence
                 || (origin.sequence == self.boot_sequence
                     && origin.boot == n.boot
@@ -756,20 +815,20 @@ impl Owner {
     }
     pub(crate) fn ticket_current(&self, board: Board, intent: &Intent, now: u64) -> bool {
         let n = &self.nodes[at(board)];
-        !n.accepted_launch && fresh(intent.source, now)
+        !n.accepted_launch && fresh(intent.stamp(), now)
             && n.boot == intent.boot
             && n.epoch == intent.epoch
             && n.last.as_ref().is_some_and(|v| {
-                v.wire == intent.wire && v.source == intent.source && v.result == 1
+                v.wire == intent.wire && v.stamp() == intent.stamp() && v.result == 1
             })
     }
     pub(crate) fn finish(&mut self, board: Board, intent: &Intent, now: u64) -> Reply {
         let n = &mut self.nodes[at(board)];
-        let valid = !n.accepted_launch && fresh(intent.source, now)
+        let valid = !n.accepted_launch && fresh(intent.stamp(), now)
             && n.boot == intent.boot
             && n.epoch == intent.epoch
             && n.last.as_ref().is_some_and(|v| {
-                v.wire == intent.wire && v.source == intent.source && v.result == 1
+                v.wire == intent.wire && v.stamp() == intent.stamp() && v.result == 1
             });
         let result = if valid {
             0
@@ -788,12 +847,13 @@ impl Owner {
             n.launched = false;
             n.accepted_launch=false;
             n.floor = intent.source;
+            n.floor_epoch = intent.source_epoch;
             n.completed = true;
             n.completed_epoch = n.epoch;
         }
         if let Some(last) = &mut n.last
             && last.wire == intent.wire
-            && last.source == intent.source
+            && last.stamp() == intent.stamp()
         {
             last.result = result;
             last.finished_epoch = (result == 0).then_some(n.epoch);

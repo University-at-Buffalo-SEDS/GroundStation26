@@ -15,32 +15,43 @@ pub(super) const POLL_BUDGET: usize = 32;
 #[derive(Clone, Copy)]
 pub(super) struct ConfirmBoundary {
     utc: u64,
+    /// Time-base epoch of `utc`: requests carry it, boundaries order by it.
+    epoch: u16,
     captured: Stamp,
     clock_failure: crate::final_proof_clock::FailureFence,
 }
 impl ConfirmBoundary {
     pub(super) fn capture(router: &sedsnet::router::Router) -> Result<Self, &'static str> {
         let clock_failure = crate::final_proof_clock::FailureFence::capture();
+        let stamp = crate::system_clock::required_control_network_stamp(router)
+            .map_err(|_| "Network UTC unavailable")?;
         Ok(Self {
             clock_failure,
-            utc: crate::system_clock::required_control_network_utc_ms(router)
-                .map_err(|_| "Network UTC unavailable")?,
+            utc: stamp.ms as u64,
+            epoch: stamp.epoch,
             captured: Stamp::now(),
         })
     }
     pub(super) fn utc(self) -> u64 {
         self.utc
     }
+    /// The boundary as a network stamp (epoch, timestamp).
+    pub(super) fn stamp(self) -> crate::network_stamp::Stamp {
+        crate::network_stamp::Stamp::new(self.epoch, self.utc as i64)
+    }
     pub(super) fn clock_failure(self) -> crate::final_proof_clock::FailureFence { self.clock_failure }
     pub(super) fn monotonic_current(self, now: Stamp) -> bool {
         self.clock_failure.current().is_ok() && now.checked_duration_since(self.captured).is_some_and(|age| age <= QUERY_TTL)
     }
     pub(super) fn current(self, router: &sedsnet::router::Router, now: Stamp) -> bool {
+        // Its age on the network clock, across any step; never in the future.
         self.monotonic_current(now)
-            && crate::system_clock::required_control_network_utc_ms(router)
-                .ok()
-                .and_then(|utc| utc.checked_sub(self.utc))
-                .is_some_and(|age| age <= QUERY_TTL.as_millis() as u64)
+            && crate::network_stamp::is_fresh_on(
+                router,
+                self.stamp(),
+                QUERY_TTL.as_millis() as u64,
+                0,
+            )
             && self.clock_failure.current().is_ok()
     }
 }
@@ -98,10 +109,12 @@ impl Exchange {
     ) -> Result<Self, &'static str> {
         // Legacy primitive controls supply a deterministic monotonic snapshot.
         // Production routes instead use capture() at actual CONFIRM admission.
+        let stamp = crate::system_clock::required_control_network_stamp(&router)
+            .map_err(|_| "Network UTC unavailable")?;
         let boundary = ConfirmBoundary {
             clock_failure: crate::final_proof_clock::FailureFence::capture(),
-            utc: crate::system_clock::required_control_network_utc_ms(&router)
-                .map_err(|_| "Network UTC unavailable")?,
+            utc: stamp.ms as u64,
+            epoch: stamp.epoch,
             captured: now,
         };
         Self::prepare_at(board, query, nonce, desired, now, router, boundary)
@@ -230,7 +243,8 @@ impl Exchange {
             utc,
             Arc::from(wire),
         )
-        .map_err(|_| "Recovery packet preparation failed")?;
+        .map_err(|_| "Recovery packet preparation failed")?
+        .with_time_epoch(boundary.epoch);
         Ok(Self {
             board,
             router,
@@ -285,7 +299,9 @@ impl Exchange {
                 self.packet.sender(),
                 self.packet.timestamp(),
                 Arc::from(self.packet.payload()),
-            ).map_err(|_| "Recovery poll packet preparation failed"),
+            )
+            .map(|packet| packet.with_time_epoch(self.packet.time_epoch()))
+            .map_err(|_| "Recovery poll packet preparation failed"),
             taken,
         )?;
         self.poll_ids.push(packet.packet_id());

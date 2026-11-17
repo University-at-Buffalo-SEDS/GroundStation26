@@ -2982,7 +2982,7 @@ mod launch_lock_release_tests {
         crate::launch_history::RecoveryTarget {
             board: board.sender_id().into(), desired: 0, boot: 42, epoch,
             intent: crate::launch_history::RecoveryIntent { body: [0; 32], source_utc_ms: 1,
-                backend: "0".repeat(32), principal_context: "0".repeat(32) },
+                backend: "0".repeat(32), principal_context: "0".repeat(32), source_epoch: 0 },
             kind: crate::launch_history::RecoveryIntentKind::Normal,
             original_first: None, uncertain_first: None,
         }

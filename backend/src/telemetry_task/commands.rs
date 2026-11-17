@@ -163,13 +163,15 @@ pub(crate) fn manual_abort_packet(
     router: &Router,
     wire: crate::manual_abort_intent::WirePolicy,
 ) -> sedsnet::TelemetryResult<Packet> {
-    let (body, original) = match wire {
-        crate::manual_abort_intent::WirePolicy::Untimed => (MANUAL_ABORT_PREFIX, 0),
+    // A known original keeps the epoch its timestamp was taken in, also when
+    // the retained Stop is re-sent after a network clock step.
+    let (body, original, epoch) = match wire {
+        crate::manual_abort_intent::WirePolicy::Untimed => (MANUAL_ABORT_PREFIX, 0, 0),
         crate::manual_abort_intent::WirePolicy::KnownUtc(original) => {
-            ("SEDS_MANUAL_ABORT_V1:K", original)
+            ("SEDS_MANUAL_ABORT_V1:K", original.ms.max(0) as u64, original.epoch)
         }
     };
-    abort_packet_from_at(router, body, &router.sender(), original)
+    abort_packet_from_at(router, body, &router.sender(), original).map(|packet| packet.with_time_epoch(epoch))
 }
 
 pub(crate) fn queue_manual_abort_wire_receipted(
@@ -492,9 +494,9 @@ mod manual_stop_owner_tests {
         intent.request();
         let mut claim = intent.try_claim().unwrap();
         let original = 1_793_000_000_123;
-        let wire = claim.freeze_wire(WirePolicy::KnownUtc(original)).unwrap();
+        let wire = claim.freeze_wire(WirePolicy::KnownUtc(crate::network_stamp::Stamp::raw(original as i64))).unwrap();
         assert!(queue_manual_abort_wire(&router, wire).is_err());
-        assert_eq!(intent.try_known_highwater(), Some(original));
+        assert_eq!(intent.try_known_highwater(), Some(crate::network_stamp::Stamp::raw(original as i64)));
         drop(claim);
         router.clear_tx_queue();
         router
@@ -504,9 +506,9 @@ mod manual_stop_owner_tests {
             .unwrap();
         let mut retry = intent.try_claim().unwrap();
         let wire = retry
-            .freeze_wire(WirePolicy::KnownUtc(original + 10_000))
+            .freeze_wire(WirePolicy::KnownUtc(crate::network_stamp::Stamp::raw(original as i64 + 10_000)))
             .unwrap();
-        assert_eq!(wire, WirePolicy::KnownUtc(original));
+        assert_eq!(wire, WirePolicy::KnownUtc(crate::network_stamp::Stamp::raw(original as i64)));
         queue_manual_abort_wire(&router, wire).unwrap();
         retry.accepted();
         router.process_all_queues_with_timeout(0).unwrap();

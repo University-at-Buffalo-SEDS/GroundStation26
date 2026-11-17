@@ -1647,9 +1647,9 @@ impl FlightSimState {
     }
 }
 
-pub(crate) fn model_report_is_old(origin:crate::testing_board_lifecycle::ReportOrigin,source:u64)->bool {
+pub(crate) fn model_report_is_old(origin:crate::testing_board_lifecycle::ReportOrigin,source:crate::network_stamp::Stamp)->bool {
     if !crate::runtime_mode::is_testing() || !crate::testing_board_lifecycle::enabled(){return false;}
-    sim().try_lock().is_ok_and(|model|model.recovery.report_is_old(origin,source))
+    sim().try_lock().is_ok_and(|model|model.recovery.report_is_old_at(origin,source))
 }
 
 pub(crate) fn observe_model_clock(utc:Option<u64>){
@@ -1657,7 +1657,7 @@ pub(crate) fn observe_model_clock(utc:Option<u64>){
 }
 pub(crate) fn initialize_model_owners(state:&crate::state::AppState,actual_abort:u8,unknown:u8) {
     if !crate::runtime_mode::is_testing() || !crate::testing_board_lifecycle::eligible() {return;}
-    let (closed,boundary)={let store=state.launch_history.lock().unwrap();(store.automatic_actions_inhibited()||store.recovery_pending().is_some_and(|p|!p.published),store.completed_abort_boundary().unwrap_or(0))};
+    let (closed,boundary)={let store=state.launch_history.lock().unwrap();(store.automatic_actions_inhibited()||store.recovery_pending().is_some_and(|p|!p.published),store.completed_abort_boundary().unwrap_or_default())};
     let (live_aborted,_)=state.board_abort.masks();
     let aborted=actual_abort|live_aborted;
     let manual=state.manual_abort_intent.pending_epoch().is_some();

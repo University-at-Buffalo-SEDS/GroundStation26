@@ -33,7 +33,9 @@ fn retired(state: &AppState, packet: &Packet) -> bool {
         .try_lock()
         .ok()
         .and_then(|history| history.completed_abort_boundary())
-        .is_some_and(|boundary| packet.timestamp() < boundary)
+        // Ordered as network stamps: a Stop made after a network clock step
+        // back is newer than the boundary; a late pre-boundary copy is not.
+        .is_some_and(|boundary| crate::network_stamp::Stamp::of(packet) < boundary)
 }
 
 pub(crate) fn observe(state: &AppState, packet: &Packet, generation: u64) {
@@ -281,7 +283,7 @@ pub(crate) mod tests {
             .unwrap()
             .completed_abort_boundary()
             .expect("actual completed healthy cohort");
-        let packet_at = |sender: &str, payload: &[u8], timestamp| {
+        let packet_raw = |sender: &str, payload: &[u8], timestamp: u64, epoch: u16| {
             Packet::new(
                 crate::telemetry_schema::data_type("ABORT"),
                 &[crate::telemetry_schema::endpoint("ABORT")],
@@ -290,6 +292,10 @@ pub(crate) mod tests {
                 Arc::from(payload),
             )
             .unwrap()
+            .with_time_epoch(epoch)
+        };
+        let packet_at = |sender: &str, payload: &[u8], stamp: crate::network_stamp::Stamp| {
+            packet_raw(sender, payload, stamp.ms as u64, stamp.epoch)
         };
         let generation = crate::gse::automatic_generation(&state);
         let epoch = state.deferred_abort.manual_epoch();
@@ -355,11 +361,17 @@ pub(crate) mod tests {
         assert!(!state.abort_indicator_latched());
         assert_eq!(crate::gse::automatic_generation(&state), generation);
 
-        for timestamp in [0, boundary, boundary + 1, u64::MAX] {
+        for timestamp in [0, boundary.ms as u64, boundary.ms as u64 + 1, u64::MAX] {
             for payload in [KNOWN_MANUAL, b"SEDS_AUTO_ABORT_V1:unknown".as_slice()] {
-                assert!(!retired(&state, &packet_at("GS", payload, timestamp)));
+                assert!(!retired(&state, &packet_raw("GS", payload, timestamp, boundary.epoch)));
             }
         }
+        // A Stop stamped after a network clock step back (a newer epoch) is
+        // newer than the boundary even though its timestamp is lower.
+        assert!(!retired(
+            &state,
+            &packet_at("GS", KNOWN_MANUAL, crate::network_stamp::Stamp::new(boundary.epoch + 1, boundary.ms - 14_400_000)),
+        ));
         for (sender, payload) in [
             ("unknown", KNOWN_MANUAL),
             ("@addr:123", KNOWN_MANUAL),

@@ -322,7 +322,7 @@ fn unknown_only_boot_is_honest_startup_while_retained_abort_stays_held() {
     prepare();
     let mut o = Owner::new();
     let ab = 1 << at(Board::ActuatorBoard);
-    o.initialize_boot(ab, ab, 0x7f, 0);
+    o.initialize_boot(ab, ab, 0x7f, crate::network_stamp::Stamp::raw(0));
     for b in BOARDS {
         let n = &o.nodes[at(b)];
         assert_ne!(n.boot, 0);

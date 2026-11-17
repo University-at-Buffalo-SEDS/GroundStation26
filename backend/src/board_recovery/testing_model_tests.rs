@@ -680,7 +680,7 @@ async fn actual_http_confirm_uses_deployed_dummy_and_receiver_owned_journal() {
     );
     let side = mesh.lock().unwrap().sides[0];
     for packet in delayed_diagnostics {
-        assert!(packet.timestamp() < completed_boundary);
+        assert!(crate::network_stamp::Stamp::of(&packet) < completed_boundary);
         let id = packet.packet_id();
         let before = mesh
             .lock()

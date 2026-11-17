@@ -9,7 +9,8 @@ use tokio::sync::{Notify, broadcast};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WirePolicy {
     Untimed,
-    KnownUtc(u64),
+    /// The original network stamp (epoch, timestamp) of the Stop.
+    KnownUtc(crate::network_stamp::Stamp),
 }
 
 #[derive(Default)]
@@ -19,7 +20,7 @@ struct Pending {
     publishing: Option<u64>,
     renewed_during_claim: bool,
     wire: Option<WirePolicy>,
-    attempted_known_highwater: u64,
+    attempted_known_highwater: crate::network_stamp::Stamp,
 }
 #[derive(Default)]
 pub(crate) struct ManualAbortIntent {
@@ -49,7 +50,7 @@ impl ManualAbortIntent {
         self.wake.notify_one();
         epoch
     }
-    pub(crate) fn try_known_highwater(&self) -> Option<u64> {
+    pub(crate) fn try_known_highwater(&self) -> Option<crate::network_stamp::Stamp> {
         self.state
             .try_lock()
             .ok()
@@ -128,7 +129,9 @@ impl Claim {
             return None;
         }
         let proposed =
-            if self.epoch == u64::MAX || matches!(proposed, WirePolicy::KnownUtc(0 | u64::MAX)) {
+            if self.epoch == u64::MAX
+                || matches!(proposed, WirePolicy::KnownUtc(stamp) if stamp.ms <= 0 || stamp.ms as u64 == u64::MAX)
+            {
                 WirePolicy::Untimed
             } else {
                 proposed
@@ -233,20 +236,20 @@ mod tests {
         intent.request();
         let mut first = intent.try_claim().unwrap();
         assert_eq!(
-            first.freeze_wire(WirePolicy::KnownUtc(1234)),
-            Some(WirePolicy::KnownUtc(1234))
+            first.freeze_wire(WirePolicy::KnownUtc(crate::network_stamp::Stamp::raw(1234 as i64))),
+            Some(WirePolicy::KnownUtc(crate::network_stamp::Stamp::raw(1234 as i64)))
         );
-        assert_eq!(intent.try_known_highwater(), Some(1234));
+        assert_eq!(intent.try_known_highwater(), Some(crate::network_stamp::Stamp::raw(1234)));
         drop(first); // SDK did not accept ownership.
         let mut retry = intent.try_claim().unwrap();
-        assert_eq!(retry.wire(), Some(WirePolicy::KnownUtc(1234)));
+        assert_eq!(retry.wire(), Some(WirePolicy::KnownUtc(crate::network_stamp::Stamp::raw(1234 as i64))));
         assert_eq!(
-            retry.freeze_wire(WirePolicy::KnownUtc(9999)),
-            Some(WirePolicy::KnownUtc(1234))
+            retry.freeze_wire(WirePolicy::KnownUtc(crate::network_stamp::Stamp::raw(9999 as i64))),
+            Some(WirePolicy::KnownUtc(crate::network_stamp::Stamp::raw(1234 as i64)))
         );
         assert!(intent.admit_if_unchanged(1, || ()).is_none());
         intent.request();
-        assert_eq!(retry.freeze_wire(WirePolicy::KnownUtc(8888)), None);
+        assert_eq!(retry.freeze_wire(WirePolicy::KnownUtc(crate::network_stamp::Stamp::raw(8888 as i64))), None);
         retry.accepted();
         let mut renewed = intent.try_claim().unwrap();
         assert_eq!(renewed.wire(), None);
@@ -255,7 +258,7 @@ mod tests {
             Some(WirePolicy::Untimed)
         );
         renewed.accepted();
-        assert_eq!(intent.try_known_highwater(), Some(1234));
+        assert_eq!(intent.try_known_highwater(), Some(crate::network_stamp::Stamp::raw(1234)));
         assert!(intent.admit_if_unchanged(2, || ()).is_some());
     }
 
@@ -266,16 +269,16 @@ mod tests {
             intent.request();
             let mut first = intent.try_claim().unwrap();
             assert_eq!(
-                first.freeze_wire(WirePolicy::KnownUtc(invalid)),
+                first.freeze_wire(WirePolicy::KnownUtc(crate::network_stamp::Stamp::raw(invalid as i64))),
                 Some(WirePolicy::Untimed)
             );
             drop(first);
             let mut retry = intent.try_claim().unwrap();
             assert_eq!(
-                retry.freeze_wire(WirePolicy::KnownUtc(42)),
+                retry.freeze_wire(WirePolicy::KnownUtc(crate::network_stamp::Stamp::raw(42 as i64))),
                 Some(WirePolicy::Untimed)
             );
-            assert_eq!(intent.try_known_highwater(), Some(0));
+            assert_eq!(intent.try_known_highwater(), Some(crate::network_stamp::Stamp::raw(0)));
         }
     }
 
@@ -285,20 +288,20 @@ mod tests {
         intent.request();
         let mut old = intent.try_claim().unwrap();
         assert_eq!(
-            old.freeze_wire(WirePolicy::KnownUtc(1234)),
-            Some(WirePolicy::KnownUtc(1234))
+            old.freeze_wire(WirePolicy::KnownUtc(crate::network_stamp::Stamp::raw(1234 as i64))),
+            Some(WirePolicy::KnownUtc(crate::network_stamp::Stamp::raw(1234 as i64)))
         );
         assert_eq!(intent.request_untimed(), 2);
-        assert_eq!(old.freeze_wire(WirePolicy::KnownUtc(9999)), None);
+        assert_eq!(old.freeze_wire(WirePolicy::KnownUtc(crate::network_stamp::Stamp::raw(9999 as i64))), None);
         old.accepted();
         let mut proxy = intent.try_claim().unwrap();
         assert_eq!(proxy.wire(), Some(WirePolicy::Untimed));
         assert_eq!(
-            proxy.freeze_wire(WirePolicy::KnownUtc(9999)),
+            proxy.freeze_wire(WirePolicy::KnownUtc(crate::network_stamp::Stamp::raw(9999 as i64))),
             Some(WirePolicy::Untimed)
         );
         proxy.accepted();
-        assert_eq!(intent.try_known_highwater(), Some(1234));
+        assert_eq!(intent.try_known_highwater(), Some(crate::network_stamp::Stamp::raw(1234)));
         assert_eq!(intent.request(), 3);
         let fresh = intent.try_claim().unwrap();
         assert_eq!(fresh.wire(), None);

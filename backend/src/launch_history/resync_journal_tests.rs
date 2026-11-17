@@ -17,6 +17,7 @@ fn pending(board: &str, operation: u8, desired: u8, boot: u64) -> RecoveryPendin
         manual_epoch: 0,
         observed_manual_epoch: 0,
         origin_utc_ms: 100,
+        origin_epoch: 0,
         prior_automatic_actions_inhibited: false,
         targets: vec![RecoveryTarget {
             board: board.into(),
@@ -27,8 +28,7 @@ fn pending(board: &str, operation: u8, desired: u8, boot: u64) -> RecoveryPendin
                 body,
                 source_utc_ms: 100,
                 backend,
-                principal_context: "a".repeat(32),
-            },
+                principal_context: "a".repeat(32), source_epoch: 0 },
             kind: RecoveryIntentKind::Normal,
             original_first: None,
             uncertain_first: None,

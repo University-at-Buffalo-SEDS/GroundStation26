@@ -381,14 +381,15 @@ pub fn initialize(router: &Router) -> Result<()> {
 /// services without synthesizing any cache/default write while CLOSED. An
 /// ordinary open bootstrap owns the same actual producer lease through IO/SDK.
 pub fn initialize_for_state(state: &crate::state::AppState, router: &Router) -> Result<()> {
-    // The retained FLIGHT_STATE keeps its epoch: never let the network epoch
-    // fall below it, even after a whole-stack power cycle.
+    // The retained FLIGHT_STATE and recovery/manual-Stop marks keep their
+    // epochs: never let the network epoch fall below them, even after a
+    // whole-stack power cycle.
     let retained_epoch = store()
         .lock()
         .expect("network-variable store lock poisoned")
         .values
         .flight_state_epoch;
-    router.raise_network_time_epoch(retained_epoch);
+    router.raise_network_time_epoch(retained_epoch.max(state.launch_history.lock().unwrap().retained_epoch()));
     let claim = crate::gse::capture_operator_origin(state)
         .and_then(|generation| crate::gse::claim_operator_dispatch(state, generation));
     if claim.is_some() {

@@ -1,4 +1,5 @@
 //! Durable clock identity and non-actuating recovery observations.
+use crate::network_stamp::Stamp;
 use crate::telemetry_db::{LaunchClockKind, LaunchClockMsg};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -87,6 +88,10 @@ pub(crate) struct RecoveryPending {
     pub manual_epoch: u64,
     pub observed_manual_epoch: u64,
     pub origin_utc_ms: u64,
+    /// Time-base epoch of `origin_utc_ms` (records written before SEDSnet 6
+    /// read as epoch 0). Recovery boundaries order by (epoch, timestamp).
+    #[serde(default, skip_serializing_if = "is_zero_epoch")]
+    pub origin_epoch: u16,
     pub prior_automatic_actions_inhibited: bool,
     pub targets: Vec<RecoveryTarget>,
     pub verified: bool,
@@ -122,8 +127,18 @@ pub(crate) struct RecoveryIntent {
     pub source_utc_ms: u64,
     pub backend: String,
     pub principal_context: String,
+    /// Time-base epoch of `source_utc_ms` (the request's packet epoch).
+    #[serde(default, skip_serializing_if = "is_zero_epoch")]
+    pub source_epoch: u16,
+}
+fn is_zero_epoch(value: &u16) -> bool {
+    *value == 0
 }
 impl RecoveryIntent {
+    /// The request's network stamp (epoch, timestamp).
+    pub(crate) fn source(&self) -> Stamp {
+        Stamp::new(self.source_epoch, self.source_utc_ms as i64)
+    }
     pub(crate) fn boot(&self) -> u64 {
         u64::from_le_bytes(self.body[12..20].try_into().unwrap())
     }
@@ -204,10 +219,14 @@ impl RecoveryTarget {
             && self.kind == RecoveryIntentKind::Normal
             && self.original_first.is_none()
             && self.uncertain_first.is_none()
-            && self.intent.source_utc_ms < pending.origin_utc_ms
+            && self.intent.source() < pending.origin()
     }
 }
 impl RecoveryPending {
+    /// The attempt's boundary as a network stamp (epoch, timestamp).
+    pub(crate) fn origin(&self) -> Stamp {
+        Stamp::new(self.origin_epoch, self.origin_utc_ms as i64)
+    }
     pub(crate) fn verified_startup_policy(&self) -> bool {
         self.verified && self.targets.iter().all(|t| t.desired == 0)
             && self.reset_policy.as_ref().map_or(self.targets.len() == 7,
@@ -230,7 +249,7 @@ impl RecoveryPending {
         // the others may be carried unchanged from an earlier attempt.
         ensure!(
             self.targets.is_empty()
-                || self.targets.iter().any(|t| t.intent.source_utc_ms == self.origin_utc_ms && t.intent.backend == self.backend),
+                || self.targets.iter().any(|t| t.intent.source() == self.origin() && t.intent.backend == self.backend),
             "Pending recovery has no target of its own attempt"
         );
         let mut seen = std::collections::HashSet::new();
@@ -255,7 +274,7 @@ impl RecoveryPending {
                     && target.intent.body[2] == target.desired
                     && u32::from_le_bytes(target.intent.body[20..24].try_into().unwrap())
                         == target.epoch
-                    && (target.intent.source_utc_ms == self.origin_utc_ms
+                    && (target.intent.source() == self.origin()
                         && target.intent.backend == self.backend
                         || target.carried_into(self)),
                 "Pending intent differs from frozen target/boundary"
@@ -266,7 +285,7 @@ impl RecoveryPending {
             {
                 first.validate(&target.board)?;
                 ensure!(
-                    first.boot() == u64::MAX && first.source_utc_ms <= self.origin_utc_ms,
+                    first.boot() == u64::MAX && first.source() <= self.origin(),
                     "Invalid retained FIRST lineage"
                 );
             }
@@ -281,7 +300,7 @@ impl RecoveryPending {
                             && target
                                 .uncertain_first
                                 .as_ref()
-                                .is_some_and(|first| first.source_utc_ms < self.origin_utc_ms
+                                .is_some_and(|first| first.source() < self.origin()
                                     && first.nonce() != target.intent.nonce()),
                 },
                 "Invalid recovery lineage kind"
@@ -296,6 +315,9 @@ struct Disk {
     version: u8,
     #[serde(default, skip_serializing_if = "is_zero_manual_ceiling")]
     manual_abort_utc_ceiling: u64,
+    /// Time-base epoch of `manual_abort_utc_ceiling`.
+    #[serde(default, skip_serializing_if = "is_zero_epoch")]
+    manual_abort_utc_ceiling_epoch: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     recovery_pending: Option<RecoveryPending>,
     /// Sticky across clock resets; only explicit board/startup recovery, or the
@@ -338,15 +360,21 @@ const RECOVERY_WAIVER_LIMIT: usize = 32;
 fn is_zero_manual_ceiling(value: &u64) -> bool {
     *value == 0
 }
+impl Disk {
+    /// The manual UTC ceiling as a network stamp (epoch, timestamp).
+    fn manual_ceiling(&self) -> Stamp {
+        Stamp::new(self.manual_abort_utc_ceiling_epoch, self.manual_abort_utc_ceiling as i64)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ManualUtcKey {
     pub owner: u64,
     pub generation: u64,
-    pub boundary: u64,
+    pub boundary: Stamp,
     pub boots: [u64; 3], // AB, VB, FC
     pub epochs: [u32; 3],
-    pub ceiling: u64,
+    pub ceiling: Stamp,
     pub ticket: u64,
 }
 pub(crate) struct ManualUtcReceipt {
@@ -366,7 +394,7 @@ impl ManualUtcReceipt {
         let disk: Disk = serde_json::from_slice(&bytes)?;
         ensure!(
             disk.version == 1
-                && disk.manual_abort_utc_ceiling >= self.key.ceiling
+                && disk.manual_ceiling() >= self.key.ceiling
                 && disk.manual_abort_utc_ceiling != u64::MAX
                 && disk.recovery_pending.as_ref() == Some(&self.marker),
             "Manual UTC reservation readback changed"
@@ -468,6 +496,7 @@ impl Store {
             Disk {
                 version: 1,
                 manual_abort_utc_ceiling: 0,
+                manual_abort_utc_ceiling_epoch: 0,
                 recovery_pending: None,
                 automatic_actions_inhibited: false,
                 launch_attempt: Some(false),
@@ -544,6 +573,7 @@ impl Store {
             data: Disk {
                 version: 1,
                 manual_abort_utc_ceiling: 0,
+                manual_abort_utc_ceiling_epoch: 0,
                 recovery_pending: None,
                 automatic_actions_inhibited: false,
                 launch_attempt: Some(false),
@@ -947,19 +977,19 @@ impl Store {
         (seen == 0x7f).then_some(ManualUtcKey {
             owner: marker.owner,
             generation: marker.generation,
-            boundary: marker.origin_utc_ms,
+            boundary: marker.origin(),
             boots,
             epochs,
-            ceiling: self.data.manual_abort_utc_ceiling,
+            ceiling: self.data.manual_ceiling(),
             ticket: self.last_write,
         })
     }
     /// Only an acknowledged, verified full-cohort recovery proves that an
     /// earlier application Abort can be retired. Pending/attempted timestamps
     /// and UTC reservations are not recovery boundaries.
-    pub(crate) fn completed_abort_boundary(&self) -> Option<u64> {
+    pub(crate) fn completed_abort_boundary(&self) -> Option<Stamp> {
         let boundary = self.manual_utc_key()?.boundary;
-        (boundary != 0 && boundary != u64::MAX && self.writer.as_ref()?.try_healthy())
+        (boundary.ms != 0 && boundary.ms as u64 != u64::MAX && self.writer.as_ref()?.try_healthy())
             .then_some(boundary)
     }
     pub(crate) fn manual_writer_settled(&self) -> Result<bool> {
@@ -972,7 +1002,23 @@ impl Store {
             }
         }
     }
-    pub(crate) fn retained_manual_utc_ceiling(&self) -> Result<u64> {
+    /// The newest time-base epoch among the retained marks (recovery
+    /// boundary, its intents, the manual UTC ceiling).
+    pub(crate) fn retained_epoch(&self) -> u16 {
+        let pending = self.data.recovery_pending.as_ref();
+        pending
+            .map(|p| {
+                p.targets
+                    .iter()
+                    .flat_map(|t| [Some(&t.intent), t.original_first.as_ref(), t.uncertain_first.as_ref()])
+                    .flatten()
+                    .map(|i| i.source_epoch)
+                    .fold(p.origin_epoch, u16::max)
+            })
+            .unwrap_or(0)
+            .max(self.data.manual_abort_utc_ceiling_epoch)
+    }
+    pub(crate) fn retained_manual_utc_ceiling(&self) -> Result<Stamp> {
         ensure!(
             self.error.is_none()
                 && self.path.is_some()
@@ -980,27 +1026,28 @@ impl Store {
                 && self.data.manual_abort_utc_ceiling != u64::MAX,
             "Durable manual UTC history unavailable"
         );
-        Ok(self.data.manual_abort_utc_ceiling)
+        Ok(self.data.manual_ceiling())
     }
     /// Serial Store owner max-merges every reservation; ordinary cloned snapshots retain it.
     pub(crate) fn reserve_manual_utc_ceiling(
         &mut self,
         expected: ManualUtcKey,
-        ceiling: u64,
+        ceiling: Stamp,
     ) -> Result<ManualUtcReceipt> {
         ensure!(
             self.manual_utc_key() == Some(expected),
             "Completed recovery cohort changed"
         );
         ensure!(
-            ceiling != 0 && ceiling != u64::MAX && ceiling > expected.boundary,
+            ceiling.ms > 0 && ceiling.ms as u64 != u64::MAX && ceiling > expected.boundary,
             "Invalid manual UTC ceiling"
         );
         let writer = self.writer.clone().context("Writer unavailable")?;
         ensure!(writer.error().is_none(), "Journal writer failed");
-        if ceiling > self.data.manual_abort_utc_ceiling {
+        if ceiling > self.data.manual_ceiling() {
             let mut next = self.data.clone();
-            next.manual_abort_utc_ceiling = ceiling;
+            next.manual_abort_utc_ceiling = ceiling.ms as u64;
+            next.manual_abort_utc_ceiling_epoch = ceiling.epoch;
             let ticket = writer.enqueue(next.clone())?;
             self.data = next;
             self.last_write = ticket;

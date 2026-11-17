@@ -120,7 +120,7 @@ impl LocalStopAdmission {
         own_station
             && self.router == router as *const Router as usize
             && state.topology_router.get().is_some_and(|owner| std::ptr::eq(owner.as_ref(), router))
-            && self.timestamp == match self.wire { WirePolicy::Untimed => 0, WirePolicy::KnownUtc(original) => original }
+            && self.timestamp == match self.wire { WirePolicy::Untimed => 0, WirePolicy::KnownUtc(original) => original.ms as u64 }
     }
 }
 /// Only the independent LOCAL publisher uses this entry. The Claim stays alive
@@ -153,7 +153,7 @@ fn publish_claim_receipt(
     } else {
         let proposed = if let Some(before) = eligible(state, router) {
             // No new application lock is held over this existing SDK API.
-            let sample = crate::system_clock::required_control_network_utc_ms(router).ok();
+            let sample = crate::system_clock::required_control_network_stamp(router).ok();
             let after = eligible(state, router);
             match (sample, after) {
                 (Some(original), Some(after))
@@ -161,7 +161,7 @@ fn publish_claim_receipt(
                         && before.key == after.key
                         && original > after.key.boundary
                         && original <= after.key.ceiling
-                        && !matches!(original, 0 | u64::MAX) =>
+                        && original.ms > 0 =>
                 {
                     WirePolicy::KnownUtc(original)
                 }
@@ -217,10 +217,9 @@ pub(crate) async fn refresh(state: &Arc<AppState>, router: &Arc<Router>) {
         return;
     };
     // A ceiling is an upper bound, NEVER an occurrence/packet timestamp.
-    let Some(ceiling) = crate::system_clock::required_control_network_utc_ms(router)
+    let Some(ceiling) = crate::system_clock::required_control_network_stamp(router)
         .ok()
-        .and_then(|actual| actual.checked_add(2000))
-        .filter(|v| *v != u64::MAX)
+        .map(|actual| crate::network_stamp::Stamp::new(actual.epoch, actual.ms.saturating_add(2000)))
     else {
         return;
     };
@@ -310,7 +309,9 @@ pub(crate) async fn before_prepare(state: &Arc<AppState>) -> Result<(), &'static
                 Err(message) => return Err(message),
             };
             let router = state.topology_router.get().ok_or("Router unavailable")?;
-            let actual = crate::system_clock::required_control_network_utc_ms(router)
+            // Ordered as network stamps: after a step back the network clock
+            // (in a newer epoch) is past every retained mark at once.
+            let actual = crate::system_clock::required_control_network_stamp(router)
                 .map_err(|_| "Network UTC unavailable")?;
             if actual > bound {
                 return Ok(());
@@ -319,7 +320,7 @@ pub(crate) async fn before_prepare(state: &Arc<AppState>) -> Result<(), &'static
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
-pub(crate) fn retained_bound(state: &AppState) -> Result<u64, &'static str> {
+pub(crate) fn retained_bound(state: &AppState) -> Result<crate::network_stamp::Stamp, &'static str> {
     let ceiling = state
         .launch_history
         .try_lock()
