@@ -24,8 +24,9 @@ pub(crate) fn observe_valve_pressure_ingress(
         .flatten()
         .filter(|v| v.is_finite() && *v >= 0.0);
     let mut rt = state.gse.lock().unwrap();
+    let source = Stamp::new(receipt.source_epoch, source_ms);
     if rt.last_valve_pressure_source_ms.is_some_and(|last| {
-        source_ms < last && (source_ms < 1_577_836_800_000 || last < 1_577_836_800_000)
+        source < last && (source.ms < 1_577_836_800_000 || last.ms < 1_577_836_800_000)
     }) {
         rt.valve_pressure = None;
         rt.turbo_evidence = None;
@@ -385,7 +386,7 @@ fn write_audit(
 ) -> Result<(), String> {
     let path = audit_path(rt)?;
     let record = serde_json::json!({"version":1,"state":phase,"evidence":evidence,"prior_evidence":rt.turbo_evidence,"original_inventory":anchor.map(|s|serde_json::json!({"kg":s.value,"at_ms":s.at_ms})),"binding":rt.turbo_binding,
-        "mass_source_timestamp_ms":rt.last_mass_source_ms,"pressure_source_timestamp_ms":rt.last_valve_pressure_source_ms,
+        "mass_source_timestamp_ms":rt.last_mass_source_ms.map(|s|s.ms),"pressure_source_timestamp_ms":rt.last_valve_pressure_source_ms.map(|s|s.ms),
         "recorded_at_ms":crate::telemetry_task::get_current_timestamp_ms(),"pressure_units":"valve-board psi","mass_units":"calibrated kg"});
     let bytes = serde_json::to_vec_pretty(&record).map_err(|e| e.to_string())?;
     if bytes.len() > 65536 {
@@ -561,8 +562,8 @@ pub(super) fn tick(state: &Arc<AppState>, interlock: bool) -> bool {
                 }
                 rt.operational.saved.turbocharge = Some(evidence.clone());
                 rt.operational.saved.turbocharge_binding = Some(serde_json::json!({
-                    "configuration":rt.turbo_binding,"pressure_source_timestamp_ms":rt.last_valve_pressure_source_ms,
-                    "mass_source_timestamp_ms":rt.last_mass_source_ms,"recorded_at_ms":crate::telemetry_task::get_current_timestamp_ms(),
+                    "configuration":rt.turbo_binding,"pressure_source_timestamp_ms":rt.last_valve_pressure_source_ms.map(|s|s.ms),
+                    "mass_source_timestamp_ms":rt.last_mass_source_ms.map(|s|s.ms),"recorded_at_ms":crate::telemetry_task::get_current_timestamp_ms(),
                     "pressure_units":"valve-board psi","mass_units":"calibrated kg",
                 }));
                 if let Err(error) = rt.operational.persist() {
@@ -743,7 +744,7 @@ pub(super) fn accepts_mass(state: &AppState, rt: &Runtime, mass: Sample) -> bool
         })
 }
 pub(crate) fn mass_ingress_snapshot(rt: &Runtime) -> serde_json::Value {
-    serde_json::json!({"kg":rt.mass.map(|m|m.value),"source":"DAQ selected loadcell","source_timestamp_ms":rt.last_mass_source_ms,"age_ms":rt.mass.and_then(|m|rt.now().checked_sub(m.at_ms)),"calibration_bound":rt.mass_calibration.is_some()})
+    serde_json::json!({"kg":rt.mass.map(|m|m.value),"source":"DAQ selected loadcell","source_timestamp_ms":rt.last_mass_source_ms.map(|s|s.ms),"age_ms":rt.mass.and_then(|m|rt.now().checked_sub(m.at_ms)),"calibration_bound":rt.mass_calibration.is_some()})
 }
 pub(super) fn decorate_status(state: &AppState, response: &mut serde_json::Value) {
     let rt = state.gse.lock().unwrap();
@@ -767,7 +768,7 @@ pub(super) fn decorate_status(state: &AppState, response: &mut serde_json::Value
         rt.fresh_mass(now)
             .is_some_and(|mass| accepts_mass(state, &rt, mass))
     );
-    response["valve_pressure"]=rt.valve_pressure.map_or(serde_json::Value::Null,|p|serde_json::json!({"psi":p.value,"source":"VB/FUEL_TANK_PRESSURE","source_timestamp_ms":rt.last_valve_pressure_source_ms,"age_ms":now.checked_sub(p.at_ms)}));
+    response["valve_pressure"]=rt.valve_pressure.map_or(serde_json::Value::Null,|p|serde_json::json!({"psi":p.value,"source":"VB/FUEL_TANK_PRESSURE","source_timestamp_ms":rt.last_valve_pressure_source_ms.map(|s|s.ms),"age_ms":now.checked_sub(p.at_ms)}));
     response["turbocharge"] = serde_json::json!({"active":rt.turbocharge.is_some(),"pending_inventory_qualification":rt.turbo_inventory_pending,"phase":rt.turbocharge.as_ref().map(Controller::phase),"evidence":rt.turbo_evidence,"max_added_nitrogen_mass_kg":rt.engine.config.turbocharge_max_added_mass_kg,"disabled_reason":configuration_reason(&rt)});
 }
 
@@ -851,7 +852,7 @@ mod tests {
         let clock = Instant::now();
         let source = 1_793_472_388_379;
         let receipt = ValveReceipt {
-            network_ms: source,
+            source_epoch: 0, network_ms: source,
             monotonic_at: clock + std::time::Duration::from_millis(1000),
             simulation_ms: None,
         };
@@ -865,7 +866,7 @@ mod tests {
             scalar_capture_at(clock, 6000, Some(source), receipt, &mut previous),
             Some(1000)
         );
-        assert_eq!(previous, Some(source));
+        assert_eq!(previous, Some(Stamp::raw(source)));
     }
     fn observe_valve_pressure_ingress(
         state: &AppState,
@@ -880,7 +881,7 @@ mod tests {
             rows,
             source_ms,
             ValveReceipt {
-                network_ms: receipt_ms,
+                source_epoch: 0, network_ms: receipt_ms,
                 monotonic_at: Instant::now(),
                 simulation_ms: crate::simulation_clock_ms(),
             },
@@ -939,7 +940,7 @@ mod tests {
         observe_valve_pressure_ingress(&state, "VB", &rows, now - 5000, now);
         assert_eq!(
             state.gse.lock().unwrap().last_valve_pressure_source_ms,
-            Some(now - 1500)
+            Some(Stamp::raw(now - 1500))
         );
         assert_eq!(
             state.gse.lock().unwrap().valve_pressure_epoch,

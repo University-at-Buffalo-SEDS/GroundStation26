@@ -79,7 +79,7 @@ async fn exercise(cached: bool, test_name: &str) {
         )
     };
     if !cached {
-        assert_eq!(evidence.1.source_ms, 10);
+        assert_eq!(evidence.1.source().ms, 10);
         assert_eq!(
             evidence.1.seen_values, 3,
             "pre-target tick retained only as a non-actionable replay floor"

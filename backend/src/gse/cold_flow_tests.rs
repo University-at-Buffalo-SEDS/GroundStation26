@@ -1074,7 +1074,7 @@ async fn actual_cold_flow_held_core_preserves_run_packet_and_stop_revokes() {
         if matches!(scenario,"backward_capture"|"equal_capture") {
             let mut rt=f.state.gse.lock().unwrap();let now=rt.now();
             assert!(now>pilot_floor);
-            let receipt=super::super::ValveReceipt { network_ms:SOURCE_UTC,monotonic_at:Instant::now(),simulation_ms:Some(now) };
+            let receipt=super::super::ValveReceipt { source_epoch: 0, network_ms:SOURCE_UTC,monotonic_at:Instant::now(),simulation_ms:Some(now) };
             assert_eq!(rt.observe_valve_source(KEYS[0],false,SOURCE_UTC,900001,receipt),Some(0));
             assert_eq!(rt.valves[0].unwrap().at_ms,now);
         }
@@ -1105,11 +1105,11 @@ async fn actual_cold_flow_held_core_preserves_run_packet_and_stop_revokes() {
             let newer_utc=SOURCE_UTC+1;
             let network_ms=newer_utc+i64::try_from(now-capture).unwrap();
             assert!(network_ms>SOURCE_UTC && newer_utc>SOURCE_UTC);
-            let receipt=super::super::ValveReceipt {network_ms,monotonic_at:Instant::now(),simulation_ms:Some(now)};
+            let receipt=super::super::ValveReceipt {source_epoch: 0, network_ms,monotonic_at:Instant::now(),simulation_ms:Some(now)};
             let age=rt.observe_valve_source(KEYS[0],false,newer_utc,900002,receipt).expect("newer UTC is genuinely accepted by actual Runtime ingestion");
             assert_eq!(age,now-capture);assert!(age<2000);
             assert_eq!(rt.valves[0].unwrap().at_ms,capture);
-            assert_eq!(rt.last_valve_captures[0].source_ms,newer_utc);
+            assert_eq!(rt.last_valve_captures[0].source().ms,newer_utc);
             assert!(capture<=pilot_floor);
             println!("COLD_FLOW_FLOOR scenario={scenario} original_since={pilot_floor} accepted_newer_utc={newer_utc} captured_at={capture} now={now} age={age} original_packet={expected:?}");
         }

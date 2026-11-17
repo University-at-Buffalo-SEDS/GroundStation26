@@ -10,10 +10,10 @@ fn same_tick_opposite_capture_retains_anchor_and_both_replays_are_rejected() {
             1_798_000_000_000
         };
         let first = history
-            .admit(source, receipt, 5000, true, 11, None)
+            .admit(crate::network_stamp::Stamp::raw(source), receipt, 5000, true, 11, None)
             .unwrap();
         let second = history
-            .admit(source, receipt + 100, 5100, false, 12, Some(first))
+            .admit(crate::network_stamp::Stamp::raw(source), receipt + 100, 5100, false, 12, Some(first))
             .unwrap();
         assert_eq!(
             second, first,
@@ -21,16 +21,16 @@ fn same_tick_opposite_capture_retains_anchor_and_both_replays_are_rejected() {
         );
         let accepted = history;
         assert_eq!(
-            history.admit(source, receipt + 200, 5200, true, 11, Some(second)),
+            history.admit(crate::network_stamp::Stamp::raw(source), receipt + 200, 5200, true, 11, Some(second)),
             None
         );
         assert_eq!(
-            history.admit(source, receipt + 200, 5200, true, 13, Some(second)),
+            history.admit(crate::network_stamp::Stamp::raw(source), receipt + 200, 5200, true, 13, Some(second)),
             None,
             "a new nonce cannot resurrect an already-seen value from this tick"
         );
         assert_eq!(
-            history.admit(source, receipt + 200, 5200, false, 14, Some(second)),
+            history.admit(crate::network_stamp::Stamp::raw(source), receipt + 200, 5200, false, 14, Some(second)),
             None
         );
         assert_eq!(history, accepted);
@@ -41,10 +41,10 @@ fn same_tick_opposite_capture_retains_anchor_and_both_replays_are_rejected() {
 fn utc_age_future_backwards_and_underflow_guards_survive_opposite_exception() {
     let utc = 1_798_000_000_000;
     let mut history = ValveCaptureHistory::default();
-    let first = history.admit(utc - 1500, utc, 5000, true, 1, None).unwrap();
+    let first = history.admit(crate::network_stamp::Stamp::raw(utc - 1500), utc, 5000, true, 1, None).unwrap();
     assert_eq!(first, 3500);
     assert_eq!(
-        history.admit(utc - 1500, utc + 100, 5100, false, 2, Some(first)),
+        history.admit(crate::network_stamp::Stamp::raw(utc - 1500), utc + 100, 5100, false, 2, Some(first)),
         Some(first)
     );
     let accepted = history;
@@ -55,20 +55,20 @@ fn utc_age_future_backwards_and_underflow_guards_survive_opposite_exception() {
         (utc - 1000, utc, 100, 6),
     ] {
         assert_eq!(
-            history.admit(source, receipt, now, true, id, Some(first)),
+            history.admit(crate::network_stamp::Stamp::raw(source), receipt, now, true, id, Some(first)),
             None
         );
         assert_eq!(history, accepted);
     }
     let mut future = ValveCaptureHistory::default();
     assert_eq!(
-        future.admit(utc + 100, utc, 5000, true, 0, None),
+        future.admit(crate::network_stamp::Stamp::raw(utc + 100), utc, 5000, true, 0, None),
         Some(5000)
     );
     let mut expired = ValveCaptureHistory::default();
-    let at = expired.admit(utc - 1500, utc, 5000, true, 1, None).unwrap();
+    let at = expired.admit(crate::network_stamp::Stamp::raw(utc - 1500), utc, 5000, true, 1, None).unwrap();
     assert_eq!(
-        expired.admit(utc - 1500, utc + 3501, 8501, false, 2, Some(at)),
+        expired.admit(crate::network_stamp::Stamp::raw(utc - 1500), utc + 3501, 8501, false, 2, Some(at)),
         None
     );
 }
@@ -81,8 +81,7 @@ fn rebooted_boot_clock_is_compatible_but_stale_or_regressed_tick_does_not_rearm(
         .into_iter()
         .enumerate()
     {
-        previous_at = history.admit(
-            stamp,
+        previous_at = history.admit(crate::network_stamp::Stamp::raw(stamp),
             1_798_000_000_000,
             5000 + index as u64,
             value,
@@ -93,21 +92,21 @@ fn rebooted_boot_clock_is_compatible_but_stale_or_regressed_tick_does_not_rearm(
     }
     let mut history = ValveCaptureHistory::default();
     assert_eq!(
-        history.admit(1234, 1_798_000_000_000, 10, true, 0, None),
+        history.admit(crate::network_stamp::Stamp::raw(1234), 1_798_000_000_000, 10, true, 0, None),
         Some(10)
     );
     let first = history;
     assert_eq!(
-        history.admit(1234, 1_798_000_000_000, 9, false, 1, Some(10)),
+        history.admit(crate::network_stamp::Stamp::raw(1234), 1_798_000_000_000, 9, false, 1, Some(10)),
         None
     );
     assert_eq!(
-        history.admit(1234, 1_798_000_000_000, 5011, false, 1, Some(10)),
+        history.admit(crate::network_stamp::Stamp::raw(1234), 1_798_000_000_000, 5011, false, 1, Some(10)),
         None
     );
     assert_eq!(history, first);
     assert_eq!(
-        history.admit(-1, 1_798_000_000_000, 20, false, 1, Some(10)),
+        history.admit(crate::network_stamp::Stamp::raw(-1), 1_798_000_000_000, 20, false, 1, Some(10)),
         None
     );
 }
@@ -120,16 +119,16 @@ fn history_is_bounded_and_only_populated_id_slots_participate() {
     );
     let mut history = ValveCaptureHistory::default();
     assert_eq!(
-        history.admit(0, 0, 100, true, 0, None),
+        history.admit(crate::network_stamp::Stamp::raw(0), 0, 100, true, 0, None),
         Some(100),
         "ID zero is valid"
     );
     assert_eq!(
-        history.admit(0, 0, 101, false, 0, Some(100)),
+        history.admit(crate::network_stamp::Stamp::raw(0), 0, 101, false, 0, Some(100)),
         None,
         "an actual populated ID cannot be reused"
     );
-    assert_eq!(history.admit(0, 0, 101, false, 1, Some(100)), Some(100));
+    assert_eq!(history.admit(crate::network_stamp::Stamp::raw(0), 0, 101, false, 1, Some(100)), Some(100));
     assert_eq!(history.packet_ids, [1, 0]);
 }
 
@@ -164,7 +163,7 @@ fn delayed_or_regressed_processing_clock_never_commits_capture_or_history() {
         let mut runtime = Runtime::default();
         let before = runtime.last_valve_captures;
         let receipt = ValveReceipt {
-            network_ms: 1_798_000_000_000,
+            source_epoch: 0, network_ms: 1_798_000_000_000,
             monotonic_at: Instant::now(),
             simulation_ms: Some(model_at),
         };
@@ -178,7 +177,7 @@ fn delayed_or_regressed_processing_clock_never_commits_capture_or_history() {
     let mut runtime = Runtime { clock: Instant::now() - std::time::Duration::from_secs(8), ..Runtime::default() };
     let before = runtime.last_valve_captures;
     let receipt = ValveReceipt {
-        network_ms: 1_798_000_000_000,
+        source_epoch: 0, network_ms: 1_798_000_000_000,
         monotonic_at: runtime.clock + std::time::Duration::from_secs(1),
         simulation_ms: None,
     };
@@ -194,7 +193,7 @@ fn delayed_or_regressed_processing_clock_never_commits_capture_or_history() {
 fn model_receipt_processing_delay_keeps_original_capture_anchor() {
     let mut runtime = Runtime::default();
     let make = |at| ValveReceipt {
-        network_ms: 1_798_000_000_000,
+        source_epoch: 0, network_ms: 1_798_000_000_000,
         monotonic_at: Instant::now(),
         simulation_ms: Some(at),
     };

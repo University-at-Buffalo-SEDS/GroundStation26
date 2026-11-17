@@ -424,8 +424,18 @@ pub(super) fn operational_tick(state: &Arc<AppState>, interlock: bool) -> bool {
         }
     skip
 }
-fn qd_dispatch_timestamp_ms() -> u64 {
-    crate::telemetry_task::procedure_clock::now().utc_ms()
+/// The network stamp a retraction report must follow: station network time
+/// with its epoch (the purpose clock only while network time is unknown).
+fn qd_dispatch_stamp(router: Option<&sedsnet::router::Router>) -> crate::network_stamp::Stamp {
+    router
+        .and_then(|router| router.network_time_ms_with_epoch())
+        .map(|(ms, epoch)| crate::network_stamp::Stamp::new(epoch, ms as i64))
+        .unwrap_or_else(|| {
+            crate::network_stamp::Stamp::new(
+                router.map_or(0, |router| router.network_time_epoch()),
+                crate::telemetry_task::procedure_clock::now().utc_ms() as i64,
+            )
+        })
 }
 pub(super) fn handle_operational_command(
     state: &Arc<AppState>,
@@ -466,7 +476,7 @@ pub(super) fn handle_operational_command(
                     now,
                     crate::actuator_plumbing::completion_timeout_ms(state),
                 );
-                rt.operational.qd_dispatch_utc_ms = Some(qd_dispatch_timestamp_ms());
+                rt.operational.qd_dispatch_stamp = Some(qd_dispatch_stamp(Some(router)));
                 drop(rt);
                 state.set_pending_umbilical_valve_state(
                     crate::rocket_commands::ActuatorBoardCommands::RetractPlumbing as u8,
@@ -1452,16 +1462,16 @@ mod tests {
             let mut rt = state.gse.lock().unwrap();
             let now = rt.now();
             rt.operational.qd.dispatched(now);
-            rt.operational.qd_dispatch_utc_ms = Some(1000);
+            rt.operational.qd_dispatch_stamp = Some(crate::network_stamp::Stamp::raw(1000));
         }
         for (sender, on, time) in [("AB", true, 999), ("VB", true, 1001), ("AB", false, 1001)] {
-            super::super::qd_confirmation(&state, sender, key, on, time);
+            super::super::qd_confirmation(&state, sender, key, on, crate::network_stamp::Stamp::raw(time));
         }
         assert_eq!(
             state.gse.lock().unwrap().operational.qd.status(3000),
             QdStatus::AwaitingAck
         );
-        super::super::qd_confirmation(&state, "AB", key, true, 1001);
+        super::super::qd_confirmation(&state, "AB", key, true, crate::network_stamp::Stamp::raw(1001));
         assert!(matches!(
             state.gse.lock().unwrap().operational.qd.status(3000),
             QdStatus::Settling { remaining_ms: 5000 }
@@ -1529,15 +1539,15 @@ mod tests {
         const NAME: &str = "gse::operational_policy::tests::qd_dispatch_uses_the_explicit_model_source_epoch_without_changing_wall_mode";
         if let Ok(mode) = std::env::var("GS_QD_CLOCK_CHILD") {
             if mode == "model" {
-                assert_eq!(qd_dispatch_timestamp_ms(), 1_767_225_612_345);
+                assert_eq!(qd_dispatch_stamp(None).ms, 1_767_225_612_345);
                 assert_eq!(
-                    qd_dispatch_timestamp_ms(),
+                    qd_dispatch_stamp(None).ms,
                     1_767_225_612_345,
                     "Paused model must not advance the dispatch watermark"
                 );
             } else {
                 let before = crate::telemetry_task::get_current_timestamp_ms();
-                let dispatched = qd_dispatch_timestamp_ms();
+                let dispatched = qd_dispatch_stamp(None).ms as u64;
                 let after = crate::telemetry_task::get_current_timestamp_ms();
                 assert!((before..=after).contains(&dispatched));
             }
@@ -1669,7 +1679,7 @@ mod tests {
             let mut rt=state.gse.lock().unwrap();
             let now=rt.now();
             rt.operational.qd.dispatched(now);
-            rt.operational.qd_dispatch_utc_ms=Some(qd_dispatch_timestamp_ms());
+            rt.operational.qd_dispatch_stamp=Some(qd_dispatch_stamp(None));
             rt.operational.qd_launch_admission=None;
             assert_eq!(rt.operational.qd.status(now),QdStatus::AwaitingAck);
         }
@@ -1696,14 +1706,14 @@ mod tests {
             .lock()
             .unwrap()
             .operational
-            .qd_dispatch_utc_ms
+            .qd_dispatch_stamp
             .unwrap();
         super::super::qd_confirmation(
             &state,
             "AB",
             crate::rocket_commands::ActuatorBoardCommands::RetractPlumbing as u8,
             true,
-            dispatched + 1,
+            crate::network_stamp::Stamp::new(dispatched.epoch, dispatched.ms + 1),
         );
         let acknowledged_at = state.gse.lock().unwrap().now();
         assert!(handle_operational_command(

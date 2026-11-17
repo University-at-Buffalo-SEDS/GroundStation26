@@ -1574,7 +1574,7 @@ impl AppState {
             source_ms,
             packet_id,
             crate::gse::ValveReceipt {
-                network_ms: receipt_ms,
+                source_epoch: 0, network_ms: receipt_ms,
                 monotonic_at: std::time::Instant::now(),
                 simulation_ms: crate::simulation_clock_ms(),
             },

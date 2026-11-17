@@ -140,18 +140,25 @@ fn source_fix_age_ms(source_ms: Option<u64>, network_utc_ms: Option<u64>) -> Opt
     }
 }
 
-pub(crate) fn observe_source_gps(row: &TelemetryRow, source_ms: u64) {
-    let network_utc_ms =
-        crate::telemetry_task::recording_network_utc_ms().and_then(|value| value.try_into().ok());
-    observe_at(row, Some(source_ms), network_utc_ms);
+/// Station network time at receipt in the source stamp's own time base, so
+/// `now - source` is the fix's true age across network clock steps.
+fn receipt_utc_ms(source: crate::network_stamp::Stamp) -> Option<u64> {
+    crate::telemetry_task::recording_network_utc_ms()
+        .map(|now| crate::network_stamp::receipt_ms_for(source, now))
+        .and_then(|value| value.try_into().ok())
+}
+
+pub(crate) fn observe_source_gps(row: &TelemetryRow, source: crate::network_stamp::Stamp) {
+    observe_at(row, u64::try_from(source.ms).ok(), receipt_utc_ms(source));
 }
 
 /// A positive satellite count alone never establishes a receiver lock.
 /// RF publishes zero when its satellite solution is absent or stale.
-pub(crate) fn observe_source_satellites(sender: &str, count: u8, source_ms: u64) {
-    let network_utc_ms =
-        crate::telemetry_task::recording_network_utc_ms().and_then(|value| value.try_into().ok());
-    observe_satellites_at(sender, count, source_ms, network_utc_ms);
+pub(crate) fn observe_source_satellites(sender: &str, count: u8, source: crate::network_stamp::Stamp) {
+    let Ok(source_ms) = u64::try_from(source.ms) else {
+        return;
+    };
+    observe_satellites_at(sender, count, source_ms, receipt_utc_ms(source));
 }
 fn observe_satellites_at(sender: &str, count: u8, source_ms: u64, network_utc_ms: Option<u64>) {
     if sender != "RF" || count != 0 || source_fix_age_ms(Some(source_ms), network_utc_ms).is_none()

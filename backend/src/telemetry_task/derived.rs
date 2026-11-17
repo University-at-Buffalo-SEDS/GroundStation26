@@ -733,7 +733,7 @@ pub(super) fn prepare_derived_loadcell_rows(
             state.gse.lock().unwrap().observe_pressure_source(
                 Some(calibrated_value),
                 sample.source_timestamp_ms,
-                super::recording_network_utc_ms().unwrap_or(sample.ts_ms),
+                sample.receipt,
             );
             {
                 let mut pressure = state.latest_fuel_tank_pressure.lock().unwrap();
@@ -1301,7 +1301,7 @@ pub(super) async fn handle_gps_satellite_count_packet(
     let count = pkt.data_as_u8().ok().and_then(|v| v.first().copied())?;
     let ts_ms = get_current_timestamp_ms() as i64;
     let sender_id = state.canonical_network_sender_id(pkt.sender());
-    crate::antenna::observe_source_satellites(&sender_id, count, pkt.timestamp());
+    crate::antenna::observe_source_satellites(&sender_id, count, crate::network_stamp::Stamp::of(pkt));
 
     {
         let mut sats = state.latest_gps_satellites_by_sender.lock().unwrap();

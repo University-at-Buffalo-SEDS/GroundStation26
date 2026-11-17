@@ -155,7 +155,7 @@ pub struct Operational {
     pub topology_healthy: bool,
     pub startup_configured: bool,
     pub qd: QdWait,
-    pub qd_dispatch_utc_ms: Option<u64>,
+    pub qd_dispatch_stamp: Option<crate::network_stamp::Stamp>,
     pub(super) qd_launch_admission: Option<super::LaunchAdmission>,
     pub persist_error: Option<String>,
 }

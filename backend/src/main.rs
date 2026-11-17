@@ -83,6 +83,7 @@ mod mission_sync;
 mod fc_command_gate;
 mod ab_command_gate;
 mod network_health;
+mod network_stamp;
 mod network_traffic;
 mod network_variables;
 mod operator_queue;

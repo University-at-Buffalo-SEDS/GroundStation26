@@ -411,11 +411,16 @@ fn refresh_station_network_time_at(router: &Router, host_ns: i64) {
 /// Startup/Idle, never from Armed through Recovery (`absolute_time::may_step`).
 /// Called before every local time source is handed to the router, so the
 /// decision always uses the current flight state.
+///
+/// An RRLS never steps the network from its own host clock (a Pi without RTC,
+/// maybe hours off): it carries the station's time base through a station
+/// outage, and its local corrections slew.
 pub(crate) fn apply_timesync_step_policy(router: &Router) -> bool {
-    let allowed = crate::absolute_time::may_step(
-        crate::network_variables::flight_state(),
-        crate::network_health::any_board_time_locked(),
-    );
+    let allowed = !crate::rrls::is_rrls()
+        && crate::absolute_time::may_step(
+            crate::network_variables::flight_state(),
+            crate::network_health::any_board_time_locked(),
+        );
     router.set_timesync_steps_allowed(allowed);
     allowed
 }
@@ -491,6 +496,11 @@ pub(crate) fn note_frame_written(
 
 pub fn set_network_time_router(router: Arc<Router>) {
     let _ = NETWORK_TIME_ROUTER.set(router);
+}
+
+/// The station router network time is judged on (set at boot).
+pub(crate) fn network_time_router() -> Option<&'static Router> {
+    NETWORK_TIME_ROUTER.get().map(|router| router.as_ref())
 }
 
 pub(crate) fn recording_network_utc_ms() -> Option<i64> {
@@ -2369,8 +2379,14 @@ fn validate_umbilical_status(
     let monotonic_at = std::time::Instant::now();
     let simulation_ms = crate::simulation_clock_ms();
     let received_ms = get_current_timestamp_ms();
+    // Network time now in the report's own time base: `network_ms - source`
+    // is its true age across any network clock step.
     let receipt = crate::gse::ValveReceipt {
-        network_ms: recording_network_utc_ms().unwrap_or(received_ms as i64),
+        network_ms: crate::network_stamp::receipt_ms_for_packet(
+            pkt,
+            recording_network_utc_ms().unwrap_or(received_ms as i64),
+        ),
+        source_epoch: pkt.time_epoch(),
         monotonic_at,
         simulation_ms,
     };
@@ -2502,7 +2518,13 @@ fn apply_captured_status_inner(
                 ),
             );
             if fresh_confirmation {
-                crate::gse::qd_confirmation(state, &sender_id, key_cmd_id, key_on, pkt.timestamp());
+                crate::gse::qd_confirmation(
+                    state,
+                    &sender_id,
+                    key_cmd_id,
+                    key_on,
+                    crate::network_stamp::Stamp::of(&pkt),
+                );
                 crate::gse::report_safety(state);
                 state.reconcile_pending_umbilical_valve_state(
                     key_cmd_id,
@@ -2607,11 +2629,6 @@ async fn handle_packet_at_ingress(
     let automatic_origin = original_entry.filter(|_| {
         matches!(state.board_from_network_sender(pkt.sender()), Some(board) if board != Board::GroundStation)
     });
-    // RRLS: track the station clock as the AV bay holds it, from the primary's
-    // and the boards' frames (system_clock::control_packet_timestamp_ms).
-    if !primary_role && state.board_from_network_sender(pkt.sender()).is_some() {
-        crate::system_clock::observe_station_timestamp(pkt.timestamp());
-    }
     let source = i64::try_from(pkt.timestamp()).ok().and_then(|source| {
         crate::telemetry_provenance::canonical_source(source, procedure_clock::timestamp_ms())
     });
@@ -2667,7 +2684,7 @@ async fn handle_packet_inner(
     } else {
         state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
     }
-    observe_board_clock(state, pkt.sender(), pkt.timestamp());
+    observe_board_clock(state, &pkt);
     #[cfg(test)]
     if crate::runtime_mode::is_test_fire() {
         crate::recovery_pending_probe::before_automatic(state, &pkt).await;
@@ -2694,9 +2711,12 @@ async fn handle_packet_inner(
                     std::time::Instant::now(),
                     get_current_timestamp_ms(),
                     pkt.timestamp(),
-                    recording_network_utc_ms()
-                        .and_then(|t| t.try_into().ok())
-                        .unwrap_or_else(get_current_timestamp_ms),
+                    crate::network_stamp::receipt_ms_for_packet(
+                        &pkt,
+                        recording_network_utc_ms()
+                            .unwrap_or_else(|| get_current_timestamp_ms() as i64),
+                    )
+                    .max(0) as u64,
                 );
             if accepted {
                 recording_diagnostics::raw_health(state, db_tx, &pkt, &sender_id);
@@ -3025,7 +3045,12 @@ async fn handle_packet_inner(
         // Keep boot/sequence words exact; f32 cannot carry their identities.
         let source_is_actuator = state.board_from_network_sender(&sender_id) == Some(Board::ActuatorBoard)
             && pkt.endpoints() == [crate::telemetry_schema::endpoint("GROUND_STATION")];
-        let source_now = recording_network_utc_ms().and_then(|n| n.try_into().ok()).unwrap_or_else(get_current_timestamp_ms);
+        // Network time now in the packet's own time base (its true age).
+        let source_now = crate::network_stamp::receipt_ms_for_packet(
+            &pkt,
+            recording_network_utc_ms().unwrap_or_else(|| get_current_timestamp_ms() as i64),
+        )
+        .max(0) as u64;
         let receipt = std::time::Instant::now();
         let observation = pkt.data_as_u32().ok().and_then(|words| {
             // All SDK/config/clock work precedes this short pure tracker lock.
@@ -3094,7 +3119,11 @@ async fn handle_packet_inner(
     if let Some(values_vec) = telemetry_f32_values(&pkt) {
         let rows = telemetry_rows_from_packet_values(state, &pkt, &sender_id, values_vec);
         let live_receipt = crate::gse::ValveReceipt {
-            network_ms: recording_network_utc_ms().unwrap_or(ts_ms),
+            network_ms: crate::network_stamp::receipt_ms_for_packet(
+                &pkt,
+                recording_network_utc_ms().unwrap_or(ts_ms),
+            ),
+            source_epoch: pkt.time_epoch(),
             monotonic_at: std::time::Instant::now(),
             simulation_ms: crate::simulation_clock_ms(),
         };
@@ -3278,7 +3307,7 @@ async fn handle_packet_inner(
                 values: row_values,
             };
             if row.data_type == "GPS_DATA" {
-                crate::antenna::observe_source_gps(&row, pkt.timestamp());
+                crate::antenna::observe_source_gps(&row, crate::network_stamp::Stamp::of(&pkt));
             }
             out.push(row);
         }
@@ -3326,9 +3355,18 @@ async fn handle_packet_inner(
 /// clock-offset column of network health. On hardware that is the host wall
 /// clock; a simulator station runs on its model clock, which is also the time
 /// the boards are synced to, so the offset is taken against that instead.
-fn observe_board_clock(state: &AppState, sender: &str, source_ms: u64) {
+/// A board's clock against the station's network clock (for the sync
+/// display): the packet's receipt reading in its own time base, so a step of
+/// the network clock does not read as a board clock offset.
+fn observe_board_clock(state: &AppState, pkt: &Packet) {
+    let station_ms =
+        crate::network_stamp::receipt_ms_for_packet(pkt, procedure_clock::timestamp_ms()).max(0)
+            as u64;
+    observe_board_clock_at(state, pkt.sender(), pkt.timestamp(), station_ms);
+}
+
+fn observe_board_clock_at(state: &AppState, sender: &str, source_ms: u64, station_ms: u64) {
     let sender = state.health_sender_id(sender);
-    let station_ms = procedure_clock::timestamp_ms().max(0) as u64;
     state.network_health.lock().unwrap().observe_clock(
         &sender,
         source_ms,
@@ -8138,8 +8176,9 @@ mod tests {
         let station_ms = model.timestamp_ms() as u64;
         let (db_tx, _db_rx) = mpsc::channel(8);
         let state = test_app_state(db_tx).await;
-        observe_board_clock(&state, "DAQ", station_ms - 40);
-        observe_board_clock(&state, "VB", station_ms + 1_500);
+        let station_now = procedure_clock::timestamp_ms() as u64;
+        observe_board_clock_at(&state, "DAQ", station_ms - 40, station_now);
+        observe_board_clock_at(&state, "VB", station_ms + 1_500, station_now);
         let rows = state.network_health.lock().unwrap().snapshot(std::time::Instant::now(), false);
         let offset = |id: &str| rows.iter().find(|r| r.sender_id == id).and_then(|r| r.clock_offset_ms);
         let daq = offset("DAQ").expect("a simulated board's clock offset is reported");

@@ -65,7 +65,7 @@ impl Control {
         let Some(now)=receipt.monotonic_at.checked_duration_since(self.fill_launch_clock).and_then(|d|u64::try_from(d.as_millis()).ok()) else {return false;};
         let mut history=self.fill_launch_history.lock().unwrap();
         let mut candidate=history.0;
-        let Some(at)=candidate.admit(source_ms,receipt.network_ms,now,active,packet_id,history.1) else {return false;};
+        let Some(at)=candidate.admit(crate::network_stamp::Stamp::new(receipt.source_epoch,source_ms),receipt.network_ms,now,active,packet_id,history.1) else {return false;};
         let processing=u64::try_from(self.fill_launch_clock.elapsed().as_millis()).unwrap_or(u64::MAX);
         if !processing.checked_sub(at).is_some_and(|age|age<=2000) {return false;}
         // Original source/receipt age counts against the lease. Re-reading,
@@ -586,7 +586,7 @@ mod fill_launch_lease_tests {
     fn active_fill_lease_expires_to_unknown_without_completion_or_replay_floor_reset() {
         let mut control=Control::default();
         let source=1_793_563_200_000_i64;
-        let receipt=crate::gse::ValveReceipt {network_ms:source,monotonic_at:std::time::Instant::now(),simulation_ms:None};
+        let receipt=crate::gse::ValveReceipt {source_epoch: 0, network_ms:source,monotonic_at:std::time::Instant::now(),simulation_ms:None};
         assert!(control.observe_fill_launch_active(true,source,41,receipt));
         assert_eq!(control.fill_launch_activity(),Some(true));
         let retained_lease=control.fill_launch_lease.load(Ordering::Acquire);
@@ -603,7 +603,7 @@ mod fill_launch_lease_tests {
         assert!(!control.observe_fill_launch_active(false,source-1,42,late));
         assert_eq!(control.fill_launch_activity(),None);
         assert!(!control.observe_fill_launch_active(true,source,41,late),"a retransmission cannot renew the expired lease");
-        assert!(control.observe_fill_launch_active(false,source+1,43,crate::gse::ValveReceipt{network_ms:source+1,..late}));
+        assert!(control.observe_fill_launch_active(false,source+1,43,crate::gse::ValveReceipt{source_epoch: 0, network_ms:source+1,..late}));
         assert_eq!(control.fill_launch_activity(),Some(false));
     }
 }

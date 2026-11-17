@@ -9,6 +9,7 @@ pub(crate) mod mode_switch;
 #[cfg(all(test, feature = "firmware_sim"))]
 pub(crate) use turbocharge::mass_ingress_snapshot;
 pub(crate) use turbocharge::{mass_calibration_signature, observe_valve_pressure_ingress};
+use crate::network_stamp::Stamp;
 mod automatic_abort;
 #[cfg(test)]
 mod rrls_http_tests;
@@ -95,12 +96,20 @@ fn completion_valve_snapshot(input: Inputs) -> [Option<bool>; 5] {
 pub(crate) struct ValveCaptureHistory {
     source_ms: i64,
     packet_ids: [u64; 2],
+    /// Time-base epoch of `source_ms`: captures order by (epoch, timestamp).
+    source_epoch: u16,
     seen_values: u8,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct ValveReceipt {
+    /// Station network time at receipt in the source's own time base
+    /// (`network_stamp::receipt_ms_for`): `network_ms - source` is the
+    /// source's true age across network clock steps.
     pub network_ms: i64,
+    /// Time-base epoch of the source timestamp; captures order by
+    /// `(source_epoch, timestamp)`.
+    pub source_epoch: u16,
     pub monotonic_at: Instant,
     pub simulation_ms: Option<u64>,
 }
@@ -113,21 +122,24 @@ pub(crate) struct PreparedValveSource {
 }
 
 impl ValveCaptureHistory {
+    pub(crate) fn source(&self) -> Stamp {
+        Stamp::new(self.source_epoch, self.source_ms)
+    }
     pub(crate) fn admit(
         &mut self,
-        source_ms: i64,
+        source: Stamp,
         receipt_ms: i64,
         now: u64,
         open: bool,
         packet_id: u64,
         previous_at: Option<u64>,
     ) -> Option<u64> {
-        if source_ms < 0 {
+        if source.ms < 0 {
             return None;
         }
         let value = usize::from(open);
         let bit = 1_u8 << value;
-        let same_tick = self.seen_values != 0 && self.source_ms == source_ms;
+        let same_tick = self.seen_values != 0 && self.source() == source;
         if (same_tick && self.seen_values & bit != 0)
             || (0..2).any(|index| {
                 self.seen_values & (1 << index) != 0 && self.packet_ids[index] == packet_id
@@ -141,9 +153,9 @@ impl ValveCaptureHistory {
         let mut previous = if same_tick || self.seen_values == 0 {
             None
         } else {
-            Some(self.source_ms)
+            Some(self.source())
         };
-        let mut at = source_sample_at(Some(source_ms), receipt_ms, now, &mut previous)?;
+        let mut at = source_sample_at(Some(source), receipt_ms, now, &mut previous)?;
         if same_tick {
             let previous_at = previous_at?;
             now.checked_sub(previous_at)?;
@@ -156,7 +168,8 @@ impl ValveCaptureHistory {
             return None;
         }
         if !same_tick {
-            self.source_ms = source_ms;
+            self.source_ms = source.ms;
+            self.source_epoch = source.epoch;
             self.seen_values = 0;
             self.packet_ids = [0; 2];
         }
@@ -179,7 +192,7 @@ pub struct Runtime {
     test_now_ms: Option<u64>,
     pressure: Option<Sample>,
     valve_pressure: Option<Sample>,
-    last_valve_pressure_source_ms: Option<i64>,
+    last_valve_pressure_source_ms: Option<Stamp>,
     valve_pressure_epoch: u64,
     turbocharge: Option<gse_sequence::turbocharge::Controller>,
     turbo_evidence: Option<gse_sequence::turbocharge::Evidence>,
@@ -190,9 +203,9 @@ pub struct Runtime {
     valves: [Option<ValveState>; 5],
     mass: Option<Sample>,
     mass_calibration: Option<[u8; 32]>,
-    last_mass_source_ms: Option<i64>,
+    last_mass_source_ms: Option<Stamp>,
     mass_source_epoch: u64,
-    last_pressure_source_ms: Option<i64>,
+    last_pressure_source_ms: Option<Stamp>,
     last_valve_captures: [ValveCaptureHistory; 5],
     fill_cutoff: crate::sequences::FillCutoff,
     fill_trim: Option<gse_sequence::fill_trim::Controller>,
@@ -252,28 +265,35 @@ impl Default for Runtime {
 // Valid network UTC captures retain their source age. Unsynchronized boot
 // counters retain receipt-time compatibility, but replaying the same capture
 // must never manufacture a new settled sample or renew its freshness.
+//
+// `receipt` is station network time in the source's own time base, so
+// `receipt - source.ms` is the capture's true age across network clock steps;
+// captures order by (epoch, timestamp), so a capture made after a step back
+// is newer and a late copy from before the step is older.
 fn source_sample_at(
-    source: Option<i64>,
+    source: Option<Stamp>,
     receipt: i64,
     now: u64,
-    previous: &mut Option<i64>,
+    previous: &mut Option<Stamp>,
 ) -> Option<u64> {
-    const UTC_2020_MS: i64 = 1_577_836_800_000;
-    let Some(source) = source.filter(|v| *v >= 0) else {
+    const UTC_2020_MS: i64 = crate::network_stamp::UTC_2020_MS;
+    let Some(source) = source.filter(|v| v.ms >= 0) else {
         return Some(now);
     };
     if *previous == Some(source) {
         return None;
     }
-    let at = if source >= UTC_2020_MS && receipt >= UTC_2020_MS {
-        let delta = receipt.checked_sub(source)?;
+    let at = if source.ms >= UTC_2020_MS && receipt >= UTC_2020_MS {
+        let delta = receipt.checked_sub(source.ms)?;
         // Network clocks may lead by a small synchronization/receipt jitter.
         // Clamp only a bounded100 ms lead, never a materially future capture.
         if delta < -100 {
             return None;
         }
         let age = delta.max(0) as u64;
-        if age > gse_sequence::VALVE_REPORT_FRESH_MS || previous.is_some_and(|old| old >= UTC_2020_MS && source < old) {
+        if age > gse_sequence::VALVE_REPORT_FRESH_MS
+            || previous.is_some_and(|old| old.ms >= UTC_2020_MS && source < old)
+        {
             return None;
         }
         now.checked_sub(age)?
@@ -288,8 +308,9 @@ fn scalar_capture_at(
     processing_now: u64,
     source: Option<i64>,
     receipt: ValveReceipt,
-    previous: &mut Option<i64>,
+    previous: &mut Option<Stamp>,
 ) -> Option<u64> {
+    let source = source.map(|ms| Stamp::new(receipt.source_epoch, ms));
     let received_at = match receipt.simulation_ms {
         Some(at) => at,
         None => u64::try_from(
@@ -431,9 +452,10 @@ impl Runtime {
             return;
         }
         if source_ms
+            .map(|ms| Stamp::new(receipt.source_epoch, ms))
             .zip(self.last_mass_source_ms)
             .is_some_and(|(new, old)| {
-                new < old && (new < 1_577_836_800_000 || old < 1_577_836_800_000)
+                new < old && (new.ms < 1_577_836_800_000 || old.ms < 1_577_836_800_000)
             })
         {
             self.mass_source_epoch = self.mass_source_epoch.saturating_add(1);
@@ -456,11 +478,11 @@ impl Runtime {
         &mut self,
         value: Option<f32>,
         source_ms: Option<i64>,
-        receipt_ms: i64,
+        receipt: ValveReceipt,
     ) {
         if let Some(at_ms) = source_sample_at(
-            source_ms,
-            receipt_ms,
+            source_ms.map(|ms| Stamp::new(receipt.source_epoch, ms)),
+            receipt.network_ms,
             self.now(),
             &mut self.last_pressure_source_ms,
         ) {
@@ -574,7 +596,7 @@ impl Runtime {
         };
         let mut history = self.last_valve_captures[index];
         let at_ms = history.admit(
-            source_ms,
+            Stamp::new(receipt.source_epoch, source_ms),
             receipt.network_ms,
             now,
             open,
@@ -2641,41 +2663,65 @@ mod tests {
         let utc = 1_798_000_000_000;
         let mut previous = None;
         assert_eq!(
-            source_sample_at(Some(utc - 1500), utc, 5000, &mut previous),
+            source_sample_at(Some(Stamp::raw(utc - 1500)), utc, 5000, &mut previous),
             Some(3500)
         );
         assert_eq!(
-            source_sample_at(Some(utc - 1500), utc + 100, 5100, &mut previous),
+            source_sample_at(Some(Stamp::raw(utc - 1500)), utc + 100, 5100, &mut previous),
             None
         );
         assert_eq!(
-            source_sample_at(Some(utc - 3000), utc, 5000, &mut previous),
+            source_sample_at(Some(Stamp::raw(utc - 3000)), utc, 5000, &mut previous),
             None
         );
         assert_eq!(
-            source_sample_at(Some(utc + 101), utc, 5000, &mut previous),
+            source_sample_at(Some(Stamp::raw(utc + 101)), utc, 5000, &mut previous),
             None
         );
         assert_eq!(
-            source_sample_at(Some(utc - 100), utc, 5000, &mut previous),
+            source_sample_at(Some(Stamp::raw(utc - 100)), utc, 5000, &mut previous),
             Some(4900)
         );
         assert_eq!(
-            source_sample_at(Some(utc - 200), utc, 5000, &mut previous),
+            source_sample_at(Some(Stamp::raw(utc - 200)), utc, 5000, &mut previous),
             None
         );
         let mut previous = None;
         assert_eq!(
-            source_sample_at(Some(1234), utc, 5000, &mut previous),
+            source_sample_at(Some(Stamp::raw(1234)), utc, 5000, &mut previous),
             Some(5000)
         );
         assert_eq!(
-            source_sample_at(Some(1234), utc + 100, 5100, &mut previous),
+            source_sample_at(Some(Stamp::raw(1234)), utc + 100, 5100, &mut previous),
             None
         );
         assert_eq!(
-            source_sample_at(Some(1235), utc + 100, 5100, &mut previous),
+            source_sample_at(Some(Stamp::raw(1235)), utc + 100, 5100, &mut previous),
             Some(5100)
+        );
+    }
+    /// After a 4 h step back of the network clock, a capture stamped in the
+    /// new epoch is newer than every pre-step capture and is aged by its
+    /// receipt reading; a late copy stamped before the step stays older.
+    #[test]
+    fn captures_order_by_epoch_across_a_network_clock_step_back() {
+        let utc = 1_798_000_000_000;
+        let mut previous = None;
+        assert_eq!(
+            source_sample_at(Some(Stamp::new(3, utc)), utc + 100, 5000, &mut previous),
+            Some(4900)
+        );
+        let after = utc - 4 * 3_600_000 + 1_000;
+        assert_eq!(
+            source_sample_at(Some(Stamp::new(4, after)), after + 200, 6000, &mut previous),
+            Some(5800),
+            "the post-step capture is newer"
+        );
+        assert_eq!(previous, Some(Stamp::new(4, after)));
+        // A late pre-step copy: 900 ms old by its own time base, yet older.
+        assert_eq!(
+            source_sample_at(Some(Stamp::new(3, utc + 50)), utc + 950, 6100, &mut previous),
+            None
         );
     }
     #[tokio::test]
@@ -3375,7 +3421,9 @@ pub fn report_safety(state: &Arc<AppState>) {
     progress::flush(state);
     }
 }
-pub fn qd_confirmation(state: &AppState, sender: &str, key: u8, open: bool, source_ms: u64) {
+/// A retraction report counts only when stamped after the QD dispatch, both
+/// ordered as network stamps (epoch, timestamp).
+pub fn qd_confirmation(state: &AppState, sender: &str, key: u8, open: bool, source: Stamp) {
     if !crate::runtime_mode::is_hitl()
         && sender == crate::types::Board::ActuatorBoard.sender_id()
         && key == crate::rocket_commands::ActuatorBoardCommands::RetractPlumbing as u8
@@ -3384,8 +3432,8 @@ pub fn qd_confirmation(state: &AppState, sender: &str, key: u8, open: bool, sour
         let mut rt = state.gse.lock().unwrap();
         if rt
             .operational
-            .qd_dispatch_utc_ms
-            .is_some_and(|sent| source_ms > sent)
+            .qd_dispatch_stamp
+            .is_some_and(|sent| source > sent)
         {
             let now = rt.now();
             rt.operational.qd.confirm(now);
@@ -3533,7 +3581,7 @@ pub(crate) fn prepare_verified_startup(state: &Arc<AppState>) -> Result<(), &'st
             .map_err(|_| "Checklist reset persistence failed")?;
         rt.operational.qd = QdWait::default();
         rt.operational.qd_launch_admission = None;
-        rt.operational.qd_dispatch_utc_ms = None;
+        rt.operational.qd_dispatch_stamp = None;
         rt.operational.startup_configured = true;
     }
     let config = rt.engine.config.clone();
@@ -3763,7 +3811,7 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
         rt.operational.persist_error = None;
         rt.operational.qd = QdWait::default();
         rt.operational.qd_launch_admission = None;
-        rt.operational.qd_dispatch_utc_ms = None;
+        rt.operational.qd_dispatch_stamp = None;
         // Do not restart automatic boot valve setup during abort recovery.
         // The next explicit self-test establishes and checks its own baseline.
         rt.operational.startup_configured = true;
@@ -5387,7 +5435,7 @@ pub(crate) fn plumbing_qd_probe_for_test(state: &AppState, advance_ms: u64) -> (
     rt.clock -= std::time::Duration::from_millis(advance_ms);
     (
         rt.operational.qd.status(rt.now()),
-        rt.operational.qd_dispatch_utc_ms.unwrap(),
+        rt.operational.qd_dispatch_stamp.unwrap().ms as u64,
     )
 }
 
