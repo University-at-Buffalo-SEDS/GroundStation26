@@ -4,6 +4,7 @@ mod admin;
 mod sequence_access;
 mod panel_control;
 mod daq_launch_log;
+mod daq_input_health;
 mod daq_sd;
 mod radio_voice;
 mod recording_replay;

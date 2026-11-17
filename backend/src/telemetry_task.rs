@@ -2727,6 +2727,27 @@ async fn handle_packet_inner(
         return Vec::new();
     }
 
+    if pkt.data_type() == crate::telemetry_schema::data_type("DAQ_INPUT_HEALTH") {
+        if let Ok(words) = pkt.data_as_u32() {
+            let report = state.network_health.lock().unwrap().observe_input_health(
+                &sender_id,
+                &words,
+                std::time::Instant::now(),
+                get_current_timestamp_ms(),
+            );
+            if let Some(report) = report {
+                recording_diagnostics::raw_health(state, db_tx, &pkt, &sender_id);
+                let now_ms = get_current_timestamp_ms() as i64;
+                for alert in crate::daq_input_health::observe_alerts(&sender_id, &report, now_ms, |sensor| {
+                    derived::claim_daq_rail_alert(&sender_id, sensor, now_ms)
+                }) {
+                    emit_warning(state, alert);
+                }
+            }
+        }
+        return Vec::new();
+    }
+
     if pkt.data_type() == crate::telemetry_schema::data_type("DAQ_SD_HEALTH") {
         if let Ok(words) = pkt.data_as_u32() {
             let accepted = state.network_health.lock().unwrap().observe_sd_status(
@@ -6852,6 +6873,55 @@ mod tests {
         }
         let kg = last.unwrap()[0].unwrap();
         assert!((kg - 100.0).abs() < 0.5, "{kg}");
+    }
+
+    #[tokio::test]
+    async fn daq_input_health_shows_the_block_records_and_warns_once_per_episode() {
+        let (db_tx, mut db_rx) = mpsc::channel(32);
+        let state = test_app_state(db_tx.clone()).await;
+        let db_overflow = test_db_overflow();
+        let mut warnings_rx = state.warnings_tx.subscribe();
+        // Chamber no signal active (bit 7), one episode, CH6 at 0.012 V as in
+        // the 2026-11-16 test fire; VMAIN healthy.
+        let words: [u32; 10] = [
+            1 | 0x200, 0x80 | (0x80 << 16), 0, 0, 0, 1 << 16,
+            14_180 | (14_200 << 16), 8 | (12 << 16), 0xFFFF_FFFF, 12_500 | (50 << 16),
+        ];
+        let packet = |timestamp| {
+            Packet::new(
+                crate::telemetry_schema::data_type("DAQ_INPUT_HEALTH"),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                "DAQ",
+                timestamp,
+                std::sync::Arc::from(words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>()),
+            )
+            .unwrap()
+        };
+        handle_packet(&state, &db_tx, &db_overflow, packet(600_000)).await;
+        let warning = tokio::time::timeout(Duration::from_millis(100), warnings_rx.recv())
+            .await
+            .expect("a dead chamber transducer raises a warning")
+            .unwrap();
+        assert!(
+            warning.message.starts_with("Chamber pressure transducer reads 0.01 V — no signal; check P4 wiring"),
+            "{}",
+            warning.message
+        );
+        handle_packet(&state, &db_tx, &db_overflow, packet(601_000)).await;
+        assert!(warnings_rx.try_recv().is_err(), "the same episode warns once");
+        let rows = state.network_health.lock().unwrap().snapshot(std::time::Instant::now(), false);
+        let daq = rows.iter().find(|row| row.sender_id == "DAQ").unwrap();
+        let input = daq.diagnostics.as_ref().unwrap().daq_input.as_ref().unwrap();
+        let chamber = input.faults.iter().find(|f| f.key == "chamber_no_signal").unwrap();
+        assert!(chamber.active && chamber.episodes == 1);
+        assert_eq!((input.chamber_mv, input.vmain_mv), (Some(12), Some(14_200)));
+        let mut recorded = false;
+        while let Ok(item) = db_rx.try_recv() {
+            if let DbQueueItem::Write(DbWrite::Telemetry { data_type, .. }) = item {
+                recorded |= data_type == "DAQ_INPUT_HEALTH";
+            }
+        }
+        assert!(recorded, "the raw report is kept in the recording");
     }
 
     #[tokio::test]

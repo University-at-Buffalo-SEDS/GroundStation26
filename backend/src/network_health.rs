@@ -18,6 +18,7 @@ struct Record {
     diagnostics: Option<(BoardDiagnostics, Instant)>,
     diagnostic_header_utc: Option<u64>,
     sd_status: Option<(crate::daq_sd::SdStatus, Instant)>,
+    input_health: Option<(crate::daq_input_health::Report, Instant)>,
     launch_log: Option<(crate::daq_launch_log::Observation, Instant, u64)>,
     first: Instant,
     last: Instant,
@@ -231,6 +232,7 @@ impl Tracker {
                     diagnostics: None,
                     diagnostic_header_utc: None,
                     sd_status: None,
+                    input_health: None,
                     launch_log: None,
                     first: now,
                     last: now,
@@ -309,6 +311,22 @@ impl Tracker {
         };
         self.record("DAQ", now, wall_ms).sd_status = Some((status, now));
         true
+    }
+
+    /// DAQ_INPUT_HEALTH; returns the decoded report for alerting.
+    pub fn observe_input_health(
+        &mut self,
+        sender: &str,
+        words: &[u32],
+        now: Instant,
+        wall_ms: u64,
+    ) -> Option<crate::daq_input_health::Report> {
+        if canonical_sender_id(sender.trim()) != "DAQ" {
+            return None;
+        }
+        let report = crate::daq_input_health::Report::decode(words)?;
+        self.record("DAQ", now, wall_ms).input_health = Some((report.clone(), now));
+        Some(report)
     }
 
     pub fn observe_launch_log_status(
@@ -459,7 +477,7 @@ impl Tracker {
                         Some(report)
                     }
                     None if status_without_health
-                        && (r.sd_status.is_some() || r.launch_log.is_some()) =>
+                        && (r.sd_status.is_some() || r.launch_log.is_some() || r.input_health.is_some()) =>
                     {
                         Some(BoardDiagnostics::default())
                     }
@@ -468,6 +486,9 @@ impl Tracker {
                 .map(|mut report| {
                     if let Some((status, received)) = &r.sd_status {
                         status.overlay(&mut report, elapsed(now, *received));
+                    }
+                    if let Some((input, received)) = &r.input_health {
+                        report.daq_input = Some(input.status(elapsed(now, *received)));
                     }
                     if let Some((status, received, initial_age)) = &r.launch_log {
                         report.launch_log = Some(status.project(

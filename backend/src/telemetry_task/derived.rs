@@ -854,6 +854,26 @@ fn observe_loadcell_rail(
     start.then(|| loadcell_rail_warning(sensor, raw))
 }
 
+/// DAQ_INPUT_HEALTH reported `sensor` at a rail. True when the live-sample
+/// rail alert above has not already told the operator: the input is not at a
+/// rail in the live stream now and no rail alert went out within the holdoff.
+/// Claiming stamps the shared holdoff, so neither path repeats the other.
+pub(super) fn claim_daq_rail_alert(sender: &str, sensor: &str, now_ms: i64) -> bool {
+    let mut latches = LOADCELL_RAIL_LATCHES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    let latch = latches.entry(format!("{sender}:{sensor}")).or_default();
+    let recent = latch
+        .last_alert_ms
+        .is_some_and(|last| now_ms >= last && now_ms.saturating_sub(last) < LOADCELL_RAIL_ALERT_HOLDOFF_MS);
+    if latch.railed || recent {
+        return false;
+    }
+    latch.last_alert_ms = Some(now_ms);
+    true
+}
+
 pub(super) fn loadcell_rail_warning(sensor: &str, raw: f32) -> String {
     let label = if sensor == loadcell::RAW_LOADCELL_DATA_TYPE_1000KG { "1000 kg" } else { "50 kg" };
     format!(
@@ -1475,6 +1495,22 @@ mod invalid_analog_tests {
 #[cfg(test)]
 mod loadcell_rail_tests {
     use super::*;
+
+    #[test]
+    fn daq_rail_reports_and_live_rail_alerts_share_one_holdoff() {
+        let sender = "DAQRAILCLAIM";
+        // Live samples alerted first: the DAQ report is not repeated.
+        assert!(observe_loadcell_rail("KG1000", sender, true, 1_000, 3.375).is_some());
+        assert!(!claim_daq_rail_alert(sender, "KG1000", 2_000), "railed now");
+        assert!(observe_loadcell_rail("KG1000", sender, false, 3_000, 0.2).is_none());
+        assert!(!claim_daq_rail_alert(sender, "KG1000", 20_000), "within 30 s of the live alert");
+        // A brief rail the stream missed: the DAQ report alerts once, and
+        // holds off the next live-sample alert.
+        assert!(claim_daq_rail_alert(sender, "KG1000", 40_000));
+        assert!(!claim_daq_rail_alert(sender, "KG1000", 41_000));
+        assert!(observe_loadcell_rail("KG1000", sender, true, 45_000, 3.375).is_none());
+        assert!(claim_daq_rail_alert(sender, "KG50", 45_000), "each load cell separately");
+    }
 
     #[test]
     fn rail_alert_fires_once_per_episode_with_holdoff() {

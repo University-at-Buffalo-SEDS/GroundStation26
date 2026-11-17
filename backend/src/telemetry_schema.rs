@@ -78,11 +78,14 @@ mod tests {
         assert_eq!(data_type("DAQ_SD_HEALTH").as_u32(), 92486907);
         assert_eq!(data_type("DAQ_SD_RETRY").as_u32(), 24116261);
         assert_eq!(data_type("DAQ_LAUNCH_LOG_STATUS").as_u32(), 203505696);
+        // DAQ-Board SEDS_DT_DAQ_INPUT_HEALTH.
+        assert_eq!(data_type("DAQ_INPUT_HEALTH").as_u32(), 188337040);
         for (name, count) in [
             ("BOARD_HEALTH", 24),
             ("DAQ_SD_HEALTH", 8),
             ("DAQ_SD_RETRY", 1),
             ("DAQ_LAUNCH_LOG_STATUS", 7),
+            ("DAQ_INPUT_HEALTH", 10),
         ] {
             let good = vec![0u8; count * 4];
             assert!(

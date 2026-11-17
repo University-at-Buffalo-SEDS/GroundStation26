@@ -598,12 +598,48 @@ pub struct BoardDiagnostics {
     pub sd_init_failures: Option<u32>,
     #[serde(default)]
     pub launch_log: Option<DaqLaunchLogStatus>,
+    /// DAQ live input faults (DAQ_INPUT_HEALTH). Missing on older firmware/other boards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daq_input: Option<DaqInputHealthStatus>,
     /// RF radio TX queue timing block. Missing on older RF firmware/other boards.
     #[serde(default)]
     pub rf_tx_timing: Option<RfTxTiming>,
     /// Board's own network-time quality (SEDSnet 4.4). Missing on older firmware.
     #[serde(default)]
     pub time_sync: Option<BoardTimeSync>,
+}
+
+/// DAQ input-health block: each monitored input fault and the readings behind
+/// it. Voltages are millivolts; `None` means no reading in the last interval.
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default, Hash)]
+pub struct DaqInputHealthStatus {
+    pub received_age_ms: u64,
+    pub faults: Vec<DaqInputFaultStatus>,
+    /// The selected KG50 input is the P6 differential (leg checks apply).
+    pub kg50_p6: bool,
+    pub vmain_mv: Option<u16>,
+    /// Lowest VMAIN since the DAQ's previous report (about 1 s).
+    pub vmain_min_mv: Option<u16>,
+    pub chamber_mv: Option<u16>,
+    pub chamber_min_mv: Option<u16>,
+    pub p6_imbalance_max_mv: Option<u16>,
+    pub p6_common_mv: Option<u16>,
+    /// The DAQ's configured supply undervoltage and chamber no-signal levels.
+    pub supply_low_mv: u16,
+    pub chamber_floor_mv: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default, Hash)]
+pub struct DaqInputFaultStatus {
+    pub key: String,
+    pub label: String,
+    /// Debounced and present now.
+    pub active: bool,
+    /// Seen, even briefly, since the DAQ's previous report.
+    pub latched: bool,
+    /// Episodes since the DAQ booted (saturates at 65535).
+    pub episodes: u16,
+    pub advice: String,
 }
 
 /// A board's network-time quality from its BOARD_HEALTH sync byte: "synced
