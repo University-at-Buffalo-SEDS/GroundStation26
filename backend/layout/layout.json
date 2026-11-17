@@ -1015,10 +1015,10 @@
             ],
             "chart_groups": [
               {
-                "title": "Raw",
+                "title": "Raw (V)",
                 "data_type": "KG1000",
                 "labels": [
-                  "Raw"
+                  "Raw (V)"
                 ],
                 "channels": [
                   0
@@ -1081,7 +1081,7 @@
             ],
             "summary_items": [
               {
-                "label": "Raw",
+                "label": "Raw (V)",
                 "data_type": "KG1000",
                 "index": 0,
                 "formatter": {
@@ -1145,10 +1145,10 @@
             ],
             "chart_groups": [
               {
-                "title": "Raw",
+                "title": "Raw (V)",
                 "data_type": "KG50",
                 "labels": [
-                  "Raw"
+                  "Raw (V)"
                 ],
                 "channels": [
                   0
@@ -1196,7 +1196,7 @@
             ],
             "summary_items": [
               {
-                "label": "Raw",
+                "label": "Raw (V)",
                 "data_type": "KG50",
                 "index": 0,
                 "formatter": {
@@ -1939,10 +1939,10 @@
             ],
             "chart_groups": [
               {
-                "title": "Raw",
+                "title": "Raw (V)",
                 "data_type": "KG1000",
                 "labels": [
-                  "Raw"
+                  "Raw (V)"
                 ],
                 "channels": [
                   0
@@ -2005,7 +2005,7 @@
             ],
             "summary_items": [
               {
-                "label": "Raw",
+                "label": "Raw (V)",
                 "data_type": "KG1000",
                 "index": 0,
                 "formatter": {
@@ -2069,10 +2069,10 @@
             ],
             "chart_groups": [
               {
-                "title": "Raw",
+                "title": "Raw (V)",
                 "data_type": "KG50",
                 "labels": [
-                  "Raw"
+                  "Raw (V)"
                 ],
                 "channels": [
                   0
@@ -2120,7 +2120,7 @@
             ],
             "summary_items": [
               {
-                "label": "Raw",
+                "label": "Raw (V)",
                 "data_type": "KG50",
                 "index": 0,
                 "formatter": {

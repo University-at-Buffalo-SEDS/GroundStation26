@@ -585,6 +585,23 @@ Calibration documents keep legacy fields for `ch1` and `iadc`. Additional channe
 `extra_channels[channel_id]` with generic `linear`, `zero_raw`, `points`, and `fit` fields. Generic
 points use `{ "expected": number, "raw": number }`.
 
+Load-cell units (calibration `version` 2): for KG1000 (`ch1`) and the AMP2 KG50
+input, KG1000/KG50 telemetry and every calibration input value (`zero_raw`,
+`points[].raw`, `temperature_captures[].raw`, thermal `raw_per_c` and points,
+noise `sigma_raw`) are ADC-pin volts, and fits are kg = f(volts): the linear
+slope `m` is kg/V. The P6 KG50 input was already in volts; `iadc` is
+unchanged. The field names are kept for compatibility. Capture requests accept
+`volts` as an alias of `raw`. Version-1 files (DAQ legacy raw scale) are
+migrated on load with the exact factor k = 16000/921 (volts = raw x k): inputs
+are multiplied by k, slopes divided by k (an x^n term by k^n), intercepts kept,
+so every ADC code gives the same kg. A save carrying `version` < 2 is refused
+with a request to reload. Recordings without a `loadcell_units` table (and rows
+before its `first_volts_id`) hold legacy raw values; replay, recent history and
+the test-fire CSV convert them to volts. An SD-resolved recording converts its
+legacy network rows and legacy-firmware SD load-cell rows when it is resolved
+(provenance `converted_from`) and marks the view with `sd_replay_loadcell_units`;
+the original `telemetry` table is never rewritten.
+
 ### `POST /api/notifications/{id}/dismiss`
 
 Purpose:

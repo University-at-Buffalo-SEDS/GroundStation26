@@ -5,7 +5,7 @@
   "noise": {},
   "temperature_captures": {},
   "thermal": {},
-  "version": 1,
+  "version": 2,
   "full_mass_kg": 10.0,
   "ch1": {
     "m": 1.0,

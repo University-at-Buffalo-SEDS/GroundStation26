@@ -261,6 +261,8 @@ pub async fn ensure_telemetry_schema(db: &SqlitePool) -> Result<()> {
             .await?;
     }
 
+    mark_loadcell_volts(db).await?;
+
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS alerts (
@@ -560,3 +562,53 @@ pub fn prune_recent_writes(buffer: &mut VecDeque<DbWrite>, newest_ts_ms: i64) {
 #[cfg(test)]
 #[path = "telemetry_db/durability_tests.rs"]
 mod durability_tests;
+
+/// DAQ load-cell inputs (KG1000, AMP2 KG50) are ADC-pin volts from telemetry
+/// row `first_volts_id` on. Rows before it, and every recording without this
+/// table, were written on the DAQ's legacy raw scale. A database first opened
+/// by this station version marks its next row id once; reopening keeps it.
+pub async fn mark_loadcell_volts(db: &SqlitePool) -> Result<()> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS loadcell_units (id INTEGER PRIMARY KEY CHECK(id=1), first_volts_id INTEGER NOT NULL, unit TEXT NOT NULL)",
+    )
+    .execute(db)
+    .await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO loadcell_units VALUES (1, (SELECT COALESCE(MAX(id), 0) + 1 FROM telemetry), 'adc_volts')",
+    )
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// First telemetry row id whose load-cell values are volts. `i64::MAX` (every
+/// row legacy raw) for a recording made before the change.
+///
+/// An activated SD-resolved view (`recording_sd::activate_resolved`) renumbers
+/// rows, so the recording's mark does not apply to it: the resolver converts
+/// legacy rows itself and marks the view `sd_replay_loadcell_units`. A view
+/// resolved before that mark existed holds only legacy raw rows.
+pub async fn loadcell_volts_from_id(db: &SqlitePool) -> i64 {
+    let table_exists = |schema: &'static str, name: &'static str, kind: &'static str| {
+        sqlx::query_scalar::<_, i64>(match schema {
+            "temp" => "SELECT COUNT(*) FROM temp.sqlite_master WHERE type=? AND name=?",
+            _ => "SELECT COUNT(*) FROM main.sqlite_master WHERE type=? AND name=?",
+        })
+        .bind(kind)
+        .bind(name)
+        .fetch_one(db)
+    };
+    if table_exists("temp", "telemetry", "view").await.unwrap_or(0) > 0 {
+        let marked = table_exists("main", "sd_replay_loadcell_units", "table").await.unwrap_or(0) > 0;
+        return if marked { i64::MIN } else { i64::MAX };
+    }
+    if table_exists("main", "loadcell_units", "table").await.unwrap_or(0) == 0 {
+        return i64::MAX;
+    }
+    sqlx::query_scalar::<_, i64>("SELECT first_volts_id FROM main.loadcell_units WHERE id=1")
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(i64::MAX)
+}

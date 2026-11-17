@@ -637,7 +637,7 @@ pub(super) fn prepare_derived_loadcell_rows(
     // A clipped load-cell input carries no load information. The raw row is
     // still recorded by the caller; only the converted weight is withheld.
     let railed = loadcell::daq_rails_apply()
-        && loadcell::loadcell_raw_at_rail(cfg.kg50_input, calibration_sensor_id, sample.raw_value);
+        && loadcell::loadcell_volts_at_rail(cfg.kg50_input, calibration_sensor_id, sample.raw_value);
     if let Some(message) = observe_loadcell_rail(
         calibration_sensor_id,
         sample.sender_id,
@@ -857,7 +857,7 @@ fn observe_loadcell_rail(
 pub(super) fn loadcell_rail_warning(sensor: &str, raw: f32) -> String {
     let label = if sensor == loadcell::RAW_LOADCELL_DATA_TYPE_1000KG { "1000 kg" } else { "50 kg" };
     format!(
-        "{label} load cell input is at its ADC/amplifier rail (raw {raw}); weight is shown as invalid until it returns to range. Check the load cell wiring and DAQ supply."
+        "{label} load cell input is at its ADC/amplifier rail ({raw} V); weight is shown as invalid until it returns to range. Check the load cell wiring and DAQ supply."
     )
 }
 

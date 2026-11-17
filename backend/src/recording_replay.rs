@@ -110,24 +110,25 @@ async fn diagnostic_payload_expression(db: &SqlitePool) -> anyhow::Result<bool> 
 }
 async fn page_from(db: &SqlitePool, window: &Window) -> anyhow::Result<Page> {
     let types = window.types()?;
+    let volts_from_id = crate::telemetry_db::loadcell_volts_from_id(db).await;
     let diagnostic_payload = diagnostic_payload_expression(db).await?;
-    let rows=sqlx::query(if diagnostic_payload { "SELECT id,timestamp_ms,source_timestamp_ms,substr(COALESCE(sender_id,''),1,257) AS sender_id,data_type,substr(COALESCE(values_json,'[]'),1,32769) AS values_json, CASE WHEN substr(data_type,1,4)='REC_' OR data_type IN ('BOARD_HEALTH','DAQ_SD_HEALTH','DAQ_LAUNCH_LOG_STATUS') THEN substr(payload_json,1,16385) ELSE NULL END AS recorded_diagnostic_payload FROM telemetry WHERE id > ? AND id <= ? AND timestamp_ms >= ? AND timestamp_ms <= ? AND data_type IN (SELECT value FROM json_each(?)) ORDER BY id LIMIT ?" } else { "SELECT id,timestamp_ms,source_timestamp_ms,substr(COALESCE(sender_id,''),1,257) AS sender_id,data_type,substr(COALESCE(values_json,'[]'),1,32769) AS values_json, NULL AS recorded_diagnostic_payload FROM telemetry WHERE id > ? AND id <= ? AND timestamp_ms >= ? AND timestamp_ms <= ? AND data_type IN (SELECT value FROM json_each(?)) ORDER BY id LIMIT ?" })
+    let rows=sqlx::query(if diagnostic_payload { "SELECT id,timestamp_ms,source_timestamp_ms,substr(COALESCE(sender_id,''),1,257) AS sender_id,data_type,substr(COALESCE(values_json,'[]'),1,32769) AS values_json, CASE WHEN substr(data_type,1,4)='REC_' OR data_type IN ('BOARD_HEALTH','DAQ_SD_HEALTH','DAQ_LAUNCH_LOG_STATUS') THEN substr(payload_json,1,16385) ELSE NULL END AS recorded_diagnostic_payload, CASE WHEN data_type='KG50' THEN substr(payload_json,1,256) END AS loadcell_payload FROM telemetry WHERE id > ? AND id <= ? AND timestamp_ms >= ? AND timestamp_ms <= ? AND data_type IN (SELECT value FROM json_each(?)) ORDER BY id LIMIT ?" } else { "SELECT id,timestamp_ms,source_timestamp_ms,substr(COALESCE(sender_id,''),1,257) AS sender_id,data_type,substr(COALESCE(values_json,'[]'),1,32769) AS values_json, NULL AS recorded_diagnostic_payload, NULL AS loadcell_payload FROM telemetry WHERE id > ? AND id <= ? AND timestamp_ms >= ? AND timestamp_ms <= ? AND data_type IN (SELECT value FROM json_each(?)) ORDER BY id LIMIT ?" })
         .bind(window.after_id).bind(window.upper_id).bind(window.start_ms).bind(window.end_ms).bind(serde_json::to_string(&types)?).bind(PAGE+1).fetch_all(db).await?;
     let has_more = rows.len() > PAGE as usize;
     let mut samples = Vec::new();
     let mut next_id = window.after_id;
     for row in rows.into_iter().take(PAGE as usize) {
-        let sample = decode(row)?;
+        let sample = decode(row, volts_from_id)?;
         next_id = sample.id;
         samples.push(sample);
     }
     let mut seeds = Vec::new();
     if window.after_id == 0 {
-        let rows = sqlx::query(if diagnostic_payload { "SELECT id,timestamp_ms,source_timestamp_ms,substr(COALESCE(sender_id,''),1,257) AS sender_id,data_type,substr(COALESCE(values_json,'[]'),1,32769) AS values_json, CASE WHEN substr(data_type,1,4)='REC_' OR data_type IN ('BOARD_HEALTH','DAQ_SD_HEALTH','DAQ_LAUNCH_LOG_STATUS') THEN substr(payload_json,1,16385) ELSE NULL END AS recorded_diagnostic_payload FROM (SELECT *,ROW_NUMBER() OVER(PARTITION BY data_type,sender_id ORDER BY timestamp_ms DESC,id DESC) AS rank FROM telemetry WHERE id <= ? AND timestamp_ms < ? AND data_type IN (SELECT value FROM json_each(?))) WHERE rank=1 LIMIT 257" } else { "SELECT id,timestamp_ms,source_timestamp_ms,substr(COALESCE(sender_id,''),1,257) AS sender_id,data_type,substr(COALESCE(values_json,'[]'),1,32769) AS values_json, NULL AS recorded_diagnostic_payload FROM (SELECT *,ROW_NUMBER() OVER(PARTITION BY data_type,sender_id ORDER BY timestamp_ms DESC,id DESC) AS rank FROM telemetry WHERE id <= ? AND timestamp_ms < ? AND data_type IN (SELECT value FROM json_each(?))) WHERE rank=1 LIMIT 257" })
+        let rows = sqlx::query(if diagnostic_payload { "SELECT id,timestamp_ms,source_timestamp_ms,substr(COALESCE(sender_id,''),1,257) AS sender_id,data_type,substr(COALESCE(values_json,'[]'),1,32769) AS values_json, CASE WHEN substr(data_type,1,4)='REC_' OR data_type IN ('BOARD_HEALTH','DAQ_SD_HEALTH','DAQ_LAUNCH_LOG_STATUS') THEN substr(payload_json,1,16385) ELSE NULL END AS recorded_diagnostic_payload, CASE WHEN data_type='KG50' THEN substr(payload_json,1,256) END AS loadcell_payload FROM (SELECT *,ROW_NUMBER() OVER(PARTITION BY data_type,sender_id ORDER BY timestamp_ms DESC,id DESC) AS rank FROM telemetry WHERE id <= ? AND timestamp_ms < ? AND data_type IN (SELECT value FROM json_each(?))) WHERE rank=1 LIMIT 257" } else { "SELECT id,timestamp_ms,source_timestamp_ms,substr(COALESCE(sender_id,''),1,257) AS sender_id,data_type,substr(COALESCE(values_json,'[]'),1,32769) AS values_json, NULL AS recorded_diagnostic_payload, NULL AS loadcell_payload FROM (SELECT *,ROW_NUMBER() OVER(PARTITION BY data_type,sender_id ORDER BY timestamp_ms DESC,id DESC) AS rank FROM telemetry WHERE id <= ? AND timestamp_ms < ? AND data_type IN (SELECT value FROM json_each(?))) WHERE rank=1 LIMIT 257" })
             .bind(window.upper_id).bind(window.start_ms).bind(serde_json::to_string(&types)?).fetch_all(db).await?;
         anyhow::ensure!(rows.len() <= 256, "too many replay source series");
         for row in rows {
-            seeds.push(decode(row)?);
+            seeds.push(decode(row, volts_from_id)?);
         }
     }
 
@@ -147,7 +148,9 @@ async fn page_from(db: &SqlitePool, window: &Window) -> anyhow::Result<Page> {
 pub(crate) async fn test_page_from(db: &SqlitePool, window: &Window) -> anyhow::Result<Page> {
     page_from(db, window).await
 }
-fn decode(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<Sample> {
+/// Load-cell inputs are served in ADC-pin volts; rows recorded before
+/// `volts_from_id` carried the DAQ legacy raw scale and are converted.
+fn decode(row: sqlx::sqlite::SqliteRow, volts_from_id: i64) -> anyhow::Result<Sample> {
     let raw: String = row.try_get("values_json")?;
     let sender: String = row.try_get("sender_id")?;
     let data_type: String = row.try_get("data_type")?;
@@ -155,7 +158,12 @@ fn decode(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<Sample> {
         raw.len() <= 32768 && sender.len() <= 256,
         "oversized recorded replay sample"
     );
-    let values: Vec<Option<f32>> = serde_json::from_str(&raw)?;
+    let mut values: Vec<Option<f32>> = serde_json::from_str(&raw)?;
+    let id: i64 = row.try_get("id")?;
+    if id < volts_from_id {
+        let payload: Option<String> = row.try_get("loadcell_payload").unwrap_or(None);
+        crate::loadcell::legacy_loadcell_row_to_volts(&data_type, payload.as_deref(), &mut values);
+    }
     anyhow::ensure!(
         values.len() <= 1024 && values.iter().flatten().all(|v| v.is_finite()),
         "invalid recorded replay values"
@@ -178,7 +186,7 @@ fn decode(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<Sample> {
         None
     };
     Ok(Sample {
-        id: row.try_get("id")?,
+        id,
         timestamp_ms: row.try_get("timestamp_ms")?,
         source_timestamp_ms: row.try_get("source_timestamp_ms")?,
         sender_id: sender,
@@ -217,15 +225,16 @@ pub(crate) async fn test_export_from(db: &SqlitePool) -> anyhow::Result<serde_js
 async fn export_from(db: &SqlitePool) -> anyhow::Result<serde_json::Value> {
     let snapshot = snapshot_from(db).await?;
     let diagnostic_payload = diagnostic_payload_expression(db).await?;
+    let volts_from_id = crate::telemetry_db::loadcell_volts_from_id(db).await;
     let mut samples = Vec::new();
     let mut bytes = 0usize;
     let mut after = 0i64;
     loop {
-        let rows = sqlx::query(if diagnostic_payload { "SELECT id,timestamp_ms,source_timestamp_ms,substr(COALESCE(sender_id,''),1,257) AS sender_id,data_type,substr(COALESCE(values_json,'[]'),1,32769) AS values_json, CASE WHEN substr(data_type,1,4)='REC_' OR data_type IN ('BOARD_HEALTH','DAQ_SD_HEALTH','DAQ_LAUNCH_LOG_STATUS') THEN substr(payload_json,1,16385) ELSE NULL END AS recorded_diagnostic_payload FROM telemetry WHERE id>? AND id<=? ORDER BY id LIMIT 512" } else { "SELECT id,timestamp_ms,source_timestamp_ms,substr(COALESCE(sender_id,''),1,257) AS sender_id,data_type,substr(COALESCE(values_json,'[]'),1,32769) AS values_json, NULL AS recorded_diagnostic_payload FROM telemetry WHERE id>? AND id<=? ORDER BY id LIMIT 512" })
+        let rows = sqlx::query(if diagnostic_payload { "SELECT id,timestamp_ms,source_timestamp_ms,substr(COALESCE(sender_id,''),1,257) AS sender_id,data_type,substr(COALESCE(values_json,'[]'),1,32769) AS values_json, CASE WHEN substr(data_type,1,4)='REC_' OR data_type IN ('BOARD_HEALTH','DAQ_SD_HEALTH','DAQ_LAUNCH_LOG_STATUS') THEN substr(payload_json,1,16385) ELSE NULL END AS recorded_diagnostic_payload, CASE WHEN data_type='KG50' THEN substr(payload_json,1,256) END AS loadcell_payload FROM telemetry WHERE id>? AND id<=? ORDER BY id LIMIT 512" } else { "SELECT id,timestamp_ms,source_timestamp_ms,substr(COALESCE(sender_id,''),1,257) AS sender_id,data_type,substr(COALESCE(values_json,'[]'),1,32769) AS values_json, NULL AS recorded_diagnostic_payload, NULL AS loadcell_payload FROM telemetry WHERE id>? AND id<=? ORDER BY id LIMIT 512" })
             .bind(after).bind(snapshot.upper_id).fetch_all(db).await?;
         if rows.is_empty() { break; }
         for row in rows {
-            let sample = decode(row)?;
+            let sample = decode(row, volts_from_id)?;
             anyhow::ensure!(samples.len() < 200_000, "Replay exceeds 200,000 rows; select a smaller recording. No rows were truncated.");
             bytes = bytes.saturating_add(serde_json::to_vec(&sample)?.len());
             anyhow::ensure!(bytes <= 64 * 1024 * 1024, "Replay exceeds 64 MiB; select a smaller recording.");
@@ -235,7 +244,7 @@ async fn export_from(db: &SqlitePool) -> anyhow::Result<serde_json::Value> {
     }
     apply_sd_validity(db,&mut samples).await?;
     let sd_provenance=crate::recording_sd::bundle_provenance(db,(64*1024*1024usize).saturating_sub(bytes)).await?;
-    let mut value=serde_json::json!({"sd_provenance":sd_provenance,"format":"seds-replay","version":1,"snapshot":snapshot,
+    let mut value=serde_json::json!({"sd_provenance":sd_provenance,"format":"seds-replay","version":1,"loadcell_units":"adc_volts","snapshot":snapshot,
         "samples":samples,"recording_diagnostics_schema":crate::telemetry_task::recording_diagnostics::descriptors(),"schema":serde_json::from_str::<serde_json::Value>(include_str!("../config/telemetry_config.json"))?});
     if let Some(config)=value["sd_provenance"]["imports"][0]["manifest"]["config"].as_object().cloned(){
         for field in ["schema","view_config","layout","valve_mappings"]{if let Some(saved)=config.get(field){value[field]=saved.clone();}}
@@ -1077,4 +1086,148 @@ mod tests {
 mod diagnostic_payload_tests {
     use super::*;
     include!("recording_diagnostics_replay_tests.rs");
+}
+
+#[cfg(test)]
+mod loadcell_volts_replay_tests {
+    use super::*;
+    use crate::loadcell::{self, HistoryCalibration, LoadcellCalibrationFile};
+
+    const FIXTURE: &str = include_str!("test-fixtures/loadcell-volts/fire-2026-11-17-loadcell.csv");
+    const CALIBRATION_V1: &str =
+        include_str!("test-fixtures/loadcell-volts/fire-2026-11-17-calibration-v1.json");
+
+    /// Rail limits of the station before load cells were volts (legacy raw):
+    /// KG1000 floor 0.0025, 2^23 codes on the raw scale, P6 +/-0.15 V.
+    fn legacy_rail(cfg: &LoadcellCalibrationFile, sensor: &str, raw: f32) -> bool {
+        let high = (8_388_608.0 * 2.2104 / 16_777_216.0 * 2.0 / 16.0) as f32;
+        match (sensor, cfg.kg50_input) {
+            ("KG1000", _) => raw <= 0.0025 || raw >= high,
+            ("KG50", loadcell::Kg50Input::P6Differential) => raw.abs() >= 0.15,
+            _ => raw.abs() >= high,
+        }
+    }
+
+    async fn legacy_recording() -> SqlitePool {
+        let db = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        // Recorded by the station before the change: no loadcell_units table.
+        sqlx::query("CREATE TABLE telemetry (id INTEGER PRIMARY KEY, timestamp_ms INTEGER NOT NULL, source_timestamp_ms INTEGER, sender_id TEXT, data_type TEXT NOT NULL, values_json TEXT, payload_json TEXT)")
+            .execute(&db).await.unwrap();
+        for line in FIXTURE.lines().skip(1) {
+            let cells: Vec<&str> = line.splitn(7, ',').collect();
+            sqlx::query("INSERT INTO telemetry VALUES (?,?,?,?,?,?,?)")
+                .bind(cells[0].parse::<i64>().unwrap())
+                .bind(cells[1].parse::<i64>().unwrap())
+                .bind(cells[2].parse::<i64>().unwrap())
+                .bind(cells[3])
+                .bind(cells[4])
+                .bind(cells[5])
+                .bind(cells[6].trim_matches('"'))
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+        db
+    }
+
+    /// The 2026-11-17 test-fire recording (KG1000 on AMP1 in legacy raw, KG50
+    /// on P6 in volts) replays with the same kg after the calibration file is
+    /// migrated, including the railed samples that carry no weight.
+    #[tokio::test]
+    async fn pre_volts_recording_replays_with_unchanged_kg() {
+        crate::mode_suite!(TestFire);
+        let db = legacy_recording().await;
+        assert_eq!(crate::telemetry_db::loadcell_volts_from_id(&db).await, i64::MAX);
+        let exported = export_from(&db).await.unwrap();
+        let samples: Vec<Sample> = serde_json::from_value(exported["samples"].clone()).unwrap();
+        let recorded: std::collections::BTreeMap<i64, f32> = FIXTURE
+            .lines()
+            .skip(1)
+            .map(|line| line.splitn(7, ',').collect::<Vec<_>>())
+            .filter(|cells| matches!(cells[4], "KG1000" | "KG50"))
+            .map(|cells| (cells[0].parse().unwrap(), cells[5].trim_matches(['[', ']']).parse().unwrap()))
+            .collect();
+
+        let old: LoadcellCalibrationFile = serde_json::from_str(CALIBRATION_V1).unwrap();
+        assert_eq!(old.version, 1);
+        let mut new = old.clone();
+        loadcell::migrate_calibration(&mut new);
+        assert_eq!(new.version, loadcell::CALIBRATION_VERSION);
+        let mut replay = HistoryCalibration::new(
+            new.clone(),
+            &crate::fill_targets::FillTargetsConfig::default(),
+            crate::types::FlightState::Startup,
+        );
+        let (mut weighed, mut railed, mut p6) = (0, 0, 0);
+        for sample in samples.iter().filter(|s| matches!(s.data_type.as_str(), "KG1000" | "KG50")) {
+            let raw = recorded[&sample.id];
+            let served = sample.values[0].unwrap();
+            if sample.data_type == "KG1000" {
+                assert_eq!(served, loadcell::legacy_raw_to_volts(raw), "id {}", sample.id);
+            } else {
+                assert_eq!(served, raw, "P6 KG50 was already volts (id {})", sample.id);
+                p6 += 1;
+            }
+            let before = (!legacy_rail(&old, &sample.data_type, raw))
+                .then(|| loadcell::calibrated_weight_kg(&old, &sample.data_type, raw))
+                .flatten();
+            let row = crate::types::TelemetryRow {
+                timestamp_ms: sample.timestamp_ms,
+                data_type: sample.data_type.clone(),
+                sender_id: sample.sender_id.clone(),
+                values: sample.values.clone(),
+            };
+            let after = replay.project(row)[1].values[0];
+            match (before, after) {
+                (Some(before), Some(after)) => {
+                    assert!(
+                        (before - after).abs() <= 2e-3 + before.abs() * 2e-6,
+                        "id {}: {before} kg before, {after} kg after",
+                        sample.id
+                    );
+                    weighed += 1;
+                }
+                (None, None) => railed += 1,
+                other => panic!("id {}: rail classification changed: {other:?}", sample.id),
+            }
+        }
+        assert_eq!(weighed + railed, 222);
+        assert_eq!(p6, 61);
+        assert!(railed > 0 && weighed > 100, "{weighed} weighed, {railed} railed");
+    }
+
+    #[tokio::test]
+    async fn recordings_made_after_the_change_are_served_unconverted() {
+        let db = legacy_recording().await;
+        crate::telemetry_db::mark_loadcell_volts(&db).await.unwrap();
+        let first = crate::telemetry_db::loadcell_volts_from_id(&db).await;
+        let last_legacy: i64 = FIXTURE.lines().last().unwrap().split(',').next().unwrap().parse().unwrap();
+        assert_eq!(first, last_legacy + 1, "rows already recorded stay legacy");
+        sqlx::query("INSERT INTO telemetry VALUES (?, 1794878858999, 1794878858990, 'DAQ', 'KG1000', '[0.25]', '[]')")
+            .bind(first)
+            .execute(&db).await.unwrap();
+        // Reopening keeps the first mark.
+        crate::telemetry_db::mark_loadcell_volts(&db).await.unwrap();
+        assert_eq!(crate::telemetry_db::loadcell_volts_from_id(&db).await, first);
+        let exported = export_from(&db).await.unwrap();
+        let last = exported["samples"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!((last["id"].as_i64(), last["values"][0].as_f64()), (Some(first), Some(0.25)));
+        assert_eq!(exported["loadcell_units"], "adc_volts");
+    }
+
+    #[tokio::test]
+    async fn an_activated_sd_resolved_view_uses_its_own_mark() {
+        let db = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE telemetry (id INTEGER PRIMARY KEY, timestamp_ms INTEGER NOT NULL, source_timestamp_ms INTEGER, sender_id TEXT, data_type TEXT NOT NULL, values_json TEXT, payload_json TEXT)")
+            .execute(&db).await.unwrap();
+        crate::telemetry_db::mark_loadcell_volts(&db).await.unwrap();
+        sqlx::query("CREATE TABLE sd_replay_telemetry (id INTEGER PRIMARY KEY, timestamp_ms INTEGER NOT NULL, source_timestamp_ms INTEGER, data_type TEXT NOT NULL, sender_id TEXT, values_json TEXT, payload_json TEXT, provenance_json TEXT NOT NULL)")
+            .execute(&db).await.unwrap();
+        crate::recording_sd::activate_resolved(&db).await.unwrap();
+        // Resolved before the resolver converted legacy rows: all legacy raw.
+        assert_eq!(crate::telemetry_db::loadcell_volts_from_id(&db).await, i64::MAX);
+        sqlx::query("CREATE TABLE sd_replay_loadcell_units (id INTEGER PRIMARY KEY CHECK(id=1), unit TEXT NOT NULL)")
+            .execute(&db).await.unwrap();
+        assert_eq!(crate::telemetry_db::loadcell_volts_from_id(&db).await, i64::MIN);
+    }
 }

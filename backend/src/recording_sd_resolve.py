@@ -5,6 +5,7 @@ firmware source identities; callers provide the recorded schema and boot/session
 assignment. Unsupported formats remain in raw SD storage for explicit selection.
 """
 import math
+import struct
 
 FC_HEAD='ec188c6daac84e3c957f57ca95d872953cbda588'
 DAQ_HEAD='ef3702d87071f204e5ccb9a124b739af82538ac2'
@@ -22,6 +23,8 @@ PROFILES={
  }},
  'daq-20261101': {'head':DAQ_HEAD,'mappings':{
   # KG50/KG1000 network publications contain raw sensor values, not SD calibrated kg.
+  # This firmware wrote them on the legacy raw scale; the resolved view converts
+  # them to ADC-pin volts (see LEGACY_RAW_TO_VOLTS).
   'kg50_raw':('calibrated_value',[0],'LOADCELL_50_WEIGHT_KG',['kg']),
   'mcp3564r_raw':('calibrated_value',[0],'LOADCELL_WEIGHT_KG',['kg']),
   'kg50_network':('value',[0],'KG50',['sensor_raw']),
@@ -29,6 +32,41 @@ PROFILES={
  }}
 }
 UTC_MIN,UTC_MAX=946684800000,4102444800000
+# DAQ KG1000/AMP2 KG50 legacy raw (code*2.2104/2^27) to ADC-pin volts
+# (code*2.4/2^23): exactly 16000/921, as loadcell::LEGACY_RAW_TO_VOLTS.
+LEGACY_RAW_TO_VOLTS=16000/921
+LEGACY_LOADCELL_KINDS=('KG1000','KG50','DAQ_LOADCELL_CHAMBER')
+
+
+def _f32(value):
+    return struct.unpack('<f',struct.pack('<f',value))[0]
+
+
+def legacy_raw_to_volts(raw):
+    """Same binary32 result as loadcell::legacy_raw_to_volts in the backend."""
+    return _f32(_f32(raw)*LEGACY_RAW_TO_VOLTS)
+
+
+def _p6_payload(payload):
+    # A P6 KG50 selection is tagged [source, volts] (8 bytes) and was always volts.
+    try:
+        return isinstance(payload,str) and len(json.loads(payload))==8
+    except (ValueError,TypeError):
+        return False
+
+
+def _network_values_to_volts(kind,values,payload):
+    """values_json of a network row recorded on the legacy raw scale, in volts."""
+    if kind not in LEGACY_LOADCELL_KINDS or (kind=='KG50' and _p6_payload(payload)):
+        return values
+    try:
+        vector=json.loads(values or '[]')
+    except ValueError:
+        return values
+    if not isinstance(vector,list) or not vector or not isinstance(vector[0],(int,float)) or isinstance(vector[0],bool):
+        return values
+    vector[0]=legacy_raw_to_volts(vector[0])
+    return canonical(vector)
 
 
 def canonical_utc(value):
@@ -106,6 +144,11 @@ def resolve_recording(db,max_database_bytes=MAX_DATABASE_BYTES):
       CREATE INDEX sd_hole_lookup ON sd_sequence_holes(import_id,start_ms,end_ms);
     """)
     unresolved=suppressed=processed=0
+    # The resolved view serves every load cell in ADC-pin volts. Network rows
+    # before the recording's loadcell_units mark (or all of them without it)
+    # were stored on the DAQ legacy raw scale.
+    marked=db.execute("SELECT 1 FROM main.sqlite_master WHERE type='table' AND name='loadcell_units'").fetchone()
+    first_volts_id=(db.execute('SELECT first_volts_id FROM main.loadcell_units WHERE id=1').fetchone() or [math.inf])[0] if marked else math.inf
     db.execute('BEGIN IMMEDIATE')
     try:
         for import_id,encoded in db.execute('SELECT id,manifest_json FROM sd_imports ORDER BY id'):
@@ -131,6 +174,8 @@ def resolve_recording(db,max_database_bytes=MAX_DATABASE_BYTES):
                     vector=[float(x) for x in fields[field].split()]
                     values=[vector[i] if math.isfinite(vector[i]) else None for i in indices]
                     if len(vector)!=len(indices):raise ValueError('Vector width mismatch')
+                    if 'sensor_raw' in units:
+                        values=[None if v is None else legacy_raw_to_volts(v) for v in values]
                 except (ValueError,IndexError):
                     previous.pop(key,None);unresolved+=1;continue
                 state=previous.get(key)
@@ -147,7 +192,8 @@ def resolve_recording(db,max_database_bytes=MAX_DATABASE_BYTES):
                 provenance.update(origin='sd',sd_sample_id=sample['sample_id'],received_timestamp_ms=None,
                     source_timestamp_ms=int(fields['timestamp_ms']),coverage_segment_id=segment_id,
                     mapping={'profile':manifest['mapping_profile'],'sensor':sensor,'field':field,'indices':indices,
-                             'data_type':kind,'units':units,'source_evidence':profile['head']})
+                             'data_type':kind,'units':['V' if u=='sensor_raw' else u for u in units],'source_evidence':profile['head']})
+                if 'sensor_raw' in units:provenance['mapping']['converted_from']={'units':'legacy_raw','volts_per_raw':'16000/921'}
                 processed+=1
                 if processed%4096==0:check_disk_limit(db,max_database_bytes)
                 db.execute('INSERT OR IGNORE INTO sd_resolution_candidates VALUES(?,?,?,?,?,?,?,?,?,?)',
@@ -159,6 +205,11 @@ def resolve_recording(db,max_database_bytes=MAX_DATABASE_BYTES):
             if len(identities)==1:suppressed+=1;continue
             provenance={'origin':'network','original_network_id':row_id,'received_timestamp_ms':received,
                         'source_timestamp_ms':source,'utc_timestamp_ms':source,'ambiguous':len(identities)>1}
+            if row_id<first_volts_id:
+                converted=_network_values_to_volts(kind,values,payload)
+                if converted!=values:
+                    provenance['converted_from']={'units':'legacy_raw','volts_per_raw':'16000/921','values_json':values}
+                    values=converted
             db.execute('INSERT INTO sd_resolution_candidates VALUES(?,?,?,?,?,?,?,?,?,?)',
                 (source,sender,kind,values or '[]',payload,canonical(provenance),row_id,None,None,None))
         # Overlapping unproven boot assignments remain separately labelled SD
@@ -180,6 +231,10 @@ def resolve_recording(db,max_database_bytes=MAX_DATABASE_BYTES):
         count=db.execute('SELECT COUNT(*) FROM sd_replay_telemetry').fetchone()[0]
         segments=db.execute('SELECT COUNT(*) FROM sd_coverage_segments').fetchone()[0]
         db.execute('DROP TABLE sd_resolution_candidates')
+        # Marks the resolved view as ADC-pin volts throughout (telemetry_db::loadcell_volts_from_id).
+        db.execute('DROP TABLE IF EXISTS sd_replay_loadcell_units')
+        db.execute("CREATE TABLE sd_replay_loadcell_units(id INTEGER PRIMARY KEY CHECK(id=1),unit TEXT NOT NULL)")
+        db.execute("INSERT INTO sd_replay_loadcell_units VALUES(1,'adc_volts')")
         db.execute('CREATE TABLE IF NOT EXISTS sd_resolution_manifest(id INTEGER PRIMARY KEY CHECK(id=1),manifest_json TEXT NOT NULL)')
         summary={'format':'seds-sd-resolution','version':1,'axis':'canonical_utc','coverage_segments':segments,
                  'coverage_table':'sd_coverage_segments','network_suppressed_in_resolved_view':suppressed,

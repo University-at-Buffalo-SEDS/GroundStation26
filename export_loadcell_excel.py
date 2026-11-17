@@ -183,7 +183,7 @@ def write_calibration(workbook, fits):
     summary.append(("Mapping", "signed kg = slope * raw + intercept; absolute kg = abs(signed kg)"))
     summary.append(("Scope", "Fit uses full recording, independent of the selected export window"))
     summary.append(("Interpretation", "Reconstructs the conversion applied during recording; not independent physical calibration"))
-    summary.append(("Input units", "Recorded KG1000 raw units; do not assume these are actual ADC-input volts"))
+    summary.append(("Input units", "Recorded KG1000 values as stored: ADC-pin volts from stations with a loadcell_units table (rows from its first_volts_id); the DAQ legacy raw scale (volts / 17.3724) before that"))
     summary.append(("Diagnostics", "Residual = recorded kg minus mapped kg; R²/RMSE compare against recorded kg"))
     summary.append(("Sender", "Method", "Slope (kg/raw)", "Intercept (kg)", "Matched pairs",
                     "R squared", "RMSE (kg)", "Max abs residual (kg)", "Raw minimum", "Raw maximum", "Zero raw"))
@@ -209,7 +209,7 @@ def write_calibration(workbook, fits):
             sheet.cell(number, 7, m * x + b)
         chart = ScatterChart()
         chart.title = f"{fit['sender']}: kg = {m:.9g} × raw + ({b:.9g})"
-        chart.x_axis.title = "Recorded raw units"
+        chart.x_axis.title = "Recorded KG1000 input (V, or legacy raw)"
         chart.y_axis.title = "Signed kg"
         chart.width, chart.height = 28, 13
         observed = Series(Reference(sheet, min_col=2, min_row=2, max_row=len(points) + 1),

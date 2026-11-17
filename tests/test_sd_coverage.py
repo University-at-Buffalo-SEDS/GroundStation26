@@ -24,6 +24,9 @@ class CoverageTests(unittest.TestCase):
         self.db.execute('DELETE FROM telemetry')
         self.db.executemany('INSERT INTO telemetry VALUES(?,?,?,?,?,?,?)',[(i+1,base+50000,base+t,'DAQ','KG50','[99]','[]') for i,t in enumerate([2,7,15,100])])
         self.db.execute('INSERT INTO telemetry VALUES(9,?,?,"DAQ","KG50","[777]","[]")',(base+3,3))
+        # Recorded by a volts-scale station: network rows are served as stored.
+        self.db.execute('CREATE TABLE loadcell_units(id INTEGER PRIMARY KEY CHECK(id=1),first_volts_id INTEGER NOT NULL,unit TEXT NOT NULL)')
+        self.db.execute("INSERT INTO loadcell_units VALUES(1,1,'adc_volts')")
         self.db.commit()
         rows=[self.row(sensor='kg50_network',value=str(seq),timestamp_ms=str(base+t),uptime_ticks=str(100+t),monotonic_ms=str(100+t),record_sequence=str(seq)) for seq,t in [(1,0),(2,5),(3,10),(5,20),(6,30),(7,200)]]
         sd.import_csv(self.db,self.file('rate.csv',rows),self.manifest())
@@ -50,5 +53,45 @@ class CoverageTests(unittest.TestCase):
         self.assertEqual(summary['unresolved_samples'],1)
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM sd_samples').fetchone()[0],1)
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM sd_replay_telemetry').fetchone()[0],1)
+    def test_legacy_raw_load_cells_are_resolved_in_volts(self):
+        base=1700000000000;k=sd.LEGACY_RAW_TO_VOLTS
+        self.db.execute('DELETE FROM telemetry')
+        # Legacy station rows: AMP2 KG50 and KG1000 on the raw scale, a P6 KG50
+        # tagged [source, volts] (already volts), then rows after the volts mark.
+        self.db.executemany('INSERT INTO telemetry VALUES(?,?,?,?,?,?,?)',[
+            (1,base+50000,base+5000,'DAQ','KG50','[0.0122373]','[1,2,3,4]'),
+            (2,base+50000,base+5001,'DAQ','KG1000','[0.0122373]','[]'),
+            (3,base+50000,base+5002,'DAQ','KG50','[0.0042532505]','[0,0,128,63,218,94,139,59]'),
+            (4,base+50000,base+5003,'DAQ','ROLL','[0.5]','[]'),
+            (5,base+50000,base+5004,'DAQ','KG1000','[0.25]','[]')])
+        self.db.execute('CREATE TABLE loadcell_units(id INTEGER PRIMARY KEY CHECK(id=1),first_volts_id INTEGER NOT NULL,unit TEXT NOT NULL)')
+        self.db.execute("INSERT INTO loadcell_units VALUES(1,5,'adc_volts')")
+        self.db.commit()
+        # SD rows from the legacy firmware profile are raw-scale too.
+        rows=[self.row(sensor='kg50_network',value='0.0122373',timestamp_ms=str(base),uptime_ticks='100',monotonic_ms='100',record_sequence='1')]
+        sd.import_csv(self.db,self.file('legacy.csv',rows),self.manifest())
+        sd.resolve_recording(self.db)
+        resolved={(json.loads(p)['origin'],kind,t):(json.loads(v),json.loads(p)) for t,kind,v,p in
+                  self.db.execute('SELECT timestamp_ms,data_type,values_json,provenance_json FROM sd_replay_telemetry')}
+        volts=sd.legacy_raw_to_volts(0.0122373)
+        self.assertAlmostEqual(volts,0.0122373*k,places=6)
+        self.assertEqual(resolved[('network','KG50',base+5000)][0],[volts])
+        self.assertEqual(resolved[('network','KG50',base+5000)][1]['converted_from']['values_json'],'[0.0122373]')
+        self.assertEqual(resolved[('network','KG1000',base+5001)][0],[volts])
+        self.assertEqual(resolved[('network','KG50',base+5002)][0],[0.0042532505],'P6 volts are not rescaled')
+        self.assertEqual(resolved[('network','ROLL',base+5003)][0],[0.5])
+        self.assertEqual(resolved[('network','KG1000',base+5004)][0],[0.25],'after the volts mark')
+        sd_value,provenance=resolved[('sd','KG50',base)]
+        self.assertEqual(sd_value,[volts])
+        self.assertEqual(provenance['mapping']['units'],['V'])
+        self.assertEqual(provenance['mapping']['converted_from']['volts_per_raw'],'16000/921')
+        self.assertEqual(self.db.execute('SELECT unit FROM sd_replay_loadcell_units').fetchone()[0],'adc_volts')
+        # The original network table is untouched.
+        self.assertEqual(self.db.execute('SELECT values_json FROM main.telemetry WHERE id=2').fetchone()[0],'[0.0122373]')
+    def test_legacy_conversion_matches_the_backend_binary32_result(self):
+        import struct
+        f32=lambda x:struct.unpack('<f',struct.pack('<f',x))[0]
+        for raw in (0.0122373,0.19427338,-0.0015,1e-7):
+            self.assertEqual(sd.legacy_raw_to_volts(raw),f32(f32(raw)*16000/921))
 
 if __name__=='__main__':unittest.main()

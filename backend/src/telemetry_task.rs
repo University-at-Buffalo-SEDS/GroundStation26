@@ -6793,8 +6793,10 @@ mod tests {
         let db_overflow = test_db_overflow();
         {
             let mut cfg = state.loadcell_calibration.lock().unwrap();
-            cfg.ch1 = loadcell::ChannelLinear { m: Some(9481.619), b: Some(0.0) };
-            cfg.ch1_zero_raw = Some(0.0122373);
+            // The test-fire fit in kg/V (legacy 9481.619 kg/raw / k) and zero.
+            let k = loadcell::LEGACY_RAW_TO_VOLTS;
+            cfg.ch1 = loadcell::ChannelLinear { m: Some((9481.619 / k) as f32), b: Some(0.0) };
+            cfg.ch1_zero_raw = Some(loadcell::legacy_raw_to_volts(0.0122373));
         }
         let mut ws_rx = state.ws_tx.subscribe();
         let mut warnings_rx = state.warnings_tx.subscribe();
@@ -6810,9 +6812,10 @@ mod tests {
             )
             .unwrap()
         };
-        let rows = handle_packet(&state, &db_tx, &db_overflow, packet(500_000, 0.19427338)).await;
+        // DAQ code 0xB40000 at the ADC pin: 3.375 V, past the 2.4 V full scale.
+        let rows = handle_packet(&state, &db_tx, &db_overflow, packet(500_000, 3.375)).await;
         assert_eq!(rows[0].data_type, "KG1000");
-        assert_eq!(rows[0].values, vec![Some(0.19427338)]);
+        assert_eq!(rows[0].values, vec![Some(3.375)]);
         let mut weights = Vec::new();
         while let Ok(row) = ws_rx.try_recv() {
             if row.data_type == loadcell::DERIVED_WEIGHT_DATA_TYPE {
@@ -6826,7 +6829,7 @@ mod tests {
                 recorded.push((data_type, values_json));
             }
         }
-        assert!(recorded.iter().any(|(kind, values)| kind == "KG1000" && values.as_deref().is_some_and(|v| v.contains("0.194"))));
+        assert!(recorded.iter().any(|(kind, values)| kind == "KG1000" && values.as_deref().is_some_and(|v| v.contains("3.375"))));
         assert!(
             recorded
                 .iter()
@@ -6837,10 +6840,10 @@ mod tests {
             .expect("a railed load cell should raise a warning")
             .unwrap();
         assert!(warning.message.contains("rail"), "{}", warning.message);
-        handle_packet(&state, &db_tx, &db_overflow, packet(500_100, 0.19427338)).await;
+        handle_packet(&state, &db_tx, &db_overflow, packet(500_100, 3.375)).await;
         assert!(warnings_rx.try_recv().is_err(), "the same episode warns once");
         // Back in range: a real weight is published again.
-        handle_packet(&state, &db_tx, &db_overflow, packet(500_200, 0.0227373)).await;
+        handle_packet(&state, &db_tx, &db_overflow, packet(500_200, loadcell::legacy_raw_to_volts(0.0227373))).await;
         let mut last = None;
         while let Ok(row) = ws_rx.try_recv() {
             if row.data_type == loadcell::DERIVED_WEIGHT_DATA_TYPE {
@@ -6949,7 +6952,7 @@ mod tests {
         let header: Vec<_> = csv.lines().next().unwrap().split(',').collect();
         assert_eq!(
             header[..15].join(","),
-            "Rx_Timestamp,Header,Seq,Timestamp,1000kg Raw,Tank Pressure Raw,Battery Voltage,CRC,1000kg Calibrated,Weight,Thrust,Tank Pressure Calibrated,50kg Raw,50kg Calibrated,ADC Temperature C"
+            "Rx_Timestamp,Header,Seq,Timestamp,1000kg ADC (V),Tank Pressure Raw,Battery Voltage,CRC,1000kg Calibrated,Weight,Thrust,Tank Pressure Calibrated,50kg ADC (V),50kg Calibrated,ADC Temperature C"
         );
         assert_eq!(
             &header[15..],
@@ -6975,7 +6978,7 @@ mod tests {
         assert_eq!(data[1][3], "200", "actual PT packet source clock retained");
         assert_eq!(
             data[1][4], "4.25",
-            "existing raw loadcell remains unchanged"
+            "recorded load-cell volts remain unchanged"
         );
         assert_eq!(
             &data[2][15..],
@@ -7103,8 +7106,8 @@ mod tests {
     async fn kg1000_packet_emits_state_tab_loadcell_rows() {
         let (db_tx, mut db_rx) = mpsc::channel(8);
         let state = test_app_state(db_tx.clone()).await;
-        // This raw==kg numeric oracle owns its calibration (raw in the DAQ ADC
-        // range, so it is not treated as clipped); do not inherit a
+        // This volts==kg numeric oracle owns its calibration (volts in the DAQ
+        // ADC range, so it is not treated as clipped); do not inherit a
         // physical installation's saved fit from the stage runtime directory.
         *state.loadcell_calibration.lock().unwrap() = loadcell::LoadcellCalibrationFile::default();
         let db_overflow = test_db_overflow();
@@ -7115,7 +7118,7 @@ mod tests {
             &[crate::telemetry_schema::endpoint("GROUND_STATION")],
             Board::DaqBoard.sender_id(),
             456_789,
-            f32_payload(&[0.0425]),
+            f32_payload(&[0.25]),
         )
         .expect("failed to build KG1000 packet");
 
@@ -7127,7 +7130,7 @@ mod tests {
 
         assert_eq!(row.data_type, loadcell::RAW_LOADCELL_DATA_TYPE_1000KG);
         assert_eq!(row.sender_id, Board::DaqBoard.sender_id());
-        assert_eq!(row.values, vec![Some(0.0425)]);
+        assert_eq!(row.values, vec![Some(0.25)]);
 
         let mut broadcast_rows = Vec::new();
         for _ in 0..1 {
@@ -7148,7 +7151,7 @@ mod tests {
             vec![loadcell::DERIVED_WEIGHT_DATA_TYPE]
         );
         assert_eq!(broadcast_rows[0].sender_id, Board::DaqBoard.sender_id());
-        assert_eq!(broadcast_rows[0].values, vec![Some(0.0425)]);
+        assert_eq!(broadcast_rows[0].values, vec![Some(0.25)]);
         assert_eq!(broadcast_rows[0].timestamp_ms, row.timestamp_ms);
         assert_eq!(*state.latest_fill_mass_kg.lock().unwrap(), None);
 

@@ -362,7 +362,7 @@ impl Service {
                 let result = (|| -> std::io::Result<()> {
                     writeln!(
                         file,
-                        "timestamp_ms,known_load_kg,raw_value,adc_temperature_c"
+                        "timestamp_ms,known_load_kg,adc_volts,adc_temperature_c"
                     )?;
                     let mut last_flush = Instant::now();
                     while !worker_stop.load(Ordering::Relaxed)

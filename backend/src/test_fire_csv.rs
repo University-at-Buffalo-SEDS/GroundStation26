@@ -41,6 +41,7 @@ pub async fn export_recording_csv(
     calibration: &LoadcellCalibrationFile,
 ) -> Result<()> {
     let db = SqlitePool::connect(&format!("sqlite://{db_path}")).await?;
+    let volts_from_id = crate::telemetry_db::loadcell_volts_from_id(&db).await;
     let rows = sqlx::query(
         r#"
         SELECT
@@ -110,11 +111,12 @@ pub async fn export_recording_csv(
     let mut writer = std::io::BufWriter::new(std::fs::File::create(csv_path)?);
     writeln!(
         writer,
-        "Rx_Timestamp,Header,Seq,Timestamp,1000kg Raw,Tank Pressure Raw,Battery Voltage,CRC,1000kg Calibrated,Weight,Thrust,Tank Pressure Calibrated,50kg Raw,50kg Calibrated,ADC Temperature C,Chamber Pressure (psig),Chamber Connector Voltage (V)"
+        "Rx_Timestamp,Header,Seq,Timestamp,1000kg ADC (V),Tank Pressure Raw,Battery Voltage,CRC,1000kg Calibrated,Weight,Thrust,Tank Pressure Calibrated,50kg ADC (V),50kg Calibrated,ADC Temperature C,Chamber Pressure (psig),Chamber Connector Voltage (V)"
     )?;
+    // Load-cell coefficients are kg = f(ADC-pin volts): m in kg/V, b in kg.
     writeln!(
         writer,
-        "CALIBRATION,,,,\"{}\",\"{}\",,,,,,,,,,",
+        "CALIBRATION,,,,\"{} (kg/V)\",\"{}\",,,,,,,,,,",
         linear_formula(calibration.ch1.m, calibration.ch1.b),
         linear_formula(calibration.iadc.m, calibration.iadc.b)
     )?;
@@ -122,7 +124,7 @@ pub async fn export_recording_csv(
     let kg50 = crate::loadcell::kg50_daq_coefficients(calibration).map_err(anyhow::Error::msg)?;
     writeln!(
         writer,
-        "CALIBRATION_50KG,,,,,,,,,,,,\"c0={};c1={};c2={};c3={};c4={};x0={};tare={}\",,,,",
+        "CALIBRATION_50KG,,,,,,,,,,,,\"c0={};c1={};c2={};c3={};c4={};x0={};tare={} (x in V)\",,,,",
         kg50[0], kg50[1], kg50[2], kg50[3], kg50[4], kg50[5], kg50[6]
     )?;
     let mut state = ExportState::default();
@@ -131,7 +133,15 @@ pub async fn export_recording_csv(
     let mut temperatures: Vec<crate::types::TelemetryRow> = Vec::new();
     for row in rows {
         let data_type: String = row.get("data_type");
-        let values = parse_values_json(row.get::<Option<String>, _>("values_json").as_deref());
+        let mut values = parse_values_json(row.get::<Option<String>, _>("values_json").as_deref());
+        if row.get::<i64, _>("id") < volts_from_id {
+            // Recorded on the DAQ legacy raw scale: export volts throughout.
+            crate::loadcell::legacy_loadcell_row_to_volts(
+                &data_type,
+                row.get::<Option<String>, _>("payload_json").as_deref(),
+                &mut values,
+            );
+        }
         let first_value = values.first().copied().flatten();
 
         match data_type.as_str() {
@@ -261,7 +271,7 @@ fn chamber_packet_key(row: &sqlx::sqlite::SqliteRow) -> (String, i64, Option<i64
 }
 
 /// A DAQ load-cell sample at an ADC or amplifier rail carries no load
-/// information: the export keeps its raw value and leaves its weight empty,
+/// information: the export keeps its volts and leaves its weight empty,
 /// like the live LOADCELL_WEIGHT_KG, and resets the smoothing filter.
 fn railed(
     calibration: &LoadcellCalibrationFile,
@@ -269,10 +279,10 @@ fn railed(
     sender: &str,
     sensor: &str,
     timestamp_ms: i64,
-    raw: f32,
+    volts: f32,
 ) -> bool {
     let railed = crate::loadcell::daq_rails_apply()
-        && crate::loadcell::loadcell_raw_at_rail(calibration.kg50_input, sensor, raw);
+        && crate::loadcell::loadcell_volts_at_rail(calibration.kg50_input, sensor, volts);
     if railed {
         let _ = filters.filter(calibration, sender, sensor, timestamp_ms, f32::NAN);
     }
@@ -343,10 +353,11 @@ mod tests {
             .unwrap();
         sqlx::query("CREATE TABLE telemetry (id INTEGER PRIMARY KEY, timestamp_ms INTEGER, source_timestamp_ms INTEGER, data_type TEXT, values_json TEXT, payload_json TEXT, sender_id TEXT)")
             .execute(&db).await.unwrap();
-        // In-range DAQ raw values (a raw beyond the ADC rail exports no weight).
+        crate::telemetry_db::mark_loadcell_volts(&db).await.unwrap();
+        // In-range DAQ volts (a value beyond the ADC rail exports no weight).
         for (i, raw) in [0.0625, 0.09375].iter().enumerate() {
             sqlx::query("INSERT INTO telemetry VALUES (?, ?, ?, 'KG50', ?, '[]', 'DAQ')")
-                .bind(i as i64)
+                .bind(i as i64 + 1)
                 .bind(10000_i64 + i as i64)
                 .bind(9000_i64 + i as i64)
                 .bind(format!("[{raw}]"))
@@ -389,10 +400,11 @@ mod tests {
     }
 
     /// A load-cell sample at the ADC clip or the KG1000 amplifier floor (the
-    /// 2026-11-16 test fire: raw 0.19427338 read as 1726 kg, raw 0.0015 as
-    /// about -100 kg) keeps its raw value and exports an empty weight.
+    /// 2026-11-16 test fire: code 0xB40000, 3.375 V, read as 1726 kg; legacy
+    /// raw 0.0015, 0.026 V, as about -100 kg) keeps its volts and exports an
+    /// empty weight.
     #[tokio::test]
-    async fn railed_loadcell_samples_export_raw_without_a_weight() {
+    async fn railed_loadcell_samples_export_volts_without_a_weight() {
         crate::mode_suite!(TestFire);
         let dir = std::env::temp_dir().join(format!(
             "gs-railed-csv-{}-{}",
@@ -410,17 +422,18 @@ mod tests {
             .unwrap();
         sqlx::query("CREATE TABLE telemetry (id INTEGER PRIMARY KEY, timestamp_ms INTEGER, source_timestamp_ms INTEGER, data_type TEXT, values_json TEXT, payload_json TEXT, sender_id TEXT)")
             .execute(&db).await.unwrap();
+        crate::telemetry_db::mark_loadcell_volts(&db).await.unwrap();
         let rows = [
-            ("KG1000", 0.0625),
-            ("KG1000", 0.19427338),
-            ("KG1000", 0.0015),
-            ("KG1000", 0.0625),
-            ("KG50", 0.0625),
-            ("KG50", 0.2109375),
+            ("KG1000", 0.5),
+            ("KG1000", 3.375),
+            ("KG1000", 0.026),
+            ("KG1000", 0.5),
+            ("KG50", 0.5),
+            ("KG50", 3.375),
         ];
         for (i, (kind, raw)) in rows.iter().enumerate() {
             sqlx::query("INSERT INTO telemetry VALUES (?, ?, ?, ?, ?, '[]', 'DAQ')")
-                .bind(i as i64)
+                .bind(i as i64 + 1)
                 .bind(10000_i64 + i as i64)
                 .bind(9000_i64 + i as i64)
                 .bind(*kind)
@@ -431,7 +444,7 @@ mod tests {
         }
         db.close().await;
         let mut cfg = LoadcellCalibrationFile::default();
-        cfg.ch1 = crate::loadcell::ChannelLinear { m: Some(1000.0), b: Some(0.0) };
+        cfg.ch1 = crate::loadcell::ChannelLinear { m: Some(125.0), b: Some(0.0) };
         cfg.extra_channels.insert(
             "kg50".into(),
             crate::loadcell::GenericCalibrationChannel {
@@ -449,14 +462,77 @@ mod tests {
             .map(|line| line.split(',').collect())
             .collect();
         assert_eq!(samples.len(), 6);
-        // KG1000: column 4 raw, 8 calibrated weight, 10 thrust.
-        assert_eq!([samples[0][4], samples[0][8], samples[0][10]], ["0.0625", "62.5", "62.5"]);
-        assert_eq!([samples[1][4], samples[1][8], samples[1][10]], ["0.19427338", "", ""], "ADC clip");
-        assert_eq!([samples[2][4], samples[2][8], samples[2][10]], ["0.0015", "", ""], "amplifier floor");
-        assert_eq!([samples[3][4], samples[3][8], samples[3][10]], ["0.0625", "62.5", "62.5"]);
-        // KG50: column 12 raw, 13 weight.
-        assert_eq!(samples[4][12..14], ["0.0625", "3"]);
-        assert_eq!(samples[5][12..14], ["0.2109375", ""], "KG50 at the ADC clip");
+        // KG1000: column 4 volts, 8 calibrated weight, 10 thrust.
+        assert_eq!([samples[0][4], samples[0][8], samples[0][10]], ["0.5", "62.5", "62.5"]);
+        assert_eq!([samples[1][4], samples[1][8], samples[1][10]], ["3.375", "", ""], "ADC clip");
+        assert_eq!([samples[2][4], samples[2][8], samples[2][10]], ["0.026", "", ""], "amplifier floor");
+        assert_eq!([samples[3][4], samples[3][8], samples[3][10]], ["0.5", "62.5", "62.5"]);
+        // KG50: column 12 volts, 13 weight.
+        assert_eq!(samples[4][12..14], ["0.5", "17"]);
+        assert_eq!(samples[5][12..14], ["3.375", ""], "KG50 at the ADC clip");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_raw_recording_exports_volts_and_the_same_kg_after_migration() {
+        crate::mode_suite!(TestFire);
+        let dir = std::env::temp_dir().join(format!(
+            "gs-legacy-csv-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("recording.db");
+        let csv_path = dir.join("recording.csv");
+        let db = SqlitePool::connect(&format!("sqlite://{}?mode=rwc", db_path.display()))
+            .await
+            .unwrap();
+        // A pre-change recording: no load-cell unit marker, raw-scale values.
+        sqlx::query("CREATE TABLE telemetry (id INTEGER PRIMARY KEY, timestamp_ms INTEGER, source_timestamp_ms INTEGER, data_type TEXT, values_json TEXT, payload_json TEXT, sender_id TEXT)")
+            .execute(&db).await.unwrap();
+        let raw = [0.0122373_f32, 0.020895265, 0.04];
+        for (i, value) in raw.iter().enumerate() {
+            sqlx::query("INSERT INTO telemetry VALUES (?, ?, ?, 'KG1000', ?, '[1]', 'DAQ')")
+                .bind(i as i64 + 1)
+                .bind(10000_i64 + i as i64)
+                .bind(9000_i64 + i as i64)
+                .bind(format!("[{value}]"))
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+        // P6 selections were volts already: tagged [1.0, volts] payload.
+        sqlx::query("INSERT INTO telemetry VALUES (9, 10009, 9009, 'KG50', '[0.0042532505]', '[0,0,128,63,218,94,139,59]', 'DAQ')")
+            .execute(&db).await.unwrap();
+        db.close().await;
+        let mut old: LoadcellCalibrationFile = serde_json::from_str(
+            r#"{"version":1,"ch1":{"m":9481.619,"b":-115.9939},"ch1_zero_raw":0.0122373,
+                "extra_channels":{"ch1":{"linear":{"m":9481.619,"b":-115.9939},"zero_raw":0.0122373,
+                "fit":{"type":"linear"}}}}"#,
+        )
+        .unwrap();
+        let before: Vec<f32> = raw
+            .iter()
+            .map(|r| crate::loadcell::calibrated_weight_kg(&old, "KG1000", *r).unwrap())
+            .collect();
+        crate::loadcell::migrate_calibration(&mut old);
+        export_recording_csv(db_path.to_str().unwrap(), &csv_path, &old)
+            .await
+            .unwrap();
+        let csv = std::fs::read_to_string(&csv_path).unwrap();
+        let rows: Vec<Vec<&str>> = csv.lines().skip(3).map(|l| l.split(',').collect()).collect();
+        assert_eq!(rows.len(), 4);
+        for (i, row) in rows[..3].iter().enumerate() {
+            let volts: f32 = row[4].parse().unwrap();
+            let expected = crate::loadcell::legacy_raw_to_volts(raw[i]);
+            assert_eq!(volts, expected);
+            let kg: f32 = row[8].parse().unwrap();
+            assert!((kg - before[i]).abs() <= 1e-3 + before[i].abs() * 1e-5, "{kg} vs {}", before[i]);
+        }
+        assert_eq!(rows[3][12], "0.0042532505", "P6 volts are not rescaled");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

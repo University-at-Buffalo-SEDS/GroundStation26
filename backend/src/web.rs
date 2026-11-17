@@ -108,6 +108,18 @@ fn values_from_row(row: &sqlx::sqlite::SqliteRow) -> Vec<Option<f32>> {
     Vec::new()
 }
 
+/// Recorded values with load-cell rows written before `volts_from_id` (the
+/// DAQ legacy raw scale) converted to ADC-pin volts.
+fn recorded_values_from_row(row: &sqlx::sqlite::SqliteRow, volts_from_id: i64) -> Vec<Option<f32>> {
+    let mut values = values_from_row(row);
+    if row.try_get::<i64, _>("id").is_ok_and(|id| id < volts_from_id) {
+        let data_type = row.try_get::<String, _>("data_type").unwrap_or_default();
+        let payload = row.try_get::<Option<String>, _>("payload_json").ok().flatten();
+        loadcell::legacy_loadcell_row_to_volts(&data_type, payload.as_deref(), &mut values);
+    }
+    values
+}
+
 /// Returns the flattened channel value at `idx` when present.
 fn value_at(values: &[Option<f32>], idx: usize) -> Option<f32> {
     values.get(idx).copied().flatten()
@@ -934,12 +946,16 @@ async fn get_map_config(
 #[derive(Deserialize)]
 struct CaptureLoadcellPointReq {
     sensor_id: String,
+    /// KG1000/KG50: ADC-pin volts (the `raw` name is kept for the wire API).
+    #[serde(alias = "volts")]
     raw: f32,
 }
 
 #[derive(Deserialize)]
 struct CaptureLoadcellSpanReq {
     sensor_id: String,
+    /// KG1000/KG50: ADC-pin volts (the `raw` name is kept for the wire API).
+    #[serde(alias = "volts")]
     raw: f32,
     known_kg: f32,
 }
@@ -1651,9 +1667,11 @@ async fn stream_recent_rows_response(state: Arc<AppState>) -> Response {
     tokio::spawn(async move {
         if let Some(end_ms) = db_end_ms {
             let db = state_for_task.telemetry_db_pool();
+            let volts_from_id = crate::telemetry_db::loadcell_volts_from_id(&db).await;
             let mut rows = sqlx::query(
                 r#"
                 SELECT
+                    id,
                     timestamp_ms,
                     source_timestamp_ms,
                     data_type,
@@ -1674,7 +1692,7 @@ async fn stream_recent_rows_response(state: Arc<AppState>) -> Response {
                     timestamp_ms: row.get::<i64, _>("timestamp_ms"),
                     data_type: row.get::<String, _>("data_type"),
                     sender_id: row.get::<String, _>("sender_id"),
-                    values: values_from_row(&row),
+                    values: recorded_values_from_row(&row, volts_from_id),
                 };
                 crate::telemetry_provenance::note(
                     &telemetry_row,
@@ -1737,9 +1755,12 @@ async fn load_recent_rows_from_db(
         return Vec::new();
     }
 
+    let db = state.telemetry_db_pool();
+    let volts_from_id = crate::telemetry_db::loadcell_volts_from_id(&db).await;
     let rows_db = sqlx::query(
         r#"
         SELECT
+            id,
             timestamp_ms,
             source_timestamp_ms,
             data_type,
@@ -1753,7 +1774,7 @@ async fn load_recent_rows_from_db(
     )
     .bind(start_ms)
     .bind(end_ms)
-    .fetch_all(&state.telemetry_db_pool())
+    .fetch_all(&db)
     .await
     .unwrap_or_default();
 
@@ -1763,7 +1784,7 @@ async fn load_recent_rows_from_db(
             timestamp_ms: row.get::<i64, _>("timestamp_ms"),
             data_type: row.get::<String, _>("data_type"),
             sender_id: row.get::<String, _>("sender_id"),
-            values: values_from_row(&row),
+            values: recorded_values_from_row(&row, volts_from_id),
         };
         crate::telemetry_provenance::note(
             &telemetry_row,
