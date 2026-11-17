@@ -424,6 +424,10 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
             get(get_kg50_input_status).post(set_kg50_input),
         )
         .route(
+            "/api/calibration/chamber_pt",
+            get(get_chamber_pt).post(set_chamber_pt),
+        )
+        .route(
             "/api/calibration/long_zero",
             get(long_zero_status).post(long_zero_start),
         )
@@ -1051,6 +1055,52 @@ async fn set_loadcell_calibration(
 #[derive(serde::Deserialize)]
 struct Kg50InputRequest {
     input: loadcell::Kg50Input,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct ChamberPtRequest {
+    installed: bool,
+}
+
+/// Whether a chamber pressure transducer is connected to the DAQ (P4).
+async fn get_chamber_pt(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let installed = state.loadcell_calibration.lock().unwrap().chamber_pt_installed;
+    Json(ChamberPtRequest { installed }).into_response()
+}
+
+/// Station setting, saved with the calibration file. Not installed: the
+/// chamber reads "not installed" instead of 0 psig and the DAQ's chamber
+/// no-signal fault is neither listed nor announced. Nothing is sent to the
+/// DAQ: an absent 0-5 V transducer and a vented one read the same there.
+async fn set_chamber_pt(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<ChamberPtRequest>,
+) -> axum::response::Response {
+    let admission_generation = crate::gse::capture_operator_origin(&state).unwrap_or(0);
+    let principal = match authorize_headers(&state, &headers, Permission::ViewData).await {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    if !principal_can_edit_calibration(&principal) {
+        return calibration_edit_forbidden_response();
+    }
+    let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
+        return admission_refused(&state, "Changing the chamber PT setting");
+    };
+    {
+        let mut current = state.loadcell_calibration.lock().unwrap();
+        if current.chamber_pt_installed != req.installed {
+            let mut cfg = current.clone();
+            cfg.chamber_pt_installed = req.installed;
+            if let Err(err) = loadcell::save(&cfg) {
+                return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
+            }
+            *current = cfg;
+        }
+    }
+    state.network_health.lock().unwrap().set_chamber_pt_installed(req.installed);
+    Json(ChamberPtRequest { installed: req.installed }).into_response()
 }
 
 /// The operator's selection against what the DAQ is reporting right now.
@@ -6873,6 +6923,39 @@ mod recovery_direct_ingress_tests {
         assert_eq!(wire["selected"], "p6_differential");
         assert_eq!(wire["board_input"], "p6_differential");
         assert_eq!(wire["state"], "synced");
+    }
+    #[tokio::test]
+    async fn chamber_pt_setting_persists_and_defaults_to_installed() {
+        if crate::operator_queue::isolated_case(
+            module_path!(),
+            "chamber_pt_setting_persists_and_defaults_to_installed",
+        ) {
+            return;
+        }
+        let (_root, state, headers, _router, _) = fixture().await;
+        assert!(state.loadcell_calibration.lock().unwrap().chamber_pt_installed);
+        let older: loadcell::LoadcellCalibrationFile =
+            serde_json::from_str(r#"{"version":2}"#).unwrap();
+        assert!(older.chamber_pt_installed, "a file without the field means installed");
+        let response = set_chamber_pt(
+            State(state.clone()),
+            headers.clone(),
+            Json(ChamberPtRequest { installed: false }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!state.loadcell_calibration.lock().unwrap().chamber_pt_installed);
+        assert!(
+            !loadcell::load_or_default().chamber_pt_installed,
+            "a restarted station reads the same setting"
+        );
+        let body = axum::body::to_bytes(get_chamber_pt(State(state.clone())).await.into_response().into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap(), serde_json::json!({"installed": false}));
+        let response = set_chamber_pt(State(state.clone()), headers, Json(ChamberPtRequest { installed: true })).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(loadcell::load_or_default().chamber_pt_installed);
     }
     #[tokio::test]
     async fn closed_admission_refuses_calibration_with_its_reason_and_next_step() {

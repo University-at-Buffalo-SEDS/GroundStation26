@@ -81,7 +81,7 @@ impl Fault {
             Fault::Kg50HighRail | Fault::Kg50LowRail => "Check the 50 kg load-cell wiring and the DAQ supply.",
             Fault::P6LegImbalance => "One sense lead is intermittent: check the P6 connector (S+ is P6/3).",
             Fault::P6CommonMode => "Both legs moved together: bridge excitation or both sense leads lost; check P6.",
-            Fault::ChamberNoSignal => "Check P4 wiring (signal P4/3) and +12VA excitation on P4/6.",
+            Fault::ChamberNoSignal => "Check P4 wiring (signal P4/3) and +12VA excitation on P4/6. If no chamber PT is connected, mark it not installed.",
         }
     }
     /// Live-sample rail alert (b15b54c) owning the same condition, if any.
@@ -147,17 +147,20 @@ impl Report {
         })
     }
 
-    pub fn status(&self, received_age_ms: u64) -> DaqInputHealthStatus {
+    /// `chamber_pt_installed`: the station's setting; without a chamber PT the
+    /// chamber check is not shown.
+    pub fn status(&self, received_age_ms: u64, chamber_pt_installed: bool) -> DaqInputHealthStatus {
         DaqInputHealthStatus {
             received_age_ms,
             faults: FAULTS
                 .iter()
                 .filter(|fault| {
                     // P6 checks apply only while P6 is the selected KG50 input,
-                    // the chamber check only once a reading arrived.
+                    // the chamber check only once a reading arrived and while
+                    // a chamber PT is installed.
                     match fault {
                         Fault::P6LegImbalance | Fault::P6CommonMode => self.kg50_p6,
-                        Fault::ChamberNoSignal => self.chamber_seen,
+                        Fault::ChamberNoSignal => self.chamber_seen && chamber_pt_installed,
                         _ => true,
                     }
                 })
@@ -171,6 +174,7 @@ impl Report {
                 })
                 .collect(),
             kg50_p6: self.kg50_p6,
+            chamber_pt_installed,
             vmain_mv: self.vmain_mv,
             vmain_min_mv: self.vmain_min_mv,
             chamber_mv: self.chamber_mv,
@@ -223,8 +227,11 @@ impl Report {
             }
             Fault::ChamberNoSignal => {
                 let reads = self.chamber_mv.or(self.chamber_min_mv).map_or_else(|| "near 0 V".into(), volts);
+                // The DAQ raises this only in the launch burn window (T0 + 1.5 s
+                // to T0 + 5 s) for the installed 0-5 V PX309, which reads 0 V
+                // when vented; at rest it is never reported.
                 format!(
-                    "Chamber pressure transducer reads {reads} — no signal; check P4 wiring (signal P4/3) and +12VA excitation on P4/6. A vented 0–5 V transducer can also read near 0 V, so confirm it rises when pressurized."
+                    "Chamber pressure transducer reads {reads} — no signal during the burn; check P4 wiring (signal P4/3) and +12VA excitation on P4/6 (if no chamber PT is connected, mark it not installed)."
                 )
             }
         }
@@ -245,11 +252,13 @@ impl AlertTracker {
     /// Alerts to raise for `report`, received at `now_ms`. `claim_rail(sensor)`
     /// returns true when the live-sample rail alert has not already told the
     /// operator (and records that this alert did), so a rail is never
-    /// announced twice.
+    /// announced twice. Without a chamber PT installed (station setting) the
+    /// chamber no-signal fault is never announced.
     pub fn observe(
         &mut self,
         report: &Report,
         now_ms: i64,
+        chamber_pt_installed: bool,
         mut claim_rail: impl FnMut(&str) -> bool,
     ) -> Vec<String> {
         let mut alerts = Vec::new();
@@ -281,6 +290,9 @@ impl AlertTracker {
             if !(started || brief && !matches!(fault, Fault::ChamberNoSignal | Fault::P6CommonMode)) {
                 continue;
             }
+            if fault == Fault::ChamberNoSignal && !chamber_pt_installed {
+                continue;
+            }
             let i = fault as usize;
             if let Some(sensor) = fault.rail_sensor() {
                 if !claim_rail(sensor) {
@@ -306,6 +318,7 @@ pub fn observe_alerts(
     sender: &str,
     report: &Report,
     now_ms: i64,
+    chamber_pt_installed: bool,
     claim_rail: impl FnMut(&str) -> bool,
 ) -> Vec<String> {
     TRACKERS
@@ -314,7 +327,7 @@ pub fn observe_alerts(
         .unwrap()
         .entry(sender.to_owned())
         .or_default()
-        .observe(report, now_ms, claim_rail)
+        .observe(report, now_ms, chamber_pt_installed, claim_rail)
 }
 
 #[cfg(test)]
@@ -368,12 +381,12 @@ mod tests {
     #[test]
     fn status_lists_only_the_checks_that_apply() {
         let r = decode(&words(1, 1, [3, 0, 0, 0, 0, 0, 0, 0], (11_030, 11_100), NONE, NONE, 0));
-        let status = r.status(250);
+        let status = r.status(250, true);
         let keys: Vec<_> = status.faults.iter().map(|f| f.key.as_str()).collect();
         assert_eq!(keys, ["supply_low", "kg1000_high_rail", "kg1000_low_rail", "kg50_high_rail", "kg50_low_rail"]);
         assert!(status.faults[0].active && status.faults[0].latched && status.faults[0].episodes == 3);
         assert_eq!(status.received_age_ms, 250);
-        let status = decode(&words(0, 0, [0; 8], HEALTHY, (8, 17), (4, 1_137), 0x300)).status(0);
+        let status = decode(&words(0, 0, [0; 8], HEALTHY, (8, 17), (4, 1_137), 0x300)).status(0, true);
         assert_eq!(status.faults.len(), 8);
         assert_eq!(status.p6_common_mv, Some(1_137));
     }
@@ -387,7 +400,8 @@ mod tests {
         );
         assert!(r.alert_text(Fault::SupplyLow, true, 1).contains("(1 dip in 60 s"));
         let chamber = r.alert_text(Fault::ChamberNoSignal, false, 0);
-        assert!(chamber.starts_with("Chamber pressure transducer reads 0.01 V — no signal; check P4 wiring"), "{chamber}");
+        assert_eq!(chamber, "Chamber pressure transducer reads 0.01 V — no signal during the burn; check P4 wiring (signal P4/3) and +12VA excitation on P4/6 (if no chamber PT is connected, mark it not installed).");
+        assert!(!chamber.contains("vented"), "the DAQ no longer reports a vented transducer at rest");
         assert!(chamber.contains("+12VA excitation on P4/6"));
         let p6 = r.alert_text(Fault::P6LegImbalance, true, 0);
         assert!(p6.contains("briefly disagreed by 0.2 V") && p6.contains("P6/3"), "{p6}");
@@ -398,7 +412,7 @@ mod tests {
     }
 
     fn observe(t: &mut AlertTracker, w: &[u32], now: i64) -> Vec<String> {
-        t.observe(&decode(w), now, |_| true)
+        t.observe(&decode(w), now, true, |_| true)
     }
 
     #[test]
@@ -445,6 +459,32 @@ mod tests {
     }
 
     #[test]
+    fn without_a_chamber_pt_installed_the_chamber_fault_is_neither_listed_nor_announced() {
+        let mut n = [0u16; 8];
+        n[7] = 1;
+        // The 2026-11-16 fire: no chamber PT connected, CH6 at 0.01 V in the burn.
+        let chamber = words(0x81, 0x81, [1, 0, 0, 0, 0, 0, 0, 1], (11_050, 11_100), (8, 12), NONE, 0x200);
+        let mut t = AlertTracker::default();
+        let alerts = t.observe(&decode(&chamber), 0, false, |_| true);
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
+        assert!(alerts[0].starts_with("DAQ supply dropped"), "other faults still alert: {alerts:?}");
+        for at in (1_000..60_000).step_by(1_000) {
+            assert!(t.observe(&decode(&chamber), at, false, |_| true).is_empty());
+        }
+        let status = decode(&chamber).status(0, false);
+        assert!(!status.chamber_pt_installed);
+        assert!(status.faults.iter().all(|f| f.key != "chamber_no_signal"));
+        assert_eq!(status.chamber_mv, Some(12), "the reading is still shown");
+        // Installed: the same report is listed and announced.
+        let status = decode(&chamber).status(0, true);
+        assert!(status.chamber_pt_installed);
+        assert!(status.faults.iter().any(|f| f.key == "chamber_no_signal" && f.active));
+        let alerts = AlertTracker::default().observe(&decode(&words(0x80, 0x80, n, HEALTHY, (8, 12), NONE, 0x200)), 0, true, |_| true);
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].contains("no signal during the burn") && alerts[0].contains("mark it not installed"));
+    }
+
+    #[test]
     fn a_brief_chamber_or_excitation_dip_is_not_an_alert() {
         let mut t = AlertTracker::default();
         observe(&mut t, &words(0, 0, [0; 8], HEALTHY, (1_000, 1_000), (4, 1_137), 0x300), 0);
@@ -463,7 +503,7 @@ mod tests {
         let railed = words(0x02, 0x02, n, HEALTHY, NONE, NONE, 0);
         // The station already alerted from the live KG1000 samples.
         let mut asked = Vec::new();
-        let alerts = t.observe(&decode(&railed), 1_000, |sensor| {
+        let alerts = t.observe(&decode(&railed), 1_000, true, |sensor| {
             asked.push(sensor.to_string());
             false
         });
@@ -472,7 +512,7 @@ mod tests {
         // A brief rail the live stream never showed is announced once.
         n[1] = 2;
         let brief = words(0, 0x02, n, HEALTHY, NONE, NONE, 0);
-        let alerts = t.observe(&decode(&brief), 2_000, |sensor| sensor == "KG1000");
+        let alerts = t.observe(&decode(&brief), 2_000, true, |sensor| sensor == "KG1000");
         assert_eq!(alerts.len(), 1);
         assert!(alerts[0].contains("briefly hit its ADC full-scale rail"), "{}", alerts[0]);
     }

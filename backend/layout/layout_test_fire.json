@@ -904,6 +904,17 @@
             ],
             "summary_items": [
               {
+                "label": "Chamber PT",
+                "data_type": "COMBUSTION_CHAMBER_PT_INSTALLED",
+                "sender_id": "DAQ",
+                "index": 0,
+                "boolean_labels": {
+                  "true_label": "Installed",
+                  "false_label": "Not installed",
+                  "unknown_label": "No reading"
+                }
+              },
+              {
                 "label": "Chamber pressure",
                 "data_type": "COMBUSTION_CHAMBER_PRESSURE",
                 "sender_id": "DAQ",

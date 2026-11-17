@@ -34,6 +34,19 @@ writing after T+20, while a later record belongs to the ordinary log. The close
 window is a capture boundary, not a requirement that the card has flushed by
 that exact instant.
 
+The DAQ also uses this T0 for its chamber no-signal input check
+(`DAQ_INPUT_HEALTH`): the installed 0-5 V chamber PT reads about 0 V when
+vented, so the DAQ checks it only from T0 + 1.5 s to T0 + 5 s, when the chamber
+must be pressurized. With no launch clock (at rest, fill, HITL without a launch)
+the check is inactive. The station alert reads "Chamber pressure transducer
+reads 0.01 V — no signal during the burn; check P4 wiring (signal P4/3) and
++12VA excitation on P4/6 (if no chamber PT is connected, mark it not
+installed)". The station setting `chamber_pt_installed` (saved in the
+calibration file, default installed; `GET/POST /api/calibration/chamber_pt`
+with `{"installed": bool}`) turns the chamber card to "Not installed" with no
+psig value, and hides and silences the chamber check. It is station-side only:
+the DAQ cannot tell an absent 0-5 V PT from a vented one.
+
 Valid UTC is required to date this window. A Pi with an invalid wall clock and
 no usable network UTC receives an explicit publication error; GroundStation
 does not invent a UTC anchor or add a new launch interlock. Router initialization

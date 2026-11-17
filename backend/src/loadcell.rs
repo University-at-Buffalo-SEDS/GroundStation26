@@ -182,6 +182,11 @@ pub struct LoadcellCalibrationFile {
     pub weights_kg: Vec<f32>,
     #[serde(default)]
     pub extra_channels: BTreeMap<String, GenericCalibrationChannel>,
+    /// A chamber pressure transducer is connected to the DAQ (P4). Off: the
+    /// chamber reads "not installed" instead of 0 psig and its no-signal
+    /// input fault is not raised. Station-side only; missing means installed.
+    #[serde(default = "default_chamber_pt_installed")]
+    pub chamber_pt_installed: bool,
 }
 
 impl Default for LoadcellCalibrationFile {
@@ -217,6 +222,7 @@ impl Default for LoadcellCalibrationFile {
             }),
             weights_kg: Vec::new(),
             extra_channels: BTreeMap::new(),
+            chamber_pt_installed: true,
         }
     }
 }
@@ -228,6 +234,10 @@ pub const CALIBRATION_VERSION: u32 = 2;
 /// A file without a version field predates versioning: legacy raw scale.
 fn default_calibration_version() -> u32 {
     1
+}
+
+fn default_chamber_pt_installed() -> bool {
+    true
 }
 
 /// Exact legacy-raw to ADC-pin-volts factor for the DAQ amplified inputs.

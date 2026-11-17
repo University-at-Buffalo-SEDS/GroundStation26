@@ -13,6 +13,9 @@ const CLOCK_WINDOW_MS: u64 = 10_000;
 pub struct Tracker {
     boards: HashMap<String, Record>,
     pub(crate) sd_retry_gate: crate::daq_sd::RetryGate,
+    /// Station setting (LoadcellCalibrationFile::chamber_pt_installed), negated
+    /// so the default is installed.
+    chamber_pt_not_installed: bool,
 }
 struct Record {
     diagnostics: Option<(BoardDiagnostics, Instant)>,
@@ -315,6 +318,11 @@ impl Tracker {
         true
     }
 
+    /// Whether a chamber pressure transducer is connected (station setting).
+    pub fn set_chamber_pt_installed(&mut self, installed: bool) {
+        self.chamber_pt_not_installed = !installed;
+    }
+
     /// DAQ_INPUT_HEALTH; returns the decoded report for alerting.
     pub fn observe_input_health(
         &mut self,
@@ -483,6 +491,7 @@ impl Tracker {
         status_without_health: bool,
     ) -> Vec<NetworkBoardHealthEntry> {
         let mut rows = Vec::new();
+        let chamber_pt_installed = !self.chamber_pt_not_installed;
         for (sender, r) in &mut self.boards {
             r.advance(now);
             if !r.visible(sender, test_fire) {
@@ -518,7 +527,7 @@ impl Tracker {
                         status.overlay(&mut report, elapsed(now, *received));
                     }
                     if let Some((input, received)) = &r.input_health {
-                        report.daq_input = Some(input.status(elapsed(now, *received)));
+                        report.daq_input = Some(input.status(elapsed(now, *received), chamber_pt_installed));
                     }
                     if let Some((status, received)) = &r.dac_status {
                         status.overlay(&mut report, elapsed(now, *received));
@@ -562,6 +571,29 @@ mod tests {
     /// A silent board is shown offline after a timeout set by its link, not a flat 12 s (fullnet: a hung FC
     /// read healthy for 12 s). Umbilical (CAN) boards: 3 s; radio boards: 6 s, above the longest frame gap seen
     /// at 30% radio loss (RF 4.3 s, PB 2.8 s, FC 1.3 s); a board whose link is not known yet keeps 12 s.
+    #[test]
+    fn chamber_check_is_listed_only_while_a_chamber_pt_is_installed() {
+        let t = Instant::now();
+        // Chamber no-signal active, CH6 at 0.012 V (the 2026-11-16 fire, no PT on P4).
+        let words: [u32; 10] = [
+            1 | 0x200, 0x80 | (0x80 << 16), 0, 0, 0, 1 << 16,
+            14_180 | (14_200 << 16), 8 | (12 << 16), 0xFFFF_FFFF, 12_500 | (50 << 16),
+        ];
+        let mut tracker = Tracker::default();
+        assert!(tracker.observe_input_health("DAQ", &words, t, 100_000).is_some());
+        let input = |tracker: &mut Tracker| {
+            tracker.snapshot(t, false).into_iter().find(|row| row.sender_id == "DAQ").unwrap()
+                .diagnostics.unwrap().daq_input.unwrap()
+        };
+        let installed = input(&mut tracker);
+        assert!(installed.chamber_pt_installed, "installed by default");
+        assert!(installed.faults.iter().any(|f| f.key == "chamber_no_signal" && f.active));
+        tracker.set_chamber_pt_installed(false);
+        let absent = input(&mut tracker);
+        assert!(!absent.chamber_pt_installed);
+        assert!(absent.faults.iter().all(|f| f.key != "chamber_no_signal"));
+        assert_eq!(absent.chamber_mv, Some(12));
+    }
     #[test]
     fn a_silent_board_goes_offline_after_its_link_timeout() {
         let t = Instant::now();

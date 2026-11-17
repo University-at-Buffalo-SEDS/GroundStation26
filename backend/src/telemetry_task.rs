@@ -2734,16 +2734,23 @@ async fn handle_packet_inner(
 
     if pkt.data_type() == crate::telemetry_schema::data_type("DAQ_INPUT_HEALTH") {
         if let Ok(words) = pkt.data_as_u32() {
-            let report = state.network_health.lock().unwrap().observe_input_health(
-                &sender_id,
-                &words,
-                std::time::Instant::now(),
-                get_current_timestamp_ms(),
-            );
+            // Station setting: without a chamber PT its no-signal fault is not
+            // listed or announced (the DAQ cannot tell an absent 0-5 V PT).
+            let chamber_pt_installed = state.loadcell_calibration.lock().unwrap().chamber_pt_installed;
+            let report = {
+                let mut health = state.network_health.lock().unwrap();
+                health.set_chamber_pt_installed(chamber_pt_installed);
+                health.observe_input_health(
+                    &sender_id,
+                    &words,
+                    std::time::Instant::now(),
+                    get_current_timestamp_ms(),
+                )
+            };
             if let Some(report) = report {
                 recording_diagnostics::raw_health(state, db_tx, &pkt, &sender_id);
                 let now_ms = get_current_timestamp_ms() as i64;
-                for alert in crate::daq_input_health::observe_alerts(&sender_id, &report, now_ms, |sensor| {
+                for alert in crate::daq_input_health::observe_alerts(&sender_id, &report, now_ms, chamber_pt_installed, |sensor| {
                     derived::claim_daq_rail_alert(&sender_id, sensor, now_ms)
                 }) {
                     emit_warning(state, alert);
@@ -6940,7 +6947,7 @@ mod tests {
             .expect("a dead chamber transducer raises a warning")
             .unwrap();
         assert!(
-            warning.message.starts_with("Chamber pressure transducer reads 0.01 V — no signal; check P4 wiring"),
+            warning.message.starts_with("Chamber pressure transducer reads 0.01 V — no signal during the burn; check P4 wiring"),
             "{}",
             warning.message
         );

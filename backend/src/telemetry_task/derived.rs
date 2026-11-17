@@ -1080,7 +1080,15 @@ pub(super) fn split_imu_values(
 // Combined publication occupies one existing DAQ load-cell packet slot.
 // Keep the original vector for raw exports plus canonical KG1000 so existing
 // calibration, derived mass, charts and recordings retain their exact path.
-fn chamber_pressure_rows(sender: &str, values: &[Option<f32>]) -> Vec<(String, Vec<Option<f32>>)> {
+/// Station-side chamber PT presence (LoadcellCalibrationFile::chamber_pt_installed),
+/// 1 = installed, 0 = not installed; shown as a label on the chamber card.
+pub(crate) const CHAMBER_PT_INSTALLED_DATA_TYPE: &str = "COMBUSTION_CHAMBER_PT_INSTALLED";
+
+fn chamber_pressure_rows(
+    sender: &str,
+    values: &[Option<f32>],
+    chamber_pt_installed: bool,
+) -> Vec<(String, Vec<Option<f32>>)> {
     if sender != "DAQ" || values.len() != 3 {
         return Vec::new();
     }
@@ -1089,6 +1097,14 @@ fn chamber_pressure_rows(sender: &str, values: &[Option<f32>]) -> Vec<(String, V
     // conversion must not hide an otherwise valid chamber-pressure sample.
     if values[0].is_some_and(f32::is_finite) {
         rows.push(("KG1000".into(), vec![values[0]]));
+    }
+    if !chamber_pt_installed {
+        // An open 0-5 V input reads about 0 V: never show it as 0 psig. The
+        // raw DAQ_LOADCELL_CHAMBER vector above is still recorded.
+        rows.push(("COMBUSTION_CHAMBER_PRESSURE".into(), vec![None]));
+        rows.push(("COMBUSTION_CHAMBER_RANGE_STATUS".into(), vec![None]));
+        rows.push((CHAMBER_PT_INSTALLED_DATA_TYPE.into(), vec![Some(0.0)]));
+        return rows;
     }
     if values[1].is_some_and(|x| x.is_finite() && (-5280.0..=5280.0).contains(&x))
         && values[2].is_some_and(|x| x.is_finite() && (-26.4..=26.4).contains(&x))
@@ -1103,17 +1119,18 @@ fn chamber_pressure_rows(sender: &str, values: &[Option<f32>]) -> Vec<(String, V
             "COMBUSTION_CHAMBER_RANGE_STATUS".into(),
             vec![Some(if outside_nominal { 1.0 } else { 0.0 })],
         ));
+        rows.push((CHAMBER_PT_INSTALLED_DATA_TYPE.into(), vec![Some(1.0)]));
     }
     rows
 }
 
 #[cfg(test)]
 mod chamber_pressure_tests {
-    use super::chamber_pressure_rows;
+    use super::{chamber_pressure_rows, CHAMBER_PT_INSTALLED_DATA_TYPE};
     #[test]
     fn combined_preserves_loadcell_and_valid_zero_pressure() {
-        let rows = chamber_pressure_rows("DAQ", &[Some(-0.125), Some(0.0), Some(0.0)]);
-        assert_eq!(rows.len(), 5);
+        let rows = chamber_pressure_rows("DAQ", &[Some(-0.125), Some(0.0), Some(0.0)], true);
+        assert_eq!(rows.len(), 6);
         assert_eq!(rows[1], ("KG1000".into(), vec![Some(-0.125)]));
         assert_eq!(
             rows[2],
@@ -1122,7 +1139,7 @@ mod chamber_pressure_tests {
     }
     #[test]
     fn omega_overrange_remains_visible_and_is_flagged() {
-        let rows = chamber_pressure_rows("DAQ", &[Some(1.0), Some(1020.0), Some(5.1)]);
+        let rows = chamber_pressure_rows("DAQ", &[Some(1.0), Some(1020.0), Some(5.1)], true);
         assert!(
             rows.iter()
                 .any(|(kind, v)| kind == "COMBUSTION_CHAMBER_PRESSURE" && v == &vec![Some(1020.0)])
@@ -1130,8 +1147,25 @@ mod chamber_pressure_tests {
         assert!(rows.iter().any(|(kind,v)|kind=="COMBUSTION_CHAMBER_RANGE_STATUS"&&v==&vec![Some(1.0)]));
     }
     #[test]
+    fn chamber_pt_not_installed_reads_not_installed_never_zero_psig() {
+        // No PT on P4 (2026-11-16): the open input reads about 0 V.
+        let rows = chamber_pressure_rows("DAQ", &[Some(0.209), Some(1.6), Some(0.008)], false);
+        let get = |kind: &str| rows.iter().find(|(k, _)| k == kind).map(|(_, v)| v.clone());
+        assert_eq!(get("COMBUSTION_CHAMBER_PRESSURE"), Some(vec![None]), "no 0 psig");
+        assert_eq!(get("COMBUSTION_CHAMBER_RANGE_STATUS"), Some(vec![None]));
+        assert_eq!(get("COMBUSTION_CHAMBER_VOLTAGE"), None);
+        assert_eq!(get(CHAMBER_PT_INSTALLED_DATA_TYPE), Some(vec![Some(0.0)]));
+        assert_eq!(get("KG1000"), Some(vec![Some(0.209)]), "the load cell is unaffected");
+        assert_eq!(get("DAQ_LOADCELL_CHAMBER"), Some(vec![Some(0.209), Some(1.6), Some(0.008)]), "raw kept");
+        let rows = chamber_pressure_rows("DAQ", &[Some(0.209), Some(1.6), Some(0.008)], true);
+        let get = |kind: &str| rows.iter().find(|(k, _)| k == kind).map(|(_, v)| v.clone());
+        assert_eq!(get("COMBUSTION_CHAMBER_PRESSURE"), Some(vec![Some(1.6)]));
+        assert_eq!(get(CHAMBER_PT_INSTALLED_DATA_TYPE), Some(vec![Some(1.0)]));
+    }
+
+    #[test]
     fn invalid_loadcell_does_not_hide_valid_chamber_pressure() {
-        let rows = chamber_pressure_rows("DAQ", &[None, Some(500.0), Some(2.5)]);
+        let rows = chamber_pressure_rows("DAQ", &[None, Some(500.0), Some(2.5)], true);
         assert!(!rows.iter().any(|(kind, _)| kind == "KG1000"));
         assert!(
             rows.iter()
@@ -1147,7 +1181,7 @@ mod chamber_pressure_tests {
     #[test]
     fn conditioned_zero_does_not_hide_raw_electrical_range_faults() {
         for raw_voltage in [-0.03, 5.01] {
-            let rows = chamber_pressure_rows("DAQ", &[Some(1.25), Some(0.0), Some(raw_voltage)]);
+            let rows = chamber_pressure_rows("DAQ", &[Some(1.25), Some(0.0), Some(raw_voltage)], true);
             assert!(
                 rows.iter()
                     .any(|(kind, values)| kind == "COMBUSTION_CHAMBER_PRESSURE"
@@ -1171,7 +1205,7 @@ mod chamber_pressure_tests {
     fn source_pressure_is_forwarded_without_a_second_cutoff_or_offset() {
         for (pressure, raw_voltage) in [(3.0, 0.015), (0.0, 0.0224), (4.5, 0.0225), (500.0, 2.5)] {
             let rows =
-                chamber_pressure_rows("DAQ", &[Some(1.25), Some(pressure), Some(raw_voltage)]);
+                chamber_pressure_rows("DAQ", &[Some(1.25), Some(pressure), Some(raw_voltage)], true);
             // Historical/older-source readings stay as recorded; conditioning
             // belongs to the DAQ firmware and is not silently applied twice.
             assert_eq!(
@@ -1200,7 +1234,7 @@ mod chamber_pressure_tests {
             (Some(0.0), Some(f32::NAN)),
             (Some(0.0), Some(f32::INFINITY)),
         ] {
-            let rows = chamber_pressure_rows("DAQ", &[Some(1.25), pressure, voltage]);
+            let rows = chamber_pressure_rows("DAQ", &[Some(1.25), pressure, voltage], true);
             assert_eq!(rows.len(), 2);
             assert_eq!(rows[1], ("KG1000".into(), vec![Some(1.25)]));
         }
@@ -1208,9 +1242,9 @@ mod chamber_pressure_tests {
 
     #[test]
     fn malformed_or_other_sender_cannot_fabricate_pressure() {
-        assert!(chamber_pressure_rows("VB", &[Some(1.0); 3]).is_empty());
-        assert!(chamber_pressure_rows("DAQ", &[Some(1.0); 2]).is_empty());
-        let rows = chamber_pressure_rows("DAQ", &[Some(1.0), None, Some(f32::NAN)]);
+        assert!(chamber_pressure_rows("VB", &[Some(1.0); 3], true).is_empty());
+        assert!(chamber_pressure_rows("DAQ", &[Some(1.0); 2], true).is_empty());
+        let rows = chamber_pressure_rows("DAQ", &[Some(1.0), None, Some(f32::NAN)], true);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].0, "KG1000");
     }
@@ -1223,7 +1257,8 @@ pub(super) fn telemetry_rows_from_packet_values(
     mut values: Vec<Option<f32>>,
 ) -> Vec<(String, Vec<Option<f32>>)> {
     if &*pkt.data_type().as_str() == "DAQ_LOADCELL_CHAMBER" {
-        return chamber_pressure_rows(sender_id, &values);
+        let installed = state.loadcell_calibration.lock().unwrap().chamber_pt_installed;
+        return chamber_pressure_rows(sender_id, &values, installed);
     }
     if matches!(&*pkt.data_type().as_str(), "KG50" | "DAQ_KG50_SELECTED") {
         if sender_id != "DAQ" {

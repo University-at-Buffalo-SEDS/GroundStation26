@@ -622,6 +622,9 @@ pub struct DaqInputHealthStatus {
     pub faults: Vec<DaqInputFaultStatus>,
     /// The selected KG50 input is the P6 differential (leg checks apply).
     pub kg50_p6: bool,
+    /// Station setting: a chamber pressure transducer is connected. When false
+    /// the chamber check is not listed and the chamber reads "not installed".
+    pub chamber_pt_installed: bool,
     pub vmain_mv: Option<u16>,
     /// Lowest VMAIN since the DAQ's previous report (about 1 s).
     pub vmain_min_mv: Option<u16>,
