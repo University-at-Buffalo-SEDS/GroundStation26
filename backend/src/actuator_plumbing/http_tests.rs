@@ -1273,7 +1273,10 @@ async fn public_motion_queue_cannot_cross_mode_commit_and_fresh_motion_keeps_ori
                         nonce as u16,
                         Arc::from([8, on]),
                     )
-                    .unwrap(),
+                    .unwrap()
+                    // A board follows the station's network time base (its
+                    // epoch); this modeled board runs no time sync.
+                    .with_time_epoch(f.state.topology_router.get().unwrap().network_time_epoch()),
                 )
                 .unwrap();
             f.pump();
