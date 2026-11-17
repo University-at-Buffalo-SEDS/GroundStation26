@@ -332,10 +332,22 @@ pub(crate) fn project(state: &AppState, policy: &mut crate::sequences::ActionPol
 /// past Startup. Resetting only the station would split it from the FC;
 /// Reset all boards resets both (CONTRACT.md "Reset protocol").
 pub(crate) fn reset_flight_state_block_reason(state: &AppState) -> Option<String> {
-    let fc = state.fc_phase.snapshot()?.phase;
-    (fc != FlightState::Startup).then(|| format!(
-        "FC is in {}; use Reset all boards, which resets the FC too.",
-        crate::mission_phase::detailed_label(fc)))
+    if let Some(fc) = state.fc_phase.snapshot().map(|seen| seen.phase)
+        && fc != FlightState::Startup
+    {
+        return Some(format!(
+            "FC is in {}; use Reset all boards, which resets the FC too.",
+            crate::mission_phase::detailed_label(fc)));
+    }
+    // Test fire has no FC: the AB/VB launch latch is what outlives a Launch.
+    // Resetting the station alone would show Idle while they stay in Launch
+    // and refuse every valve command.
+    let latched = crate::board_recovery::latched_launch_boards(state);
+    (!latched.is_empty()).then(|| format!(
+        "{} still {} Launch and keep{} the launch latch until a verified board reset; use Reset all boards.",
+        latched.join(" and "),
+        if latched.len() == 1 { "reports" } else { "report" },
+        if latched.len() == 1 { "s" } else { "" }))
 }
 pub(crate) fn project_reset_flight_state(state: &AppState, policy: &mut crate::sequences::ActionPolicyMsg) {
     if !crate::runtime_mode::is_hitl() {
@@ -498,6 +510,42 @@ mod tests {
         assert_eq!(fixture.state.local_flight_state_snapshot(), FlightState::InFlight, "the station alone is never reset");
         crate::fc_phase::observe(&fixture.state, FlightState::Startup as u8, crate::fc_phase::Source::FcStateReport, 0);
         assert!(reset(&fixture.state).enabled);
+        crate::telemetry_task::reset_operator_flight_state_for_test(&fixture.state);
+        assert_eq!(fixture.state.local_flight_state_snapshot(), FlightState::Idle);
+    }
+
+    /// 2026-11-16 static fire (HITL, fill side only, no FC): after Launch the
+    /// operator's "Reset flight state to Idle" put the station in Idle while
+    /// AB and VB, holding their launch latch, refused the lower FLIGHT_STATE
+    /// and stayed in Launch. With no FC to hold it, the reset is held while
+    /// AB or VB reads back Launch (or later) and points at Reset all boards.
+    #[tokio::test]
+    async fn reset_flight_state_waits_for_ab_and_vb_to_leave_launch_without_an_fc() {
+        crate::mode_suite!(Hitl);
+        let fixture = crate::actuator_plumbing::http_tests::Fixture::new().await;
+        fixture.state.set_preexisting_flight_state_for_test(FlightState::Launch);
+        assert!(fixture.state.fc_phase.snapshot().is_none(), "test fire: no FC");
+        let reset = |state: &AppState| state.action_policy_snapshot().controls.into_iter()
+            .find(|c| c.cmd == "ResetFlightState").unwrap();
+        use crate::types::{Board, NetworkFlightState as N};
+        crate::board_recovery::observe_board_state_for_test(&fixture.state, Board::ActuatorBoard, N::Launch as u8);
+        crate::board_recovery::observe_board_state_for_test(&fixture.state, Board::ValveBoard, N::Launch as u8);
+        crate::board_recovery::observe_board_state_for_test(&fixture.state, Board::GatewayBoard, N::Launch as u8);
+        crate::sequences::refresh_action_policy_now(&fixture.state);
+        let control = reset(&fixture.state);
+        assert!(!control.enabled);
+        assert_eq!(control.disabled_reason.as_deref(), Some(
+            "AB and VB still report Launch and keep the launch latch until a verified board reset; use Reset all boards."));
+        crate::telemetry_task::reset_operator_flight_state_for_test(&fixture.state);
+        assert_eq!(fixture.state.local_flight_state_snapshot(), FlightState::Launch, "the station alone is never reset");
+        // After Reset all boards AB reads back Startup; VB still in Launch holds it.
+        crate::board_recovery::observe_board_state_for_test(&fixture.state, Board::ActuatorBoard, N::Startup as u8);
+        crate::sequences::refresh_action_policy_now(&fixture.state);
+        assert_eq!(reset(&fixture.state).disabled_reason.as_deref(), Some(
+            "VB still reports Launch and keeps the launch latch until a verified board reset; use Reset all boards."));
+        crate::board_recovery::observe_board_state_for_test(&fixture.state, Board::ValveBoard, N::Idle as u8);
+        crate::sequences::refresh_action_policy_now(&fixture.state);
+        assert!(reset(&fixture.state).enabled, "GB follows the station and never holds the reset");
         crate::telemetry_task::reset_operator_flight_state_for_test(&fixture.state);
         assert_eq!(fixture.state.local_flight_state_snapshot(), FlightState::Idle);
     }

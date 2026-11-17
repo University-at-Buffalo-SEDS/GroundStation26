@@ -314,6 +314,39 @@ fn targeted_recovery_state(board: Board) -> Option<u8> {
 fn resync_board(board: Board) -> bool {
     matches!(board, Board::ActuatorBoard | Board::ValveBoard)
 }
+/// The Actuator and Valve Boards whose latest readback reports Launch or a
+/// later flight state. After an accepted Launch they hold a persisted launch
+/// latch and refuse a lower FLIGHT_STATE (a late or replayed Idle must never
+/// undo Launch), so the station's managed Idle alone never moves them: only a
+/// verified board reset (Reset all boards, or Resync) clears the latch. The
+/// latest readback counts whatever its age; a board that powered off since
+/// reads back again before this changes.
+pub(crate) fn latched_launch_boards(state: &AppState) -> Vec<&'static str> {
+    use crate::types::NetworkFlightState as N;
+    let inner = state.board_recovery.inner.lock().unwrap();
+    BOARDS.iter().zip(inner.values.iter())
+        .filter(|(board, _)| resync_board(**board))
+        .filter_map(|(board, value)| {
+            let row = &value.as_ref()?.value;
+            (row.flags & STATE_VALID != 0
+                && matches!(network_state(row.state).and_then(N::from_u8), Some(N::Launch | N::InFlight | N::Landed)))
+                .then(|| board.sender_id())
+        })
+        .collect()
+}
+/// A current verified readback of `board` reporting `network_state`.
+#[cfg(test)]
+pub(crate) fn observe_board_state_for_test(state: &AppState, board: Board, network_state: u8) {
+    let now = Stamp::now();
+    state.board_recovery.inner.lock().unwrap().values[index(board).unwrap()] = Some(Observation {
+        received: now,
+        observed_after: now,
+        value: Readback {
+            result: 0, state: Some(network_state), flags: STATE_VALID, nonce: 1,
+            boot: 1, epoch: 1, uptime: 1, outputs: 0, issuer: 1,
+        },
+    });
+}
 /// Station phases a board may be resynced to: Startup, Idle, the fill phases
 /// and Armed. Resync to Startup or Idle brings a board back from any state,
 /// including Launch, without an Abort first: the board stops its own launch
