@@ -511,6 +511,10 @@ pub struct ActionSpec {
     pub spacer_row_before: bool,
     #[serde(default)]
     pub spacer_row_after: bool,
+    /// Actions-tab section, assigned at load from
+    /// [`crate::sequences::control_section`]; a layout file cannot override it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section: Option<crate::sequences::ControlSection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -699,7 +703,16 @@ pub fn load_layout() -> Result<LayoutConfig, String> {
         serde_json::from_str(&raw).map_err(|e| format!("Invalid layout JSON: {e}"))?;
     normalize_flight_phases(&mut layout)?;
     apply_runtime_layout_overrides(&mut layout);
+    assign_control_sections(&mut layout);
     Ok(layout)
+}
+
+/// Every action carries the section its command belongs to, from the one
+/// backend table beside the per-mode command catalogs.
+fn assign_control_sections(layout: &mut LayoutConfig) {
+    for action in &mut layout.actions_tab.actions {
+        action.section = crate::sequences::control_section(&action.cmd);
+    }
 }
 
 fn normalize_flight_phases(layout: &mut LayoutConfig) -> Result<(), String> {
@@ -775,6 +788,7 @@ fn apply_runtime_layout_overrides(layout: &mut LayoutConfig) {
             new_row_after: true,
             spacer_row_before: false,
             spacer_row_after: true,
+            section: None,
         },
     );
 }
@@ -954,6 +968,39 @@ mod tests {
         assert!(!layout.actions_tab.actions.is_empty());
         assert!(!layout.data_tab.tabs.is_empty());
         assert!(!layout.state_tab.states.is_empty());
+    }
+
+    #[test]
+    fn every_control_in_every_mode_has_exactly_one_section() {
+        use crate::sequences::{ControlSection, control_section};
+        use crate::station_mode::Mode;
+        let mut names: Vec<&str> = crate::sequences::every_mode_catalog().concat();
+        for mode in [Mode::Normal, Mode::Hitl, Mode::TestFire, Mode::Testing] {
+            names.extend(crate::types::client_command_names(mode));
+        }
+        names.extend(GSE_SEQUENCE_ACTIONS.iter().map(|(cmd, _)| *cmd));
+        names.extend(["ResetSim", "AutoColdFlow", "ResetFlightState", "ResetTClock"]);
+        for name in &names {
+            assert!(control_section(name).is_some(), "{name} has no Actions-tab section");
+        }
+        assert_eq!(control_section("Abort"), Some(ControlSection::Safety));
+        assert_eq!(control_section("NotACommand"), None);
+        // Only Abort is a Safety control.
+        assert_eq!(
+            names.iter().filter(|n| control_section(n) == Some(ControlSection::Safety)).count(),
+            names.iter().filter(|n| **n == "Abort").count()
+        );
+        // The served layout of every mode assigns each action its section.
+        for mode in [Mode::Normal, Mode::Hitl, Mode::TestFire, Mode::Testing] {
+            let _mode = crate::runtime_mode::test_support::thread_mode(mode);
+            let layout = load_layout().expect("layout should parse");
+            for action in &layout.actions_tab.actions {
+                assert_eq!(action.section, control_section(&action.cmd), "{mode:?} {}", action.cmd);
+                assert!(action.section.is_some(), "{mode:?} {} has no section", action.cmd);
+            }
+            let wire = serde_json::to_value(&layout.actions_tab).unwrap();
+            assert!(wire["actions"].as_array().unwrap().iter().all(|a| a["section"].is_string()));
+        }
     }
 
     #[test]

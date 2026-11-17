@@ -176,7 +176,7 @@ const HITL_CLIENT_COMMANDS: &[&str] = &[
     "AbortAfter250", "ReinitAfter15", "ReinitAfter30", "ReinitAfter50", "StartFill",
     "PauseFill", "CancelFill", "ValveSelfTest", "NitrogenTest", "Turbocharge",
 ];
-fn client_command_names(mode: crate::station_mode::Mode) -> &'static [&'static str] {
+pub(crate) fn client_command_names(mode: crate::station_mode::Mode) -> &'static [&'static str] {
     use crate::station_mode::Mode;
     match mode {
         Mode::Hitl => HITL_CLIENT_COMMANDS,

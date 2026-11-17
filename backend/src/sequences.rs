@@ -1315,6 +1315,67 @@ pub(crate) fn is_fill_system_control(name: &str) -> bool {
         | "Turbocharge")
 }
 
+/// The Actions-tab section an operator control is listed under. Presentation
+/// only: it never enables, gates or admits a command. Defined here, beside
+/// the per-mode catalogs above, so a new control gets its section where its
+/// mode availability is decided.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlSection {
+    /// Abort. Always first and never collapsed.
+    Safety,
+    /// Manual GSE valves and the QD / fill-line retraction.
+    FillSystem,
+    /// Fill, test and cold-flow sequences, ignition, Launch and the T-clock.
+    Sequences,
+    /// FC setup, flight-state stepping, pyro and evaluation thresholds.
+    FlightComputer,
+    /// AV-bay network outputs (underglow, buzzer).
+    AvBay,
+    /// Returning the station to a known state.
+    Recovery,
+    /// Recording to the station database.
+    DaqRecording,
+    /// HITL bench interlocks and simulator controls.
+    Testing,
+}
+
+pub(crate) fn control_section(cmd: &str) -> Option<ControlSection> {
+    use ControlSection::*;
+    Some(match cmd {
+        "Abort" => Safety,
+        "Dump" | "NormallyOpen" | "Pilot" | "Nitrogen" | "NitrogenClose" | "Nitrous"
+        | "NitrousClose" | "RetractPlumbing" => FillSystem,
+        "StartFill" | "PauseFill" | "CancelFill" | "ValveSelfTest" | "NitrogenTest"
+        | "Turbocharge" | "AutoColdFlow" | "ContinueFillSequence" | "ColdFlowPanelRelease"
+        | "Igniter" | "IgniterSequence" | "Launch" | "GroundStationLaunch" | "ResetTClock" => {
+            Sequences
+        }
+        "Postinit" | "AdvanceFlightState" | "RewindFlightState" | "DeployParachute"
+        | "ExpandParachute" | "EvaluationRelax" | "EvaluationFocus" | "EvaluationAbort"
+        | "ReinitSensors" | "ReinitBarometer" | "EnableIMU" | "DisableIMU" | "MonitorAltitude"
+        | "RevokeMonitorAltitude" | "ConsecutiveSamples" | "RevokeConsecutiveSamples"
+        | "ResetFailures" | "RevokeResetFailures" | "ValidateMeasms" | "RevokeValidateMeasms"
+        | "AbortAfter100" | "AbortAfter40" | "AbortAfter250" | "ReinitAfter15"
+        | "ReinitAfter30" | "ReinitAfter50" => FlightComputer,
+        "ToggleAvBayUnderglow" | "ToggleFlightBuzzer" => AvBay,
+        "ResetFlightState" => Recovery,
+        "StartWritingNow" | "StartWritingLastTwoMinutes" | "PauseWritingDb" | "StopWritingDb" => {
+            DaqRecording
+        }
+        "ToggleButtonInterlock" | "ToggleGroundStationControl" | "ToggleLaunchInterlock"
+        | "TogglePlumbingDelayInterlock" | "ToggleChecklistInterlock" | "ToggleSupplyInterlock"
+        | "ToggleBoardStateProofInterlock" | "TogglePhysicalLaunchMode" | "ResetLaunchLatch"
+        | "ResetSim" => Testing,
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn every_mode_catalog() -> [Vec<&'static str>; 3] {
+    [all_command_names_default(), all_command_names_hitl(), all_command_names_test_fire()]
+}
+
 pub fn default_action_policy() -> ActionPolicyMsg {
     if crate::runtime_mode::is_hitl() {
         hitl_action_policy(ValveSnapshot {
