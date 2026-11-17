@@ -23,7 +23,10 @@ const MAX_BYTES: u64 = 16 * 1024;
 pub enum Source {
     #[default]
     Manual,
+    /// The location of the operator's phone or computer.
     DeviceLocation,
+    /// Copied from the station's own live GPS fix in the editor.
+    StationGps,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -68,6 +71,7 @@ impl Coordinate {
                 match self.source {
                     Source::Manual => "manual",
                     Source::DeviceLocation => "device location",
+                    Source::StationGps => "station GPS",
                 }
             ),
         }
@@ -544,6 +548,17 @@ mod tests {
         assert_eq!(fix.source, "Saved GroundStation (device location)");
         assert_eq!(fix.accuracy_m, Some(12.0));
         assert_eq!(position().fix("RRLS").source, "Saved RRLS (manual)");
+        // A copied live station fix is still a saved fallback, never a GPS lock.
+        let copied: Coordinate = serde_json::from_str(
+            r#"{"latitude":43.0012,"longitude":-78.7891,"altitude_m":181.5,"accuracy_m":2.6,"source":"station_gps"}"#,
+        )
+        .unwrap();
+        assert!(copied.validate().is_ok());
+        let fix = copied.fix("RRLS");
+        assert_eq!(fix.source, "Saved RRLS (station GPS)");
+        assert!(fix.manual && !fix.stale);
+        assert_eq!(fix.altitude_reference, AltitudeReference::Unknown);
+        assert_eq!(fix.accuracy_m, Some(2.6));
     }
     #[test]
     fn fresh_station_gps_wins_and_saved_positions_are_only_fallbacks() {
