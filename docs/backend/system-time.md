@@ -17,10 +17,18 @@ with the same explicit `set_system_time` account permission. This updates the
 primary station's SEDSnet UTC source, without invoking systemd or changing the
 host wall clock. The selected client source remains anchored to SEDSnet's
 monotonic clock; periodic host-clock fallback refreshes do not overwrite it.
-The API reports admission failures instead of claiming success. Existing network
-clocks converge using SEDSnet's bounded slew;
-they do not immediately jump to the requested value. Network time labels use
-the router's synchronized UTC when available. RRLS must receive its time from
+The API reports admission failures instead of claiming success. SEDSnet decides
+how the network clock follows the new UTC: more than 1 s off, it **steps** to it
+at once and starts a new time-base epoch, which every board adopts within one or
+two time sync exchanges; within 1 s, or while the station's step policy
+inhibits steps, it slews at 20 ppm (boards track it). Steps are allowed in
+Startup/Idle or before any board is locked, never from Armed through Recovery.
+A correction made while steps are inhibited keeps slewing and steps as soon as
+the policy allows it again (the next one-second host refresh or operator set).
+Packets carry their epoch, so a command or report stamped just before a step is
+judged by its true age and ordered correctly on both sides of it; nothing has to
+be re-sent after a step. Network time labels use the router's synchronized UTC
+when available. RRLS must receive its time from
 the primary; direct network-clock writes on RRLS return a conflict response.
 
 AV-bay underglow, FC buzzer, and T-clock reset are available in normal, HITL,
@@ -41,7 +49,12 @@ authorized operations, not unsolicited clock changes from telemetry.
 
 `GET /api/system/time` returns current OS UTC, available network UTC, and whether
 the current user has clock permission, whether the host can perform an OS
-clock update, and an explanation when unavailable. `POST` requires that permission and accepts either
+clock update, and an explanation when unavailable. `network_time_base` reports
+the network clock's epoch, the newest epoch heard on the network (above
+`epoch` the station is re-anchoring), `holding`, `steps_allowed`, the step
+count and `last_step` (`delta_ms`, `reason`, `from_epoch`, `to_epoch`,
+`age_ms`); the topology message's station time carries the same fields as
+`time_base`. `POST` requires that permission and accepts either
 `{"source":"client","utc_ms":1790000000000}` or `{"source":"network"}`.
 Network uptime and ordinary packet timestamps are not treated as UTC.
 
@@ -51,9 +64,10 @@ Settings → Maintenance → Station system date/time provides an explicit
 **Set OS + network from this device** action. Date/time and network-source
 changes are also permission-gated at the backend. OS success is followed by a
 checked SDK source update; if SDK admission fails, the response explicitly says
-that the OS clock changed but the network source was not accepted. Network
-corrections still converge gradually at the SDK's configured slew rate. A
-nine-minute offset at the default 5% correction rate can take about three hours.
+that the OS clock changed but the network source was not accepted. The network
+clock then steps or slews as described above, and the one-second host-clock
+refresh resumes from the corrected OS clock. An RRLS never steps the network
+from its own host clock: its corrections slew.
 This action does not reset discovery, monotonic clocks, or launch deadlines.
 
 The Linux backend uses `clock_settime(CLOCK_REALTIME)` directly. It needs
