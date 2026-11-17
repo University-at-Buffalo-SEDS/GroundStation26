@@ -53,6 +53,13 @@ const PROXY_LEASE_MS: u64 = 6_000;
 /// back once the primary's HEALTH has been continuous for RESTORE_MS, so a
 /// primary at the edge of range does not flap authority.
 const TAKEOVER_MS: u64 = PROXY_LEASE_MS;
+/// An RRLS that has not heard the primary at all since it booted waits this
+/// long instead. Both stations usually power up together and the primary's
+/// first HEALTH can take 8-14 s to reach the RRLS (its own boot, the modem
+/// check, collisions); taking over at 6 s made the RRLS command the AV bay as
+/// the station, network variables included, before the primary was up
+/// (fullnet rrls_takeover, GS->RRLS unheard for the first 14 s).
+const BOOT_TAKEOVER_MS: u64 = 30_000;
 /// HEALTH byte 8: bit 0 the primary's direct AV-bay link, bit 1 a fresh
 /// discovery route from the primary to RF/FC/PB (what its Abort is sent on).
 const HEALTH_DIRECT: u8 = 1;
@@ -577,7 +584,7 @@ pub struct Mesh {
     /// Listening RRLS: until this mesh time, ABORT frames (only) may leave on
     /// the radio although there is no takeover (an operator Abort here).
     abort_egress_until: Option<u64>,
-    /// First tick: an RRLS that has never heard the primary waits TAKEOVER_MS
+    /// First tick: an RRLS that has never heard the primary waits BOOT_TAKEOVER_MS
     /// from here before taking over (not at once at boot); a primary that has
     /// never heard the AV bay counts its relay loss gap from here.
     first_tick: Option<u64>,
@@ -2562,12 +2569,13 @@ impl Mesh {
             return;
         }
         let since = *self.first_tick.get_or_insert(now);
-        let silent = now.saturating_sub(self.health_received.unwrap_or(since)) >= TAKEOVER_MS;
+        let wait = if self.health_received.is_some() { TAKEOVER_MS } else { BOOT_TAKEOVER_MS };
+        let silent = now.saturating_sub(self.health_received.unwrap_or(since)) >= wait;
         let restored = self.health_received.is_some_and(|v| now.saturating_sub(v) < LEASE_MS)
             && self.health_streak_since.is_some_and(|since| now.saturating_sub(since) >= RESTORE_MS);
         if !self.takeover && silent && self.hears_av_bay(now) {
             self.takeover = true;
-            log::warn!("RRLS takeover: the primary has been unheard for {TAKEOVER_MS} ms while the AV bay is heard; this RRLS now commands the AV bay directly");
+            log::warn!("RRLS takeover: the primary has been unheard for {wait} ms while the AV bay is heard; this RRLS now commands the AV bay directly");
         } else if self.takeover && restored {
             // Hand back only once the primary can reach the AV bay: after a
             // cut longer than the route lifetime it is heard again before it
@@ -3800,14 +3808,34 @@ mod tests {
         rr.tick(10 + ABORT_EGRESS_MS);
         assert!(!abort_egress_open());
     }
+    /// fullnet rrls_takeover (both stations powered up together, the primary
+    /// unheard at the RRLS for its first 14 s): the RRLS took over at 14.1 s
+    /// and commanded the AV bay as the station before the primary was up.
+    /// With no primary heard since boot it waits BOOT_TAKEOVER_MS.
     #[test]
-    fn a_booting_rrls_waits_before_taking_over() {
+    fn a_booting_rrls_waits_for_the_primary_to_boot_before_taking_over() {
         let mut rr = Mesh::new(Role::Rrls, 2);
         rr.assume_av_bay_heard_for_test();
         rr.tick(1_000);
-        rr.tick(1_000 + TAKEOVER_MS - 1);
-        assert!(!rr.takeover(), "no primary heard yet, but not silent for TAKEOVER_MS either");
-        rr.tick(1_000 + TAKEOVER_MS);
+        for at in [1_000 + TAKEOVER_MS, 15_000, 1_000 + BOOT_TAKEOVER_MS - 1] {
+            rr.tick(at);
+            assert!(!rr.takeover(), "no primary heard since boot, {at} ms");
+        }
+        rr.tick(1_000 + BOOT_TAKEOVER_MS);
+        assert!(rr.takeover(), "the primary never came up: take over");
+    }
+    /// Once the primary has been heard, losing it is a takeover after
+    /// TAKEOVER_MS, as before.
+    #[test]
+    fn an_rrls_that_heard_the_primary_takes_over_after_the_normal_wait() {
+        let mut rr = Mesh::new(Role::Rrls, 2);
+        rr.assume_av_bay_heard_for_test();
+        rr.tick(1_000);
+        rr.incoming(true, &health(7, 1, true), 9_000);
+        rr.tick(9_000);
+        rr.tick(9_000 + TAKEOVER_MS - 1);
+        assert!(!rr.takeover());
+        rr.tick(9_000 + TAKEOVER_MS);
         assert!(rr.takeover());
     }
     #[test]
