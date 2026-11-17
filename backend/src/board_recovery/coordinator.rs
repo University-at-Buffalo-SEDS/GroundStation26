@@ -5628,7 +5628,7 @@ mod tests {
             let mut seen=false;
             // These budgets sit just above the warm-up floor, which grows with the
             // registered GS schema; recalibrate them when a schema type is added.
-            'search: for budget in [19298usize,19350,19402] {for pressure in 0..7 {
+            'search: for budget in [20099usize,20151,20203] {for pressure in 0..7 {
                 let mut scene=crate::ignition_pair::constrained_fixture::Scene::new(budget).await;
                 scene.warm().await.unwrap();
                 // Fresh queried SAME Router scope; this does not claim the old
