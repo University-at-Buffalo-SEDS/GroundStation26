@@ -303,6 +303,11 @@ fn source_sample_at(
     *previous = Some(source);
     Some(at)
 }
+/// The capture age `source_sample_at` admits for a fresh report (tests).
+#[cfg(test)]
+pub(crate) fn source_age_for_test(source: Stamp, receipt: i64) -> Option<u64> {
+    source_sample_at(Some(source), receipt, 1_000_000, &mut None).map(|at| 1_000_000 - at)
+}
 fn scalar_capture_at(
     clock: Instant,
     processing_now: u64,

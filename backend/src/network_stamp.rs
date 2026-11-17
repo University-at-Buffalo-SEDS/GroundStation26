@@ -24,7 +24,7 @@ pub(crate) const UTC_2020_MS: i64 = 1_577_836_800_000;
 /// A network stamp: the epoch its timestamp was taken in and the timestamp.
 /// The derived order is `(epoch, ms)`, SEDSnet's
 /// `timesync::compare_network_stamps`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub(crate) struct Stamp {
     pub(crate) epoch: u16,
     pub(crate) ms: i64,
@@ -46,6 +46,22 @@ impl Stamp {
             epoch: packet.time_epoch(),
             ms: i64::try_from(packet.timestamp()).unwrap_or(i64::MAX),
         }
+    }
+}
+
+/// A stamp `ms` later in the same epoch.
+impl std::ops::Add<i64> for Stamp {
+    type Output = Stamp;
+    fn add(self, ms: i64) -> Stamp {
+        Stamp::new(self.epoch, self.ms.saturating_add(ms))
+    }
+}
+
+/// A stamp `ms` earlier in the same epoch.
+impl std::ops::Sub<i64> for Stamp {
+    type Output = Stamp;
+    fn sub(self, ms: i64) -> Stamp {
+        Stamp::new(self.epoch, self.ms.saturating_sub(ms))
     }
 }
 
@@ -180,6 +196,51 @@ mod tests {
             let post = Stamp::new(epoch, ms as i64 - 50);
             assert_eq!(receipt_ms_on(Some(&router), post, 0) - post.ms, 50);
             assert!(post > pre, "{delta}: the post-step report orders after the pre-step one");
+        }
+    }
+
+    /// DAQ_LAUNCH_LOG_STATUS and valve reports through the receive-path
+    /// arithmetic (`receipt - source`): after an operator step (3.8 h
+    /// forward or 4 h back) a report stamped in the new epoch is accepted; a
+    /// copy stamped 6 s before the step is judged 6 s old and refused as a
+    /// valve report (5 s window), never as hours ahead or behind.
+    #[test]
+    fn launch_log_and_valve_reports_across_an_operator_step() {
+        for delta in [13_700_000i64, -14_400_000] {
+            let clock = Arc::new(AtomicU64::new(10_000));
+            let router = station(&clock);
+            router.set_timesync_steps_allowed(true);
+            set(&router, 1_800_000_000_000);
+            let (ms, epoch) = router.network_time_ms_with_epoch().unwrap();
+            let pre_step = Stamp::new(epoch, ms as i64);
+            clock.fetch_add(6_000, Ordering::SeqCst);
+            let now = router.network_time_ms().unwrap() as i64;
+            set(&router, (now + delta) as u64);
+            let (ms, epoch) = router.network_time_ms_with_epoch().unwrap();
+            let post_step = Stamp::new(epoch, ms as i64 - 30);
+
+            let receipt = receipt_ms_on(Some(&router), post_step, 0);
+            assert_eq!(
+                crate::daq_launch_log::source_age_ms(post_step.ms as u64, receipt as u64),
+                Some(30),
+                "{delta}: new-epoch launch-log status accepted"
+            );
+            assert!(
+                crate::gse::source_age_for_test(post_step, receipt).is_some(),
+                "{delta}: new-epoch valve report accepted"
+            );
+
+            let receipt = receipt_ms_on(Some(&router), pre_step, 0);
+            assert!((receipt - pre_step.ms - 6_000).abs() <= 2, "{delta}: aged 6 s");
+            assert!(crate::gse::source_age_for_test(pre_step, receipt).is_none());
+            assert_eq!(
+                crate::valve_report_health::classify_refusal(pre_step.ms, receipt),
+                crate::valve_report_health::Refusal::ClockSkew {
+                    source_minus_station_ms: pre_step.ms - receipt
+                }
+            );
+            // The raw comparison this replaces read the copy as hours off.
+            assert!((pre_step.ms - now - delta).abs() > 3_600_000);
         }
     }
 
