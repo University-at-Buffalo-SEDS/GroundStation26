@@ -18,6 +18,8 @@ independently.
 - [GSE sequences](backend/gse-sequences.md): grouped control and equipment scene.
 - [Per-account client settings](backend/client-settings.md): watch companion preferences
   synced to the signed-in account.
+- [Watch direct link](backend/watch-direct.md): watch tokens, the compact watch status and
+  watch-eligible page actions.
 - [Frontend contract fixtures](backend/contract-fixtures.md): real replies the UI decodes;
   how to regenerate and run them.
 - [Station mode switch](backend/station-modes.md): switch build and simulation

@@ -522,6 +522,7 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .merge(crate::panel_control::routes())
         .merge(crate::checklists::routes())
         .merge(crate::client_settings::routes())
+        .merge(crate::watch::routes())
         .merge(crate::mission_sync::routes())
         .merge(crate::station_mode::routes())
         .merge(crate::station_mode_switch::routes())
@@ -529,6 +530,8 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .merge(crate::launch_history::api::routes())
         // anything that doesn’t match the above routes goes to the static files
         .fallback_service(static_dir)
+        // Watch tokens reach only the watch status, /api/command and logout.
+        .layer(axum::middleware::from_fn(crate::watch::scope_watch_tokens))
         .with_state(state)
 }
 
@@ -615,7 +618,7 @@ async fn get_session_status(
 }
 
 /// Revokes the current session token when one is present.
-async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
+pub(crate) async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
     let Some(token) = bearer_token_from_headers(&headers) else {
         return StatusCode::NO_CONTENT.into_response();
     };
@@ -2613,7 +2616,7 @@ async fn cancel_firmware_update(
 
 /// RRLS forwards opaque operation names, so a normal RRLS build does not need
 /// to compile primary HITL variants or execute them locally.
-async fn send_command_entry(
+pub(crate) async fn send_command_entry(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(value): Json<serde_json::Value>,

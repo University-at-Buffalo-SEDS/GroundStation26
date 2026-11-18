@@ -39,6 +39,7 @@ mod igniter_sense;
 mod ignition_pair;
 mod checklists;
 mod client_settings;
+mod watch;
 mod command_probe;
 mod command_proxy;
 mod comms;

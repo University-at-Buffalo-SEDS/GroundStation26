@@ -829,6 +829,17 @@ impl AuthManager {
 
     pub async fn logout(&self, db: &SqlitePool, token: &str) -> Result<(), AuthFailure> {
         let token = token.trim();
+        if is_watch_token(token) {
+            // A watch signing itself out removes only its own row.
+            sqlx::query("DELETE FROM auth_sessions WHERE token = ?")
+                .bind(watch_row_key(token))
+                .execute(db)
+                .await
+                .map_err(|e| AuthFailure::Internal(format!("failed to remove watch token: {e}")))?;
+            return Ok(());
+        }
+        // Signing out a phone session also revokes the watch tokens it issued.
+        revoke_watch_children(db, token).await?;
         if token.starts_with("paired1.") {
             let pairing = crate::station_pairing::Pairing::load()
                 .ok()
@@ -929,6 +940,9 @@ impl AuthManager {
 
         if let Some(token) = token.filter(|token| !token.trim().is_empty()) {
             let token = token.trim();
+            if is_watch_token(token) {
+                return self.authorize_watch(db, token, required).await;
+            }
             let row = sqlx::query(
                 r#"
                 SELECT username, session_type, can_view_data, can_send_commands, expires_at_ms
@@ -1075,6 +1089,206 @@ impl AuthManager {
             }
             Err(err) => Err(err),
         }
+    }
+
+    /// Issues a watch token for the account behind `parent_token` (a normal
+    /// phone session). The token may read data and send only the granted
+    /// commands: `requested` filtered to watch-eligible commands the account
+    /// may send now. One token per account and `device_id`; issuing again
+    /// replaces it. It never outlives the parent session, and signing the
+    /// parent out revokes it.
+    pub async fn issue_watch_token(
+        &self,
+        db: &SqlitePool,
+        parent_token: &str,
+        principal: &AuthPrincipal,
+        device_id: &str,
+        requested: &[String],
+        eligible: impl Fn(&str) -> bool,
+    ) -> Result<WatchTokenGrant, AuthFailure> {
+        let parent_token = parent_token.trim();
+        if principal.anonymous || is_watch_token(parent_token) || parent_token.is_empty() {
+            return Err(AuthFailure::Forbidden(
+                "sign in on the phone to link a watch".into(),
+            ));
+        }
+        let username = principal
+            .username
+            .clone()
+            .ok_or_else(|| AuthFailure::Forbidden("sign in on the phone to link a watch".into()))?;
+        if !valid_watch_device_id(device_id) {
+            return Err(AuthFailure::Forbidden("invalid watch device id".into()));
+        }
+        let commands = grant_watch_commands(requested, |cmd| {
+            eligible(cmd) && principal.allows_command_name(cmd)
+        });
+        let config = self
+            .load_users_file()
+            .map_err(|e| AuthFailure::Internal(format!("failed to load users.json: {e}")))?;
+        let now = now_ms();
+        let ttl_ms = (config.session_ttl_seconds.min(WATCH_TOKEN_MAX_TTL_SECONDS) as i64) * 1000;
+        let expires_at_ms = principal
+            .expires_at_ms
+            .unwrap_or(i64::MAX)
+            .min(now.saturating_add(ttl_ms));
+        if expires_at_ms <= now {
+            return Err(AuthFailure::Unauthorized("session token expired".into()));
+        }
+        let token = format!("{WATCH_TOKEN_PREFIX}{}", generate_token());
+        let session_type = format!(
+            "{WATCH_SESSION_PREFIX}{device_id}|{}",
+            token_fingerprint(parent_token)
+        );
+        let device_prefix = format!("{WATCH_SESSION_PREFIX}{device_id}|");
+        let commands_json = serde_json::to_string(&commands)
+            .map_err(|e| AuthFailure::Internal(format!("failed to serialize commands: {e}")))?;
+        let mut tx = db
+            .begin()
+            .await
+            .map_err(|e| AuthFailure::Internal(format!("failed to start transaction: {e}")))?;
+        sqlx::query(
+            "DELETE FROM auth_sessions WHERE username = ? COLLATE NOCASE AND substr(session_type, 1, ?) = ?",
+        )
+        .bind(&username)
+        .bind(device_prefix.len() as i64)
+        .bind(&device_prefix)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AuthFailure::Internal(format!("failed to replace watch token: {e}")))?;
+        sqlx::query(
+            r#"
+            INSERT INTO auth_sessions (
+                token, username, session_type, can_view_data, can_send_commands, allowed_commands_json, created_at_ms, expires_at_ms
+            )
+            VALUES (?, ?, ?, 1, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(watch_row_key(&token))
+        .bind(&username)
+        .bind(&session_type)
+        .bind(!commands.is_empty() as i64)
+        .bind(commands_json)
+        .bind(now)
+        .bind(expires_at_ms)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AuthFailure::Internal(format!("failed to store watch token: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| AuthFailure::Internal(format!("failed to store watch token: {e}")))?;
+        Ok(WatchTokenGrant {
+            token,
+            device_id: device_id.to_string(),
+            expires_at_ms,
+            commands,
+        })
+    }
+
+    /// Revokes the account's watch tokens: one device, or all of them.
+    /// Returns how many were removed.
+    pub async fn revoke_watch_tokens(
+        &self,
+        db: &SqlitePool,
+        username: &str,
+        device_id: Option<&str>,
+    ) -> Result<u64, AuthFailure> {
+        let prefix = match device_id {
+            Some(id) if valid_watch_device_id(id) => format!("{WATCH_SESSION_PREFIX}{id}|"),
+            Some(_) => return Err(AuthFailure::Forbidden("invalid watch device id".into())),
+            None => WATCH_SESSION_PREFIX.to_string(),
+        };
+        let result = sqlx::query(
+            "DELETE FROM auth_sessions WHERE username = ? COLLATE NOCASE AND substr(session_type, 1, ?) = ?",
+        )
+        .bind(username)
+        .bind(prefix.len() as i64)
+        .bind(&prefix)
+        .execute(db)
+        .await
+        .map_err(|e| AuthFailure::Internal(format!("failed to revoke watch tokens: {e}")))?;
+        Ok(result.rows_affected())
+    }
+
+    /// A watch token resolves to a narrow principal: no roles (so no
+    /// administrator authority), view data, and only the granted commands
+    /// that are still watch-eligible and still allowed for the account. The
+    /// router additionally limits watch tokens to the watch endpoints.
+    async fn authorize_watch(
+        &self,
+        db: &SqlitePool,
+        token: &str,
+        required: Permission,
+    ) -> Result<AuthPrincipal, AuthFailure> {
+        let row = sqlx::query(
+            r#"
+            SELECT username, session_type, can_view_data, can_send_commands, expires_at_ms, allowed_commands_json
+            FROM auth_sessions
+            WHERE token = ?
+            LIMIT 1
+            "#,
+        )
+        .bind(watch_row_key(token))
+        .fetch_optional(db)
+        .await
+        .map_err(|e| AuthFailure::Internal(format!("failed to query session: {e}")))?
+        .ok_or_else(|| AuthFailure::Unauthorized("invalid or revoked watch token".into()))?;
+        if !row
+            .get::<String, _>("session_type")
+            .starts_with(WATCH_SESSION_PREFIX)
+        {
+            return Err(AuthFailure::Unauthorized("invalid or revoked watch token".into()));
+        }
+        let expires_at_ms = row.get::<i64, _>("expires_at_ms");
+        if expires_at_ms <= now_ms() {
+            return Err(AuthFailure::Unauthorized("watch token expired".into()));
+        }
+        let config = self
+            .load_users_file()
+            .map_err(|e| AuthFailure::Internal(format!("failed to load users.json: {e}")))?;
+        let username = row.get::<String, _>("username");
+        let user = config
+            .users
+            .iter()
+            .find(|u| u.username.eq_ignore_ascii_case(&username) && !u.disabled)
+            .ok_or_else(|| AuthFailure::Unauthorized("Account disabled or removed".into()))?;
+        let current = user.permissions.for_roles(&user.roles);
+        let granted: Vec<String> =
+            serde_json::from_str(&row.get::<String, _>("allowed_commands_json")).unwrap_or_default();
+        let (account_commands, _) = configured_user_access(&config, &username);
+        let allowed = grant_watch_commands(&granted, |cmd| {
+            crate::watch::command_watch_eligible(cmd) && account_commands.allows(cmd)
+        });
+        let send_commands =
+            row.get::<i64, _>("can_send_commands") != 0 && current.send_commands && !allowed.is_empty();
+        let permissions = Permissions {
+            view_data: row.get::<i64, _>("can_view_data") != 0 && current.view_data,
+            send_commands,
+            ..Permissions::default()
+        }
+        .normalized();
+        let principal = AuthPrincipal {
+            roles: Vec::new(),
+            username: Some(user.username.clone()),
+            permissions,
+            expires_at_ms: Some(expires_at_ms),
+            anonymous: false,
+            session_type: Some(WATCH_SESSION_TYPE.into()),
+            command_access: CommandAccess {
+                // Empty would mean "unrestricted"; a watch never has that.
+                allowed_commands: if allowed.is_empty() {
+                    vec![NO_WATCH_COMMANDS.into()]
+                } else {
+                    allowed
+                },
+            },
+            calibration_access: CalibrationAccess::default(),
+        };
+        if !principal.permissions.allows(required) {
+            return Err(AuthFailure::Forbidden(
+                "watch token does not have the required permission".into(),
+            ));
+        }
+        Ok(principal)
     }
 
     pub async fn cleanup_expired_sessions(&self, db: &SqlitePool) -> Result<(), AuthFailure> {
@@ -1389,6 +1603,89 @@ fn intersect_commands(source: &[String], destination: &[String]) -> Vec<String> 
             .cloned()
             .collect()
     }
+}
+
+/// Watch tokens: `gsw1.` + 32 random bytes. Only a SHA-256 digest is
+/// stored, so the sessions table never holds a usable watch credential.
+pub const WATCH_TOKEN_PREFIX: &str = "gsw1.";
+const WATCH_ROW_PREFIX: &str = "gsw1h:";
+/// `watch|<device id>|<parent session fingerprint>`
+const WATCH_SESSION_PREFIX: &str = "watch|";
+pub const WATCH_SESSION_TYPE: &str = "watch";
+/// Most commands one watch token may carry (pages × 2 actions).
+pub const MAX_WATCH_COMMANDS: usize = 16;
+/// Upper bound on a watch token's life, even with a longer session TTL.
+const WATCH_TOKEN_MAX_TTL_SECONDS: u64 = 60 * 60 * 24 * 30;
+const NO_WATCH_COMMANDS: &str = "__no_watch_commands__";
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WatchTokenGrant {
+    pub token: String,
+    pub device_id: String,
+    pub expires_at_ms: i64,
+    pub commands: Vec<String>,
+}
+
+pub fn is_watch_token(token: &str) -> bool {
+    token.trim().starts_with(WATCH_TOKEN_PREFIX)
+}
+
+fn sha256_hex(text: &str) -> String {
+    ring::digest::digest(&ring::digest::SHA256, text.as_bytes())
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn watch_row_key(token: &str) -> String {
+    format!("{WATCH_ROW_PREFIX}{}", sha256_hex(token.trim()))
+}
+
+/// Identifies the phone session that issued a watch token without storing it.
+fn token_fingerprint(token: &str) -> String {
+    sha256_hex(token.trim())[..32].to_string()
+}
+
+fn valid_watch_device_id(id: &str) -> bool {
+    (1..=64).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Deduplicated, order-preserving, at most [`MAX_WATCH_COMMANDS`].
+fn grant_watch_commands(requested: &[String], allowed: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for cmd in requested {
+        let cmd = cmd.trim();
+        if cmd.is_empty() || cmd.len() > 64 || out.iter().any(|c| c == cmd) || !allowed(cmd) {
+            continue;
+        }
+        out.push(cmd.to_string());
+        if out.len() == MAX_WATCH_COMMANDS {
+            break;
+        }
+    }
+    out
+}
+
+async fn revoke_watch_children(db: &SqlitePool, parent_token: &str) -> Result<(), AuthFailure> {
+    if parent_token.trim().is_empty() {
+        return Ok(());
+    }
+    let suffix = format!("|{}", token_fingerprint(parent_token));
+    sqlx::query(
+        "DELETE FROM auth_sessions WHERE substr(session_type, 1, ?) = ? AND substr(session_type, -?) = ?",
+    )
+    .bind(WATCH_SESSION_PREFIX.len() as i64)
+    .bind(WATCH_SESSION_PREFIX)
+    .bind(suffix.len() as i64)
+    .bind(&suffix)
+    .execute(db)
+    .await
+    .map_err(|e| AuthFailure::Internal(format!("failed to revoke watch tokens: {e}")))?;
+    Ok(())
 }
 
 fn generate_token() -> String {
