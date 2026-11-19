@@ -31,9 +31,16 @@ A watch token resolves to a narrow principal: no roles (so no administrator
 authority), view data, and only the granted commands that are still
 watch-eligible and still allowed for the account; no calibration, checklist,
 voice, camera or clock permissions. The router additionally limits watch
-tokens to `GET /api/watch/status`, `POST /api/command` and
-`POST /api/auth/logout`; every other request with a watch token (including
-`/ws?token=`) gets HTTP 403.
+tokens to `GET /api/watch/status`, `POST /api/command`,
+`POST /api/auth/logout` and `GET /tiles/{z}/{x}/{y}[.jpg]` (decimal indices
+only); every other request with a watch token (including `/ws?token=` and
+any query-string token) gets HTTP 403.
+
+The tile endpoint is read-only: it serves the station's offline map bundle
+(the same tiles the map tab shows) and no telemetry. The watch uses it for
+the compass map background in direct mode, fetching only the few tiles of
+its current view that the phone has not already sent it (at most six at a
+time, a missing tile not again for a minute).
 
 ## Watch-eligible actions
 

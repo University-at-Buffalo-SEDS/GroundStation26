@@ -12,7 +12,9 @@
 //!
 //! Commands from a watch use the ordinary `POST /api/command` with the watch
 //! token, so they pass exactly the same authorization, action policy and
-//! admission as the phone. A watch token reaches no other endpoint.
+//! admission as the phone. Besides those, a watch token may only read map
+//! tiles (`GET /tiles/{z}/{x}/{y}.jpg`, the compass map background) and log
+//! itself out; it reaches no other endpoint.
 use crate::auth::{AuthFailure, Permission, WatchTokenGrant};
 use crate::state::AppState;
 use crate::web::{authorize_headers, bearer_token_from_headers};
@@ -83,7 +85,21 @@ fn watch_token_allowed(method: &Method, path: &str) -> bool {
     matches!(
         (method.as_str(), path),
         ("GET", STATUS_PATH) | ("POST", "/api/command") | ("POST", "/api/auth/logout")
-    )
+    ) || (method == Method::GET && is_tile_path(path))
+}
+
+/// `/tiles/{z}/{x}/{y}` or `/tiles/{z}/{x}/{y}.jpg` with decimal indices:
+/// the read-only map tiles the watch compass draws under its arrow.
+fn is_tile_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/tiles/") else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('/').collect();
+    let digits = |s: &str| (1..=9).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit());
+    parts.len() == 3
+        && digits(parts[0])
+        && digits(parts[1])
+        && digits(parts[2].strip_suffix(".jpg").unwrap_or(parts[2]))
 }
 
 fn query_token(query: Option<&str>) -> Option<String> {
@@ -106,7 +122,7 @@ pub async fn scope_watch_tokens(request: Request, next: Next) -> Response {
     {
         return (
             StatusCode::FORBIDDEN,
-            "A watch token can only read the watch status and send its page actions.",
+            "A watch token can only read the watch status and map tiles and send its page actions.",
         )
             .into_response();
     }
@@ -1240,6 +1256,8 @@ mod tests {
             .route("/api/recent", get(|| async { "reached" }))
             .route("/api/action_policy", get(|| async { "reached" }))
             .route("/ws", get(|| async { "reached" }))
+            .route("/tiles/{z}/{x}/{y}", get(|| async { "tile" }))
+            .route("/tiles/{z}/{x}/{y}/extra", get(|| async { "reached" }))
             .merge(routes())
             .layer(axum::middleware::from_fn(scope_watch_tokens))
             .with_state(state.clone());
@@ -1381,6 +1399,21 @@ mod tests {
         // WebSocket tokens travel in the query string.
         let ws = format!("/ws?token={}", grant.token);
         assert_eq!(call(&app, "GET", &ws, None, None).await.0, StatusCode::FORBIDDEN);
+        // Map tiles are read-only and allowed (the compass map background);
+        // nothing else under /tiles and no other method.
+        for uri in ["/tiles/15/9204/12054.jpg", "/tiles/3/1/2"] {
+            assert_eq!(call(&app, "GET", uri, token, None).await, (StatusCode::OK, "tile".into()), "{uri}");
+        }
+        for (method, uri) in [
+            ("GET", "/tiles/15/9204/12054/extra"),
+            ("GET", "/tiles/15/x/12054.jpg"),
+            ("POST", "/tiles/15/9204/12054.jpg"),
+            ("GET", "/tiles/15/9204/12054.jpg/../../api/recent"),
+        ] {
+            assert_eq!(call(&app, method, uri, token, None).await.0, StatusCode::FORBIDDEN, "{method} {uri}");
+        }
+        let tile_ws = format!("/tiles/1/1/1?token={}", grant.token);
+        assert_eq!(call(&app, "GET", &tile_ws, None, None).await.0, StatusCode::FORBIDDEN, "query tokens stay refused");
         // A phone session is not affected.
         assert_eq!(call(&app, "GET", "/api/recent", Some("operator-phone"), None).await.0, StatusCode::OK);
         assert_eq!(call(&app, "GET", ACTIONS_PATH, Some("operator-phone"), None).await.0, StatusCode::OK);

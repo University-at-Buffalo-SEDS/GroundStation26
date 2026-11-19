@@ -530,7 +530,7 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .merge(crate::launch_history::api::routes())
         // anything that doesn’t match the above routes goes to the static files
         .fallback_service(static_dir)
-        // Watch tokens reach only the watch status, /api/command and logout.
+        // Watch tokens reach only the watch status, map tiles, /api/command and logout.
         .layer(axum::middleware::from_fn(crate::watch::scope_watch_tokens))
         .with_state(state)
 }
