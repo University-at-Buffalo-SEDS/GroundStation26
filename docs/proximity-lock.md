@@ -16,8 +16,8 @@ the device test checklist) is in the UI repository's `docs/proximity-lock.md`.
 | Default | Off. An administrator opts the station in (Settings > Safety). |
 | Who takes part | Every signed-in device, once the station is opted in, unless its user opts out on that device. A denied location permission counts as opting out. |
 | What a device sends | `participating`, `in_range` (true / false / null = cannot tell), an accuracy class, the kind of reference, a heartbeat counter. Never a latitude, longitude, distance or bearing. |
-| What is refused | New **arming**, **fill/pressurizing** and **launch/ignition** commands, per class as configured. |
-| What is never refused | Abort, Stop, vent and dump (either direction), supply closes, PILOT close, igniter off, Pause and Cancel fill, Rewind, Reset, Recover, and every FC evaluation/abort command. |
+| What is refused | New **arming**, **fill sequence** and **launch sequence** commands (and, if an admin opts in, single manual valve opens), per class as configured. |
+| What is never refused | Valve self-test, Abort, Stop, vent and dump (either direction), supply closes, PILOT close, igniter off, Pause and Cancel fill, Rewind, Reset, Recover, and every FC evaluation/abort command. |
 | Already running | Continues. Nothing is actuated because someone enters range; a warning is raised. |
 | Devices that stop reporting | "Unknown" after the heartbeat timeout (default 60 s). Policy: **warn** (default) or **block**. |
 | Override | Administrator only, 1–30 min, with a reason and a confirmation; logged and shown on every view; ends early on request. |
@@ -36,7 +36,8 @@ settings: configure the primary and the RRLS.
 | `radius_m` | 150 | 25–2000 | Lockout radius around the rocket. |
 | `exit_margin_m` | 30 | 5–500 | Hysteresis: a device in range leaves only beyond radius + margin (see below). |
 | `blocks.arming` | true | | Postinit, operator Advance (AdvanceFlightState / phase step), LIVE PYRO confirm, and the automatic Fill → Armed publication (which waits). |
-| `blocks.fill` | true | | Nitrogen or Nitrous toggle that would open, StartFill (and the recorded Fill), ContinueFillSequence, NitrogenTest, Turbocharge, ValveSelfTest. |
+| `blocks.fill` | true | | Fill sequences: StartFill (and the recorded Fill), ContinueFillSequence, NitrogenTest, Turbocharge. |
+| `blocks.manual_valves` | false | | A single Nitrogen, Nitrous or PILOT toggle that would open. Off by default so pad crew can work valves by hand. |
 | `blocks.launch` | true | | Launch, GroundStationLaunch, IgniterSequence, Igniter that would turn on, Pilot that would open. Launch also needs Armed. |
 | `stale_policy` | `warn` | `warn` / `block` | What an unknown device does. |
 | `heartbeat_timeout_s` | 60 | 30–600 | A participating device silent this long is unknown. Devices report every 15 s. |

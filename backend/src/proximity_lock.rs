@@ -79,16 +79,20 @@ pub enum StalePolicy {
 pub struct Blocks {
     /// Postinit, operator Advance (Fill to Armed), automatic Armed, LIVE PYRO.
     pub arming: bool,
-    /// Supply valve opens, Start fill/continue, Nitrogen test, Turbocharge,
-    /// valve self-test.
+    /// Fill sequences: Start fill/continue, Nitrogen test, Turbocharge.
     pub fill: bool,
-    /// Launch, GroundStationLaunch, igniter on/sequence, PILOT open.
+    /// Launch sequences: Launch, GroundStationLaunch, igniter on/sequence.
     pub launch: bool,
+    /// Single manual valve opens (Nitrogen, Nitrous, PILOT). Off by default:
+    /// pad crew work valves by hand next to the vehicle. Valve self-test is
+    /// never refused.
+    #[serde(default)]
+    pub manual_valves: bool,
 }
 
 impl Default for Blocks {
     fn default() -> Self {
-        Self { arming: true, fill: true, launch: true }
+        Self { arming: true, fill: true, launch: true, manual_valves: false }
     }
 }
 
@@ -138,7 +142,7 @@ impl Settings {
                 HEARTBEAT_TIMEOUT_RANGE_S.end()
             ));
         }
-        if self.enabled && !(self.blocks.arming || self.blocks.fill || self.blocks.launch) {
+        if self.enabled && !(self.blocks.arming || self.blocks.fill || self.blocks.launch || self.blocks.manual_valves) {
             return Err("Choose at least one blocked action class, or turn the lock off.".into());
         }
         Ok(())
@@ -149,6 +153,7 @@ impl Settings {
             ActionClass::Arming => self.blocks.arming,
             ActionClass::Fill => self.blocks.fill,
             ActionClass::Launch => self.blocks.launch,
+            ActionClass::ManualValves => self.blocks.manual_valves,
         }
     }
 
@@ -173,6 +178,7 @@ impl Settings {
             ("arming", self.blocks.arming, next.blocks.arming),
             ("fill/pressurizing", self.blocks.fill, next.blocks.fill),
             ("launch/ignition", self.blocks.launch, next.blocks.launch),
+            ("manual valve opens", self.blocks.manual_valves, next.blocks.manual_valves),
         ] {
             if before != after {
                 out.push(format!("block {name} {}", on_off(after)));
@@ -229,23 +235,22 @@ pub enum ActionClass {
     Arming,
     Fill,
     Launch,
+    ManualValves,
 }
 
 /// The class of a command the lock may refuse, or None (never refused).
 /// `opens(name)` says whether a toggle would open its valve / turn its
 /// output on now; a toggle that would close or turn off is safing and never
-/// refused. Explicit closes, vent, dump, pause, cancel, Abort, Rewind,
+/// refused. Valve self-test (run on the pad with crew nearby), explicit closes, vent, dump, pause, cancel, Abort, Rewind,
 /// Reset, Recover and every flight-computer evaluation/abort command are
 /// not listed and so never refused.
 pub fn classify(name: &str, opens: impl Fn(&str) -> bool) -> Option<ActionClass> {
     match name {
         "Postinit" | "AdvanceFlightState" | "IgtLivePyro" => Some(ActionClass::Arming),
-        "StartFill" | "ContinueFillSequence" | "NitrogenTest" | "Turbocharge" | "ValveSelfTest" => {
-            Some(ActionClass::Fill)
-        }
-        "Nitrogen" | "Nitrous" => opens(name).then_some(ActionClass::Fill),
+        "StartFill" | "ContinueFillSequence" | "NitrogenTest" | "Turbocharge" => Some(ActionClass::Fill),
+        "Nitrogen" | "Nitrous" | "Pilot" => opens(name).then_some(ActionClass::ManualValves),
         "Launch" | "GroundStationLaunch" | "IgniterSequence" => Some(ActionClass::Launch),
-        "Igniter" | "Pilot" => opens(name).then_some(ActionClass::Launch),
+        "Igniter" => opens(name).then_some(ActionClass::Launch),
         _ => None,
     }
 }
@@ -253,7 +258,7 @@ pub fn classify(name: &str, opens: impl Fn(&str) -> bool) -> Option<ActionClass>
 /// Every command name the lock can refuse (toggles in their opening direction).
 pub const CLASSIFIED: &[&str] = &[
     "Postinit", "AdvanceFlightState", "IgtLivePyro", "StartFill", "ContinueFillSequence", "NitrogenTest",
-    "Turbocharge", "ValveSelfTest", "Nitrogen", "Nitrous", "Launch", "GroundStationLaunch",
+    "Turbocharge", "Nitrogen", "Nitrous", "Launch", "GroundStationLaunch",
     "IgniterSequence", "Igniter", "Pilot",
 ];
 

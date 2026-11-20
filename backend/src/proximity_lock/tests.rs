@@ -43,6 +43,7 @@ fn cmd(name: &str) -> TelemetryCommand {
 
 /// Every client command name that the lock never refuses, whatever state.
 const SAFING: &[&str] = &[
+    "ValveSelfTest",
     "Abort", "Dump", "NormallyOpen", "NitrogenClose", "NitrousClose", "PauseFill", "CancelFill",
     "RetractPlumbing", "ResetSim", "StartWritingNow", "StartWritingLastTwoMinutes", "PauseWritingDb",
     "StopWritingDb", "ResetTClock", "MonitorAltitude", "RevokeMonitorAltitude", "ConsecutiveSamples",
@@ -61,12 +62,17 @@ fn classes_cover_arming_fill_and_launch_and_never_safing() {
     for name in ["Postinit", "AdvanceFlightState", "IgtLivePyro"] {
         assert_eq!(classify(name, opening), Some(ActionClass::Arming), "{name}");
     }
-    for name in ["StartFill", "ContinueFillSequence", "NitrogenTest", "Turbocharge", "ValveSelfTest", "Nitrogen", "Nitrous"] {
+    for name in ["StartFill", "ContinueFillSequence", "NitrogenTest", "Turbocharge"] {
         assert_eq!(classify(name, opening), Some(ActionClass::Fill), "{name}");
     }
-    for name in ["Launch", "GroundStationLaunch", "IgniterSequence", "Igniter", "Pilot"] {
+    for name in ["Launch", "GroundStationLaunch", "IgniterSequence", "Igniter"] {
         assert_eq!(classify(name, opening), Some(ActionClass::Launch), "{name}");
     }
+    for name in ["Nitrogen", "Nitrous", "Pilot"] {
+        assert_eq!(classify(name, opening), Some(ActionClass::ManualValves), "{name}");
+    }
+    // Valve self-test runs on the pad with crew next to the vehicle.
+    assert_eq!(classify("ValveSelfTest", opening), None);
     // A toggle that would close (supply, PILOT) or turn off (igniter) is safing.
     for name in ["Nitrogen", "Nitrous", "Pilot", "Igniter"] {
         assert_eq!(classify(name, closing), None, "{name} closing");
@@ -117,12 +123,18 @@ async fn in_range_refuses_each_enabled_class_and_never_safing() {
     assert!(status.active);
     assert_eq!(status.reason.as_deref(), Some("Proximity lock: 1 person within 150 m of the rocket (Alex's iPhone)"));
     assert_eq!(status.counts, Counts { reporting: 1, in_range: 1, unknown: 0, opted_out: 0 });
-    for name in ["Postinit", "StartFill", "NitrogenTest", "Turbocharge", "ValveSelfTest", "Launch", "IgniterSequence"] {
+    for name in ["Postinit", "StartFill", "NitrogenTest", "Turbocharge", "Launch", "IgniterSequence"] {
         let reason = refusal_at(&state, &cmd(name), now).unwrap_or_else(|| panic!("{name} admitted"));
         assert!(reason.contains("Alex's iPhone"), "{reason}");
     }
-    // Supply toggles open from an unknown/closed position: refused.
+    // By default the pad crew may run the valve self-test and work single
+    // valves by hand; only the fill and launch sequences (and arming) lock.
+    assert_eq!(refusal_at(&state, &TelemetryCommand::ValveSelfTest, now), None);
+    assert_eq!(refusal_at(&state, &TelemetryCommand::Nitrogen, now), None);
+    // Opted into: supply toggles open from an unknown/closed position: refused.
+    enable(&state, json!({"blocks": {"arming": true, "fill": true, "launch": true, "manual_valves": true}}));
     assert!(refusal_at(&state, &TelemetryCommand::Nitrogen, now).is_some());
+    assert_eq!(refusal_at(&state, &TelemetryCommand::ValveSelfTest, now), None);
     for name in SAFING.iter().filter(|n| crate::types::client_command_names(crate::station_mode::Mode::Hitl).contains(n)) {
         assert_eq!(refusal_at(&state, &cmd(name), now), None, "{name}");
     }
@@ -138,14 +150,14 @@ async fn in_range_refuses_each_enabled_class_and_never_safing() {
     assert!(refusal_at(&state, &TelemetryCommand::GroundStationLaunch, now).is_some());
     assert_eq!(refusal_at(&state, &TelemetryCommand::Nitrous, now), None);
     // At least one class while enabled.
-    let none = update_settings(&state, &admin(), br#"{"blocks":{"arming":false,"fill":false,"launch":false}}"#);
+    let none = update_settings(&state, &admin(), br#"{"blocks":{"arming":false,"fill":false,"launch":false,"manual_valves":false}}"#);
     assert_eq!(none.unwrap_err().0, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
 async fn an_open_supply_may_still_be_closed_by_its_toggle() {
     let state = crate::state::tests::test_app_state().await;
-    enable(&state, json!({}));
+    enable(&state, json!({"blocks": {"arming": true, "fill": true, "launch": true, "manual_valves": true}}));
     let now = Instant::now();
     send(&state, "alex", &report("phone-a", "Alex's iPhone", true, Some(true)), now).unwrap();
     let key = crate::rocket_commands::ActuatorBoardCommands::NitrogenOpen as u8;
@@ -423,7 +435,7 @@ async fn settings_are_admin_only_validated_audited_and_persisted() {
 #[tokio::test]
 async fn controls_are_disabled_with_the_reason_and_safing_stays_enabled() {
     let state = crate::state::tests::test_app_state().await;
-    enable(&state, json!({}));
+    enable(&state, json!({"blocks": {"arming": true, "fill": true, "launch": true, "manual_valves": true}}));
     send(&state, "alex", &report("phone-a", "Alex's iPhone", true, Some(true)), Instant::now()).unwrap();
     let control = |cmd: &str, enabled: bool, actuated: Option<bool>| crate::sequences::ActionControl {
         disabled_reason: None,
@@ -555,7 +567,7 @@ async fn the_safety_catalog_shows_the_live_lock() {
 #[tokio::test]
 async fn an_rrls_judges_forwarded_names_by_the_mirrored_controls() {
     let state = crate::state::tests::test_app_state().await;
-    enable(&state, json!({}));
+    enable(&state, json!({"blocks": {"arming": true, "fill": true, "launch": true, "manual_valves": true}}));
     send(&state, "alex", &report("phone-a", "Alex's iPhone", true, Some(true)), Instant::now()).unwrap();
     let mut policy = crate::sequences::default_action_policy();
     if let Some(control) = policy.controls.iter_mut().find(|c| c.cmd == "Nitrogen") {
