@@ -562,6 +562,22 @@
       ]
     },
     {
+      "name": "LAUNCH_SITE",
+      "doc": "Launch site: lat_deg, lon_deg, alt_msl_m (3 x float32). Station to FC before Launch; the FC echoes the site it uses. Centre of the FC's GPS acceptance window.",
+      "reliable": "Unordered",
+      "priority": 0,
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 3
+      },
+      "endpoints": [
+        "GROUND_STATION",
+        "FLIGHT_CONTROLLER"
+      ]
+    },
+    {
       "name": "SIM_SAMPLE",
       "doc": "Integrated ground test: replayed sensor sample or estimator output computed from replayed data. 8 x float32: kind (1 IMU, 2 barometer, 3 GPS, 4 ascent state, 5 descent state), seconds since the FC accepted Launch, then that kind's values (zero padded). Logged only to GroundStation.",
       "reliable": "Off",

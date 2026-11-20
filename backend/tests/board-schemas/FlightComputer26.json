@@ -492,6 +492,23 @@
       ]
     },
     {
+      "rust": "ActuatorLaunchSite",
+      "name": "LAUNCH_SITE",
+      "doc": "Launch site: lat_deg, lon_deg, alt_msl_m (3 x float32). Station to FC before Launch; the FC echoes the site it uses. Centre of the FC's GPS acceptance window.",
+      "reliable": "Unordered",
+      "priority": 0,
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 3
+      },
+      "endpoints": [
+        "ActuatorGroundStation",
+        "ActuatorFlightController"
+      ]
+    },
+    {
       "rust": "ActuatorGyroLocal",
       "name": "GYRO_LOCAL",
       "doc": "Gyro Data: 3 \u00d7 float32 elements (x, y, z). Logged only to SD.",
