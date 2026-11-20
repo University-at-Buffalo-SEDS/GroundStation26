@@ -47,6 +47,7 @@ independently.
 5. Use `docs/backend/i2c.md` when changing the Linux-to-Pico I2C transport.
 
 - [Application administration](application-administration.md): account roles, permissions and session revocation.
+- [Personnel proximity lock](proximity-lock.md): opt-in lock on arming and filling while people are near the rocket; on-device geofencing, stale policy, override, RRLS.
 - [Optional RRLS radio voice](rrls-radio-voice.md): opt-in push-to-talk and radio budget.
 - [Pico-Fi over Ethernet](picofi-ethernet.md): TCP client/server setup.
 

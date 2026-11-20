@@ -84,6 +84,7 @@ mod mission_phase;
 mod fc_phase;
 mod fc_estimator;
 mod igt;
+mod proximity_lock;
 mod launch_site;
 mod valve_report_health;
 mod mission_sync;
@@ -1714,6 +1715,7 @@ async fn main() -> anyhow::Result<()> {
         fc_phase: Default::default(),
         fc_estimator: Default::default(),
         igt: Default::default(),
+        proximity: Default::default(),
         hitl_button_interlock_enabled: Arc::new(AtomicBool::new(false)),
         hitl_launch_interlock_enabled: Arc::new(AtomicBool::new(false)),
         hitl_safety_interlocks: state::default_hitl_safety_interlocks(),
@@ -2532,6 +2534,8 @@ async fn main() -> anyhow::Result<()> {
         state.clone(),
         state.shutdown_subscribe(),
     ));
+    // Proximity lock: staleness, override expiry and publication.
+    crate::proximity_lock::spawn_tick(state.clone());
     let _valve_report_health = tokio::spawn(crate::valve_report_health::service(
         state.clone(),
         state.shutdown_subscribe(),

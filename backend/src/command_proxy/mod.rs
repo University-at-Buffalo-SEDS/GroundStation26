@@ -1759,6 +1759,14 @@ pub(crate) async fn submit_with_origins(
     plumbing_origin_utc_ms: Option<u64>,
     launch_origin: Option<RemoteLaunchOrigin>,
 ) -> Response {
+    // The proximity lock of the devices reporting to this RRLS. The primary
+    // applies its own devices' lock when it admits the forwarded command.
+    if crate::rrls::is_rrls()
+        && let Operation::Command(name) = &operation
+        && let Some(message) = crate::proximity_lock::rrls_forward_refusal(state, name, principal.username.as_deref())
+    {
+        return (StatusCode::CONFLICT, message).into_response();
+    }
     let Some(lease) = state.control_ingress.handler() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "Control ingress is closed").into_response();
     };

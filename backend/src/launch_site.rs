@@ -215,6 +215,11 @@ pub(crate) fn tick(state: &AppState, now: Instant) {
     }
 }
 
+/// The administrator's configured site, if any (never the compiled default).
+pub(crate) fn configured(state: &AppState) -> Option<Site> {
+    tracker(state).inner.lock().unwrap().configured
+}
+
 /// `GET /api/fc/launch-site`.
 pub(crate) fn view(state: &AppState) -> serde_json::Value {
     let inner = tracker(state).inner.lock().unwrap();

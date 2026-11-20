@@ -829,6 +829,59 @@ const IGT_RULES: &[Spec] = &[
 ];
 
 #[allow(clippy::type_complexity)]
+const PROXIMITY: &[Spec] = &[
+    Spec {
+        id: "proximity-lock",
+        title: "Personnel proximity lock",
+        summary: "Optional, off by default; an administrator opts the station in ({proximity.enabled}). While a participating device reports that it is within {proximity.radius_m} m of the rocket, the station refuses new {proximity.blocked_classes} commands (409, with the device names) and disables those controls. Now: {proximity.live}",
+        details: &[
+            "Arming: Postinit, operator Advance, LIVE PYRO, and the automatic Fill to Armed step, which waits. Fill/pressurizing: opening Nitrogen or Nitrous, Start fill and continue, Nitrogen test, Turbocharge, valve self-test. Launch/ignition: Launch, GroundStationLaunch, igniter on or sequence, PILOT open.",
+            "Never refused: Abort, Stop, Pause and Cancel fill, vent and dump in either direction, supply closes, PILOT close, igniter off, Rewind, Reset and Recover, and every FC evaluation and abort command.",
+            "It applies at admission (HTTP, websocket, physical panel, the RRLS forward, the ground test LIVE PYRO confirm). A command already admitted and a sequence already running continue: nothing is actuated because someone enters range. Entering range while the vehicle may be pressurized raises a warning.",
+            "Each station judges the devices that report to it. A command forwarded by an RRLS passes the RRLS's lock and then the primary's.",
+        ],
+        modes: ALL,
+        enforced_in: &[
+            "backend/src/proximity_lock.rs:classify",
+            "backend/src/proximity_lock.rs:admission_refusal",
+            "backend/src/proximity_lock.rs:project_policy",
+            "backend/src/proximity_lock.rs:holds_automatic_arming",
+            "backend/src/proximity_lock.rs:rrls_forward_refusal",
+        ],
+        config_keys: &["proximity.enabled", "proximity.radius_m", "proximity.blocked_classes", "proximity.live"],
+    },
+    Spec {
+        id: "proximity-privacy",
+        title: "Proximity is decided on the device",
+        summary: "The device compares its own location with the rocket's GPS fix (or the configured launch site without a fresh fix) and sends only in range / out of range / cannot tell, its accuracy class and a heartbeat every {proximity.heartbeat_interval_s} s. A report carrying any other field (a latitude, a distance) is refused; the station stores flags in memory only and logs names, never places.",
+        details: &[
+            "Hysteresis on the device: a device in range leaves only beyond the radius plus {proximity.exit_margin_m} m or its accuracy, whichever is larger. A fix whose accuracy circle reaches the radius counts as in range.",
+            "A user may opt out on each device at any time; a denied location permission counts as opting out. The device then stops affecting the lock.",
+        ],
+        modes: ALL,
+        enforced_in: &["backend/src/proximity_lock.rs:accept_report", "backend/src/proximity_lock.rs:Report"],
+        config_keys: &["proximity.heartbeat_interval_s", "proximity.exit_margin_m"],
+    },
+    Spec {
+        id: "proximity-stale",
+        title: "Devices that stop reporting",
+        summary: "A participating device with no report for {proximity.heartbeat_timeout_s} s, or one that cannot tell, is unknown. Unknown devices {proximity.stale_policy}: \"warn\" lists them prominently without blocking; \"block\" refuses like a device in range. Opted-out devices are never unknown.",
+        details: &["An administrator can remove a device that has left (it is listed by name). A station restart forgets every device until they report again."],
+        modes: ALL,
+        enforced_in: &["backend/src/proximity_lock.rs:refresh_at", "backend/src/proximity_lock.rs:dismiss"],
+        config_keys: &["proximity.heartbeat_timeout_s", "proximity.stale_policy"],
+    },
+    Spec {
+        id: "proximity-override",
+        title: "Proximity lock override",
+        summary: "An administrator may override the lock for 1–30 minutes with a reason and a confirmation (the pad crew filling on purpose). It is logged, shown on every view while active, ends early on request, and expires by itself; then the lock applies again at once.",
+        details: &[],
+        modes: ALL,
+        enforced_in: &["backend/src/proximity_lock.rs:start_override", "backend/src/proximity_lock.rs:end_override"],
+        config_keys: &[],
+    },
+];
+
 const SECTIONS: &[(&str, &str, &str, &[Spec])] = &[
     ("tank", "Tank pressure", "Overpressure relief and abort, overfill, and what the Valve Board does on its own.", TANK),
     ("failures", "When a sequence fails", "Which failures pause with every valve closed and which keep relieving.", FAILURES),
@@ -838,5 +891,6 @@ const SECTIONS: &[(&str, &str, &str, &[Spec])] = &[
     ("boards", "Board behaviour", "What each board does by itself: heartbeat and fault aborts, the abort latch, overpressure, watchdog resets and igniter timing. Entries marked reported can act after Launch.", BOARDS),
     ("phases", "Mission phases", "Startup, Idle, Fill, Launch, In flight and Landed, and who decides Landed.", PHASES),
     ("interlocks", "Interlocks", "Key, button and launch interlocks, ignition pair, igniter sense and checklists.", INTERLOCKS),
+    ("proximity", "Personnel proximity lock", "The optional lock that refuses arming and pressurizing while participating devices report people near the rocket.", PROXIMITY),
     ("igt", "Integrated ground test", "Entering the ground test, LIVE PYRO, the IGT Launch gate, the ground-test image latch, mock wet dress, the HITL replay, the launch site and FC SD retry.", IGT_RULES),
 ];

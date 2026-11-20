@@ -528,6 +528,7 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .merge(crate::station_mode_switch::routes())
         .merge(crate::igt::routes())
         .merge(crate::launch_site::routes())
+        .merge(crate::proximity_lock::routes())
         .merge(crate::station_pairing::manage::routes())
         .merge(crate::launch_history::api::routes())
         // anything that doesn’t match the above routes goes to the static files
@@ -647,6 +648,9 @@ pub enum WsOutMsg {
     FcEstimator(crate::fc_estimator::Status),
     /// The FC's integrated ground test status (`igt`).
     IgtStatus(crate::igt::Status),
+    /// The personnel proximity lock (`proximity_lock`): states and names,
+    /// never positions.
+    ProximityLock(crate::proximity_lock::Status),
     LaunchClock(LaunchClockMsg),
     Error(ErrorMsg),
     AlertAckState(AlertAckStateMsg),
@@ -3027,6 +3031,11 @@ async fn dispatch_command_inner(
         emit_notification_warning(&state, &message);
         return (StatusCode::FORBIDDEN, message);
     }
+    // The personnel proximity lock refuses new arming, pressurizing and
+    // launch commands; safing commands are never classified (proximity_lock).
+    if let Some(message) = crate::proximity_lock::admission_refusal(&state, &cmd, principal.username.as_deref()) {
+        return (StatusCode::CONFLICT, message);
+    }
     // Phase-step gates read shared state with try_lock; a lock that is merely
     // busy at this instant must not refuse a valid step. Re-check briefly.
     let mut allowed=command_allowed_waiting_out_core(&state,&cmd).await;
@@ -5351,6 +5360,7 @@ async fn handle_ws(
     let mut flight_maxima_rx = crate::flight_maxima::subscribe();
     let mut fc_estimator_rx = state.fc_estimator.subscribe();
     let mut igt_rx = state.igt.subscribe();
+    let mut proximity_rx = state.proximity.subscribe();
     let mut station_mode_rx = crate::runtime_mode::subscribe();
     station_mode_rx.borrow_and_update();
 
@@ -5430,6 +5440,14 @@ async fn handle_ws(
         // latch matter in normal and test fire too), and on every change.
         if ws_out_tx
             .send(serde_json::to_string(&WsOutMsg::IgtStatus(state_for_send.igt.status())).unwrap_or_default())
+            .await
+            .is_err()
+        {
+            return;
+        }
+        proximity_rx.borrow_and_update();
+        if ws_out_tx
+            .send(serde_json::to_string(&WsOutMsg::ProximityLock(crate::proximity_lock::status(&state_for_send))).unwrap_or_default())
             .await
             .is_err()
         {
@@ -5636,6 +5654,16 @@ async fn handle_ws(
                     }
                     let status = igt_rx.borrow_and_update().clone();
                     let text = serde_json::to_string(&WsOutMsg::IgtStatus(status)).unwrap_or_default();
+                    if ws_out_tx.send(text).await.is_err() {
+                        break;
+                    }
+                }
+                changed = proximity_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let status = proximity_rx.borrow_and_update().clone();
+                    let text = serde_json::to_string(&WsOutMsg::ProximityLock(status)).unwrap_or_default();
                     if ws_out_tx.send(text).await.is_err() {
                         break;
                     }
@@ -6203,6 +6231,10 @@ pub(crate) async fn handle_ws_control_text_with_source(
                     emit_notification_warning(&state_for_recv, message);
                     return;
                 }
+            }
+            if let Some(message) = crate::proximity_lock::admission_refusal(&state_for_recv, &cmd.cmd, principal.username.as_deref()) {
+                log::warn!("{message}");
+                return;
             }
             if !command_allowed_waiting_out_core(&state_for_recv,&cmd.cmd).await {
                 emit_notification_warning(&state_for_recv,command_disabled_message(&state_for_recv,&cmd.cmd));

@@ -97,6 +97,7 @@ impl Sources {
         );
         docs.insert("auto_zero".into(), crate::auto_zero::catalog_settings(state));
         docs.insert("station".into(), station_values(state));
+        docs.insert("proximity".into(), proximity_values(state));
         Self { docs }
     }
     /// Resolve `document.key[.nested]`. None when the key no longer exists.
@@ -108,6 +109,35 @@ impl Sources {
         }
         Some(value.clone())
     }
+}
+
+/// The proximity lock's settings and its live state, in words (names only).
+fn proximity_values(state: &AppState) -> Value {
+    let status = crate::proximity_lock::status(state);
+    let s = status.settings;
+    let classes: Vec<&str> = [(s.blocks.arming, "arming"), (s.blocks.fill, "fill/pressurizing"), (s.blocks.launch, "launch/ignition")]
+        .into_iter()
+        .filter_map(|(on, name)| on.then_some(name))
+        .collect();
+    let live = if !s.enabled {
+        "Off: the station has not opted in.".to_owned()
+    } else if let Some(o) = &status.override_view {
+        format!("OVERRIDDEN by {} ({} s left): {}. {}", o.by, o.remaining_s, o.reason, status.summary)
+    } else if let Some(reason) = &status.reason {
+        format!("ACTIVE. {reason}.")
+    } else {
+        format!("Not blocking. {}.", status.summary)
+    };
+    json!({
+        "enabled": s.enabled,
+        "radius_m": s.radius_m,
+        "exit_margin_m": s.exit_margin_m,
+        "stale_policy": match s.stale_policy { crate::proximity_lock::StalePolicy::Warn => "warn", crate::proximity_lock::StalePolicy::Block => "block" },
+        "heartbeat_timeout_s": s.heartbeat_timeout_s,
+        "heartbeat_interval_s": crate::proximity_lock::HEARTBEAT_INTERVAL_S,
+        "blocked_classes": if classes.is_empty() { "none".to_owned() } else { classes.join(", ") },
+        "live": live,
+    })
 }
 
 /// Station-wide values that are not part of the GSE configuration document.
@@ -292,6 +322,7 @@ mod tests {
             "igt-reset-exits", "igt-dry-run-default", "igt-vb-auto-vent", "igt-abort",
             "igt-image-identification", "igt-image-latch", "igt-image-no-latch", "igt-image-mismatch",
             "igt-mock-wet-dress", "igt-hitl-replay", "igt-settings", "fc-sd-retry", "fc-launch-site",
+            "proximity-lock", "proximity-privacy", "proximity-stale", "proximity-override",
         ] {
             assert!(ids.contains(required), "missing safety rule {required}");
         }

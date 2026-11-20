@@ -507,7 +507,8 @@ where
                 .iter()
                 .find(|c| c.cmd == panel_cmd)
                 .and_then(|c| c.disabled_reason.as_deref())
-                .filter(|reason| *reason == crate::sequence_access::DISABLED_REASON)
+                // The proximity lock names who is in range; say it on a press too.
+                .filter(|reason| *reason == crate::sequence_access::DISABLED_REASON || reason.starts_with("Proximity lock"))
                 .map(str::to_owned);
             if let Some(reason) = launch_only_reason {
                 let now_ms = crate::telemetry_task::get_current_timestamp_ms();

@@ -282,6 +282,9 @@ pub(super) fn publish_qualified_flight_armed_with_observation(
     state: &Arc<AppState>, observation: &crate::automatic_flight_state::Observation,
 ) {
     if crate::runtime_mode::is_test_fire() || !prelaunch(state) { return; }
+    // Personnel within the lockout radius: Armed waits (it asks the FC to
+    // arm). Nothing is actuated; the next tick tries again.
+    if crate::proximity_lock::holds_automatic_arming(state) { return; }
     let qualification_generation = {
         let rt = state.gse.lock().unwrap();
         if rt.operational.saved.qualification.stage() != gse_sequence::qualification::MissionStage::Armed

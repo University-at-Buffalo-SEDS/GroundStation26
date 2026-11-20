@@ -369,6 +369,9 @@ pub struct AppState {
     pub fc_estimator: Arc<crate::fc_estimator::Tracker>,
     /// The FC's integrated ground test status from its BOARD_HEALTH (igt).
     pub igt: Arc<crate::igt::Tracker>,
+    /// Personnel proximity lockout: device flags, settings, override
+    /// (proximity_lock, docs/proximity-lock.md).
+    pub proximity: Arc<crate::proximity_lock::Tracker>,
 
     pub hitl_button_interlock_enabled: Arc<AtomicBool>,
 
@@ -2162,6 +2165,8 @@ impl AppState {
             }
             crate::sequence_access::project_policy(self, &mut local);
             crate::sequences::explain_disabled_policy(&mut local);
+            // After the reasons above: the lock adds its own (proximity_lock).
+            crate::proximity_lock::project_policy(self, &mut local);
             if let Some(control) = local.controls.iter_mut().find(|c| c.cmd == "RetractPlumbing") {
                 control.progress = crate::actuator_plumbing::retract_progress(self);
             }
@@ -2202,6 +2207,9 @@ impl AppState {
             }));
         crate::board_abort::block_policy(self, &mut mirrored);
         crate::sequences::explain_disabled_policy(&mut mirrored);
+        // The primary projects its own devices; this RRLS adds those that
+        // report here, and refuses forwarding their blocked commands.
+        crate::proximity_lock::project_policy(self, &mut mirrored);
         mirrored
     }
 
@@ -4589,6 +4597,7 @@ pub(crate) mod tests {
             fc_phase: Default::default(),
             fc_estimator: Default::default(),
             igt: Default::default(),
+            proximity: Default::default(),
             hitl_button_interlock_enabled: Arc::new(AtomicBool::new(false)),
             hitl_launch_interlock_enabled: Arc::new(AtomicBool::new(false)),
             hitl_safety_interlocks: default_hitl_safety_interlocks(),

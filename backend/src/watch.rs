@@ -13,7 +13,8 @@
 //! Commands from a watch use the ordinary `POST /api/command` with the watch
 //! token, so they pass exactly the same authorization, action policy and
 //! admission as the phone. Besides those, a watch token may only read map
-//! tiles (`GET /tiles/{z}/{x}/{y}.jpg`, the compass map background) and log
+//! tiles (`GET /tiles/{z}/{x}/{y}.jpg`, the compass map background), send a
+//! proximity-lock flag (`POST /api/proximity/report`, no coordinates) and log
 //! itself out; it reaches no other endpoint.
 use crate::auth::{AuthFailure, Permission, WatchTokenGrant};
 use crate::state::AppState;
@@ -84,7 +85,10 @@ pub fn routes() -> Router<Arc<AppState>> {
 fn watch_token_allowed(method: &Method, path: &str) -> bool {
     matches!(
         (method.as_str(), path),
-        ("GET", STATUS_PATH) | ("POST", "/api/command") | ("POST", "/api/auth/logout")
+        ("GET", STATUS_PATH)
+            | ("POST", "/api/command")
+            | ("POST", "/api/auth/logout")
+            | ("POST", "/api/proximity/report")
     ) || (method == Method::GET && is_tile_path(path))
 }
 
@@ -1005,6 +1009,20 @@ mod tests {
 
     fn none(_: &str, _: Option<&str>, _: usize) -> Option<(f64, i64)> {
         None
+    }
+
+    #[test]
+    fn a_watch_token_may_send_a_proximity_flag_and_nothing_else_new() {
+        assert!(watch_token_allowed(&Method::POST, "/api/proximity/report"));
+        for (method, path) in [
+            (Method::GET, "/api/proximity"),
+            (Method::PUT, "/api/proximity/settings"),
+            (Method::POST, "/api/proximity/override"),
+            (Method::POST, "/api/proximity/dismiss"),
+            (Method::GET, "/api/proximity/report"),
+        ] {
+            assert!(!watch_token_allowed(&method, path), "{method} {path}");
+        }
     }
 
     fn base_input<'a>(telemetry: &'a dyn Fn(&str, Option<&str>, usize) -> Option<(f64, i64)>) -> Inputs<'a> {

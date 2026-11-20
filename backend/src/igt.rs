@@ -1099,7 +1099,8 @@ pub(crate) fn load_persisted(state: &AppState) {
         .map(|dir| dir.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
     settings::load(state, dir.clone());
-    crate::launch_site::load(state, dir);
+    crate::launch_site::load(state, dir.clone());
+    crate::proximity_lock::load(state, dir);
 }
 
 async fn get_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -1137,6 +1138,10 @@ async fn post_confirm(State(state): State<Arc<AppState>>, headers: HeaderMap, bo
         Ok(cmd) => cmd,
         Err(error) => return error_response(error),
     };
+    // LIVE PYRO arms the FC's pyro channels: the proximity lock's arming class.
+    if let Some(message) = crate::proximity_lock::admission_refusal(&state, &cmd, principal.username.as_deref()) {
+        return error_response(refusal(StatusCode::CONFLICT, message));
+    }
     let Some(router) = state.topology_router.get() else {
         return error_response(refusal(StatusCode::SERVICE_UNAVAILABLE, "The station network is not running."));
     };
