@@ -291,7 +291,8 @@ fn update_vehicle_speed_state(
             }
         }
         dt if dt == &*crate::telemetry_schema::data_type("BAROMETER_DATA").as_str() => {
-            if let Some(altitude_m) = values.get(2).copied().flatten()
+            if let Some(altitude_m) =
+                values.get(crate::telemetry_schema::baro::ALTITUDE_M).copied().flatten()
                 && altitude_m.is_finite()
             {
                 (
@@ -1433,7 +1434,7 @@ mod invalid_analog_tests {
                 &mut state,
                 &baro,
                 1000,
-                &[Some(100000.0), Some(20.0), Some(100.0)]
+                &[Some(100.0), Some(100000.0), Some(20.0)]
             )
             .is_none()
         );
@@ -1442,7 +1443,7 @@ mod invalid_analog_tests {
                 &mut state,
                 &baro,
                 1200,
-                &[Some(100000.0), Some(20.0), Some(102.0)]
+                &[Some(102.0), Some(100000.0), Some(20.0)]
             )
             .is_some()
         );
@@ -1462,7 +1463,7 @@ mod invalid_analog_tests {
                 &mut state,
                 &baro,
                 60200,
-                &[Some(100000.0), Some(20.0), Some(200.0)]
+                &[Some(200.0), Some(100000.0), Some(20.0)]
             )
             .is_none()
         );
@@ -1471,10 +1472,21 @@ mod invalid_analog_tests {
                 &mut state,
                 &baro,
                 60400,
-                &[Some(100000.0), Some(20.0), Some(202.0)]
+                &[Some(202.0), Some(100000.0), Some(20.0)]
             )
             .is_some()
         );
+    }
+    /// BAROMETER_DATA arrives as (alt, prs, tmp): speed follows the altitude,
+    /// not the constant sensor temperature.
+    #[test]
+    fn vehicle_speed_reads_barometer_altitude_in_fc_order() {
+        let mut state = SpeedEstimatorState::default();
+        let baro = crate::telemetry_schema::data_type("BAROMETER_DATA").as_str();
+        update_vehicle_speed_state(&mut state, &baro, 1000, &[Some(100.0), Some(100_000.0), Some(21.5)]);
+        let speed = update_vehicle_speed_state(&mut state, &baro, 1200, &[Some(104.0), Some(99_950.0), Some(21.5)])
+            .expect("two altitude samples give a speed");
+        assert!(speed > 1.0, "{speed}");
     }
     #[test]
     fn speed_expiry_preserves_existing_accelerometer_and_gps_bounds() {

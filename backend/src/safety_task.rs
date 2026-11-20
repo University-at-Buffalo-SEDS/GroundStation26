@@ -24,12 +24,15 @@ const GYRO_X_MIN_THRESHOLD: f32 = -5.0;
 const GYRO_Y_MIN_THRESHOLD: f32 = -5.0;
 const GYRO_Z_MIN_THRESHOLD: f32 = -360.0;
 
-// Barometric pressure thresholds (Pa)
+// Barometer thresholds, applied to BAROMETER_DATA (alt m, pressure Pa, temp C).
 const BARO_PRESSURE_MIN_THRESHOLD: f32 = 30000.0; // Pa
 const BARO_PRESSURE_MAX_THRESHOLD: f32 = 110000.0; // Pa
-const BARO_TEMPERATURE_MIN_THRESHOLD: f32 = 0.0; // °C
-const BARO_TEMPERATURE_MAX_THRESHOLD: f32 = 85.0; // °
-const BARO_ALTITUDE_MIN_THRESHOLD: f32 = -5.0; // m
+// The BMP390's operating range; a winter pad sits below 0 °C.
+const BARO_TEMPERATURE_MIN_THRESHOLD: f32 = -40.0; // °C
+const BARO_TEMPERATURE_MAX_THRESHOLD: f32 = 85.0; // °C
+// The FC's own MIN_ALT: below it the FC rejects the sample. Pad weather moves
+// the relative altitude a few metres.
+const BARO_ALTITUDE_MIN_THRESHOLD: f32 = -30.0; // m
 const BARO_ALTITUDE_MAX_THRESHOLD: f32 = 11000.0; // m
 
 // GPS thresholds
@@ -254,6 +257,28 @@ fn check_gyro_thresholds(values: &[f32], warnings: &mut HashSet<&'static str>) {
         && ((GYRO_Z_MIN_THRESHOLD > *gyro_z) || (*gyro_z > GYRO_Z_MAX_THRESHOLD))
     {
         warnings.insert("Critical: Gyro Z threshold exceeded!");
+    }
+}
+
+/// One BAROMETER_DATA sample in the FC's order: altitude m, pressure Pa, temperature C.
+pub(crate) fn check_baro_thresholds(values: &[f32], warnings: &mut HashSet<&'static str>) {
+    use crate::telemetry_schema::baro;
+    if let Some(pressure) = values.get(baro::PRESSURE_PA)
+        && ((BARO_PRESSURE_MIN_THRESHOLD > *pressure) || (*pressure > BARO_PRESSURE_MAX_THRESHOLD))
+    {
+        warnings.insert("Critical: Barometer pressure threshold exceeded!");
+    }
+
+    if let Some(temp) = values.get(baro::TEMPERATURE_C)
+        && ((BARO_TEMPERATURE_MIN_THRESHOLD > *temp) || (*temp > BARO_TEMPERATURE_MAX_THRESHOLD))
+    {
+        warnings.insert("Critical: Barometer temperature threshold exceeded!");
+    }
+
+    if let Some(alt) = values.get(baro::ALTITUDE_M)
+        && ((BARO_ALTITUDE_MIN_THRESHOLD > *alt) || (*alt > BARO_ALTITUDE_MAX_THRESHOLD))
+    {
+        warnings.insert("Critical: Barometer altitude threshold exceeded!");
     }
 }
 
@@ -597,33 +622,8 @@ async fn safety_loop(
                 }
 
                 ty if ty == crate::telemetry_schema::data_type("BAROMETER_DATA") => {
-                    // [pressure_Pa, temperature_C, altitude_m]
                     let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 3]);
-
-                    // Pressure
-                    if let Some(pressure) = values.first()
-                        && ((BARO_PRESSURE_MIN_THRESHOLD > *pressure)
-                            || (*pressure > BARO_PRESSURE_MAX_THRESHOLD))
-                    {
-                        cycle_warnings.insert("Critical: Barometer pressure threshold exceeded!");
-                    }
-
-                    // Temperature
-                    if let Some(temp) = values.get(1)
-                        && ((BARO_TEMPERATURE_MIN_THRESHOLD > *temp)
-                            || (*temp > BARO_TEMPERATURE_MAX_THRESHOLD))
-                    {
-                        cycle_warnings
-                            .insert("Critical: Barometer temperature threshold exceeded!");
-                    }
-
-                    // Altitude
-                    if let Some(alt) = values.get(2)
-                        && ((BARO_ALTITUDE_MIN_THRESHOLD > *alt)
-                            || (*alt > BARO_ALTITUDE_MAX_THRESHOLD))
-                    {
-                        cycle_warnings.insert("Critical: Barometer altitude threshold exceeded!");
-                    }
+                    check_baro_thresholds(&values, &mut cycle_warnings);
                 }
 
                 // GPS: [lat, lon] in "xy"

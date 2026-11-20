@@ -559,9 +559,9 @@
         "id": "BAROMETER_DATA",
         "label": "Barometer Data",
         "channels": [
+          "Altitude",
           "Pressure",
-          "Temp",
-          "Altitude"
+          "Temp"
         ],
         "chart_groups": [
           {

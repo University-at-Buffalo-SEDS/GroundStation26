@@ -284,9 +284,9 @@
         "id": "BAROMETER_DATA",
         "label": "Barometer Data",
         "channels": [
+          "Altitude",
           "Pressure",
-          "Temp",
-          "Altitude"
+          "Temp"
         ],
         "chart_groups": [
           {
@@ -3108,15 +3108,15 @@
                 "items": [
                   {
                     "label": "Altitude",
-                    "index": 2
-                  },
-                  {
-                    "label": "Pressure",
                     "index": 0
                   },
                   {
-                    "label": "Temp",
+                    "label": "Pressure",
                     "index": 1
+                  },
+                  {
+                    "label": "Temp",
+                    "index": 2
                   }
                 ]
               },
@@ -3160,7 +3160,7 @@
                 "chart_series": [
                   {
                     "data_type": "BAROMETER_DATA",
-                    "index": 2,
+                    "index": 0,
                     "label": "Barometer",
                     "display_filter": {
                       "enabled": true,
@@ -3298,15 +3298,15 @@
                 "items": [
                   {
                     "label": "Baro Alt",
-                    "index": 2
-                  },
-                  {
-                    "label": "Pressure",
                     "index": 0
                   },
                   {
-                    "label": "Temp",
+                    "label": "Pressure",
                     "index": 1
+                  },
+                  {
+                    "label": "Temp",
+                    "index": 2
                   }
                 ]
               },
@@ -3336,7 +3336,7 @@
                 "chart_series": [
                   {
                     "data_type": "BAROMETER_DATA",
-                    "index": 2,
+                    "index": 0,
                     "label": "Barometer",
                     "display_filter": {
                       "enabled": true,

@@ -1268,7 +1268,8 @@ impl FlightSimState {
                 let altitude_m = self.altitude_ft * 0.3048;
                 let pressure_pa = 101_325.0_f32 * f32::powf(1.0 - altitude_m / 44_330.0, 5.255);
                 let temp_c = (24.0 - altitude_m * 0.0065).clamp(-20.0, 35.0);
-                vec![pressure_pa, temp_c, altitude_m]
+                // FC wire order: alt, prs, tmp.
+                vec![altitude_m, pressure_pa, temp_c]
                     .into_iter()
                     .flat_map(|v| v.to_le_bytes())
                     .collect()
@@ -2288,6 +2289,41 @@ mod tests {
             );
             assert_eq!(sim.queued.len(), queued);
         }
+    }
+
+    /// The modeled FC sends BAROMETER_DATA as its own `baro { alt, prs, tmp }`,
+    /// and every station consumer reads it back that way.
+    #[test]
+    fn modeled_barometer_round_trips_in_fc_order() {
+        use crate::telemetry_schema::baro;
+        let mut sim = super::FlightSimState::new();
+        sim.altitude_ft = 1_000.5;
+        let spec = super::SimSensorSpec {
+            dtype: crate::telemetry_schema::types::BAROMETER_DATA,
+            sender: super::Board::FlightComputer,
+        };
+        let pkt = sim.next_sensor_packet(spec, 1_000).unwrap().expect("barometer packet");
+        let values = pkt.data_as_f32().unwrap();
+        assert_eq!(values.len(), 3);
+        let altitude_m = sim.altitude_ft * 0.3048;
+        assert!(altitude_m > 300.0);
+        assert!((values[baro::ALTITUDE_M] - altitude_m).abs() < 1e-3, "{values:?}");
+        assert!((95_000.0..100_000.0).contains(&values[baro::PRESSURE_PA]), "{values:?}");
+        assert!((20.0..24.0).contains(&values[baro::TEMPERATURE_C]), "{values:?}");
+        let reference = crate::fc_estimator::reference_pressure(&values).expect("plausible sample");
+        assert!((reference - 101_325.0).abs() < 100.0, "{reference}");
+        let row = crate::types::TelemetryRow {
+            timestamp_ms: 1_000,
+            data_type: "BAROMETER_DATA".into(),
+            sender_id: "FC".into(),
+            values: values.iter().copied().map(Some).collect(),
+        };
+        let maxima = crate::flight_maxima::samples(&row);
+        assert_eq!(maxima.len(), 1);
+        assert!((maxima[0].1 - f64::from(altitude_m)).abs() < 1e-3);
+        let mut warnings = std::collections::HashSet::new();
+        crate::safety_task::check_baro_thresholds(&values, &mut warnings);
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 }
 

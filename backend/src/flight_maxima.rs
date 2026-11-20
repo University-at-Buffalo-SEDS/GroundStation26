@@ -83,7 +83,7 @@ pub fn samples(row: &TelemetryRow) -> Vec<(Quantity, f64, &'static str, u8)> {
             }
         }
         "BAROMETER_DATA" => {
-            if let Some(alt) = v(2) {
+            if let Some(alt) = v(crate::telemetry_schema::baro::ALTITUDE_M) {
                 out.push((Quantity::Altitude, alt, "Barometer altitude", 1));
             }
         }

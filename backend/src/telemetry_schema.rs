@@ -68,6 +68,17 @@ pub fn data_type(name: &str) -> DataType {
     DataType::named(name)
 }
 
+/// BAROMETER_DATA element order on the wire: the FC sends its
+/// `baro { alt, prs, tmp }` struct whole (schema: "alt, prs, tmp").
+pub mod baro {
+    /// Altitude above the FC's ground reference, metres.
+    pub const ALTITUDE_M: usize = 0;
+    /// Compensated static pressure, pascals.
+    pub const PRESSURE_PA: usize = 1;
+    /// Sensor temperature, degrees Celsius.
+    pub const TEMPERATURE_C: usize = 2;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

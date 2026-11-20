@@ -3677,6 +3677,8 @@ mod radio_schema_route_tests;
 #[cfg(test)]
 mod abort_push_order_tests;
 #[cfg(test)]
+mod baro_order_tests;
+#[cfg(test)]
 mod av_bay_schema_contract;
 
 mod automatic_flight_state;

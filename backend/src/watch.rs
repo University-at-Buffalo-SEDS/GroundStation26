@@ -436,7 +436,7 @@ const ITEMS: &[ItemDef] = &[
             channels: &[
                 ("ASCENT_STATE", None, 4),
                 ("DESCENT_STATE", None, 2),
-                ("BAROMETER_DATA", None, 2),
+                ("BAROMETER_DATA", None, crate::telemetry_schema::baro::ALTITUDE_M),
             ],
             quantity: Quantity::Length,
             precision: 0,
