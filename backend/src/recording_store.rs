@@ -20,6 +20,8 @@ use std::sync::Mutex;
 
 #[path = "recording_store/api.rs"]
 pub(crate) mod api;
+#[path = "recording_store/board_sd.rs"]
+pub(crate) mod board_sd;
 #[cfg(test)]
 #[path = "recording_store/tests.rs"]
 mod tests;
@@ -170,7 +172,8 @@ pub struct EventPolicy {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// Rolling ring budget. Event captures are not counted.
+    /// Rolling ring budget ceiling. Event captures are not counted. The ring
+    /// also never grows into `reserve_free_mb` (see [`effective_budget`]).
     pub ring_budget_mb: u64,
     /// A segment is closed and a new one opened past this size.
     pub segment_mb: u64,
@@ -178,16 +181,21 @@ pub struct Settings {
     pub warn_free_mb: u64,
     /// Below this the ring shrinks (oldest segments first) to restore it.
     pub critical_free_mb: u64,
+    /// Free space the ring always leaves for event captures, board SD
+    /// attachments and the OS: it stops growing (oldest segments go) here.
+    pub reserve_free_mb: u64,
     pub events: BTreeMap<EventKind, EventPolicy>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            ring_budget_mb: 4096,
+            // 50 GB, or until the disk is nearly full, whichever comes first.
+            ring_budget_mb: 50 * 1024,
             segment_mb: 64,
             warn_free_mb: 2048,
             critical_free_mb: 512,
+            reserve_free_mb: 8 * 1024,
             events: EventKind::ALL
                 .into_iter()
                 .map(|kind| (kind, kind.default_policy()))
@@ -203,6 +211,8 @@ impl Settings {
         self.segment_mb = self.segment_mb.clamp(8, 1024).min(self.ring_budget_mb / 4);
         self.critical_free_mb = self.critical_free_mb.clamp(64, 1024 * 1024);
         self.warn_free_mb = self.warn_free_mb.clamp(self.critical_free_mb, 4 * 1024 * 1024);
+        // The ring stops before captures could push the disk into a warning.
+        self.reserve_free_mb = self.reserve_free_mb.clamp(self.warn_free_mb, 4 * 1024 * 1024);
         for kind in EventKind::ALL {
             let policy = self.events.entry(kind).or_insert_with(|| kind.default_policy());
             policy.pre_roll_s = policy.pre_roll_s.min(4 * 3600);
@@ -219,6 +229,17 @@ impl Settings {
     }
     pub fn segment_bytes(&self) -> u64 {
         self.segment_mb.saturating_mul(MIB)
+    }
+}
+
+/// The ring's budget now: the configured ceiling, but never more than the
+/// ring plus the free space above the reserve (so the ring fills the disk
+/// only up to the reserve kept for captures and the OS).
+pub(crate) fn effective_budget(settings: &Settings, ring_bytes: u64, free: Option<u64>) -> u64 {
+    let ceiling = settings.ring_budget_bytes();
+    match free {
+        Some(free) => ceiling.min(ring_bytes.saturating_add(free).saturating_sub(settings.reserve_free_mb.saturating_mul(MIB))),
+        None => ceiling,
     }
 }
 
@@ -508,7 +529,10 @@ pub struct RingStatus {
     pub enabled: bool,
     pub segments: usize,
     pub bytes: u64,
+    /// The configured ceiling.
     pub budget_bytes: u64,
+    /// The budget applied now (ceiling, limited by free disk above the reserve).
+    pub effective_budget_bytes: u64,
     pub segment_bytes: u64,
     pub oldest_ms: Option<i64>,
     pub newest_ms: Option<i64>,
@@ -997,6 +1021,9 @@ pub(crate) async fn capture_task(
         }
         run_due(&state, &root).await;
         persist_pending(&state, &root);
+        if crate::sd_download::take_launch_fetch() {
+            tokio::spawn(crate::sd_download::fetch_launch_files(state.clone()));
+        }
     }
 }
 
@@ -1018,6 +1045,15 @@ pub(crate) async fn run_due(state: &AppState, root: &Path) -> Vec<Result<Capture
                     }
                 }
                 state.recording_store.finish(capture.serial);
+                if matches!(capture.kind, EventKind::Launch | EventKind::Hitl | EventKind::GroundTest) {
+                    // Board SD launch files follow the launch capture: attach any
+                    // already downloaded, then fetch the DAQ's over the network.
+                    let root_owned = root.to_path_buf();
+                    let _ = tokio::task::spawn_blocking(move || board_sd::rescan_downloads(&root_owned)).await;
+                    if capture.kind == EventKind::Launch {
+                        crate::sd_download::schedule_launch_fetch();
+                    }
+                }
                 let message = format!(
                     "Saved {} capture \"{}\" ({} telemetry rows) to {}",
                     capture.kind.title(),
@@ -1069,6 +1105,9 @@ pub struct Manifest {
     pub saved_at_ms: i64,
     #[serde(default)]
     pub details: serde_json::Value,
+    /// Board SD launch files attached automatically (`board_sd/<BOARD>/`).
+    #[serde(default)]
+    pub board_sd: Vec<board_sd::BoardSdEntry>,
 }
 
 pub struct CaptureSaved {
@@ -1146,6 +1185,7 @@ pub(crate) async fn materialize(root: &Path, capture: &Capture, now: i64) -> any
         source_segments: sources,
         saved_at_ms: now,
         details: capture.details.clone(),
+        board_sd: Vec::new(),
     };
     let telemetry_rows = manifest.rows.get("telemetry").copied().unwrap_or(0);
     write_atomic(&folder.join(MANIFEST_FILE), &serde_json::to_vec_pretty(&manifest)?)?;
@@ -1297,7 +1337,9 @@ pub(crate) fn maintain_ring(
     let segments = scan_segments(&dir);
     let pin = state.recording_store.pin_ms();
     let critical = settings.critical_free_mb.saturating_mul(MIB);
-    let deletions = plan_deletions(&segments, active, pin, settings.ring_budget_bytes(), free, critical);
+    let ring_bytes: u64 = segments.iter().map(|s| s.bytes).sum();
+    let budget = effective_budget(&settings, ring_bytes, free);
+    let deletions = plan_deletions(&segments, active, pin, budget, free, critical);
     for path in &deletions {
         log::info!("rolling recording: deleting oldest segment {}", path.display());
         remove_sqlite_files(path);
@@ -1331,6 +1373,7 @@ pub(crate) fn maintain_ring(
         segments: remaining.len(),
         bytes: remaining.iter().map(|s| s.bytes).sum(),
         budget_bytes: settings.ring_budget_bytes(),
+        effective_budget_bytes: budget,
         segment_bytes: settings.segment_bytes(),
         oldest_ms: remaining.first().map(|s| s.start_ms),
         newest_ms: Some(now_ms()),

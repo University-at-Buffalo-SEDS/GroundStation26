@@ -20,6 +20,7 @@ pub(crate) fn routes() -> Router<Arc<AppState>> {
         .route("/api/recordings/{id}/delete", post(delete_recording))
         .route("/api/recordings/{id}/file", get(download_file))
         .route("/api/recordings/{id}/manifest", get(manifest))
+        .route("/api/recordings/{id}/board_sd/{board}/{name}", get(board_sd_file))
 }
 
 fn root(state: &AppState) -> PathBuf {
@@ -314,4 +315,39 @@ async fn manifest(
         Some(manifest) => no_store(Json(manifest).into_response()),
         None => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+/// An attached board SD launch file (or its lead-up), byte for byte.
+async fn board_sd_file(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    UrlPath((id, board, name)): UrlPath<(String, String, String)>,
+) -> Response {
+    if let Err(response) = crate::web::authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
+    if !matches!(RecordingId::parse(&id), Some(RecordingId::Event { file: None, .. })) {
+        return (StatusCode::BAD_REQUEST, "Only event captures have board SD files").into_response();
+    }
+    let capture = match crate::recording_export::recording_path(&root(&state), &id).await {
+        Ok(path) => path,
+        Err(status) => return status.into_response(),
+    };
+    let Some(path) = board_sd::attached_path(&capture, &board, &name) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(file) => file,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    no_store(
+        (
+            [
+                (header::CONTENT_TYPE, "text/csv; charset=utf-8".to_owned()),
+                (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{board}-{name}\"")),
+            ],
+            Body::from_stream(tokio_util_stream(file)),
+        )
+            .into_response(),
+    )
 }

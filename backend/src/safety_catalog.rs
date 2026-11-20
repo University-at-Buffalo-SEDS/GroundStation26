@@ -127,6 +127,7 @@ fn recording_values(state: &AppState) -> Value {
         "segment_mb": settings.segment_mb,
         "warn_free_mb": settings.warn_free_mb,
         "critical_free_mb": settings.critical_free_mb,
+        "reserve_free_mb": settings.reserve_free_mb,
         "launch_pre_roll_s": launch.pre_roll_s,
         "launch_post_roll_s": launch.post_roll_s,
         "live": live,

@@ -132,6 +132,8 @@ fn settings_normalize_into_safe_ranges_and_keep_every_event_type() {
     assert!(settings.warn_free_mb >= settings.critical_free_mb);
     assert_eq!(settings.events.len(), EventKind::ALL.len());
     let defaults = Settings::default();
+    assert_eq!(defaults.ring_budget_mb, 50 * 1024, "50 GB unless the disk fills first");
+    assert!(defaults.reserve_free_mb >= defaults.warn_free_mb);
     assert_eq!(defaults.policy(EventKind::Launch).pre_roll_s, 600);
     assert!(EventKind::ALL.iter().all(|k| defaults.policy(*k).auto));
     let text = serde_json::to_string(&defaults).unwrap();
@@ -664,4 +666,183 @@ async fn incomplete_capture_copies_are_removed_at_startup() {
     remove_incomplete_captures(&root.0);
     assert!(!folder.exists());
     assert!(kept.exists());
+}
+
+// ---------------------------------------------------------------------------
+// Disk-aware budget
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ring_budget_is_50_gb_or_the_disk_above_the_capture_reserve_whichever_is_smaller() {
+    let settings = Settings::default().normalized();
+    let gib = 1024 * MIB;
+    // Plenty of disk: the 50 GB ceiling applies.
+    assert_eq!(effective_budget(&settings, 10 * gib, Some(500 * gib)), 50 * gib);
+    // A 32 GB card with 12 GB of ring and 10 GB free: the ring may grow by only
+    // 2 GB more, keeping the 8 GB reserve for captures and the OS.
+    assert_eq!(effective_budget(&settings, 12 * gib, Some(10 * gib)), 14 * gib);
+    // Captures ate into the reserve: the budget falls below the ring, so the
+    // oldest segments go until the reserve is free again.
+    assert_eq!(effective_budget(&settings, 12 * gib, Some(4 * gib)), 8 * gib);
+    assert_eq!(effective_budget(&settings, 1 * gib, Some(1 * gib)), 0);
+    assert_eq!(effective_budget(&settings, 1 * gib, None), 50 * gib, "unknown free space: ceiling only");
+    // The reserve never sits below the warning threshold.
+    let tight = Settings { reserve_free_mb: 1, ..Default::default() }.normalized();
+    assert_eq!(tight.reserve_free_mb, tight.warn_free_mb);
+}
+
+#[tokio::test]
+async fn the_ring_stops_at_the_reserve_and_reports_its_effective_budget() {
+    let root = TestDirectory::new();
+    let state = crate::state::tests::test_app_state().await;
+    state.recording_store.enable_rolling();
+    let rolling = rolling_dir(&root.0);
+    let mut paths = Vec::new();
+    for i in 0..3 {
+        paths.push(write_segment(&rolling, T0 + i * 600_000, &[(T0 + i * 600_000 + 1, "RAW")]).await);
+    }
+    let ring: u64 = scan_segments(&rolling).iter().map(|s| s.bytes).sum();
+    let mut settings = Settings::default();
+    settings.reserve_free_mb = 4096;
+    state.recording_store.set_settings(settings);
+    // Free space exactly at the reserve plus one segment: the ring is over its
+    // effective budget by the other two... minus what fits.
+    let one = scan_segments(&rolling)[0].bytes;
+    let free = 4096 * MIB - ring + one;
+    let deleted = maintain_ring(&state, &root.0, Some(&paths[2]), Some(free));
+    assert_eq!(deleted, paths[..2].to_vec(), "oldest go first, the active one stays");
+    let status = state.recording_store.ring_status();
+    assert_eq!(status.budget_bytes, 50 * 1024 * MIB);
+    assert_eq!(status.effective_budget_bytes, one);
+    assert_eq!(status.disk, DiskState::Ok, "the reserve keeps the disk above the warning");
+}
+
+// ---------------------------------------------------------------------------
+// Board SD launch files follow the launch capture
+// ---------------------------------------------------------------------------
+
+const BOARD_HEADER: &str = "timestamp_ms,monotonic_ms,sensor,value,raw_adc_code,raw_value,calibrated_value,time_source,adc_temperature_c,adc_temperature_code,uptime_ticks,uptime_frequency_hz,record_sequence";
+
+fn board_csv(path: &Path, rows: &[(i64, i64, &str)]) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut text = format!("{BOARD_HEADER}\n# calibration,ch0,1,0\n");
+    for (i, (ts, mono, source)) in rows.iter().enumerate() {
+        // FC rows quote a space-separated vector in `value`; commas inside
+        // quotes must not shift `time_source`.
+        text.push_str(&format!("{ts},{mono},accelerometer_sample,\"1,5 2 3\",,,,{source},,,{mono},1000,{i}\n"));
+    }
+    std::fs::write(path, text).unwrap();
+}
+
+async fn launch_capture(root: &Path, kind: EventKind, start: i64, end: i64) -> CaptureSaved {
+    write_segment(&rolling_dir(root), start - 120_000, &[(start, "EVENT")]).await;
+    let mut c = capture(kind, start, 60, end, 30);
+    c.label = kind.title().into();
+    materialize(root, &c, end + 60_000).await.unwrap()
+}
+
+#[test]
+fn board_file_names_and_quoted_rows_are_understood() {
+    use board_sd::classify_name;
+    assert_eq!(classify_name("irec_LAUNCH-1800000000-0.csv"), Some(("FC", true)));
+    assert_eq!(classify_name("irec-1800000000-0.csv"), Some(("FC", false)));
+    assert_eq!(classify_name("DAQ_LAUNCH_0001.CSV"), Some(("DAQ", true)));
+    assert_eq!(classify_name("DAQ_0001.CSV"), Some(("DAQ", false)));
+    assert_eq!(classify_name("notes.txt"), None);
+    assert_eq!(classify_name("other.csv"), None);
+    let dir = TestDirectory::new();
+    let path = dir.0.join("irec_LAUNCH-1-0.csv");
+    board_csv(&path, &[(5, 1, "local"), (T0 + 1_000, 2, "network"), (T0 + 9_000, 3, "network")]);
+    let file = board_sd::scan(&path, "irec_LAUNCH-1-0.csv").unwrap();
+    assert_eq!((file.board, file.launch, file.first_utc, file.last_utc, file.rows), ("FC", true, T0 + 1_000, T0 + 9_000, 2));
+    let local_only = dir.0.join("DAQ_LAUNCH_2.CSV");
+    board_csv(&local_only, &[(5, 1, "local")]);
+    assert!(board_sd::scan(&local_only, "DAQ_LAUNCH_2.CSV").is_none(), "no network UTC: cannot be dated");
+}
+
+#[tokio::test]
+async fn board_launch_files_attach_to_the_matching_launch_capture_with_a_lead_up() {
+    use board_sd::Outcome;
+    let root = TestDirectory::new();
+    // An earlier fill and two launch captures; the board file belongs to the second.
+    let first = launch_capture(&root.0, EventKind::Launch, T0, T0 + 120_000).await;
+    let second = launch_capture(&root.0, EventKind::Launch, T0 + 3_600_000, T0 + 3_720_000).await;
+    let igt = launch_capture(&root.0, EventKind::GroundTest, T0 + 3_000_000, T0 + 4_000_000).await;
+    let incoming = root.0.join("incoming");
+    // The DAQ launch file (T0..T+20 s of the second launch).
+    let launch = incoming.join("DAQ_LAUNCH_0007.CSV");
+    board_csv(&launch, &[(T0 + 3_600_000, 50_000, "network"), (T0 + 3_620_000, 70_000, "network")]);
+    let out = board_sd::offer_file(&root.0, &launch, "DAQ_LAUNCH_0007.CSV", "network_download").unwrap();
+    assert_eq!(out, vec![Outcome::Attached(second.folder.clone())], "launch beats the overlapping ground test");
+    let attached = second.folder.join("board_sd/DAQ/DAQ_LAUNCH_0007.CSV");
+    assert_eq!(std::fs::read(&attached).unwrap(), std::fs::read(&launch).unwrap(), "copied unchanged");
+    let manifest = read_manifest(&second.folder).unwrap();
+    assert_eq!(manifest.board_sd.len(), 1);
+    let entry = &manifest.board_sd[0];
+    assert_eq!((entry.board.as_str(), entry.rows, entry.matched_by.as_str(), entry.source.as_str()), ("DAQ", 2, "utc_window", "network_download"));
+    assert_eq!(entry.sha256.len(), 64);
+    assert!(read_manifest(&first.folder).unwrap().board_sd.is_empty());
+    assert!(read_manifest(&igt.folder).unwrap().board_sd.is_empty());
+    // Offering it again (download and import of the same file) adds nothing.
+    board_sd::offer_file(&root.0, &launch, "DAQ_LAUNCH_0007.CSV", "sd_import").unwrap();
+    assert_eq!(read_manifest(&second.folder).unwrap().board_sd.len(), 1);
+
+    // The ordinary file of the same boot supplies the minute before launch.
+    let ordinary = incoming.join("DAQ_0006.CSV");
+    board_csv(&ordinary, &[
+        (T0 + 3_500_000, 0, "network"),       // too early
+        (T0 + 3_545_000, 45_000, "network"),  // 55 s before
+        (T0 + 3_599_000, 49_000, "network"),  // 1 s before
+    ]);
+    let out = board_sd::offer_file(&root.0, &ordinary, "DAQ_0006.CSV", "sd_import").unwrap();
+    assert_eq!(out, vec![Outcome::LeadUp(second.folder.clone())]);
+    let entry = read_manifest(&second.folder).unwrap().board_sd[0].clone();
+    assert_eq!(entry.lead_up_file.as_deref(), Some("DAQ_LAUNCH_0007.leadup.csv"));
+    assert_eq!(entry.lead_up_from_ms, Some(T0 + 3_600_000 - board_sd::LEAD_UP_MS));
+    assert_eq!(entry.lead_up_rows, 2);
+    let lead = std::fs::read_to_string(second.folder.join("board_sd/DAQ/DAQ_LAUNCH_0007.leadup.csv")).unwrap();
+    assert!(lead.starts_with(BOARD_HEADER) && lead.contains("# calibration"));
+    assert_eq!(lead.lines().filter(|l| l.contains("accelerometer_sample")).count(), 2);
+
+    // A launch file outside every capture stays where it is.
+    let stray = incoming.join("irec_LAUNCH-9-0.csv");
+    board_csv(&stray, &[(T0 + 90_000_000, 1, "network")]);
+    assert_eq!(board_sd::offer_file(&root.0, &stray, "irec_LAUNCH-9-0.csv", "sd_import").unwrap(), vec![Outcome::NoCapture]);
+    // Not a board log.
+    assert_eq!(board_sd::offer_file(&root.0, &stray, "../x.csv", "sd_import").unwrap(), vec![Outcome::Ignored]);
+}
+
+#[tokio::test]
+async fn downloads_made_before_the_capture_was_saved_attach_when_it_is_and_are_served() {
+    let root = TestDirectory::new();
+    // The DAQ files were downloaded first (ordinary one included).
+    let downloads = root.0.join("sd-downloads/DAQ");
+    board_csv(&downloads.join("LAUNCH/DAQ_LAUNCH_0001.CSV"), &[(T0 + 1_000, 61_000, "network"), (T0 + 21_000, 81_000, "network")]);
+    board_csv(&downloads.join("UTC/DAQ_0001.CSV"), &[(T0 - 30_000, 30_000, "network"), (T0 + 500, 60_500, "network")]);
+    let saved = launch_capture(&root.0, EventKind::Launch, T0, T0 + 60_000).await;
+    board_sd::rescan_downloads(&root.0);
+    let manifest = read_manifest(&saved.folder).unwrap();
+    assert_eq!(manifest.board_sd.len(), 1);
+    assert_eq!(manifest.board_sd[0].lead_up_rows, 2, "lead-up cut from the downloaded ordinary file");
+    // Served by the recordings API.
+    let state = admin_state(&root.0).await;
+    let app = crate::recording_export::routes().with_state(state);
+    let get = |uri: String| Request::get(uri).header("authorization", "Bearer rec-token").body(Body::empty()).unwrap();
+    let response = app.clone().oneshot(get(format!("/api/recordings/{}/board_sd/DAQ/DAQ_LAUNCH_0001.CSV", saved.id))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    assert!(String::from_utf8_lossy(&body).starts_with(BOARD_HEADER));
+    for bad in ["DAQ/..%2Fmanifest.json", "XX/DAQ_LAUNCH_0001.CSV", "DAQ/missing.CSV"] {
+        let status = app.clone().oneshot(get(format!("/api/recordings/{}/board_sd/{bad}", saved.id))).await.unwrap().status();
+        assert!(status == StatusCode::NOT_FOUND || status == StatusCode::BAD_REQUEST, "{bad}: {status}");
+    }
+    let store = body_json(app.oneshot(get("/api/recordings/store".into())).await.unwrap()).await;
+    assert_eq!(store["groups"][0]["captures"][0]["manifest"]["board_sd"][0]["board"], "DAQ");
+}
+
+#[test]
+fn a_saved_launch_capture_requests_the_daq_launch_file_fetch() {
+    crate::sd_download::schedule_launch_fetch();
+    assert!(crate::sd_download::take_launch_fetch());
+    assert!(!crate::sd_download::take_launch_fetch(), "taken once");
 }

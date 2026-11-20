@@ -554,6 +554,19 @@ pub async fn upload(
         }
     }
     drop(file);
+    // A board launch file imported against any recording also follows its GS
+    // launch capture (copied unchanged; the import below is not affected).
+    {
+        let data_root = crate::recording_export::directory(&state);
+        let csv = csv_path.clone();
+        let name = metadata["filename"].as_str().unwrap_or("source.csv").to_owned();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Err(error) = crate::recording_store::board_sd::offer_file(&data_root, &csv, &name, "sd_import") {
+                log::warn!("board SD {name}: could not attach to its launch capture: {error}");
+            }
+        })
+        .await;
+    }
     let output = directory.join("derived.db");
     let output_name = format!("groundstation_recording_{token}.db");
     let final_path = source.parent().unwrap().join(&output_name);

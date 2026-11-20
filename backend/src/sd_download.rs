@@ -922,7 +922,78 @@ async fn transfer(
         s.phase = Phase::Complete;
         s.message = "downloaded; ready to import".into();
     });
+    // A board launch file follows its GS launch capture; an ordinary file can
+    // supply the lead-up of one already attached.
+    if let Some(data_root) = req.root.parent().map(FsPath::to_path_buf) {
+        let name = req.name.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Err(error) = crate::recording_store::board_sd::offer_file(&data_root, &final_path, &name, "network_download") {
+                log::warn!("board SD {name}: could not attach to its launch capture: {error}");
+            }
+        })
+        .await;
+    }
     Ok(())
+}
+
+static LAUNCH_FETCH: AtomicBool = AtomicBool::new(false);
+/// A launch capture was saved: fetch the DAQ's launch files once allowed.
+pub(crate) fn schedule_launch_fetch() {
+    LAUNCH_FETCH.store(true, Ordering::Release);
+}
+pub(crate) fn take_launch_fetch() -> bool {
+    LAUNCH_FETCH.swap(false, Ordering::AcqRel)
+}
+
+/// Downloads the DAQ's `/LAUNCH` files the station does not have yet, one at
+/// a time, as soon as downloads are allowed (Idle, Landed or Recovery, no
+/// sequence, no other transfer). Each completed file attaches itself to its
+/// launch capture (see `transfer`). Gives up after an hour of waiting.
+pub(crate) async fn fetch_launch_files(state: Arc<AppState>) {
+    let deadline = Instant::now() + Duration::from_secs(3600);
+    loop {
+        if station_gate(&state).is_none() && !MANAGER.active() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            log::warn!("DAQ launch files were not fetched: downloads stayed unavailable for an hour");
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+    let Some(router) = state.topology_router.get().cloned() else { return };
+    let listing = match refresh_listing(&MANAGER, router.clone(), Board::DaqBoard, app_gate(&state)).await {
+        Ok(listing) => listing,
+        Err(error) => {
+            log::warn!("DAQ launch files: listing failed: {error}");
+            return;
+        }
+    };
+    let root = download_root(&state);
+    if std::fs::create_dir_all(&root).is_err() {
+        return;
+    }
+    for file in listing.files.iter().filter(|f| f.dir == "LAUNCH" && !f.open) {
+        let local = completed_file(&root, "DAQ", "LAUNCH", &file.name);
+        if local.as_ref().is_some_and(|p| std::fs::metadata(p).is_ok_and(|m| m.len() >= file.size)) {
+            continue;
+        }
+        if disk_ok(&root, file.size.saturating_add(64 * 1024 * 1024)).is_err() {
+            log::warn!("DAQ launch files: not enough free disk for {}", file.name);
+            return;
+        }
+        let job = match start_job(&MANAGER, router.clone(), Board::DaqBoard, "LAUNCH", &file.name, root.clone(), app_gate(&state)) {
+            Ok(job) => job,
+            Err(error) => {
+                log::warn!("DAQ launch file {}: {error}", file.name);
+                return;
+            }
+        };
+        log::info!("fetching DAQ launch file {} for its launch capture", file.name);
+        while MANAGER.get(job.id).is_some_and(|s| s.phase.is_active()) {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
 }
 
 async fn run_job(

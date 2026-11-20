@@ -886,7 +886,7 @@ const RECORDING: &[Spec] = &[
     Spec {
         id: "recording-always-on",
         title: "Recording is always on",
-        summary: "The station records every row from start-up into a rolling store of {recording.ring_budget_mb} MB (segments of {recording.segment_mb} MB); when it is full the oldest segment is deleted. There is no start, pause or stop: no operator action can turn the safety record off. Now: {recording.live}",
+        summary: "The station records every row from start-up into a rolling store of up to {recording.ring_budget_mb} MB (segments of {recording.segment_mb} MB), never growing into the last {recording.reserve_free_mb} MB of free disk kept for captures and the OS; when it is full the oldest segment is deleted. There is no start, pause or stop: no operator action can turn the safety record off. Now: {recording.live}",
         details: &[
             "Each segment is a complete SQLite recording, closed cleanly when the next opens; a crash can affect only the open segment, whose journal is recovered at start-up.",
             "Reset of the live history opens a new segment; nothing already written is deleted.",
@@ -897,7 +897,7 @@ const RECORDING: &[Spec] = &[
             "backend/src/telemetry_task/rolling.rs:maintain",
             "backend/src/recording_store.rs:plan_deletions",
         ],
-        config_keys: &["recording.ring_budget_mb", "recording.segment_mb", "recording.live"],
+        config_keys: &["recording.ring_budget_mb", "recording.segment_mb", "recording.reserve_free_mb", "recording.live"],
     },
     Spec {
         id: "recording-event-captures",
@@ -907,6 +907,7 @@ const RECORDING: &[Spec] = &[
             "Launch: from {recording.launch_pre_roll_s} s before Launch until Landed, Recovery, Aborted or Idle, plus {recording.launch_post_roll_s} s.",
             "While a capture is pending, the rolling store keeps the segments it needs.",
             "Only an administrator can delete a capture; each deletion is logged with the name.",
+            "Board SD launch files (FC and DAQ) follow the launch capture: downloaded DAQ files and any imported FC or DAQ launch file are matched by their network-UTC rows and saved unchanged in the capture's board_sd folder, with the minute before launch cut from the board's ordinary file when the station has it.",
         ],
         modes: ALL,
         enforced_in: &[
