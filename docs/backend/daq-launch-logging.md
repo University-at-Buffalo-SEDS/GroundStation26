@@ -26,6 +26,10 @@ reconnect replay own the accepted value. Startup seeds the saved literal pair
 and revision instead of calculating a new deadline. RRLS never originates this
 publication or retry.
 
+The DAQ opens its launch file when this clock arrives (Launch acceptance,
+about one countdown before T0; at most 15 s before T0) and closes it at T+20,
+so the countdown, igniter and pilot opening are in it.
+
 SDK admission is not proof that the physical DAQ has received or written the
 recording. Firmware uses the session to rotate launch records into its special
 file and enforces the close instant against its mapped monotonic clock. Queued

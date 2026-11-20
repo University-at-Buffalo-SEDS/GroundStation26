@@ -65,6 +65,8 @@ struct StoreResponse {
     legacy: Vec<Listed>,
     settings: Settings,
     is_admin: bool,
+    /// Background DAQ lead-up fetches (progress for the Recordings panel).
+    board_sd_fetch: Vec<crate::sd_download::leadup::Job>,
 }
 
 async fn store(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -115,6 +117,7 @@ async fn store(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
             legacy,
             settings: state.recording_store.settings(),
             is_admin: principal.is_admin(),
+            board_sd_fetch: crate::sd_download::leadup::load(&root),
         })
         .into_response(),
     )

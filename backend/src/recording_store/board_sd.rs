@@ -107,6 +107,17 @@ fn row_fields(line: &str) -> Option<(i64, i64, bool)> {
     Some((ts, mono, network))
 }
 
+/// The network-UTC timestamp of one board CSV data row, if it has one.
+pub(crate) fn network_time(line: &str) -> Option<i64> {
+    if !data_line(line) {
+        return None;
+    }
+    match row_fields(line) {
+        Some((ts, _, true)) => Some(ts),
+        _ => None,
+    }
+}
+
 fn data_line(line: &str) -> bool {
     !line.is_empty() && !line.starts_with('#') && !line.starts_with("timestamp_ms")
 }
@@ -292,8 +303,14 @@ pub(crate) fn offer_file(root: &Path, path: &Path, name: &str, source: &str) -> 
         })?;
         log::info!("board SD {name} attached to {}", folder.display());
     }
-    // A lead-up from an ordinary file of the same board already on the station.
+    // A lead-up from an ordinary file of the same board already on the station;
+    // otherwise the DAQ's is fetched from its card in the background.
     fill_lead_ups(&folder, file.board, None)?;
+    let has_lead_up = read_manifest(&folder)
+        .is_some_and(|m| m.board_sd.iter().any(|e| e.board == file.board && e.file == name && e.lead_up_file.is_some()));
+    if file.board == "DAQ" && !has_lead_up {
+        crate::sd_download::leadup::enqueue(root, &folder, name, file.first_utc);
+    }
     Ok(vec![Outcome::Attached(folder)])
 }
 
@@ -349,23 +366,39 @@ fn fill_lead_ups(folder: &Path, board: &str, candidate: Option<(&Path, &BoardFil
         else {
             continue;
         };
-        let lead_name = format!("{}.leadup.csv", entry.file.trim_end_matches(".csv").trim_end_matches(".CSV"));
-        let out = folder.join(BOARD_SD_DIR).join(board).join(&lead_name);
-        let rows = write_lead_up(path, &out, from, to)?;
-        if rows == 0 {
-            let _ = std::fs::remove_file(&out);
-            continue;
-        }
-        let file = entry.file.clone();
-        changed |= update_manifest(folder, |m| {
-            let Some(e) = m.board_sd.iter_mut().find(|e| e.board == board && e.file == file) else { return false };
-            e.lead_up_file = Some(lead_name.clone());
-            e.lead_up_from_ms = Some(from);
-            e.lead_up_rows = rows;
-            true
-        })?;
+        changed |= cut_lead_up(folder, board, &entry.file, path, from, to)? > 0;
     }
     Ok(changed)
+}
+
+/// Cuts the rows of `source` with network UTC in `[from, to)` into
+/// `<launch file>.leadup.csv` beside the attached launch file and records it
+/// in the manifest. `to` is the launch file's first row, so the lead-up and
+/// the launch file never overlap. Returns the rows saved (an existing lead-up
+/// is kept and its count returned).
+pub(crate) fn cut_lead_up(folder: &Path, board: &str, launch_file: &str, source: &Path, from: i64, to: i64) -> std::io::Result<u64> {
+    if let Some(existing) = read_manifest(folder)
+        .and_then(|m| m.board_sd.into_iter().find(|e| e.board == board && e.file == launch_file))
+        .filter(|e| e.lead_up_file.is_some())
+    {
+        return Ok(existing.lead_up_rows);
+    }
+    let lead_name = format!("{}.leadup.csv", launch_file.trim_end_matches(".csv").trim_end_matches(".CSV"));
+    let out = folder.join(BOARD_SD_DIR).join(board).join(&lead_name);
+    std::fs::create_dir_all(out.parent().unwrap_or(folder))?;
+    let rows = write_lead_up(source, &out, from, to)?;
+    if rows == 0 {
+        let _ = std::fs::remove_file(&out);
+        return Ok(0);
+    }
+    update_manifest(folder, |m| {
+        let Some(e) = m.board_sd.iter_mut().find(|e| e.board == board && e.file == launch_file) else { return false };
+        e.lead_up_file = Some(lead_name.clone());
+        e.lead_up_from_ms = Some(from);
+        e.lead_up_rows = rows;
+        true
+    })?;
+    Ok(rows)
 }
 
 /// After a launch capture is saved: attach board launch files already on the

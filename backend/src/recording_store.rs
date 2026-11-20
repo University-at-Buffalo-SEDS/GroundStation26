@@ -1011,6 +1011,7 @@ pub(crate) async fn capture_task(
 ) {
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut ticks = 0u64;
     loop {
         tokio::select! {
             _ = tick.tick() => {}
@@ -1023,6 +1024,11 @@ pub(crate) async fn capture_task(
         persist_pending(&state, &root);
         if crate::sd_download::take_launch_fetch() {
             tokio::spawn(crate::sd_download::fetch_launch_files(state.clone()));
+        }
+        // Pending DAQ lead-up fetches (also after a restart) run in the background.
+        ticks = ticks.wrapping_add(1);
+        if ticks % 15 == 0 && crate::sd_download::leadup::pending(&root) {
+            tokio::spawn(crate::sd_download::leadup::run(state.clone()));
         }
     }
 }

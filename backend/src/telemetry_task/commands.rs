@@ -289,6 +289,8 @@ mod control_clock_tests {
 }
 
 pub(crate) fn flush_command_tx(router: &Router, context: &str) {
+    // Background SD lead-up fetches stay off the link around commands.
+    crate::sd_download::leadup::note_command_traffic();
     if let Err(err) = router.process_all_queues_with_timeout(ROUTER_TX_BUDGET_MS) {
         log_telemetry_error(context, err);
     }

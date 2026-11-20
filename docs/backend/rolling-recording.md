@@ -137,18 +137,33 @@ without a launch capture, the integrated ground test capture):
   `GET /api/recordings/{id}/board_sd/{board}/{file}`. The same file offered
   twice is attached once.
 * **Lead-up.** Boards switch to their launch file only when they learn of the
-  launch: the DAQ at T0 (its launch file holds exactly T0..T+20 s, from the
-  `DAQ_LOG_CLOCK` deadline published at Launch acceptance), the FC at the
-  accepted Launch command (about the 10 s countdown before ignition) or
-  detected boost. Neither can hold a minute of full-rate rows in RAM (the
-  FC's 32/16 KiB SD buffers cover under a second; the DAQ already uses
-  740 of 768 KiB of RAM), and copying file tails on the card during the
-  launch would load the writer at the worst moment. So the lead-up is cut on
-  the station: when the board's ordinary file of the same boot is also on
-  the station (DAQ `/UTC` download or an SD import), its last 60 s before the
-  launch file's first row is saved as `<file>.leadup.csv`. 60 s covers
-  arming, the countdown, igniter and pilot transients and the pre-liftoff
-  sensor baseline; the GS capture itself keeps 10 min of network telemetry.
+  launch: the DAQ at Launch acceptance (its launch file runs from the arrival
+  of the `DAQ_LOG_CLOCK` deadline, published as Launch is accepted, about one
+  10 s countdown before T0, to T+20 s), the FC at the accepted Launch command
+  or detected boost. Neither can hold a minute of full-rate rows in RAM (the
+  FC's 32/16 KiB SD buffers cover under a second; the DAQ uses 757 of
+  768 KiB of RAM), so the minute before the launch file's first row is taken
+  from the board's regular session file of the same boot and saved as
+  `<file>.leadup.csv`. It ends exactly at the launch file's first row (rows
+  strictly before it), so the two never overlap. 60 s covers arming, the
+  countdown, igniter and pilot transients and the pre-liftoff baseline; the GS
+  capture itself keeps 10 min of network telemetry.
+* **DAQ lead-up fetch.** Attaching a DAQ launch file queues a background job
+  (`sd-downloads/DAQ/leadup/jobs.json`) that reads only the needed part of the
+  DAQ's session file over the SD stream, which reads any byte range: the last
+  blocks of each regular file identify the session that ended at the launch,
+  a binary search of single blocks finds the window start, and blocks are then
+  read in order until a row reaches the launch file's first row. A session file
+  of 16 MB or less is downloaded whole and kept instead. The job never competes
+  with live work: it runs only in the SD download states (Idle, Landed or
+  Recovery, no fill or launch sequence), pauses while any other SD transfer runs
+  and for 10 s after any command transmission, is rate-limited
+  (`GS_SD_LEADUP_MAX_BYTES_PER_SEC`, default 8 KiB/s, half the operator
+  download rate), and keeps its offsets on disk so it resumes after a link drop
+  or a station restart. Only the extracted window is kept for a large file.
+  Progress shows in the Recordings panel (`board_sd_fetch` in
+  `/api/recordings/store`). An ordinary file imported by hand supplies the
+  lead-up the same way (FC lead-ups need the FC card).
 
 ## RRLS
 

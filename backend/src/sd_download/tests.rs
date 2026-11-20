@@ -641,3 +641,166 @@ async fn completed_download_feeds_the_unchanged_sd_import() {
     assert_eq!(imported["summary"]["network_suppressed_in_resolved_view"], 1, "SD rows win over network rows");
     assert_eq!(std::fs::read(root.0.join(source)).unwrap(), before, "original recording unchanged");
 }
+
+// ------------------------------------------------- DAQ lead-up background fetch
+
+const T0: i64 = 1_800_000_000_000;
+const CSV_HEADER: &str = "timestamp_ms,monotonic_ms,sensor,value,raw_adc_code,raw_value,calibrated_value,time_source,adc_temperature_c,adc_temperature_code,uptime_ticks,uptime_frequency_hz,record_sequence\n";
+
+/// DAQ CSV rows every `period` ms over `[from, to)` (network time).
+fn daq_csv(from: i64, to: i64, period: i64) -> Vec<u8> {
+    let mut text = format!("{CSV_HEADER}# calibration,kg1000,2.5,0\n");
+    let mut ts = from;
+    let mut seq = 0;
+    while ts < to {
+        text.push_str(&format!("{ts},{},kg1000_kg,,123,0.5,1.25,network,25.0,100,{},1000,{seq}\n", ts - T0 + 600_000, ts - T0 + 600_000));
+        ts += period;
+        seq += 1;
+    }
+    text.into_bytes()
+}
+
+/// A saved launch capture around T0, the DAQ launch file attached to it
+/// (which queues the lead-up job). The launch file starts at acceptance.
+async fn capture_with_daq_launch(root: &FsPath, launch_name: &str) -> PathBuf {
+    let capture = crate::recording_store::Capture {
+        serial: 1,
+        kind: crate::recording_store::EventKind::Launch,
+        key: "flight".into(),
+        label: "Launch".into(),
+        event_start_ms: T0,
+        window_start_ms: T0 - 600_000,
+        event_end_ms: Some(T0 + 120_000),
+        post_roll_ms: 0,
+        max_end_ms: T0 + 7_200_000,
+        result: Some("Landed".into()),
+        operator: None,
+        station_mode: "normal".into(),
+        details: serde_json::Value::Null,
+        materializing: false,
+    };
+    let saved = crate::recording_store::materialize(root, &capture, T0 + 200_000).await.unwrap();
+    let launch = root.join("incoming").join(launch_name);
+    std::fs::create_dir_all(launch.parent().unwrap()).unwrap();
+    std::fs::write(&launch, daq_csv(T0 - 10_000, T0 + 20_000, 100)).unwrap();
+    crate::recording_store::board_sd::offer_file(root, &launch, launch_name, "network_download").unwrap();
+    saved.folder
+}
+
+fn leadup_rows(folder: &FsPath, launch_name: &str) -> Vec<i64> {
+    let lead = folder.join("board_sd/DAQ").join(format!("{}.leadup.csv", launch_name.trim_end_matches(".CSV")));
+    std::fs::read_to_string(lead)
+        .unwrap()
+        .lines()
+        .filter_map(crate::recording_store::board_sd::network_time)
+        .collect()
+}
+
+#[test]
+fn block_times_skip_partial_lines_and_command_traffic_quiets_the_link() {
+    let block = b"0,partial\n1800000000100,1,x,,,,,network,,,1,1000,1\n1800000000200,2,x,,,,,network,,,2,1000,2\n18000000003";
+    assert_eq!(leadup::block_times(block, false), (Some(T0 + 100), Some(T0 + 200)));
+    assert_eq!(leadup::block_times(b"timestamp_ms,x\n", true), (None, None));
+    leadup::note_command_traffic();
+    assert_eq!(leadup::command_quiet().as_deref(), Some("commands were sent recently"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn large_session_file_yields_only_the_lead_up_window_and_resumes_after_a_drop() {
+    leadup::TEST_RATE.store(10_000_000, Ordering::Relaxed);
+    leadup::TEST_SMALL_FILE_BYTES.store(64 * 1024, Ordering::Relaxed);
+    let root = TestDirectory::new();
+    let launch_name = "DAQ_LAUNCH_1800000000000_000.CSV";
+    let folder = capture_with_daq_launch(&root.0, launch_name).await;
+    let jobs = leadup::load(&root.0);
+    assert_eq!(jobs.len(), 1, "attaching the DAQ launch file queues its lead-up");
+    assert_eq!((jobs[0].from_ms, jobs[0].to_ms), (T0 - 70_000, T0 - 10_000), "ends at the launch file's first row");
+    // The session that ended at Launch acceptance: ten minutes of rows, far
+    // larger than the small-file limit; an older session ended long before.
+    let session = daq_csv(T0 - 610_000, T0 - 10_000, 100);
+    assert!(session.len() as u64 > 4 * 64 * 1024);
+    let old = daq_csv(T0 - 7_200_000, T0 - 7_100_000, 1_000);
+    let (gs, daq) = link();
+    let gate_open = Arc::new(AtomicBool::new(true));
+    let flip = gate_open.clone();
+    let board = Arc::new(MockBoard {
+        files: vec![
+            (0, launch_name.into(), daq_csv(T0 - 10_000, T0 + 20_000, 100)),
+            (1, "DAQ_1799999390000_000.CSV".into(), session.clone()),
+            (2, "DAQ_0_000.CSV".into(), old),
+        ],
+        reads: AtomicUsize::new(0),
+        // Drop the link part-way through the window fetch.
+        trigger_after: 40,
+        on_read: Box::new(move || flip.store(false, Ordering::SeqCst)),
+    });
+    serve(&daq, board.clone());
+    let (running, task) = pump(gs.clone(), daq.clone());
+    let manager: &'static Manager = Box::leak(Box::new(Manager::default()));
+    let gate_flag = gate_open.clone();
+    let gate: Gate = Arc::new(move || (!gate_flag.load(Ordering::SeqCst)).then(|| "link busy".to_owned()));
+    let job = leadup::load(&root.0).remove(0);
+    let first = leadup::step(manager, &root.0, gs.clone(), &job, &gate).await;
+    assert!(matches!(first, Err(StreamError::Gate(_))), "{first:?}");
+    let paused = leadup::load(&root.0).remove(0);
+    assert_eq!(paused.source.as_deref(), Some("DAQ_1799999390000_000.CSV"));
+    assert!(paused.start_offset.is_some() && !paused.done);
+    let reads_before = board.reads.load(Ordering::SeqCst);
+    // Link back: the job resumes from what it already has.
+    gate_open.store(true, Ordering::SeqCst);
+    leadup::step(manager, &root.0, gs.clone(), &paused, &gate).await.unwrap();
+    let done = leadup::load(&root.0).remove(0);
+    assert!(done.done, "{done:?}");
+    assert_eq!(done.phase, "complete");
+    // Only the window was read, never the whole session file.
+    let read_bytes = (board.reads.load(Ordering::SeqCst) as u64) * BLOCK_BYTES;
+    assert!(read_bytes < session.len() as u64 / 3, "read {read_bytes} of {}", session.len());
+    let _ = reads_before;
+    // Exactly the minute before the launch file, no overlap, no duplicates.
+    let rows = leadup_rows(&folder, launch_name);
+    assert_eq!(rows.len(), 600);
+    assert_eq!((rows[0], *rows.last().unwrap()), (T0 - 70_000, T0 - 10_100));
+    assert!(rows.windows(2).all(|w| w[1] == w[0] + 100));
+    let lead = std::fs::read_to_string(folder.join("board_sd/DAQ/DAQ_LAUNCH_1800000000000_000.leadup.csv")).unwrap();
+    assert!(lead.starts_with(CSV_HEADER) && lead.contains("# calibration"));
+    let manifest = crate::recording_store::read_manifest(&folder).unwrap();
+    assert_eq!(manifest.board_sd[0].lead_up_rows, 600);
+    // Large source: only the window is kept; scratch files are gone.
+    assert!(completed_file(&root.0.join("sd-downloads"), "DAQ", "UTC", "DAQ_1799999390000_000.CSV").is_none());
+    let scratch: Vec<_> = std::fs::read_dir(root.0.join("sd-downloads/DAQ/leadup")).unwrap().flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n != "jobs.json").collect();
+    assert!(scratch.is_empty(), "{scratch:?}");
+    assert!(!leadup::pending(&root.0));
+    running.store(false, Ordering::Relaxed);
+    task.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_small_session_file_is_downloaded_whole_and_kept() {
+    leadup::TEST_RATE.store(10_000_000, Ordering::Relaxed);
+    let root = TestDirectory::new();
+    let launch_name = "DAQ_LAUNCH_1800000000000_001.CSV";
+    let folder = capture_with_daq_launch(&root.0, launch_name).await;
+    // A short session (two minutes at 1 Hz) is far under the small-file limit.
+    let session = daq_csv(T0 - 120_000, T0 - 10_000, 1_000);
+    let (gs, daq) = link();
+    let board = Arc::new(MockBoard {
+        files: vec![(1, "DAQ_1799999880000_000.CSV".into(), session.clone())],
+        reads: AtomicUsize::new(0),
+        trigger_after: usize::MAX,
+        on_read: Box::new(|| {}),
+    });
+    serve(&daq, board);
+    let (running, task) = pump(gs.clone(), daq.clone());
+    let manager: &'static Manager = Box::leak(Box::new(Manager::default()));
+    let job = leadup::load(&root.0).remove(0);
+    leadup::step(manager, &root.0, gs.clone(), &job, &open_gate()).await.unwrap();
+    assert!(leadup::load(&root.0)[0].done, "{:?}", leadup::load(&root.0));
+    let kept = completed_file(&root.0.join("sd-downloads"), "DAQ", "UTC", "DAQ_1799999880000_000.CSV").unwrap();
+    assert_eq!(std::fs::read(kept).unwrap(), session, "small source kept whole");
+    let rows = leadup_rows(&folder, launch_name);
+    assert_eq!(rows.len(), 60);
+    assert_eq!((rows[0], *rows.last().unwrap()), (T0 - 70_000, T0 - 11_000));
+    running.store(false, Ordering::Relaxed);
+    task.await.unwrap();
+}

@@ -1324,5 +1324,8 @@ pub fn routes() -> axum::Router<Arc<AppState>> {
         )
 }
 
+#[path = "sd_download/leadup.rs"]
+pub(crate) mod leadup;
+
 #[cfg(test)]
 mod tests;
