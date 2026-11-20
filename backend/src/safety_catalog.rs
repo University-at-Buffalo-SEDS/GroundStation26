@@ -23,11 +23,18 @@ pub(crate) struct Modes {
     pub flight: bool,
     pub hitl: bool,
     pub test_fire: bool,
+    /// Integrated ground test (docs/integrated-ground-test.md).
+    pub igt: bool,
 }
-const ALL: Modes = Modes { flight: true, hitl: true, test_fire: true };
-const NOT_HITL: Modes = Modes { flight: true, hitl: false, test_fire: true };
-const FLIGHT: Modes = Modes { flight: true, hitl: false, test_fire: false };
-const HITL: Modes = Modes { flight: false, hitl: true, test_fire: false };
+const ALL: Modes = Modes { flight: true, hitl: true, test_fire: true, igt: true };
+const NOT_HITL: Modes = Modes { flight: true, hitl: false, test_fire: true, igt: true };
+/// Flight rules that keep applying in an integrated ground test (the AV bay
+/// and the safety task run as in flight).
+const FLIGHT: Modes = Modes { flight: true, hitl: false, test_fire: false, igt: true };
+/// Flight only: not in an integrated ground test (its fill and QD follow test fire).
+const FLIGHT_ONLY: Modes = Modes { flight: true, hitl: false, test_fire: false, igt: false };
+const HITL: Modes = Modes { flight: false, hitl: true, test_fire: false, igt: false };
+const IGT: Modes = Modes { flight: false, hitl: false, test_fire: false, igt: true };
 
 #[derive(Serialize, Debug)]
 pub(crate) struct Rule {
@@ -60,6 +67,8 @@ pub(crate) fn build_mode() -> &'static str {
         "hitl"
     } else if crate::runtime_mode::is_test_fire() {
         "test_fire"
+    } else if crate::runtime_mode::is_igt() {
+        "igt"
     } else {
         "flight"
     }
@@ -68,6 +77,7 @@ fn applies(modes: Modes) -> bool {
     match build_mode() {
         "hitl" => modes.hitl,
         "test_fire" => modes.test_fire,
+        "igt" => modes.igt,
         _ => modes.flight,
     }
 }
@@ -278,11 +288,36 @@ mod tests {
             "ignition-pair", "hitl-interlocks", "key-interlock", "plumbing-retraction", "checklists",
             "valve-freshness", "supply-interlock", "fill-limits", "qd-settle", "igniter-sense",
             "stale-data", "connectivity-loss", "mission-phases", "fc-owns-landing", "board-heartbeat-abort", "board-vb-post-launch-vent", "board-vb-overpressure", "board-abort-latch", "board-fc-vigilant",
+            "igt-mode-entry", "igt-enter", "igt-live-pyro", "igt-plain-path", "igt-launch-gate", "igt-replay-admission",
+            "igt-reset-exits", "igt-dry-run-default", "igt-pyro-gate", "igt-vb-auto-vent", "igt-abort",
         ] {
             assert!(ids.contains(required), "missing safety rule {required}");
         }
         let json = serde_json::to_value(&catalog).unwrap();
         assert!(json["sections"].as_array().unwrap().len() >= 6);
+        // Every rule states whether it applies in an integrated ground test.
+        assert!(json["sections"].as_array().unwrap().iter().all(|section| {
+            section["rules"].as_array().unwrap().iter().all(|rule| rule["modes"]["igt"].is_boolean())
+        }));
+        let igt = catalog.sections.iter().find(|s| s.id == "igt").expect("igt section");
+        assert!(igt.rules.iter().all(|r| r.modes == IGT));
+    }
+
+    #[tokio::test]
+    async fn integrated_ground_test_build_mode_applies_igt_rules() {
+        let _mode = crate::runtime_mode::test_support::thread_mode(crate::station_mode::Mode::IntegratedGroundTest);
+        let state = crate::state::tests::test_app_state().await;
+        let catalog = catalog(&state);
+        assert_eq!(catalog.build_mode, "igt");
+        let all: Vec<&Rule> = catalog.sections.iter().flat_map(|s| s.rules.iter()).collect();
+        let applies = |id: &str| all.iter().find(|r| r.id == id).unwrap().applies_in_this_build;
+        assert!(applies("igt-launch-gate") && applies("igt-live-pyro") && applies("automatic-abort"));
+        assert!(!applies("qd-settle"), "an integrated ground test handles the QD as a test fire");
+        assert!(!applies("hitl-interlocks"));
+        let _normal = crate::runtime_mode::test_support::thread_mode(crate::station_mode::Mode::Normal);
+        let catalog = super::catalog(&state);
+        let all: Vec<&Rule> = catalog.sections.iter().flat_map(|s| s.rules.iter()).collect();
+        assert!(!all.iter().find(|r| r.id == "igt-launch-gate").unwrap().applies_in_this_build);
     }
 
     #[tokio::test]
