@@ -3134,7 +3134,7 @@ async fn handle_packet_inner(
                 values: status_values,
             });
             if let Some(signal) = observed.signal {
-                let mut signal_values=vec![signal.raw_counts,signal.volts,None];
+                let mut signal_values=vec![signal.raw_counts,signal.volts,signal.amps];
                 signal_values.extend(owner.iter().copied());
                 let row = TelemetryRow {
                     timestamp_ms: signal.source_utc_ms.unwrap_or(ts_ms),

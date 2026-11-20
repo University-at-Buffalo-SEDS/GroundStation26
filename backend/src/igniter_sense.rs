@@ -1,12 +1,24 @@
 //! Read-only AB analog signal. Acknowledgment/command/continuity are unrelated.
-//! The fitted 045B5 sensor is powered at3V3, outside its specified5V supply;
-//! amperes are deliberately unavailable. Raw wire metadata remains recorded.
+//! The fitted ACS71240LLCBTR-045B5 is powered at 3V3, outside its specified
+//! 5 V supply. `amps` is an ESTIMATE only: it assumes the output stays
+//! ratiometric (zero at VCC/2, 44.4 mV/A per 5 V of supply) and that the
+//! sensor shares the ADC's 3V3 rail, so the supply cancels and
+//! amps = (counts/4095 - 0.5) * 5 / 0.0444. Not calibrated; likely wrong
+//! until the hardware is corrected and measured at known currents.
+//! Raw wire metadata remains recorded.
 use std::time::{Duration, Instant};
 
 const ADC_MAX: u32 = 4095;
 const YEAR_2020: u64 = 1_577_836_800_000;
 const YEAR_2100: u64 = 4_102_444_800_000;
 const CURRENT_UNSUPPORTED: u32 = 8;
+/// ACS71240LLCBTR-045B5 datasheet sensitivity at VCC = 5.0 V.
+const SENSITIVITY_V_PER_A_AT_5V: f32 = 0.0444;
+
+/// Uncalibrated ratiometric current estimate from ADC counts (see module docs).
+pub(crate) fn estimated_amps(raw_counts: f32) -> f32 {
+    (raw_counts / ADC_MAX as f32 - 0.5) * 5.0 / SENSITIVITY_V_PER_A_AT_5V
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Status {
     Waiting = 0,
@@ -44,6 +56,8 @@ pub(crate) struct Observation {
 pub(crate) struct Signal {
     pub raw_counts: Option<f32>,
     pub volts: Option<f32>,
+    /// Uncalibrated estimate; None at an ADC rail or for a stale sample.
+    pub amps: Option<f32>,
     pub source_utc_ms: Option<i64>,
 }
 impl Tracker {
@@ -200,9 +214,13 @@ impl Tracker {
             let volts = raw_counts
                 .filter(|_| reference_ok)
                 .map(|raw| raw * vdda as f32 / (ADC_MAX as f32 * 1000.0));
+            let amps = raw_counts
+                .filter(|&raw| raw > 0.0 && raw < ADC_MAX as f32)
+                .map(estimated_amps);
             result.signal = Some(Signal {
                 raw_counts,
                 volts,
+                amps,
                 source_utc_ms: source_utc,
             });
         }
@@ -230,6 +248,8 @@ mod tests {
         let s = a.signal.unwrap();
         assert_eq!(s.raw_counts, Some(2048.0));
         assert!((s.volts.unwrap() - 1.6504).abs() < 0.001);
+        // 2048 counts sits at mid-rail: about zero amps.
+        assert!(s.amps.unwrap().abs() < 0.05);
         let mut f = frame();
         f[4] = 2;
         f[5] += 50;
@@ -240,6 +260,23 @@ mod tests {
             .signal
             .unwrap();
         assert!((s.volts.unwrap() - 1.5004).abs() < 0.001);
+    }
+    #[test]
+    fn current_estimate_is_ratiometric_and_absent_at_rails() {
+        // +1 A moves the output by 44.4 mV per 5 V of supply = 8.88 mV/A at
+        // any rail (ratiometric), i.e. 4095 * 0.00888 = 36.36 counts per amp.
+        assert!((estimated_amps(2047.5 + 36.36) - 1.0).abs() < 0.01);
+        assert!((estimated_amps(2047.5 - 363.6) + 10.0).abs() < 0.05);
+        for raw in [0, 4095] {
+            let mut f = frame();
+            f[7] = raw;
+            let s = Tracker::default()
+                .observe(true, &f, UTC, UTC, Instant::now())
+                .unwrap()
+                .signal
+                .unwrap();
+            assert_eq!(s.amps, None);
+        }
     }
     #[test]
     fn rejects_bad_source_kind_shape_version_profile_and_nonfinite_routes() {

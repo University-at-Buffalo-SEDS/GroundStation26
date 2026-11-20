@@ -26,7 +26,7 @@ async fn igniter_sense_actual_wire_ingress_records_original_signal_and_exact_met
     assert_eq!(signal.timestamp_ms,now as i64-20);
     assert_eq!(signal.values[0],Some(2048.0));
     assert!((signal.values[1].unwrap()-1.6504).abs()<0.001);
-    assert_eq!(signal.values[2],None,"no unsupported amperes may be synthesized");
+    assert!(signal.values[2].unwrap().abs()<0.05,"mid-rail is an estimated ~0 A");
     assert_eq!(&signal.values[3..],&[Some(65534.0),Some(65535.0),Some(47768.0),Some(65244.0),Some(65533.0),Some(65535.0)]);
     let mut raw=false;let mut stored_signal=false;
     while let Ok(item)=db_rx.try_recv(){
@@ -35,7 +35,7 @@ async fn igniter_sense_actual_wire_ingress_records_original_signal_and_exact_met
                 assert!(values_json.is_none());assert_eq!(serde_json::from_str::<Vec<u8>>(&payload_json).unwrap(),payload);raw=true;
             }else if data_type=="IGNITER_SENSE_SIGNAL" {
                 let values:Vec<Option<f32>>=serde_json::from_str(&values_json.unwrap()).unwrap();
-                assert_eq!(values[2],None);assert_eq!(source_timestamp_ms,Some(now as i64-20));stored_signal=true;
+                assert!(values[2].is_some());assert_eq!(source_timestamp_ms,Some(now as i64-20));stored_signal=true;
             }
         }
     }

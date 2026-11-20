@@ -1752,7 +1752,7 @@
         "channels": [
           "ADC counts",
           "Signal voltage",
-          "Current (unavailable)"
+          "Current (estimated)"
         ],
         "show_min_max": true,
         "channel_formatters": [
@@ -1764,6 +1764,7 @@
             "suffix": " V"
           },
           {
+            "precision": 2,
             "suffix": " A"
           }
         ],
@@ -1780,6 +1781,17 @@
             ],
             "channels": [
               1
+            ]
+          },
+          {
+            "title": "Estimated current (uncalibrated, 3V3 ratiometric assumption)",
+            "data_type": "IGNITER_SENSE_SIGNAL",
+            "sender_id": "AB",
+            "labels": [
+              "Current (A, estimated)"
+            ],
+            "channels": [
+              2
             ]
           },
           {
@@ -1803,7 +1815,7 @@
             "channels": [
               "ADC counts",
               "Signal voltage",
-              "Current (unavailable)"
+              "Current (estimated)"
             ],
             "show_min_max": true
           }
