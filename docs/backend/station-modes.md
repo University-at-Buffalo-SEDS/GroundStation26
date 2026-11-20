@@ -141,6 +141,22 @@ replaying a flight from its SD card after Launch. The contract is
 - The served layout is `layout.json` with the Ground test actions first and
   `igt_mode: true`. `GET /api/igt`, the websocket `IgtStatus` frame and
   `POST /api/igt/prepare|confirm` live in `backend/src/igt.rs`.
+- Mock wet dress (`GET/PUT /api/igt/settings`, Admin) switches the fill to the
+  flight steps (`igt::test_fire_fill`); the QD and the rest of the stand
+  handling stay as above.
+- `igt::igt_active` is the integrated ground test mode, or HITL with the
+  `hitl_replay` setting on. It gates the Ground test controls, the IGT Launch
+  gate, the IGT status, SIMULATED labels and the replay recording rows. In
+  HITL with the replay, Launch takes the FC path and needs IGT Ready,
+  GroundStationLaunch is refused and Advance/Rewind are refused while the FC
+  reports Sim; the fill side stays HITL's. HITL lists the Ground test actions
+  and refuses them while the replay is off.
+- In normal, testing and test fire a ground-test FC image latches Launch
+  closed until the FC reports a flight image (`igt::latch_refusal`); HITL
+  only notifies and the integrated ground test only shows it. The latch and
+  the settings persist in `data/igt_settings.json`, the FC launch site
+  (`GET/PUT /api/fc/launch-site`, `backend/src/launch_site.rs`) in
+  `data/fc_launch_site.json`.
 
 ## What stays fixed at start
 
