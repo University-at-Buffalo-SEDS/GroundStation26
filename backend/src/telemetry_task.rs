@@ -2789,6 +2789,14 @@ async fn handle_packet_inner(
         return Vec::new();
     }
 
+    // The FC's barometer ground reference (shown with its estimator status).
+    if pkt.data_type() == crate::telemetry_schema::data_type("BAROMETER_DATA")
+        && crate::types::canonical_sender_id(sender_id.trim()) == "FC"
+        && let Ok(values) = pkt.data_as_f32()
+    {
+        crate::fc_estimator::observe_barometer(state, &values);
+    }
+
     if pkt.data_type() == crate::telemetry_schema::data_type("BOARD_HEALTH") {
         if let Ok(words) = pkt.data_as_u32() {
             let accepted = state.network_health.lock().unwrap().observe_diagnostics_with_source(

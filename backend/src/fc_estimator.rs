@@ -8,8 +8,19 @@
 //! - word 13: bits 24..31 the 'K' tag (0x4B), bits 20..23 the phase (0 idle,
 //!   1 initializing, 2 running, 3 converged, 4 paused, 5 stopped,
 //!   6 diverged), bits 0..19 the completed filter cycles this flight (wraps);
-//! - word 15: the FC uptime tick (word 2's low word, word 4 Hz) the filter
-//!   started running at; 0 before it has run.
+//! - word 15: bits 0..17 the FC uptime tick (word 2's low word, word 4 Hz)
+//!   the filter started running at, in 16-tick units modulo 2^18 (70 min at
+//!   1 kHz); 0 before it has run. Bits 18..31 the barometer ground
+//!   reference (FlightComputer26 `baro_reference.h`): bits 18..19 its mode
+//!   (0 none, 1 tracking, 2 paused, 3 frozen), bits 20..31 its shift since the
+//!   FC booted in Pa (signed, saturating at +-2047).
+//!
+//! The reference pressure itself is the FC's BAROMETER_DATA pressure
+//! converted back through the altitude it reports from it (the FC's own
+//! hypsometric formula), so it needs no wire field. The FC tracks it against
+//! weather and sensor drift while the vehicle sits still on the pad, pauses
+//! while it is handled, and freezes it at Launch:
+//! "Baro ref 1003.2 hPa · drift +1.8 hPa · tracking".
 //!
 //! The FC sends a report at once on a phase change and again 1 s later, then
 //! every 5 s. The station raises a notification when the filter starts
@@ -38,6 +49,71 @@ const REPORT_FRESH: Duration = Duration::from_secs(12);
 /// Republish ages (time since start, report age) at most this often.
 const PUBLISH_EVERY: Duration = Duration::from_secs(1);
 const CYCLE_MASK: u32 = 0xF_FFFF;
+const START_MASK: u32 = 0x3_FFFF;
+const START_SHIFT: u32 = 4;
+/// FC barometer.h ALT_PRES_CONST and BARO_HYPSOMETRIC_EXPONENT.
+const ALT_PRES_CONST: f64 = 44_330.0;
+const HYPSOMETRIC_EXPONENT: f64 = 0.1903;
+
+/// Word 15 as the FC builds it (`FC_EST_WORD15`): the start tick in 16-tick
+/// units and the barometer reference bits (mode, shift << 2).
+pub(crate) fn word15(start_tick: u32, baro_bits: u32) -> u32 {
+    let mut start = (start_tick >> START_SHIFT) & START_MASK;
+    if start_tick != 0 && start == 0 {
+        start = 1;
+    }
+    (baro_bits << 18) | start
+}
+
+/// The FC's barometer ground reference mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BaroMode {
+    /// Following slow weather/sensor drift while the vehicle is still.
+    Tracking,
+    /// On the pad but not still (handled, a pressure transient): held.
+    Paused,
+    /// Launch or later: fixed.
+    Frozen,
+}
+
+impl BaroMode {
+    fn from_wire(value: u32) -> Option<Self> {
+        match value {
+            1 => Some(BaroMode::Tracking),
+            2 => Some(BaroMode::Paused),
+            3 => Some(BaroMode::Frozen),
+            _ => None,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            BaroMode::Tracking => "tracking",
+            BaroMode::Paused => "paused (not still)",
+            BaroMode::Frozen => "frozen",
+        }
+    }
+}
+
+/// Word 15 bits 18..31.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BaroRef {
+    pub mode: BaroMode,
+    /// Reference minus the FC's boot reference (Pa), saturating at +-2047.
+    pub shift_pa: i16,
+}
+
+/// The FC's barometer ground reference from one BAROMETER_DATA sample
+/// (alt m, pressure Pa, temperature C): the pressure its altitude is
+/// measured from. `None` for an implausible sample.
+pub fn reference_pressure(values: &[f32]) -> Option<f64> {
+    let (alt, pressure) = (f64::from(*values.first()?), f64::from(*values.get(1)?));
+    if !(30_000.0..=125_000.0).contains(&pressure) || !(-1_000.0..=10_000.0).contains(&alt) {
+        return None;
+    }
+    let reference = pressure / (1.0 - alt / ALT_PRES_CONST).powf(1.0 / HYPSOMETRIC_EXPONENT);
+    (60_000.0..=125_000.0).contains(&reference).then_some(reference)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -93,8 +169,10 @@ pub struct Report {
     pub phase: Phase,
     /// Completed filter cycles, modulo 2^20.
     pub cycles: u32,
-    /// FC uptime tick (low word) at the filter's start.
+    /// FC uptime tick (low word) at the filter's start, to 16 ticks.
     pub start_tick: Option<u32>,
+    /// The barometer ground reference; `None` before the FC has one.
+    pub baro: Option<BaroRef>,
     pub uptime_tick: u64,
     pub frequency_hz: u32,
 }
@@ -108,16 +186,34 @@ impl Report {
     }
 }
 
+/// The start tick from word 15's 16-tick units: the latest tick at or before
+/// the report's uptime that matches them (unambiguous for 70 min at 1 kHz).
+fn start_tick(word15: u32, uptime_low: u32) -> Option<u32> {
+    let units = word15 & START_MASK;
+    if units == 0 {
+        return None;
+    }
+    let span = START_MASK << START_SHIFT | ((1 << START_SHIFT) - 1);
+    let since = uptime_low.wrapping_sub(units << START_SHIFT) & span;
+    Some(uptime_low.wrapping_sub(since))
+}
+
 /// The estimator words of an FC BOARD_HEALTH; `None` for older firmware or
 /// another board's use of words 13/15.
 pub fn decode(words: &[u32]) -> Option<Report> {
     if words.len() != 24 || words[0] != 1 || words[4] == 0 || words[1] & (4 | 64) != 0 || words[13] >> 24 != TAG {
         return None;
     }
+    let baro = words[15] >> 18;
     Some(Report {
         phase: Phase::from_wire((words[13] >> 20) & 0xF)?,
         cycles: words[13] & CYCLE_MASK,
-        start_tick: (words[15] != 0).then_some(words[15]),
+        start_tick: start_tick(words[15], words[2]),
+        baro: BaroMode::from_wire(baro & 3).map(|mode| BaroRef {
+            mode,
+            // Bits 2..13: a signed 12-bit count.
+            shift_pa: ((baro << 18) as i32 >> 20) as i16,
+        }),
         uptime_tick: u64::from(words[2]) | (u64::from(words[3]) << 32),
         frequency_hz: words[4],
     })
@@ -167,6 +263,8 @@ struct Inner {
     /// No FC in this configuration (test fire); until known, one is expected.
     not_expected: bool,
     published_at: Option<Instant>,
+    /// The latest reference pressure from the FC's BAROMETER_DATA.
+    baro_reference: Option<(f64, Instant)>,
 }
 
 /// `fc_estimator` in the API and WebSocket.
@@ -193,6 +291,14 @@ pub struct Status {
     pub stalled: bool,
     /// The active warning, if any.
     pub warning: Option<String>,
+    /// The barometer ground reference pressure (hPa), from the FC's
+    /// barometer samples.
+    pub baro_ref_hpa: Option<f64>,
+    /// How far the FC moved it since it booted (hPa).
+    pub baro_drift_hpa: Option<f64>,
+    pub baro_mode: Option<BaroMode>,
+    /// "Baro ref 1003.2 hPa · drift +1.8 hPa · tracking".
+    pub baro_label: Option<String>,
 }
 
 impl Status {
@@ -205,6 +311,7 @@ impl Status {
             && self.started_t_plus_ms == other.started_t_plus_ms
             && self.launch_seen == other.launch_seen
             && self.expected == other.expected
+            && self.baro_mode == other.baro_mode
     }
 }
 
@@ -251,6 +358,13 @@ fn fault_text(phase: Phase) -> String {
 impl Tracker {
     pub fn subscribe(&self) -> watch::Receiver<Status> {
         self.tx.subscribe()
+    }
+
+    /// One FC BAROMETER_DATA sample (alt, pressure, temperature).
+    pub fn observe_barometer(&self, values: &[f32], now: Instant) {
+        if let Some(reference) = reference_pressure(values) {
+            self.inner.lock().unwrap().baro_reference = Some((reference, now));
+        }
     }
 
     /// One FC BOARD_HEALTH report. Returns the notices to raise.
@@ -389,6 +503,24 @@ impl Tracker {
         } else {
             None
         };
+        let baro = fresh.and_then(|seen| seen.report.baro);
+        let baro_ref_hpa = inner
+            .baro_reference
+            .filter(|(_, at)| now.saturating_duration_since(*at) <= REPORT_FRESH)
+            .map(|(pa, _)| (pa / 10.0).round() / 10.0);
+        let baro_drift_hpa = baro.map(|b| f64::from(b.shift_pa) / 100.0);
+        let baro_label = baro.map(|b| {
+            let mut parts = Vec::new();
+            if let Some(hpa) = baro_ref_hpa {
+                parts.push(format!("Baro ref {hpa:.1} hPa"));
+            } else {
+                parts.push("Baro ref".to_string());
+            }
+            let saturated = b.shift_pa.unsigned_abs() >= 2047;
+            parts.push(format!("drift {}{:+.1} hPa", if saturated { "beyond " } else { "" }, f64::from(b.shift_pa) / 100.0));
+            parts.push(b.mode.label().to_string());
+            parts.join(" · ")
+        });
         let label = match state {
             "running" => format!("FC estimator: {}", phase.map_or("running", Phase::label)),
             "faulted" => format!("FC estimator: faulted ({})", if inner.stalled && !phase.is_some_and(Phase::faulted) { "stalled" } else { phase.map_or("faulted", Phase::label) }),
@@ -423,6 +555,10 @@ impl Tracker {
             expected: !inner.not_expected,
             stalled: inner.stalled,
             warning,
+            baro_ref_hpa,
+            baro_drift_hpa,
+            baro_mode: baro.map(|b| b.mode),
+            baro_label,
         }
     }
 
@@ -513,6 +649,11 @@ fn publish(state: &crate::state::AppState, now: Instant) {
             payload_json: serde_json::to_string(&status).unwrap_or_default(),
         },
     ));
+}
+
+/// An FC BAROMETER_DATA sample arrived.
+pub(crate) fn observe_barometer(state: &crate::state::AppState, values: &[f32]) {
+    state.fc_estimator.observe_barometer(values, Instant::now());
 }
 
 /// An FC BOARD_HEALTH report arrived (`network_ms`: its SEDSnet stamp).

@@ -465,7 +465,7 @@ impl FlightSimState {
         words[3] = (now_ms >> 32) as u32;
         words[4] = 1000;
         words[13] = (crate::fc_estimator::TAG << 24) | (phase << 20) | (cycles & 0xF_FFFF);
-        words[15] = start as u32 | 1;
+        words[15] = crate::fc_estimator::word15(start as u32 | 1, 0);
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         if let Ok(pkt) = Packet::new(
             crate::telemetry_schema::data_type("BOARD_HEALTH"),
@@ -1881,13 +1881,13 @@ mod tests {
         sim.set_flight_state(F::Launch, 5_000);
         let started = estimator(&sim);
         assert_eq!(started.len(), 1, "reported at once");
-        assert_eq!((started[0].phase, started[0].start_tick), (crate::fc_estimator::Phase::Running, Some(5_001)));
+        assert_eq!((started[0].phase, started[0].start_tick), (crate::fc_estimator::Phase::Running, Some(4_992)));
         sim.queued.clear();
         sim.set_flight_state(F::Ascent, 6_000);
         sim.queue_housekeeping(7_000);
         let later = estimator(&sim);
         assert_eq!(later.len(), 1, "one start per flight");
-        assert_eq!((later[0].phase, later[0].cycles, later[0].start_tick), (crate::fc_estimator::Phase::Converged, 101, Some(5_001)));
+        assert_eq!((later[0].phase, later[0].cycles, later[0].start_tick), (crate::fc_estimator::Phase::Converged, 101, Some(4_992)));
         sim.queued.clear();
         sim.set_flight_state(F::Aborted, 8_000);
         sim.queue_housekeeping(9_000);

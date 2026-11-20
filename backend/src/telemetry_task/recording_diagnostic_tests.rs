@@ -134,7 +134,7 @@ async fn fc_estimator_start_after_launch_is_notified_shown_and_recorded() {
             words[2] = uptime;
             words[4] = 1000;
             words[13] = (crate::fc_estimator::TAG << 24) | (phase << 20) | cycles;
-            words[15] = start;
+            words[15] = crate::fc_estimator::word15(start, 0);
             let bytes: Vec<u8> = words.iter().flat_map(|v| v.to_le_bytes()).collect();
             Packet::new(crate::telemetry_schema::data_type("BOARD_HEALTH"),
                 &[crate::telemetry_schema::endpoint("GROUND_STATION")], "FC", stamp, bytes.into()).unwrap()
@@ -149,7 +149,7 @@ async fn fc_estimator_start_after_launch_is_notified_shown_and_recorded() {
         assert_eq!(running.len(), 1, "primary={primary}: {:?}", state.notifications_snapshot());
         let status = state.fc_estimator.snapshot();
         assert_eq!(status.phase, Some(crate::fc_estimator::Phase::Running), "primary={primary}");
-        assert_eq!(status.started_network_ms, Some(7_000));
+        assert_eq!(status.started_network_ms, Some(6_999), "start 50_001 travels as 50_000");
         assert!(status.launch_seen);
         if crate::station_mode::local_mode() != crate::station_mode::Mode::TestFire {
             assert_eq!(status.state, "running");

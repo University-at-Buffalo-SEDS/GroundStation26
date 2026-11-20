@@ -12,7 +12,7 @@ fn health(phase: u32, cycles: u32, start_ms: u32, uptime_ms: u64) -> [u32; 24] {
     words[4] = HZ;
     words[13] = (TAG << 24) | (phase << 20) | (cycles & CYCLE_MASK);
     words[14] = 0x4F55 << 16;
-    words[15] = start_ms;
+    words[15] = word15(start_ms, 0);
     words
 }
 
@@ -32,8 +32,10 @@ fn decodes_the_fc_words_and_nothing_else() {
     let report = decode(&health(2, 0x1_0005, 40_001, 40_251)).unwrap();
     assert_eq!(report.phase, Phase::Running);
     assert_eq!(report.cycles, 0x1_0005);
-    assert_eq!(report.start_tick, Some(40_001));
-    assert_eq!(report.since_start(), Some(Duration::from_millis(250)));
+    // Word 15 carries the start in 16-tick units.
+    assert_eq!(report.start_tick, Some(40_000));
+    assert_eq!(report.since_start(), Some(Duration::from_millis(251)));
+    assert_eq!(report.baro, None);
     let idle = decode(&health(0, 0, 0, 1_000)).unwrap();
     assert_eq!((idle.phase, idle.start_tick, idle.since_start()), (Phase::Idle, None, None));
     for (phase, expected) in [
@@ -43,7 +45,7 @@ fn decodes_the_fc_words_and_nothing_else() {
     }
     // The start tick wraps with the 32-bit uptime word.
     let wrapped = decode(&health(2, 9, u32::MAX - 99, (1u64 << 32) + 100)).unwrap();
-    assert_eq!(wrapped.since_start(), Some(Duration::from_millis(200)));
+    assert_eq!(wrapped.since_start(), Some(Duration::from_millis(212)), "200 ms plus the 16-tick truncation");
     // Older FC firmware (no tag), another board's generic word 13/15
     // counters (word 1 flags 4/64), an unknown phase, or a short report.
     let mut old = health(2, 5, 1, 2);
@@ -88,9 +90,10 @@ fn the_start_after_launch_raises_one_notification_with_t_plus() {
     assert_eq!(status.label, "FC estimator: running (converged)");
     assert_eq!(status.phase, Some(Phase::Converged));
     assert_eq!(status.rate_hz, Some(50.0));
-    assert_eq!(status.running_for_ms, Some(2_250));
-    assert_eq!(status.started_t_plus_ms, Some(300));
-    assert_eq!(status.started_network_ms, Some(1_001_051), "network stamp minus the time since start");
+    // The start tick 11_051 travels as 11_040 (16-tick units).
+    assert_eq!(status.running_for_ms, Some(2_261));
+    assert_eq!(status.started_t_plus_ms, Some(289));
+    assert_eq!(status.started_network_ms, Some(1_001_040), "network stamp minus the time since start");
     assert_eq!(status.report_age_ms, Some(1_000));
     assert!(status.launch_seen && status.expected && status.warning.is_none());
 }
@@ -234,9 +237,59 @@ fn publishes_changes_at_once_and_ages_once_a_second() {
     assert_eq!(rx.borrow_and_update().state, "running");
     assert_eq!(tracker.publish(t + Duration::from_millis(1_400)), None, "an age alone is not recorded");
     assert!(rx.has_changed().unwrap(), "but the time since start is republished");
-    assert_eq!(rx.borrow_and_update().running_for_ms, Some(1_200));
+    assert_eq!(rx.borrow_and_update().running_for_ms, Some(1_209), "start 1_001 travels as 992");
     let json = serde_json::to_value(tracker.snapshot()).unwrap();
     assert_eq!(json["state"], "running");
     assert_eq!(json["phase"], "running");
     assert_eq!(json["label"], "FC estimator: running");
+}
+
+/// The barometer ground reference: mode and shift since boot in word 15
+/// bits 18..31, the pressure from the FC's own BAROMETER_DATA (alt, prs, tmp).
+#[test]
+fn shows_the_barometer_ground_reference() {
+    let with_baro = |mode: u32, shift: i32, start: u32| {
+        let mut words = health(if start == 0 { 0 } else { 2 }, 5, start, 40_251);
+        words[15] = word15(start, (((shift as u32) & 0xFFF) << 2) | mode);
+        words
+    };
+    let report = decode(&with_baro(1, 180, 0)).unwrap();
+    assert_eq!(report.baro, Some(BaroRef { mode: BaroMode::Tracking, shift_pa: 180 }));
+    assert_eq!(report.start_tick, None, "the reference bits are not a start");
+    let report = decode(&with_baro(3, -2047, 40_001)).unwrap();
+    assert_eq!(report.baro, Some(BaroRef { mode: BaroMode::Frozen, shift_pa: -2047 }));
+    assert_eq!((report.start_tick, report.since_start()), (Some(40_000), Some(Duration::from_millis(251))));
+    assert_eq!(decode(&with_baro(0, 0, 0)).unwrap().baro, None, "no reference yet");
+
+    // The FC's altitude is measured from the pressure that maps it to 0 m.
+    let reference = 100_320.0f64;
+    let pressure = |alt: f64| reference * (1.0 - alt / 44_330.0).powf(1.0 / 0.1903);
+    for alt in [0.0, 12.5, -3.0, 2_900.0] {
+        let got = reference_pressure(&[alt as f32, pressure(alt) as f32, 21.0]).unwrap();
+        assert!((got - reference).abs() < 2.0, "{alt} m: {got}");
+    }
+    assert_eq!(reference_pressure(&[0.0, 20.0, 100_000.0]), None, "not (alt, prs, tmp)");
+    assert_eq!(reference_pressure(&[1.0]), None);
+
+    let tracker = Tracker::default();
+    let t = Instant::now();
+    tracker.observe_barometer(&[1.5, pressure(1.5) as f32, 20.0], t);
+    tracker.observe(&with_baro(1, 180, 0), t, None, PAD);
+    let status = tracker.status(t);
+    assert_eq!(status.baro_mode, Some(BaroMode::Tracking));
+    assert_eq!(status.baro_ref_hpa, Some(1003.2));
+    assert_eq!(status.baro_drift_hpa, Some(1.8));
+    assert_eq!(status.baro_label.as_deref(), Some("Baro ref 1003.2 hPa · drift +1.8 hPa · tracking"));
+    tracker.publish(t);
+    // Handling the vehicle pauses it; Launch freezes it: both are news.
+    tracker.observe(&with_baro(2, 180, 0), t, None, PAD);
+    assert_eq!(tracker.publish(t + Duration::from_millis(10)).and_then(|s| s.baro_label),
+        Some("Baro ref 1003.2 hPa · drift +1.8 hPa · paused (not still)".into()));
+    tracker.observe(&with_baro(3, 2047, 40_001), t, None, FLIGHT);
+    assert_eq!(tracker.publish(t + Duration::from_millis(20)).and_then(|s| s.baro_label),
+        Some("Baro ref 1003.2 hPa · drift beyond +20.5 hPa · frozen".into()));
+    // Stale reports show nothing.
+    let later = t + REPORT_FRESH + Duration::from_secs(1);
+    let status = tracker.status(later);
+    assert_eq!((status.baro_mode, status.baro_ref_hpa, status.baro_label), (None, None, None));
 }

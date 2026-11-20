@@ -1,5 +1,9 @@
 {
   "data": {
+    "baro_drift_hpa": -0.76,
+    "baro_label": "Baro ref 1003.2 hPa · drift -0.8 hPa · tracking",
+    "baro_mode": "tracking",
+    "baro_ref_hpa": 1003.2,
     "cycles": 62,
     "expected": true,
     "label": "FC estimator: running (converged)",
@@ -7,10 +11,10 @@
     "phase": "converged",
     "rate_hz": null,
     "report_age_ms": 2000,
-    "running_for_ms": 2250,
+    "running_for_ms": 2261,
     "stalled": false,
-    "started_network_ms": 1767225601000,
-    "started_t_plus_ms": 300,
+    "started_network_ms": 1767225600989,
+    "started_t_plus_ms": 289,
     "state": "running",
     "warning": null
   },

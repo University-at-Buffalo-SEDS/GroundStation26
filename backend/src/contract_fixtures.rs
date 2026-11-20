@@ -623,7 +623,8 @@ async fn fc_estimator(app: &axum::Router, out: &mut Fixtures) {
     words[2] = 11_301;
     words[4] = 1000;
     words[13] = (TAG << 24) | (3 << 20) | 62;
-    words[15] = 11_051;
+    words[15] = crate::fc_estimator::word15(11_051, (0xFB4 << 2) | 1); // tracking, -0.76 hPa
+    tracker.observe_barometer(&[0.0, 100_320.0, 21.5], launch);
     tracker.observe(&words, launch + Duration::from_millis(550), Some(T0 as u64 + 1_250), flight);
     let status = tracker.status(launch + Duration::from_millis(2_550));
     out.add("websocket/fc-estimator", serde_json::to_value(WsOutMsg::FcEstimator(status)).unwrap());
