@@ -79,6 +79,12 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/auth/watch-token/revoke", post(revoke_tokens))
 }
 
+/// Crew voice for a watch token granted voice (`voice` in the token request).
+/// The socket authenticates in its first message; `voice.rs` refuses a watch
+/// token without the voice grant.
+pub const VOICE_WS_PATH: &str = "/api/voice/ws";
+pub const VOICE_STATUS_PATH: &str = "/api/voice/status";
+
 /// Endpoints a watch token may reach. Everything else answers 403, whatever
 /// permission the endpoint itself asks for (including the WebSocket, which
 /// takes its token from the query string).
@@ -86,6 +92,8 @@ fn watch_token_allowed(method: &Method, path: &str) -> bool {
     matches!(
         (method.as_str(), path),
         ("GET", STATUS_PATH)
+            | ("GET", VOICE_WS_PATH)
+            | ("GET", VOICE_STATUS_PATH)
             | ("POST", "/api/command")
             | ("POST", "/api/auth/logout")
             | ("POST", "/api/proximity/report")
@@ -126,7 +134,7 @@ pub async fn scope_watch_tokens(request: Request, next: Next) -> Response {
     {
         return (
             StatusCode::FORBIDDEN,
-            "A watch token can only read the watch status and map tiles and send its page actions.",
+            "A watch token can only read the watch status and map tiles, join crew voice and send its page actions.",
         )
             .into_response();
     }
@@ -150,6 +158,9 @@ struct IssueRequest {
     device_id: String,
     #[serde(default)]
     commands: Vec<String>,
+    /// Ask for crew voice; granted only with the voice transmit permission.
+    #[serde(default)]
+    voice: bool,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -185,16 +196,18 @@ async fn issue_token(
             &principal,
             &request.device_id,
             &request.commands,
+            request.voice,
             command_watch_eligible,
         )
         .await
     {
         Ok(grant) => {
             log::info!(
-                "Watch token issued to {} for device {} ({} commands)",
+                "Watch token issued to {} for device {} ({} commands, voice {})",
                 principal.username.as_deref().unwrap_or("?"),
                 grant.device_id,
-                grant.commands.len()
+                grant.commands.len(),
+                grant.voice
             );
             Json::<WatchTokenGrant>(grant).into_response()
         }
@@ -1025,6 +1038,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_watch_token_may_reach_crew_voice_and_nothing_else_of_voice_or_media() {
+        assert!(watch_token_allowed(&Method::GET, VOICE_WS_PATH));
+        assert!(watch_token_allowed(&Method::GET, VOICE_STATUS_PATH));
+        for (method, path) in [
+            (Method::POST, VOICE_STATUS_PATH),
+            (Method::POST, VOICE_WS_PATH),
+            (Method::GET, "/api/voice/ws/"),
+            (Method::GET, "/api/program/commentary/ws"),
+            (Method::GET, "/radio"),
+            (Method::GET, "/studio-audio"),
+            (Method::GET, "/api/media-assets/program/audio"),
+            (Method::POST, "/api/live_streams/control"),
+        ] {
+            assert!(!watch_token_allowed(&method, path), "{method} {path}");
+        }
+    }
+
     fn base_input<'a>(telemetry: &'a dyn Fn(&str, Option<&str>, usize) -> Option<(f64, i64)>) -> Inputs<'a> {
         Inputs {
             now_ms: 100_000,
@@ -1253,6 +1284,8 @@ mod tests {
                  "command_access":{"allowed_commands":["Abort","Dump","Launch","Igniter","StartWritingNow"]}},
                 {"username":"viewer","roles":[],"password":{"salt_b64":"","hash_b64":""},
                  "permissions":{"view_data":true}},
+                {"username":"speaker","roles":[],"password":{"salt_b64":"","hash_b64":""},
+                 "permissions":{"view_data":true,"voice_transmit":true}},
                 {"username":"administrator","roles":["admin"],"password":{"salt_b64":"","hash_b64":""},
                  "permissions":{"view_data":true}}
             ]})
@@ -1263,6 +1296,7 @@ mod tests {
             ("operator-phone", "operator"),
             ("operator-phone-2", "operator"),
             ("viewer-phone", "viewer"),
+            ("speaker-phone", "speaker"),
             ("admin-phone", "administrator"),
         ] {
             sqlx::query("INSERT INTO auth_sessions(token,username,session_type,can_view_data,can_send_commands,created_at_ms,expires_at_ms) VALUES(?,?,'session',1,1,0,9999999999999)")
@@ -1276,6 +1310,13 @@ mod tests {
             .route("/ws", get(|| async { "reached" }))
             .route("/tiles/{z}/{x}/{y}", get(|| async { "tile" }))
             .route("/tiles/{z}/{x}/{y}/extra", get(|| async { "reached" }))
+            .route(VOICE_STATUS_PATH, get(|| async { "reached" }).post(|| async { "reached" }))
+            .route(VOICE_WS_PATH, get(|| async { "reached" }))
+            .route("/api/voice/ws/extra", get(|| async { "reached" }))
+            .route("/radio", get(|| async { "reached" }))
+            .route("/api/program/commentary/ws", get(|| async { "reached" }))
+            .route("/api/live_streams/control", post(|| async { "reached" }))
+            .route("/api/media-assets/program/audio", get(|| async { "reached" }))
             .merge(routes())
             .layer(axum::middleware::from_fn(scope_watch_tokens))
             .with_state(state.clone());
@@ -1322,6 +1363,90 @@ mod tests {
             device_id: value["device_id"].as_str().unwrap().into(),
             expires_at_ms: value["expires_at_ms"].as_i64().unwrap(),
             commands: serde_json::from_value(value["commands"].clone()).unwrap(),
+            voice: value["voice"].as_bool().unwrap(),
+        }
+    }
+
+    async fn issue_voice(app: &axum::Router, parent: &str, device: &str) -> WatchTokenGrant {
+        let (status, body) = call(
+            app,
+            "POST",
+            "/api/auth/watch-token",
+            Some(parent),
+            Some(serde_json::json!({"device_id": device, "commands": ["Abort"], "voice": true})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        WatchTokenGrant {
+            token: value["token"].as_str().unwrap().into(),
+            device_id: value["device_id"].as_str().unwrap().into(),
+            expires_at_ms: value["expires_at_ms"].as_i64().unwrap(),
+            commands: serde_json::from_value(value["commands"].clone()).unwrap(),
+            voice: value["voice"].as_bool().unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn voice_is_granted_only_with_the_voice_permission_and_rechecked_on_use() {
+        let (root, state, app) = fixture().await;
+        let voice = |token: String| {
+            let state = state.clone();
+            async move {
+                state
+                    .auth
+                    .authorize_token(&state.auth_db, Some(&token), Permission::VoiceTransmit)
+                    .await
+            }
+        };
+        // Without the account permission the request is narrowed to no voice.
+        let operator = issue_voice(&app, "operator-phone", "phone-o").await;
+        assert!(!operator.voice);
+        assert!(matches!(voice(operator.token.clone()).await, Err(AuthFailure::Forbidden(_))));
+        // Not asked for: not granted, even for a speaker.
+        let quiet = issue(&app, "speaker-phone", "phone-q", &[]).await;
+        assert!(!quiet.voice);
+        assert!(voice(quiet.token.clone()).await.is_err());
+        // A speaker asking gets voice, and nothing beyond it.
+        let speaker = issue_voice(&app, "speaker-phone", "phone-s").await;
+        assert!(speaker.voice);
+        let principal = voice(speaker.token.clone()).await.unwrap();
+        assert!(principal.roles.is_empty());
+        assert!(!principal.permissions.camera_publish && !principal.permissions.sign_checklists);
+        assert!(!principal.permissions.set_system_time && !principal.calibration_access.view);
+        assert!(!principal.can_manage_stream());
+        assert!(matches!(
+            state.auth.authorize_token(&state.auth_db, Some(&speaker.token), Permission::SendCommands).await,
+            Err(AuthFailure::Forbidden(_))
+        ));
+        // Administrators inherit voice.
+        assert!(issue_voice(&app, "admin-phone", "phone-a").await.voice);
+        // Revoking the account's permission stops the existing token at once.
+        let users: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(root.0.join("auth.json")).unwrap()).unwrap();
+        let mut revoked = users.clone();
+        for user in revoked["users"].as_array_mut().unwrap() {
+            if user["username"] == "speaker" {
+                user["permissions"]["voice_transmit"] = false.into();
+            }
+        }
+        std::fs::write(root.0.join("auth.json"), revoked.to_string()).unwrap();
+        assert!(matches!(voice(speaker.token.clone()).await, Err(AuthFailure::Forbidden(_))));
+        std::fs::write(root.0.join("auth.json"), users.to_string()).unwrap();
+        assert!(voice(speaker.token.clone()).await.is_ok());
+        // The grant does not widen the router scope beyond the voice endpoints.
+        let token = Some(speaker.token.as_str());
+        assert_eq!(call(&app, "GET", "/api/voice/status", token, None).await.0, StatusCode::OK);
+        for (method, uri) in [
+            ("GET", "/radio"),
+            ("GET", "/api/program/commentary/ws"),
+            ("POST", "/api/live_streams/control"),
+            ("GET", "/api/media-assets/program/audio"),
+            ("POST", "/api/voice/status"),
+            ("GET", "/api/voice/ws/extra"),
+            ("GET", "/api/recent"),
+        ] {
+            assert_eq!(call(&app, method, uri, token, None).await.0, StatusCode::FORBIDDEN, "{method} {uri}");
         }
     }
 

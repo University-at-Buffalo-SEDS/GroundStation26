@@ -81,20 +81,51 @@ This favors broad browser support over bandwidth efficiency; capacity-plan your
 link for the number of simultaneous speakers. Browser buffering and server queues
 are bounded. Old/excess audio is dropped rather than accumulating without limit.
 
-Voice is not recorded. HTTPS encrypts traffic in transit; the Ground Station
+Voice is not recorded. Watch audio (below) is decoded into the same PCM16
+pipeline as browser audio, so the audience program buffer, the radio bridge
+and any future recording treat it exactly like browser audio. HTTPS encrypts traffic in transit; the Ground Station
 relays decoded PCM, so this is not end-to-end encryption between participants.
 It grants no hardware command access.
+
+## Watches
+
+The Apple Watch and Wear OS companions join the same channel with a scoped
+watch token (`docs/backend/watch-direct.md`): the phone asks for `"voice":
+true` when issuing it, and the station grants voice only to an account with
+the voice transmit permission, rechecked every second like a browser session.
+Watches send Opus instead of PCM (about 24 kbit/s instead of 256 kbit/s per
+speaker, which matters on watch LTE and Bluetooth). The station decodes each
+Opus packet to one PCM16 frame for browsers, the program buffer and the radio
+bridge, and encodes PCM speakers to Opus once per frame for Opus listeners
+(libopus, 16 kHz mono, VoIP mode). Opus packets from a watch are forwarded to
+other Opus listeners unchanged.
+
+**One person's phone and watch never echo.** The station groups a phone
+session with the watch whose token that session issued (the token row stores
+the issuing session's fingerprint). Within a group no audio is relayed. While
+the watch is joined and has not yielded (`{"type":"active","enabled":false}`),
+every other member of its group is *held*: its microphone frames are ignored,
+it receives no audio, `transmitting` is refused and it receives
+`{"type":"handoff","held":true,"by":"watch"}`; the crew voice page then shows
+that the watch has voice and switches open mic to listen-only. When the watch
+leaves or yields, the held page receives `held:false` and listens again; its
+microphone needs a new press. Other groups, including other people signed in
+with the same shared account, are unaffected. Code: `backend/src/voice/pairing.rs`.
 
 ## Protocol
 
 1. Upgrade `/api/voice/ws`; within five seconds send
-   `{"type":"auth","token":"SESSION_TOKEN"}`. Tokens are sent inside the connection,
+   `{"type":"auth","token":"SESSION_TOKEN"}` (optionally `"codec":"opus"`;
+   the default is `"pcm16"`). Tokens are sent inside the connection,
    not in URL query parameters. Invalid, expired, and anonymous sessions are rejected.
-2. Receive `{"type":"joined","id":N,"sample_rate":16000}` and `roster` updates.
+2. Receive `{"type":"joined","id":N,"sample_rate":16000,"codec":"pcm16","frame_samples":320,"device":"web"}`
+   and `roster` updates (`peers[]`: `id`, `name`, `transmitting`, `device` = `web|watch`).
 3. Send `{"type":"transmitting","enabled":true}` before audio, or `false` to mute.
-4. Client binary frames contain exactly 640 bytes: 320 little-endian signed PCM16
-   samples. Server binary frames prepend the authenticated sender's four-byte
-   little-endian ID. Clients cannot choose another sender ID.
+4. PCM16 client binary frames contain exactly 640 bytes: 320 little-endian signed PCM16
+   samples; Opus clients send one packet (1–400 bytes) that decodes to exactly
+   320 samples. Anything else closes the connection. Server binary frames prepend the authenticated sender's four-byte
+   little-endian ID to the payload in the listener's codec. Clients cannot choose another sender ID.
+   Watches may send `{"type":"active","enabled":…}`; held peers receive `handoff`.
 5. Send `{"type":"ping"}` every ten seconds while idle. Accounts and sessions are
    rechecked every second; dead clients are removed after 40 seconds without
    messages. A socket closing removes its participant immediately.
@@ -119,6 +150,12 @@ Run backend tests and the audio processor tests:
 cargo test -p groundstation_backend --no-default-features
 (cd ui && node tests/station-voice_audio.cjs)
 ```
+
+`voice::tests` include a fake watch client: it joins over a real socket with
+a watch token and Opus next to a PCM browser client, and checks both hear each
+other, that watch audio reaches the program buffer, the phone/watch handoff,
+and that a token without the voice grant (or an account without voice
+permission) is refused.
 
 For the optional browser test, start the existing isolated media fixture (no
 hardware tasks or MediaMTX are started):

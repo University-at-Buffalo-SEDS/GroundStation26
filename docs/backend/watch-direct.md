@@ -9,14 +9,19 @@ handling in `backend/src/auth.rs`. Client side: the frontend
 
 ## Watch token
 
-`POST /api/auth/watch-token` `{"device_id":"<phone install id>","commands":["Abort","Dump"]}`
+`POST /api/auth/watch-token` `{"device_id":"<phone install id>","commands":["Abort","Dump"],"voice":true}`
 with a signed-in phone session returns
-`{"token":"gsw1.…","device_id":…,"expires_at_ms":…,"commands":[granted]}`.
+`{"token":"gsw1.…","device_id":…,"expires_at_ms":…,"commands":[granted],"voice":true|false}`.
 
 * Issued only to a named, non-anonymous session; never to a watch token.
 * `commands` is narrowed to the commands the account may send now **and**
   that are watch-eligible (below), deduplicated, at most 16. A viewer gets a
   read-only token.
+* `voice` (optional, default false) asks for crew voice. It is granted only
+  when the account may transmit on crew voice now (`voice_transmit`, or the
+  admin role), and stored with the commands
+  (`allowed_commands_json` = `{"commands":[…],"voice":true}`; a plain array
+  means no voice).
 * One token per account and `device_id`: issuing again replaces the old
   one. The token never outlives the issuing session (and at most 30 days).
 * Only a SHA-256 digest is stored in `auth_sessions`
@@ -29,12 +34,19 @@ with a signed-in phone session returns
 
 A watch token resolves to a narrow principal: no roles (so no administrator
 authority), view data, and only the granted commands that are still
-watch-eligible and still allowed for the account; no calibration, checklist,
-voice, camera or clock permissions. The router additionally limits watch
-tokens to `GET /api/watch/status`, `POST /api/command`,
-`POST /api/auth/logout` and `GET /tiles/{z}/{x}/{y}[.jpg]` (decimal indices
-only); every other request with a watch token (including `/ws?token=` and
-any query-string token) gets HTTP 403.
+watch-eligible and still allowed for the account; crew voice only when it
+was granted and the account still has voice permission; no calibration,
+checklist, camera, stream-management or clock permissions. The router
+additionally limits watch tokens to `GET /api/watch/status`,
+`POST /api/command`, `POST /api/auth/logout`, `POST /api/proximity/report`,
+`GET /api/voice/status`, `GET /api/voice/ws` and
+`GET /tiles/{z}/{x}/{y}[.jpg]` (decimal indices only); every other request
+with a watch token (including `/ws?token=` and any query-string token) gets
+HTTP 403. The voice socket authenticates inside the connection, so
+`voice.rs` itself refuses a watch token without the voice grant, and the
+audience commentary socket refuses every watch token. See
+`docs/backend/crew-voice.md` "Watches" for the codec and the phone/watch
+echo rule.
 
 The tile endpoint is read-only: it serves the station's offline map bundle
 (the same tiles the map tab shows) and no telemetry. The watch uses it for

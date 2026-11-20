@@ -1104,6 +1104,7 @@ impl AuthManager {
         principal: &AuthPrincipal,
         device_id: &str,
         requested: &[String],
+        want_voice: bool,
         eligible: impl Fn(&str) -> bool,
     ) -> Result<WatchTokenGrant, AuthFailure> {
         let parent_token = parent_token.trim();
@@ -1122,6 +1123,8 @@ impl AuthManager {
         let commands = grant_watch_commands(requested, |cmd| {
             eligible(cmd) && principal.allows_command_name(cmd)
         });
+        // Crew voice only for an account that may talk on the voice channel now.
+        let voice = want_voice && principal.permissions.allows(Permission::VoiceTransmit);
         let config = self
             .load_users_file()
             .map_err(|e| AuthFailure::Internal(format!("failed to load users.json: {e}")))?;
@@ -1140,7 +1143,7 @@ impl AuthManager {
             token_fingerprint(parent_token)
         );
         let device_prefix = format!("{WATCH_SESSION_PREFIX}{device_id}|");
-        let commands_json = serde_json::to_string(&commands)
+        let commands_json = watch_grant_json(&commands, voice)
             .map_err(|e| AuthFailure::Internal(format!("failed to serialize commands: {e}")))?;
         let mut tx = db
             .begin()
@@ -1181,6 +1184,7 @@ impl AuthManager {
             device_id: device_id.to_string(),
             expires_at_ms,
             commands,
+            voice,
         })
     }
 
@@ -1252,17 +1256,20 @@ impl AuthManager {
             .find(|u| u.username.eq_ignore_ascii_case(&username) && !u.disabled)
             .ok_or_else(|| AuthFailure::Unauthorized("Account disabled or removed".into()))?;
         let current = user.permissions.for_roles(&user.roles);
-        let granted: Vec<String> =
-            serde_json::from_str(&row.get::<String, _>("allowed_commands_json")).unwrap_or_default();
+        let (granted, voice_granted) =
+            parse_watch_grant(&row.get::<String, _>("allowed_commands_json"));
         let (account_commands, _) = configured_user_access(&config, &username);
         let allowed = grant_watch_commands(&granted, |cmd| {
             crate::watch::command_watch_eligible(cmd) && account_commands.allows(cmd)
         });
         let send_commands =
             row.get::<i64, _>("can_send_commands") != 0 && current.send_commands && !allowed.is_empty();
+        // Crew voice: granted at issue and still allowed for the account now.
+        let voice_transmit = voice_granted && current.allows(Permission::VoiceTransmit);
         let permissions = Permissions {
             view_data: row.get::<i64, _>("can_view_data") != 0 && current.view_data,
             send_commands,
+            voice_transmit,
             ..Permissions::default()
         }
         .normalized();
@@ -1624,6 +1631,59 @@ pub struct WatchTokenGrant {
     pub device_id: String,
     pub expires_at_ms: i64,
     pub commands: Vec<String>,
+    /// The watch may join crew voice (`/api/voice/ws`). Only for an account
+    /// with the voice transmit permission, rechecked on every use.
+    pub voice: bool,
+}
+
+/// Stored grant: the plain command array (no voice), or
+/// `{"commands":[…],"voice":true}` when crew voice was granted.
+fn watch_grant_json(commands: &[String], voice: bool) -> serde_json::Result<String> {
+    if voice {
+        serde_json::to_string(&serde_json::json!({"commands": commands, "voice": true}))
+    } else {
+        serde_json::to_string(commands)
+    }
+}
+
+fn parse_watch_grant(json: &str) -> (Vec<String>, bool) {
+    #[derive(Deserialize)]
+    struct Grant {
+        #[serde(default)]
+        commands: Vec<String>,
+        #[serde(default)]
+        voice: bool,
+    }
+    if let Ok(commands) = serde_json::from_str::<Vec<String>>(json) {
+        return (commands, false);
+    }
+    serde_json::from_str::<Grant>(json)
+        .map(|g| (g.commands, g.voice))
+        .unwrap_or_default()
+}
+
+/// Groups a voice participant with the other devices of the same person:
+/// a phone session's own fingerprint, or for a watch token the fingerprint of
+/// the phone session that issued it. Crew voice never relays audio between
+/// members of one group (no echo loop between a phone and its watch).
+pub async fn voice_device_group(db: &SqlitePool, token: &str) -> String {
+    if !is_watch_token(token) {
+        return token_fingerprint(token);
+    }
+    let session_type: Option<String> =
+        sqlx::query_scalar("SELECT session_type FROM auth_sessions WHERE token = ? LIMIT 1")
+            .bind(watch_row_key(token))
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+    session_type
+        .as_deref()
+        .and_then(|t| t.strip_prefix(WATCH_SESSION_PREFIX))
+        .and_then(|rest| rest.rsplit_once('|'))
+        .map(|(_, parent)| parent.to_string())
+        // Unknown issuer: a group of its own, so nothing is suppressed.
+        .unwrap_or_else(|| format!("watch:{}", token_fingerprint(token)))
 }
 
 pub fn is_watch_token(token: &str) -> bool {
