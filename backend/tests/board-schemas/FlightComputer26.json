@@ -557,6 +557,22 @@
       ]
     },
     {
+      "rust": "ActuatorSimSample",
+      "name": "SIM_SAMPLE",
+      "doc": "Integrated ground test: replayed sensor sample or estimator output computed from replayed data. 8 x float32: kind (1 IMU, 2 barometer, 3 GPS, 4 ascent state, 5 descent state), seconds since the FC accepted Launch, then that kind's values (zero padded). Logged only to GroundStation.",
+      "reliable": "Off",
+      "priority": 0,
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 8
+      },
+      "endpoints": [
+        "ActuatorGroundStation"
+      ]
+    },
+    {
       "rust": "ActuatorBarometerLocal",
       "name": "BAROMETER_LOCAL",
       "doc": "Barometer Data: 3 \u00d7 float32 elements (alt, prs, tmp). Logged only to SD.",
