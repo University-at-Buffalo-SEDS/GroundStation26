@@ -23,6 +23,53 @@ const HEADER: &str =
     "id,received_timestamp_ms,source_timestamp_ms,sender_id,data_type,values_json,payload_json\r\n";
 const RESOLVED_HEADER: &str = "id,received_timestamp_ms,source_timestamp_ms,sender_id,data_type,values_json,payload_json,canonical_utc_ms,provenance_json\r\n";
 const PAGE_SIZE: i64 = 512;
+/// Appended to an integrated ground test recording's header (other modes keep
+/// the header above byte for byte).
+const PROVENANCE_COLUMN: &str = "data_provenance";
+
+/// Where an integrated ground test row came from: `simulated` (SIM_SAMPLE
+/// rows, and FC FLIGHT_STATE rows received while the FC reported ground test
+/// Sim), `ground_station` (GS rows) or `real` (board data). Rows are read in
+/// id order, so the latest `GS_IGT` row gives the FC mode at each row.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Provenance {
+    fc_sim: bool,
+}
+impl Provenance {
+    pub(crate) fn classify(&mut self, sender: &str, data_type: &str, payload: Option<&str>) -> &'static str {
+        let sender = crate::types::canonical_sender_id(sender.trim());
+        if data_type == "GS_IGT"
+            && let Some(mode) = payload
+                .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+                .and_then(|v| v["fc_mode"].as_str().map(str::to_owned))
+        {
+            self.fc_sim = mode == "sim";
+        }
+        if data_type.starts_with("SIM_") {
+            "simulated"
+        } else if data_type == "FLIGHT_STATE" && sender == "FC" && self.fc_sim {
+            "simulated"
+        } else if sender == "GS" || data_type.starts_with("GS_") {
+            "ground_station"
+        } else {
+            "real"
+        }
+    }
+}
+
+/// The recording was made in an integrated ground test (its GS_STATION_MODE row).
+async fn integrated_ground_test(db: &SqlitePool) -> bool {
+    sqlx::query_scalar::<_, Option<String>>(
+        "SELECT payload_json FROM telemetry WHERE data_type='GS_STATION_MODE' ORDER BY id LIMIT 1",
+    )
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .flatten()
+    .and_then(|payload| serde_json::from_str::<serde_json::Value>(&payload).ok())
+    .is_some_and(|value| value["mode"] == "integrated_ground_test")
+}
 
 #[derive(Serialize)]
 struct Recording {
@@ -220,17 +267,25 @@ async fn download(
     };
     let resolved=sqlx::query_scalar::<_,i64>("SELECT COUNT(*) FROM main.sqlite_master WHERE name='sd_replay_telemetry'").fetch_one(&db).await.unwrap_or(0)>0;
     let csv_header=if resolved {RESOLVED_HEADER}else{HEADER};
-    let body = stream::try_unfold((db, 0i64, false), move |(db, last, started)| async move {
-        if !started {
-            return Ok::<_, std::io::Error>(Some((csv_header.to_owned(), (db, last, true))));
-        }
-        let (chunk, next) = csv_page(&db, last, upper)
-            .await
-            .map_err(std::io::Error::other)?;
-        if next == last {
-            Ok(None)
-        } else {
-            Ok(Some((chunk, (db, next, true))))
+    let provenance = integrated_ground_test(&db).await.then(Provenance::default);
+    let csv_header = match provenance {
+        Some(_) => format!("{},{PROVENANCE_COLUMN}\r\n", csv_header.trim_end_matches("\r\n")),
+        None => csv_header.to_owned(),
+    };
+    let body = stream::try_unfold((db, 0i64, false, provenance), move |(db, last, started, mut provenance)| {
+        let csv_header = csv_header.clone();
+        async move {
+            if !started {
+                return Ok::<_, std::io::Error>(Some((csv_header, (db, last, true, provenance))));
+            }
+            let (chunk, next) = csv_page(&db, last, upper, provenance.as_mut())
+                .await
+                .map_err(std::io::Error::other)?;
+            if next == last {
+                Ok(None)
+            } else {
+                Ok(Some((chunk, (db, next, true, provenance))))
+            }
         }
     });
     let filename = id.trim_end_matches(".db");
@@ -258,19 +313,30 @@ pub(crate) fn text_cell(value: &str) -> String {
     )
 }
 
-async fn csv_page(db: &SqlitePool, last: i64, upper: i64) -> Result<(String, i64), sqlx::Error> {
+async fn csv_page(
+    db: &SqlitePool,
+    last: i64,
+    upper: i64,
+    mut provenance: Option<&mut Provenance>,
+) -> Result<(String, i64), sqlx::Error> {
     let resolved=sqlx::query_scalar::<_,i64>("SELECT COUNT(*) FROM main.sqlite_master WHERE name='sd_replay_telemetry'").fetch_one(db).await?>0;
     if resolved {
         let rows=sqlx::query("SELECT id,timestamp_ms,source_timestamp_ms,sender_id,data_type,values_json,payload_json,provenance_json FROM main.sd_replay_telemetry WHERE id>? AND id<=? ORDER BY id LIMIT ?").bind(last).bind(upper).bind(PAGE_SIZE).fetch_all(db).await?;
         let mut csv=String::new();let mut next=last;
         for row in rows {
-            next=row.try_get("id")?;let provenance:String=row.try_get("provenance_json")?;
-            let parsed:serde_json::Value=serde_json::from_str(&provenance).unwrap_or_default();
-            let cells=vec![next.to_string(),parsed["received_timestamp_ms"].as_i64().map(|v|v.to_string()).unwrap_or_default(),
+            next=row.try_get("id")?;let provenance_json:String=row.try_get("provenance_json")?;
+            let parsed:serde_json::Value=serde_json::from_str(&provenance_json).unwrap_or_default();
+            let sender=row.try_get::<Option<String>,_>("sender_id")?.unwrap_or_default();
+            let ty=row.try_get::<String,_>("data_type")?;
+            let payload=row.try_get::<Option<String>,_>("payload_json")?.unwrap_or_default();
+            let mut cells=vec![next.to_string(),parsed["received_timestamp_ms"].as_i64().map(|v|v.to_string()).unwrap_or_default(),
                 row.try_get::<Option<i64>,_>("source_timestamp_ms")?.map(|v|v.to_string()).unwrap_or_default(),
-                text_cell(&row.try_get::<Option<String>,_>("sender_id")?.unwrap_or_default()),text_cell(&row.try_get::<String,_>("data_type")?),
-                text_cell(&row.try_get::<Option<String>,_>("values_json")?.unwrap_or_default()),text_cell(&row.try_get::<Option<String>,_>("payload_json")?.unwrap_or_default()),
-                row.try_get::<i64,_>("timestamp_ms")?.to_string(),text_cell(&provenance)];
+                text_cell(&sender),text_cell(&ty),
+                text_cell(&row.try_get::<Option<String>,_>("values_json")?.unwrap_or_default()),text_cell(&payload),
+                row.try_get::<i64,_>("timestamp_ms")?.to_string(),text_cell(&provenance_json)];
+            if let Some(state)=provenance_state(&mut provenance) {
+                cells.push(state.classify(&sender,&ty,Some(&payload)).to_owned());
+            }
             csv.push_str(&cells.join(","));csv.push_str("\r\n");
         }
         return Ok((csv,next));
@@ -288,15 +354,24 @@ async fn csv_page(db: &SqlitePool, last: i64, upper: i64) -> Result<(String, i64
         let values: Option<String> = row.try_get("values_json")?;
         let payload: Option<String> = row.try_get("payload_json")?;
         chunk.push_str(&format!(
-            "{next},{received},{},{},{},{},{}\r\n",
+            "{next},{received},{},{},{},{},{}",
             source.map(|s| s.to_string()).unwrap_or_default(),
             text_cell(sender.as_deref().unwrap_or("")),
             text_cell(&ty),
             text_cell(values.as_deref().unwrap_or("")),
             text_cell(payload.as_deref().unwrap_or(""))
         ));
+        if let Some(state) = provenance_state(&mut provenance) {
+            chunk.push(',');
+            chunk.push_str(state.classify(sender.as_deref().unwrap_or(""), &ty, payload.as_deref()));
+        }
+        chunk.push_str("\r\n");
     }
     Ok((chunk, next))
+}
+
+fn provenance_state<'a>(provenance: &'a mut Option<&mut Provenance>) -> Option<&'a mut Provenance> {
+    provenance.as_mut().map(|state| &mut **state)
 }
 
 #[cfg(test)]
@@ -467,7 +542,7 @@ pub(crate) mod tests {
             sqlx::query("INSERT INTO telemetry(timestamp_ms,source_timestamp_ms,sender_id,data_type,values_json,payload_json) VALUES(123456,98765,'DAQ',?,?,'[0,1,2,3]')")
                 .bind(kind).bind(value).execute(&db).await.unwrap();
         }
-        let (csv, _) = csv_page(&db, 0, 2).await.unwrap();
+        let (csv, _) = csv_page(&db, 0, 2, None).await.unwrap();
         assert!(csv.contains("123456,98765"));
         assert!(csv.contains("DAQ"));
         assert!(csv.contains("COMBUSTION_CHAMBER_PRESSURE"));
@@ -482,13 +557,13 @@ pub(crate) mod tests {
         let db = crate::telemetry_db::open_in_memory_telemetry_db()
             .await
             .unwrap();
-        assert_eq!(csv_page(&db, 0, 0).await.unwrap(), (String::new(), 0));
+        assert_eq!(csv_page(&db, 0, 0, None).await.unwrap(), (String::new(), 0));
         sqlx::query("INSERT INTO telemetry(timestamp_ms,data_type) VALUES(42,'RAW')")
             .execute(&db)
             .await
             .unwrap();
         assert_eq!(
-            csv_page(&db, 0, 1).await.unwrap().0,
+            csv_page(&db, 0, 1, None).await.unwrap().0,
             "1,42,,\"\",\"RAW\",\"\",\"\"\r\n"
         );
     }
@@ -502,13 +577,81 @@ pub(crate) mod tests {
                 .bind(i).bind(if i == 1 { None } else { Some(i*10) }).bind(if i%2 == 0 { "DAQ" } else { "FC" })
                 .bind(if i%2 == 0 { "KG1000" } else { "BAROMETER" }).bind("[0.001,-570,null]").bind("[1,2,3]").execute(&db).await.unwrap();
         }
-        let (first, id) = csv_page(&db, 0, 514).await.unwrap();
+        let (first, id) = csv_page(&db, 0, 514, None).await.unwrap();
         assert_eq!(id, 512);
         assert_eq!(first.lines().count(), 512);
         assert!(first.starts_with("1,1,,\"FC\",\"BAROMETER\",\"[0.001,-570,null]\""));
-        let (last, id) = csv_page(&db, id, 514).await.unwrap();
+        let (last, id) = csv_page(&db, id, 514, None).await.unwrap();
         assert_eq!(id, 514);
         assert_eq!(last.lines().count(), 2);
-        assert!(csv_page(&db, id, 514).await.unwrap().0.is_empty());
+        assert!(csv_page(&db, id, 514, None).await.unwrap().0.is_empty());
+    }
+
+    async fn download_csv(root: &FsPath, id: &str, rows: &[(&str, &str, Option<&str>)]) -> String {
+        let (db, _) = crate::telemetry_db::open_telemetry_db(&root.join(id)).await.unwrap();
+        for (sender, kind, payload) in rows {
+            sqlx::query("INSERT INTO telemetry(timestamp_ms,sender_id,data_type,values_json,payload_json) VALUES(10,?,?,'[1.0]',?)")
+                .bind(sender).bind(kind).bind(payload).execute(&db).await.unwrap();
+        }
+        db.close().await;
+        let state = export_state(root, true).await;
+        let response = download(State(state), HeaderMap::new(), Path(id.into())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn integrated_ground_test_export_adds_a_trailing_provenance_column() {
+        let root = TestDirectory::new();
+        let csv = download_csv(
+            &root.0,
+            "groundstation_recording_2026-11-19_12-00-00_000.db",
+            &[
+                ("GS", "GS_STATION_MODE", Some(r#"{"mode":"integrated_ground_test"}"#)),
+                ("GS", "GS_IGT", Some(r#"{"fc_mode":"ready"}"#)),
+                ("FC", "FLIGHT_STATE", None),
+                ("FC", "IMU_DATA", None),
+                ("GS", "GS_IGT", Some(r#"{"fc_mode":"sim"}"#)),
+                ("FC", "SIM_SAMPLE", None),
+                ("FC", "FLIGHT_STATE", None),
+                ("VB", "FLIGHT_STATE", None),
+                ("FC", "IMU_DATA", None),
+                ("GS", "GS_IGT", Some(r#"{"fc_mode":"done"}"#)),
+                ("FC", "FLIGHT_STATE", None),
+            ],
+        )
+        .await;
+        let lines: Vec<&str> = csv.split("\r\n").filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines[0], format!("{},data_provenance", HEADER.trim_end()));
+        let provenance: Vec<&str> = lines[1..].iter().map(|l| l.rsplit(',').next().unwrap()).collect();
+        assert_eq!(
+            provenance,
+            [
+                "ground_station", "ground_station", "real", "real", "ground_station", "simulated",
+                "simulated", "real", "real", "ground_station", "real",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn other_recordings_keep_the_old_header_byte_for_byte() {
+        let root = TestDirectory::new();
+        for (index, mode) in ["normal", "test_fire"].into_iter().enumerate() {
+            let payload = format!(r#"{{"mode":"{mode}"}}"#);
+            let csv = download_csv(
+                &root.0,
+                &format!("groundstation_recording_2026-11-19_12-00-0{index}_000.db"),
+                &[("GS", "GS_STATION_MODE", Some(&payload)), ("FC", "SIM_SAMPLE", None)],
+            )
+            .await;
+            assert!(csv.starts_with(HEADER), "{mode}");
+            assert!(!csv.contains("data_provenance"));
+            assert!(csv.lines().nth(2).unwrap().ends_with("\"\""), "no trailing column: {csv}");
+        }
+        // A recording from before the GS_STATION_MODE row: old header too.
+        let csv = download_csv(&root.0, "groundstation_recording_2026-11-19_12-00-09_000.db", &[("FC", "IMU_DATA", None)]).await;
+        assert!(csv.starts_with(HEADER));
+        assert!(!csv.contains("data_provenance"));
     }
 }
