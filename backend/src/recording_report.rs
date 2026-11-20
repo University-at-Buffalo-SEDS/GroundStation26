@@ -82,10 +82,26 @@ pub async fn report(
     request["channel_metadata"]=export_layout.as_ref().map(channel_metadata).unwrap_or_else(||serde_json::json!([]));
     request["recording_diagnostic_streams"] = crate::telemetry_task::recording_diagnostics::descriptors();
     // The root is always server-controlled, regardless of request JSON.
-    request["root"] = crate::recording_export::directory(&state)
-        .to_string_lossy()
-        .into_owned()
-        .into();
+    let root = crate::recording_export::directory(&state);
+    request["root"] = root.to_string_lossy().into_owned().into();
+    // The server resolves the files: one selected recording (any kind), or
+    // the ring plus legacy files for "all recordings".
+    let selected = request["recording"].as_str().unwrap_or("").to_owned();
+    let files: Vec<serde_json::Value> = if selected.is_empty() {
+        let listing_root = root.clone();
+        tokio::task::spawn_blocking(move || crate::recording_store::primary_sources(&listing_root))
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|l| serde_json::json!([l.id, l.path.to_string_lossy()]))
+            .collect()
+    } else {
+        match crate::recording_export::recording_path(&root, &selected).await {
+            Ok(path) => vec![serde_json::json!([selected, path.to_string_lossy()])],
+            Err(_) => return (StatusCode::NOT_FOUND, "Recording not found. Refresh the recording list.").into_response(),
+        }
+    };
+    request["files"] = files.into();
     static JOBS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
     let Ok(_permit) = JOBS.try_acquire() else {
         return (

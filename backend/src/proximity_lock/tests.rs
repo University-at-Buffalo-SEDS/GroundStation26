@@ -45,8 +45,7 @@ fn cmd(name: &str) -> TelemetryCommand {
 const SAFING: &[&str] = &[
     "ValveSelfTest",
     "Abort", "Dump", "NormallyOpen", "NitrogenClose", "NitrousClose", "PauseFill", "CancelFill",
-    "RetractPlumbing", "ResetSim", "StartWritingNow", "StartWritingLastTwoMinutes", "PauseWritingDb",
-    "StopWritingDb", "ResetTClock", "MonitorAltitude", "RevokeMonitorAltitude", "ConsecutiveSamples",
+    "RetractPlumbing", "ResetSim", "ResetTClock", "MonitorAltitude", "RevokeMonitorAltitude", "ConsecutiveSamples",
     "RevokeConsecutiveSamples", "ResetFailures", "RevokeResetFailures", "ValidateMeasms",
     "RevokeValidateMeasms", "ToggleAvBayUnderglow", "ToggleFlightBuzzer", "FcSdRetry", "RewindFlightState",
     "ResetFlightState", "ResetLaunchLatch", "EvaluationAbort", "EvaluationRelax", "EvaluationFocus",

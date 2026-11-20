@@ -791,10 +791,6 @@ impl FlightSimState {
             | TelemetryCommand::ValveSelfTest
             | TelemetryCommand::NitrogenTest
             | TelemetryCommand::Turbocharge
-            | TelemetryCommand::StartWritingNow
-            | TelemetryCommand::StartWritingLastTwoMinutes
-            | TelemetryCommand::PauseWritingDb
-            | TelemetryCommand::StopWritingDb
             | TelemetryCommand::ResetSim => {
                 // Backend-local controls are handled outside the simulator command stream.
             }
@@ -1506,10 +1502,6 @@ pub fn handle_command(cmd: &TelemetryCommand) -> bool {
             | TelemetryCommand::ValveSelfTest
             | TelemetryCommand::NitrogenTest
             | TelemetryCommand::Turbocharge
-            | TelemetryCommand::StartWritingNow
-            | TelemetryCommand::StartWritingLastTwoMinutes
-            | TelemetryCommand::PauseWritingDb
-            | TelemetryCommand::StopWritingDb
     ) {
         // Shared backend sequence/recording owners handle these controls. Never consume
         // one here or manufacture completion independently of its interlocks.
@@ -2039,28 +2031,6 @@ mod tests {
             NitrogenTest,
         ] {
             assert!(!super::handle_command(&command));
-        }
-    }
-    #[test]
-    fn selected_actual_dummy_models_do_not_consume_backend_recording_controls() {
-        crate::mode_suite!(Testing);
-        const NAME:&str="flight_sim::tests::selected_actual_dummy_models_do_not_consume_backend_recording_controls";
-        const CHILD:&str="FLIGHT_SIM_RECORDING_OWNER_CHILD";
-        if std::env::var(CHILD).as_deref()!=Ok("1") {
-            let output=std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact",NAME,"--nocapture"]).env(CHILD,"1")
-                .env("GS_SIM_MODE","1").env("GS_RRLS_ROLE","off").output().unwrap();
-            assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stdout));
-            return;
-        }
-        use crate::comms::CommsDevice;
-        crate::telemetry_schema::initialize().unwrap();
-        let rocket=crate::comms::DummyComms::new("Rocket Comms");
-        let fill=crate::comms::DummyComms::new("Umbilical Comms");
-        crate::testing_board_lifecycle::bind_selected(rocket.testing_model_link(),fill.testing_model_link());
-        assert!(crate::testing_board_lifecycle::enabled(),"actual selected model links required");
-        for command in [crate::types::TelemetryCommand::StartWritingNow,crate::types::TelemetryCommand::StartWritingLastTwoMinutes,crate::types::TelemetryCommand::PauseWritingDb,crate::types::TelemetryCommand::StopWritingDb] {
-            assert!(!super::handle_command(&command),"recording command absorbed: {command:?}");
         }
     }
     #[test]

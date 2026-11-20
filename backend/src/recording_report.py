@@ -25,21 +25,30 @@ def read_rows(request):
     root = Path(request["root"]).resolve(strict=True)
     recording = request.get("recording", "")
     paths = []
-    for path in root.iterdir():
-        if not re.fullmatch(r"groundstation_recording_[0-9_-]+\.db", path.name):
-            continue
-        if recording and path.name != recording:
-            continue
-        if path.is_symlink() or not path.is_file() or path.resolve().parent != root:
-            continue
-        paths.append(path)
+    if "files" in request:
+        # Server-resolved [id, path] pairs (rolling segments, event captures,
+        # legacy files); the id labels each row.
+        for name, file in request["files"]:
+            path = Path(file)
+            if path.is_symlink() or not path.is_file():
+                continue
+            paths.append((name, path))
+    else:
+        for path in root.iterdir():
+            if not re.fullmatch(r"groundstation_recording_[0-9_-]+\.db", path.name):
+                continue
+            if recording and path.name != recording:
+                continue
+            if path.is_symlink() or not path.is_file() or path.resolve().parent != root:
+                continue
+            paths.append((path.name, path))
     if recording and not paths:
         raise ValueError("Recording not found. Refresh the recording list.")
     start, end = request.get("start_ms"), request.get("end_ms")
     if start is not None and end is not None and end <= start:
         raise ValueError("End time must be after start time.")
     result, history, provenance = [], defaultdict(list), {}
-    for path in sorted(paths):
+    for name, path in sorted(paths):
         with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=5)) as db:
             db.execute("BEGIN")
             resolved = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sd_replay_telemetry'").fetchone()
@@ -49,7 +58,7 @@ def read_rows(request):
                 db.execute("CREATE TEMP VIEW telemetry AS SELECT id,timestamp_ms,source_timestamp_ms,sender_id,data_type,values_json,payload_json,provenance_json FROM main.sd_replay_telemetry")
             if db.execute("SELECT 1 FROM sqlite_master WHERE name='calibration_history'").fetchone():
                 for t, sender, sensor, config in db.execute("SELECT timestamp_ms,sender_id,sensor_id,config_json FROM calibration_history ORDER BY timestamp_ms"):
-                    entries = history[(path.name, sender, sensor)]
+                    entries = history[(name, sender, sensor)]
                     snapshot = json.loads(config)
                     if not entries or entries[-1][1] != snapshot:
                         entries.append((t, snapshot))
@@ -67,9 +76,9 @@ def read_rows(request):
                     info=json.loads(row[-1])
                     if not isinstance(info,dict) or info.get("origin") not in ("sd","network"):
                         raise ValueError("Resolved recording has invalid source provenance; no export was produced.")
-                    provenance[(path.name,row[0])]=info
+                    provenance[(name,row[0])]=info
                     row=row[:-1]
-                result.append((path.name,) + row)
+                result.append((name,) + row)
                 if len(result) > MAX_ROWS:
                     raise ValueError("Selection exceeds 200,000 recorded rows. Choose a recording or narrower time window; no rows were silently dropped.")
     if not result:

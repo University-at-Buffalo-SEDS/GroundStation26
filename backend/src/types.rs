@@ -23,10 +23,6 @@ pub enum TelemetryCommand {
     NitrogenClose,
     Nitrous,
     NitrousClose,
-    StartWritingNow,
-    StartWritingLastTwoMinutes,
-    PauseWritingDb,
-    StopWritingDb,
     ResetSim,
     ContinueFillSequence,
     MonitorAltitude,
@@ -151,7 +147,6 @@ impl<'de> Deserialize<'de> for TelemetryCommand {
 const NORMAL_CLIENT_COMMANDS: &[&str] = &[
     "Postinit", "Launch", "Dump", "Abort", "NormallyOpen", "Pilot", "Igniter",
     "RetractPlumbing", "Nitrogen", "NitrogenClose", "Nitrous", "NitrousClose",
-    "StartWritingNow", "StartWritingLastTwoMinutes", "PauseWritingDb", "StopWritingDb",
     "ResetSim", "ContinueFillSequence", "MonitorAltitude", "RevokeMonitorAltitude",
     "ConsecutiveSamples", "RevokeConsecutiveSamples", "ResetFailures", "RevokeResetFailures",
     "ValidateMeasms", "RevokeValidateMeasms", "ToggleAvBayUnderglow", "ToggleFlightBuzzer",
@@ -161,7 +156,6 @@ const NORMAL_CLIENT_COMMANDS: &[&str] = &[
 const IGT_CLIENT_COMMANDS: &[&str] = &[
     "Postinit", "Launch", "Dump", "Abort", "NormallyOpen", "Pilot", "Igniter",
     "RetractPlumbing", "Nitrogen", "NitrogenClose", "Nitrous", "NitrousClose",
-    "StartWritingNow", "StartWritingLastTwoMinutes", "PauseWritingDb", "StopWritingDb",
     "ResetSim", "ContinueFillSequence", "MonitorAltitude", "RevokeMonitorAltitude",
     "ConsecutiveSamples", "RevokeConsecutiveSamples", "ResetFailures", "RevokeResetFailures",
     "ValidateMeasms", "RevokeValidateMeasms", "ToggleAvBayUnderglow", "ToggleFlightBuzzer",
@@ -171,7 +165,6 @@ const IGT_CLIENT_COMMANDS: &[&str] = &[
 const TEST_FIRE_CLIENT_COMMANDS: &[&str] = &[
     "Postinit", "Launch", "Dump", "Abort", "NormallyOpen", "Pilot", "Igniter",
     "RetractPlumbing", "Nitrogen", "NitrogenClose", "Nitrous", "NitrousClose",
-    "StartWritingNow", "StartWritingLastTwoMinutes", "PauseWritingDb", "StopWritingDb",
     "ResetSim", "ContinueFillSequence", "MonitorAltitude", "RevokeMonitorAltitude",
     "ConsecutiveSamples", "RevokeConsecutiveSamples", "ResetFailures", "RevokeResetFailures",
     "ValidateMeasms", "RevokeValidateMeasms", "GroundStationLaunch", "ToggleAvBayUnderglow",
@@ -181,8 +174,7 @@ const TEST_FIRE_CLIENT_COMMANDS: &[&str] = &[
 const HITL_CLIENT_COMMANDS: &[&str] = &[
     "Postinit", "Launch", "Dump", "Abort", "NormallyOpen", "Pilot", "Igniter",
     "IgniterSequence", "RetractPlumbing", "Nitrogen", "NitrogenClose", "Nitrous",
-    "NitrousClose", "StartWritingNow", "StartWritingLastTwoMinutes", "PauseWritingDb",
-    "StopWritingDb", "ResetSim", "ContinueFillSequence", "MonitorAltitude",
+    "NitrousClose", "ResetSim", "ContinueFillSequence", "MonitorAltitude",
     "RevokeMonitorAltitude", "ConsecutiveSamples", "RevokeConsecutiveSamples", "ResetFailures",
     "RevokeResetFailures", "ValidateMeasms", "RevokeValidateMeasms", "GroundStationLaunch",
     "ToggleButtonInterlock", "ToggleGroundStationControl", "ToggleLaunchInterlock",

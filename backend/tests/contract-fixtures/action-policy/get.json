@@ -77,32 +77,6 @@
       "enabled": false
     },
     {
-      "actuated": true,
-      "blink": "none",
-      "cmd": "StartWritingNow",
-      "enabled": true
-    },
-    {
-      "actuated": true,
-      "blink": "none",
-      "cmd": "StartWritingLastTwoMinutes",
-      "enabled": true
-    },
-    {
-      "actuated": false,
-      "blink": "none",
-      "cmd": "PauseWritingDb",
-      "disabled_reason": "This command is unavailable under the current GroundStation policy.",
-      "enabled": false
-    },
-    {
-      "actuated": false,
-      "blink": "none",
-      "cmd": "StopWritingDb",
-      "disabled_reason": "This command is unavailable under the current GroundStation policy.",
-      "enabled": false
-    },
-    {
       "actuated": null,
       "blink": "none",
       "cmd": "ContinueFillSequence",

@@ -164,6 +164,13 @@ pub async fn init(
         )
             .into_response();
     }
+    if matches!(crate::recording_store::RecordingId::parse(&id), Some(crate::recording_store::RecordingId::Segment(_))) {
+        return (
+            StatusCode::CONFLICT,
+            "SD recovery attaches to an event capture or legacy recording. Save a manual capture covering this time, then import into it.",
+        )
+            .into_response();
+    }
     let source = match crate::recording_export::recording_path(
         &crate::recording_export::directory(&state),
         &id,
@@ -271,7 +278,17 @@ pub async fn cancel(
     if let Err(e) = admin(&state, &headers).await {
         return e;
     }
-    let directory = match stage(&crate::recording_export::directory(&state), &token) {
+    // Staging lives beside the source recording (a capture's own folder).
+    let stage_root = match crate::recording_export::recording_path(
+        &crate::recording_export::directory(&state),
+        &id,
+    )
+    .await
+    {
+        Ok(source) => source.parent().map(std::path::Path::to_path_buf).unwrap_or_else(|| crate::recording_export::directory(&state)),
+        Err(_) => crate::recording_export::directory(&state),
+    };
+    let directory = match stage(&stage_root, &token) {
         Ok(p) => p,
         Err(e) => return e,
     };
@@ -538,8 +555,13 @@ pub async fn upload(
     }
     drop(file);
     let output = directory.join("derived.db");
-    let output_id = format!("groundstation_recording_{token}.db");
-    let final_path = source.parent().unwrap().join(&output_id);
+    let output_name = format!("groundstation_recording_{token}.db");
+    let final_path = source.parent().unwrap().join(&output_name);
+    // Beside a legacy file this is a legacy id; inside an event capture folder
+    // it is that capture's attachment (board SD data attached to the capture).
+    let Some(output_id) = crate::recording_store::RecordingId::parse(&id).and_then(|parsed| parsed.sibling(&output_name)) else {
+        return StatusCode::CONFLICT.into_response();
+    };
     let request = serde_json::json!({"source":source,"output":output,"csv_path":csv_path,"manifest":metadata["manifest"],"max_bytes":maximum,"max_database_bytes":disk_limit().min(free_disk(source.parent().unwrap()).unwrap_or(0).saturating_sub(reserve_bytes())),"minimum_free_bytes":reserve_bytes()});
     let script = format!(
         "{}\n{}\nworker()",

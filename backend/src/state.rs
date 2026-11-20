@@ -7,7 +7,7 @@ use crate::sequences::{
     ActionPolicyMsg, PersistentNotification, SequencePolicyState, command_name,
 };
 use crate::telemetry_db::{
-    DbQueueItem, LaunchClockKind, LaunchClockMsg, RecordingModeWire, RecordingStatusMsg,
+    DbQueueItem, LaunchClockKind, LaunchClockMsg, RecordingStatusMsg,
 };
 use crate::telemetry_task;
 use crate::types::{
@@ -111,23 +111,6 @@ impl PendingUmbilicalValveState {
     }
 }
 
-fn recording_command_state(cmd: &str, mode: RecordingModeWire) -> Option<(bool, bool)> {
-    match cmd {
-        "StartWritingNow" | "StartWritingLastTwoMinutes" => match mode {
-            RecordingModeWire::Idle | RecordingModeWire::Paused => Some((true, true)),
-            RecordingModeWire::Recording => Some((false, false)),
-        },
-        "PauseWritingDb" => match mode {
-            RecordingModeWire::Recording => Some((true, true)),
-            RecordingModeWire::Idle | RecordingModeWire::Paused => Some((false, false)),
-        },
-        "StopWritingDb" => match mode {
-            RecordingModeWire::Recording | RecordingModeWire::Paused => Some((true, true)),
-            RecordingModeWire::Idle => Some((false, false)),
-        },
-        _ => None,
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct BoardStatus {
@@ -213,6 +196,9 @@ pub struct AppState {
 
     /// Placeholder telemetry DB path used while not recording to a timestamped session DB.
     pub placeholder_db_path: String,
+
+    /// Rolling recording ring and protected event captures.
+    pub recording_store: Arc<crate::recording_store::Store>,
 
     /// Shared DB writer/control queue.
     pub db_queue_tx: mpsc::Sender<DbQueueItem>,
@@ -577,11 +563,32 @@ impl AppState {
         recording.db_path = Some(path);
     }
 
-    pub fn set_recording_status(&self, status: RecordingStatusMsg) {
-        *self.recording_status.lock().unwrap() = status.clone();
+    /// The DB actor owns mode/path; capture fields are kept from the current
+    /// status (owned by `update_recording_captures`).
+    pub fn set_recording_status(&self, mut status: RecordingStatusMsg) {
+        {
+            let mut current = self.recording_status.lock().unwrap();
+            status.captures = current.captures.clone();
+            status.always_on = self.recording_store.rolling_enabled();
+            *current = status.clone();
+        }
         let _ = self.recording_status_tx.send(status);
         let current_policy = self.action_policy_snapshot();
         self.set_action_policy(current_policy);
+    }
+
+    /// Publishes the in-progress event captures to every client.
+    pub fn update_recording_captures(&self, captures: Vec<crate::recording_store::CaptureBrief>) {
+        let status = {
+            let mut current = self.recording_status.lock().unwrap();
+            if current.captures == captures {
+                return;
+            }
+            current.captures = captures;
+            current.always_on = self.recording_store.rolling_enabled();
+            current.clone()
+        };
+        let _ = self.recording_status_tx.send(status);
     }
 
     pub fn recording_status_snapshot(&self) -> RecordingStatusMsg {
@@ -2192,17 +2199,13 @@ impl AppState {
                 if matches!(control.cmd.as_str(),"AdvanceFlightState"|"RewindFlightState") {control.enabled=false;control.blink=crate::sequences::BlinkMode::None;}
             }
         }
-        // Recording and durable clock reset retain their separate local paths.
+        // The durable clock reset retains its separate local path.
         mirrored
             .controls
             .extend(local.controls.into_iter().filter(|control| {
                 matches!(
                     control.cmd.as_str(),
-                    "StartWritingNow"
-                        | "StartWritingLastTwoMinutes"
-                        | "PauseWritingDb"
-                        | "StopWritingDb"
-                        | "ResetTClock"
+                    "ResetTClock"
                 )
             }));
         crate::board_abort::block_policy(self, &mut mirrored);
@@ -2242,7 +2245,6 @@ impl AppState {
 
     /// Replaces the current action policy and broadcasts it if it changed.
     pub fn set_action_policy(&self, policy: ActionPolicyMsg) {
-        let recording_mode = self.recording_status_snapshot().mode;
         let mut policy = policy;
         if crate::runtime_mode::is_hitl() {
             let button_interlock_ok = self.hitl_button_interlock_satisfied();
@@ -2256,10 +2258,6 @@ impl AppState {
                 let button_interlock_exempt = matches!(
                     cmd,
                     "Abort"
-                        | "StartWritingNow"
-                        | "StartWritingLastTwoMinutes"
-                        | "PauseWritingDb"
-                        | "StopWritingDb"
                         | "Postinit"
                         | "ToggleButtonInterlock"
                         | "ToggleLaunchInterlock"
@@ -2285,11 +2283,6 @@ impl AppState {
                 control.requested = Some(view.requested);
                 control.actuated = view.confirmed;
                 control.network_note = crate::sequences::network_output_note(view);
-            }
-            if let Some((enabled, actuated)) = recording_command_state(&control.cmd, recording_mode)
-            {
-                control.enabled = enabled;
-                control.actuated = Some(actuated);
             }
             if control.cmd == "Abort" && self.abort_indicator_latched() {
                 control.actuated = Some(true);
@@ -2493,10 +2486,6 @@ impl AppState {
             return matches!(
                 cmd,
                 TelemetryCommand::ResetTClock
-                    | TelemetryCommand::StartWritingNow
-                    | TelemetryCommand::StartWritingLastTwoMinutes
-                    | TelemetryCommand::PauseWritingDb
-                    | TelemetryCommand::StopWritingDb
             );
         }
         if crate::sequences::is_station_utility_command(command_name(cmd)) {
@@ -2512,10 +2501,6 @@ impl AppState {
                 cmd,
                 TelemetryCommand::Abort
                     | TelemetryCommand::Postinit
-                    | TelemetryCommand::StartWritingNow
-                    | TelemetryCommand::StartWritingLastTwoMinutes
-                    | TelemetryCommand::PauseWritingDb
-                    | TelemetryCommand::StopWritingDb
                     | TelemetryCommand::ToggleButtonInterlock
                     | TelemetryCommand::ToggleGroundStationControl
                     | TelemetryCommand::ToggleLaunchInterlock
@@ -4524,6 +4509,7 @@ pub(crate) mod tests {
             db: Arc::new(Mutex::new(db)),
             db_path: Arc::new(Mutex::new("sqlite::memory:".to_string())),
             placeholder_db_path: condition_runtime.test_placeholder_path(),
+            recording_store: Default::default(),
             db_queue_tx,
             db_write_runtime: tokio::runtime::Handle::current(),
             auth_db,
@@ -4602,10 +4588,7 @@ pub(crate) mod tests {
             hitl_launch_interlock_enabled: Arc::new(AtomicBool::new(false)),
             hitl_safety_interlocks: default_hitl_safety_interlocks(),
             hitl_physical_launch_uses_ground_station: Arc::new(AtomicBool::new(false)),
-            recording_status: Arc::new(Mutex::new(RecordingStatusMsg {
-                mode: RecordingModeWire::Idle,
-                db_path: None,
-            })),
+            recording_status: Arc::new(Mutex::new(RecordingStatusMsg::new(RecordingModeWire::Idle, None))),
             recording_status_tx,
             last_command_ms: Arc::new(Mutex::new(HashMap::new())),
             fill_sequence_continue_requests: Arc::new(AtomicU64::new(0)),
@@ -4668,77 +4651,15 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn recording_action_policy_matches_recording_mode() {
+    async fn recording_is_not_an_action_policy_control() {
         let state = test_app_state().await;
-
-        state.set_recording_status(RecordingStatusMsg {
-            mode: RecordingModeWire::Idle,
-            db_path: None,
-        });
+        state.set_recording_status(RecordingStatusMsg::new(RecordingModeWire::Recording, Some("recording.db".to_string())));
         state.set_action_policy(crate::sequences::default_action_policy());
-        let idle = state.action_policy_snapshot();
-        assert_eq!(
-            control_state(&idle, "StartWritingNow"),
-            Some((true, Some(true)))
-        );
-        assert_eq!(
-            control_state(&idle, "StartWritingLastTwoMinutes"),
-            Some((true, Some(true)))
-        );
-        assert_eq!(
-            control_state(&idle, "PauseWritingDb"),
-            Some((false, Some(false)))
-        );
-        assert_eq!(
-            control_state(&idle, "StopWritingDb"),
-            Some((false, Some(false)))
-        );
-
-        state.set_recording_status(RecordingStatusMsg {
-            mode: RecordingModeWire::Recording,
-            db_path: Some("recording.db".to_string()),
-        });
-        state.set_action_policy(crate::sequences::default_action_policy());
-        let recording = state.action_policy_snapshot();
-        assert_eq!(
-            control_state(&recording, "StartWritingNow"),
-            Some((false, Some(false)))
-        );
-        assert_eq!(
-            control_state(&recording, "StartWritingLastTwoMinutes"),
-            Some((false, Some(false)))
-        );
-        assert_eq!(
-            control_state(&recording, "PauseWritingDb"),
-            Some((true, Some(true)))
-        );
-        assert_eq!(
-            control_state(&recording, "StopWritingDb"),
-            Some((true, Some(true)))
-        );
-
-        state.set_recording_status(RecordingStatusMsg {
-            mode: RecordingModeWire::Paused,
-            db_path: None,
-        });
-        state.set_action_policy(crate::sequences::default_action_policy());
-        let paused = state.action_policy_snapshot();
-        assert_eq!(
-            control_state(&paused, "StartWritingNow"),
-            Some((true, Some(true)))
-        );
-        assert_eq!(
-            control_state(&paused, "StartWritingLastTwoMinutes"),
-            Some((true, Some(true)))
-        );
-        assert_eq!(
-            control_state(&paused, "PauseWritingDb"),
-            Some((false, Some(false)))
-        );
-        assert_eq!(
-            control_state(&paused, "StopWritingDb"),
-            Some((true, Some(true)))
-        );
+        let policy = state.action_policy_snapshot();
+        for removed in ["StartWritingNow", "StartWritingLastTwoMinutes", "PauseWritingDb", "StopWritingDb"] {
+            assert_eq!(control_state(&policy, removed), None, "{removed} must not be offered");
+            assert!(serde_json::from_value::<TelemetryCommand>(serde_json::json!(removed)).is_err());
+        }
     }
 
     #[tokio::test]

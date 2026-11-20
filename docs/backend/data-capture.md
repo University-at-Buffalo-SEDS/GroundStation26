@@ -51,8 +51,8 @@ serialized to avoid concurrent report work exhausting a Pi. The report workflow
 limits a selection to 200,000 recorded rows/channel samples and 128 channels;
 PDF tables are limited to 20,000 samples. Oversized selections fail explicitly,
 never silently truncate. Use a narrower date range or the original streaming CSV
-for large unfiltered captures. Stop recording before exporting if every final
-sample must be included; active databases are read using finite snapshots.
+for large unfiltered captures. The segment being written is read as a finite
+snapshot; use an event capture or a manual snapshot for a closed copy.
 
 API: `GET /api/recordings/report?request=<URL-encoded JSON>` with `recording`
 (empty means all local recordings), optional `start_ms`/`end_ms`, `channels`
@@ -67,15 +67,17 @@ environment with `pypdf` added for PDF document validation.
 
 CSV downloads are available in normal (main), HITL, and Test Fire builds.
 
-1. In **Actions**, start recording before the test.
-2. Stop recording after the test to include all flushed samples.
-3. Open the **Data Export** tab, refresh the list, select the
-   session, and click **Download CSV**.
+Recording is always on (see [rolling-recording.md](rolling-recording.md)).
+
+1. Open the **Data Export** tab. Launches, aborts and each station sequence
+   are listed as event captures; the rolling segments and legacy recordings
+   are in the list too.
+2. Select the capture (or segment) and click **Download CSV**.
 
 Browser clients use the browser download location. Native clients save to
 Downloads (Documents if Downloads is unavailable) and show the saved path.
-An active recording can also be downloaded: the export ends at the last committed
-row when requested, not at the eventual end of that recording.
+The segment being written can also be downloaded: the export ends at the last
+committed row when requested.
 
 The export contains every recorded telemetry row, without chart decimation,
 resampling, or additional calibration. It is long-form CSV: one message per row,

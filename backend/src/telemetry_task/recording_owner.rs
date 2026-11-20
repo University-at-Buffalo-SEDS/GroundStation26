@@ -151,7 +151,7 @@ impl PendingEnsure {
                     // actor can flush its old owner before the next attempt.
                     return Err(error);
                 }
-                state.set_recording_status(RecordingStatusMsg { mode: RecordingModeWire::Recording, db_path: Some(path_string.clone()) });
+                state.set_recording_status(RecordingStatusMsg::new(RecordingModeWire::Recording, Some(path_string.clone())));
                 if let Err(err) = insert_db_batch_with_retry(pool, &crate::igt::recording_start_rows(state)).await {
                     eprintln!("Failed to write recording start rows: {err}");
                 }
@@ -201,10 +201,8 @@ pub(crate) async fn run(
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .to_path_buf();
-    let mut recent_writes: VecDeque<DbWrite> = VecDeque::new();
     let mut active_recording: Option<ActiveRecording> = None;
     let mut mode = RecordingMode::Idle;
-    let mut last_recording_end_ms: Option<i64> = None;
 
     let mut pending: Vec<DbWrite> = Vec::with_capacity(db_batch_max);
     let mut condition_store = crate::alert_condition_runtime::initialize(&state).await;
@@ -216,13 +214,44 @@ pub(crate) async fn run(
     let mut shutting_down = false;
     let mut pending_ensure: Option<PendingEnsure> = None;
     let mut ensure_retry_at = tokio::time::Instant::now();
+    // Always-on rolling recording (production). Fixtures that never enable
+    // the ring keep the legacy idle/session behaviour below.
+    let mut rolling: Option<super::rolling::Rolling> = None;
+    let mut capture_task: Option<tokio::task::JoinHandle<()>> = None;
+    if state.recording_store.rolling_enabled() {
+        let (ctx, active) = super::rolling::Rolling::start(&state, recordings_dir.clone()).await;
+        if active.is_some() {
+            mode = RecordingMode::Recording;
+            if let Ok(instance) = state.fill_recording.reserve_instance() {
+                let _dispatch = crate::gse::recording_publication_gate();
+                state.fill_recording.publish_under_dispatch(instance);
+            }
+        }
+        active_recording = active;
+        capture_task = Some(tokio::spawn(crate::recording_store::capture_task(
+            state.clone(),
+            recordings_dir.clone(),
+            state.shutdown_subscribe(),
+        )));
+        rolling = Some(ctx);
+    }
+    // Every accepted write: ring triggers and the batch (always in rolling mode; only while recording otherwise).
+    macro_rules! accept_write {
+        ($write:expr) => {{
+            let write: DbWrite = $write;
+            if let Some(ring) = rolling.as_mut() {
+                ring.observe(&state, &write);
+            }
+            if rolling.is_some() || matches!(mode, RecordingMode::Recording) {
+                pending.push(write);
+            }
+        }};
+    }
     loop {
         let diagnostic_path = if !shutting_down && pending.is_empty() && matches!(mode, RecordingMode::Recording) {
             active_recording.as_ref().map(|a| a.path.as_str())
         } else { None };
         for write in diagnostics.poll(&state, diagnostic_path).await {
-            recent_writes.push_back(write.clone());
-            prune_recent_writes(&mut recent_writes, write.timestamp_ms());
             pending.push(write);
         }
         let first = if shutting_down {
@@ -256,14 +285,7 @@ pub(crate) async fn run(
 
         let mut deferred_control: Option<DbQueueItem> = deferred_control_carry.take();
         match first {
-            Some(DbQueueItem::Write(write)) => {
-                let newest_ts = write.timestamp_ms();
-                recent_writes.push_back(write.clone());
-                prune_recent_writes(&mut recent_writes, newest_ts);
-                if matches!(mode, RecordingMode::Recording) {
-                    pending.push(write);
-                }
-            }
+            Some(DbQueueItem::Write(write)) => accept_write!(write),
             Some(DbQueueItem::Condition(work)) => {
                 crate::alert_condition_runtime::stage(
                     &state,
@@ -287,14 +309,7 @@ pub(crate) async fn run(
             // must still get a bounded fair turn under a continuous input feed.
             ensure_batch_items = ensure_batch_items.saturating_add(1);
             match db_rx.try_recv() {
-                Ok(DbQueueItem::Write(write)) => {
-                    let newest_ts = write.timestamp_ms();
-                    recent_writes.push_back(write.clone());
-                    prune_recent_writes(&mut recent_writes, newest_ts);
-                    if matches!(mode, RecordingMode::Recording) {
-                        pending.push(write);
-                    }
-                }
+                Ok(DbQueueItem::Write(write)) => accept_write!(write),
                 Ok(DbQueueItem::Condition(work)) => {
                     crate::alert_condition_runtime::stage(
                         &state,
@@ -315,14 +330,7 @@ pub(crate) async fn run(
                     }
                     let remaining = deadline.saturating_duration_since(now);
                     match tokio::time::timeout(remaining, db_rx.recv()).await {
-                        Ok(Some(DbQueueItem::Write(write))) => {
-                            let newest_ts = write.timestamp_ms();
-                            recent_writes.push_back(write.clone());
-                            prune_recent_writes(&mut recent_writes, newest_ts);
-                            if matches!(mode, RecordingMode::Recording) {
-                                pending.push(write);
-                            }
-                        }
+                        Ok(Some(DbQueueItem::Write(write))) => accept_write!(write),
                         Ok(Some(DbQueueItem::Condition(work))) => {
                             crate::alert_condition_runtime::stage(
                                 &state,
@@ -350,8 +358,18 @@ pub(crate) async fn run(
             &mut pending_conditions,
         )
         .await;
-        let flush_ok =
-            flush_recording_batch(active_recording.as_ref().map(|a| &a.pool), &mut pending).await;
+        let flush_ok = if rolling.is_some() && active_recording.is_none() {
+            // No segment could be opened: keep rows (bounded) until one opens.
+            const MAX_UNWRITTEN: usize = 200_000;
+            if pending.len() > MAX_UNWRITTEN {
+                let excess = pending.len() - MAX_UNWRITTEN;
+                pending.drain(..excess);
+                log::error!("rolling recording unavailable; dropped {excess} oldest unwritten rows");
+            }
+            true
+        } else {
+            flush_recording_batch(active_recording.as_ref().map(|a| &a.pool), &mut pending).await
+        };
         if !flush_ok {
             if let Some(stage) = pending_ensure.take() { stage.finish(Err(Error::Unavailable)).await; }
             recording_owner::revoke(&state);
@@ -376,11 +394,29 @@ pub(crate) async fn run(
             let DbQueueItem::Control(cmd) = control else {
                 unreachable!("only controls deferred")
             };
+            if let Some(ring) = rolling.as_mut() {
+                match cmd {
+                    RecordingCommand::StartNow => {
+                        log::info!("recording is always on; start request ignored");
+                    }
+                    RecordingCommand::Pause | RecordingCommand::Stop => {
+                        log::warn!("recording is always on; pause/stop request refused");
+                    }
+                    RecordingCommand::ResetAll | RecordingCommand::RotateSegment => {
+                        // A reset clears live history by starting a fresh
+                        // segment; the ring keeps every row written so far.
+                        if pending_ensure.is_none() {
+                            ring.rotate(&state, &mut active_recording).await;
+                        }
+                    }
+                }
+                continue;
+            }
             // A real recording control supersedes an unpublished preparation;
             // retain the control itself and clean only that original owned file.
             if let Some(stage) = pending_ensure.take() { stage.finish(Err(Error::Unavailable)).await; }
             match cmd {
-                RecordingCommand::StartNow | RecordingCommand::StartWithRecent => {
+                RecordingCommand::StartNow => {
                     let started_at_ms = get_current_timestamp_ms() as i64;
                     let target_path = session_db_path(&recordings_dir, started_at_ms);
                     match open_telemetry_db(&target_path).await {
@@ -390,14 +426,10 @@ pub(crate) async fn run(
                                 log::info!("recording session closing db={}", active.path);
                                 close_and_finalize_sqlite(active.pool, &active.path).await;
                                 export_test_fire_csv_if_enabled(&state, &active.path).await;
-                                last_recording_end_ms = Some(get_current_timestamp_ms() as i64);
                             }
                             log::info!("recording session started db={new_path}");
                             state.replace_telemetry_db(new_pool.clone(), new_path.clone());
-                            state.set_recording_status(RecordingStatusMsg {
-                                mode: RecordingModeWire::Recording,
-                                db_path: Some(new_path.clone()),
-                            });
+                            state.set_recording_status(RecordingStatusMsg::new(RecordingModeWire::Recording, Some(new_path.clone())));
                             // The station mode (and an IGT's FC status) the
                             // recording starts in; the CSV export reads it.
                             if let Err(err) = insert_db_batch_with_retry(
@@ -418,24 +450,6 @@ pub(crate) async fn run(
                                 state.fill_recording.publish_under_dispatch(instance);
                             }
 
-                            if matches!(cmd, RecordingCommand::StartWithRecent)
-                                && let Some(active) = &active_recording
-                            {
-                                let cutoff = started_at_ms.saturating_sub(120_000);
-                                let min_ts = last_recording_end_ms
-                                    .map(|prev| prev.max(cutoff))
-                                    .unwrap_or(cutoff);
-                                let backfill: Vec<DbWrite> = recent_writes
-                                    .iter()
-                                    .filter(|write| write.timestamp_ms() > min_ts)
-                                    .cloned()
-                                    .collect();
-                                if let Err(err) =
-                                    insert_db_batch_with_retry(&active.pool, &backfill).await
-                                {
-                                    eprintln!("Failed to backfill recent writes: {err}");
-                                }
-                            }
                         }
                         Err(err) => {
                             emit_warning(
@@ -454,7 +468,6 @@ pub(crate) async fn run(
                         if !deleted {
                             export_test_fire_csv_if_enabled(&state, &active.path).await;
                         }
-                        last_recording_end_ms = Some(get_current_timestamp_ms() as i64);
                     }
                     mode = if matches!(cmd, RecordingCommand::Pause) {
                         RecordingMode::Paused
@@ -462,14 +475,11 @@ pub(crate) async fn run(
                         RecordingMode::Idle
                     };
                     rotate_placeholder_db(&state, mode).await;
-                    state.set_recording_status(RecordingStatusMsg {
-                        mode: RecordingModeWire::from(mode),
-                        db_path: None,
-                    });
+                    state.set_recording_status(RecordingStatusMsg::new(RecordingModeWire::from(mode), None));
                 }
+                RecordingCommand::RotateSegment => {}
                 RecordingCommand::ResetAll => {
                     pending.clear();
-                    recent_writes.clear();
                     let db = active_recording
                         .as_ref()
                         .map(|active| active.pool.clone())
@@ -490,6 +500,12 @@ pub(crate) async fn run(
                 EnsurePoll::Ready(result) => stage.finish(result).await,
             }
         }
+        if !shutting_down
+            && let Some(ring) = rolling.as_mut()
+            && ring.maintenance_due()
+        {
+            ring.maintain(&state, &mut active_recording, pending_ensure.is_none()).await;
+        }
     }
 
     drop(diagnostics);
@@ -499,8 +515,15 @@ pub(crate) async fn run(
         log::info!("recording worker finalizing active db={}", active.path);
         close_and_finalize_sqlite(active.pool, &active.path).await;
         let deleted = delete_empty_recording_if_needed(&active.path).await;
-        if !deleted {
+        // A rolling segment gets no CSV; its captures carry one.
+        if !deleted && rolling.is_none() {
             export_test_fire_csv_if_enabled(&state, &active.path).await;
+        }
+    }
+    if let Some(task) = capture_task.take() {
+        let abort = task.abort_handle();
+        if tokio::time::timeout(Duration::from_secs(5), task).await.is_err() {
+            abort.abort();
         }
     }
     if let Some(store) = condition_store {

@@ -118,9 +118,6 @@ fn backend_blink_for(cmd: &str, enabled: bool, recommended: Option<&BlinkMode>) 
     if let Some(blink) = recommended {
         return blink.clone();
     }
-    if is_recording_command(cmd) {
-        return BlinkMode::None;
-    }
     BlinkMode::None
 }
 
@@ -138,13 +135,6 @@ pub(crate) fn explain_disabled_policy(policy: &mut ActionPolicyMsg) {
         else { "This command is unavailable under the current GroundStation policy.".into() });
     }
 }
-fn is_recording_command(cmd: &str) -> bool {
-    matches!(
-        cmd,
-        "StartWritingNow" | "StartWritingLastTwoMinutes" | "PauseWritingDb" | "StopWritingDb"
-    )
-}
-
 pub(crate) fn is_station_utility_command(cmd: &str) -> bool {
     matches!(
         cmd,
@@ -152,27 +142,11 @@ pub(crate) fn is_station_utility_command(cmd: &str) -> bool {
     )
 }
 
-fn default_recording_command_enabled(cmd: &str) -> Option<bool> {
-    match cmd {
-        "StartWritingNow" | "StartWritingLastTwoMinutes" => Some(true),
-        "PauseWritingDb" | "StopWritingDb" => Some(false),
-        _ => None,
-    }
-}
-
-fn default_recording_command_actuated(cmd: &str) -> Option<bool> {
-    match cmd {
-        "StartWritingNow" | "StartWritingLastTwoMinutes" => Some(true),
-        "PauseWritingDb" | "StopWritingDb" => Some(false),
-        _ => None,
-    }
-}
-
 fn default_command_actuated(cmd: &str) -> Option<bool> {
     match cmd {
         "ResetSim" => Some(true),
         "ToggleAvBayUnderglow" | "ToggleFlightBuzzer" => None,
-        _ => default_recording_command_actuated(cmd),
+        _ => None,
     }
 }
 
@@ -1124,10 +1098,6 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         TelemetryCommand::RetractPlumbing => "RetractPlumbing",
         TelemetryCommand::Nitrogen | TelemetryCommand::NitrogenClose => "Nitrogen",
         TelemetryCommand::Nitrous | TelemetryCommand::NitrousClose => "Nitrous",
-        TelemetryCommand::StartWritingNow => "StartWritingNow",
-        TelemetryCommand::StartWritingLastTwoMinutes => "StartWritingLastTwoMinutes",
-        TelemetryCommand::PauseWritingDb => "PauseWritingDb",
-        TelemetryCommand::StopWritingDb => "StopWritingDb",
         TelemetryCommand::ResetSim => "ResetSim",
         TelemetryCommand::ContinueFillSequence => "ContinueFillSequence",
         TelemetryCommand::StartFill | TelemetryCommand::FillWithRecording { .. } => "StartFill",
@@ -1223,10 +1193,6 @@ fn all_command_names_default() -> Vec<&'static str> {
         "RetractPlumbing",
         "Nitrogen",
         "Nitrous",
-        "StartWritingNow",
-        "StartWritingLastTwoMinutes",
-        "PauseWritingDb",
-        "StopWritingDb",
         "ContinueFillSequence",
         "Postinit",
         "Launch",
@@ -1257,10 +1223,6 @@ fn all_command_names_hitl() -> Vec<&'static str> {
         "RetractPlumbing",
         "Nitrogen",
         "Nitrous",
-        "StartWritingNow",
-        "StartWritingLastTwoMinutes",
-        "PauseWritingDb",
-        "StopWritingDb",
         "ContinueFillSequence",
         "Postinit",
         "Launch",
@@ -1325,10 +1287,6 @@ fn all_command_names_test_fire() -> Vec<&'static str> {
         "RetractPlumbing",
         "Nitrogen",
         "Nitrous",
-        "StartWritingNow",
-        "StartWritingLastTwoMinutes",
-        "PauseWritingDb",
-        "StopWritingDb",
         "ContinueFillSequence",
         "Postinit",
         "Launch",
@@ -1378,8 +1336,6 @@ pub enum ControlSection {
     AvBay,
     /// Returning the station to a known state.
     Recovery,
-    /// Recording to the station database.
-    DaqRecording,
     /// HITL bench interlocks and simulator controls.
     Testing,
 }
@@ -1407,9 +1363,6 @@ pub(crate) fn control_section(cmd: &str) -> Option<ControlSection> {
         // RecoverStation is an HTTP action (board_recovery::coordinator::station_recover),
         // listed in the Actions tab beside the other recovery controls.
         "ResetFlightState" | "RecoverStation" => Recovery,
-        "StartWritingNow" | "StartWritingLastTwoMinutes" | "PauseWritingDb" | "StopWritingDb" => {
-            DaqRecording
-        }
         "ToggleButtonInterlock" | "ToggleGroundStationControl" | "ToggleLaunchInterlock"
         | "TogglePlumbingDelayInterlock" | "ToggleChecklistInterlock" | "ToggleSupplyInterlock"
         | "ToggleBoardStateProofInterlock" | "TogglePhysicalLaunchMode" | "ResetLaunchLatch"
@@ -1445,8 +1398,7 @@ pub fn default_action_policy() -> ActionPolicyMsg {
             .into_iter()
             .map(|cmd| {
                 let enabled = is_station_utility_command(cmd)
-                    || default_recording_command_enabled(cmd)
-                        .unwrap_or(matches!(cmd, "Abort" | "Postinit" | "ResetSim"));
+                    || matches!(cmd, "Abort" | "Postinit" | "ResetSim");
                 ActionControl { disabled_reason: None, requested: None, network_note: None, progress: None,
                     cmd: cmd.to_string(),
                     enabled,
@@ -1479,12 +1431,7 @@ fn policy_with_overrides(
             // Keep controls pressable while key is enabled; blink indicates recommendation.
             let enabled = if matches!(
                 cmd,
-                "Abort"
-                    | "StartWritingNow"
-                    | "StartWritingLastTwoMinutes"
-                    | "PauseWritingDb"
-                    | "StopWritingDb"
-                    | "Postinit"
+                "Abort" | "Postinit"
             ) {
                 true
             } else if cmd == "ContinueFillSequence" {

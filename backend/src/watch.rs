@@ -1090,7 +1090,7 @@ mod tests {
             assert!(!command_watch_eligible(cmd), "{cmd} must not be watch-eligible");
             assert!(excluded_reason(cmd).is_some());
         }
-        for cmd in ["Abort", "Dump", "Nitrogen", "StartWritingNow", "ToggleFlightBuzzer", "ResetTClock"] {
+        for cmd in ["Abort", "Dump", "Nitrogen", "ToggleFlightBuzzer", "ResetTClock"] {
             assert!(command_watch_eligible(cmd), "{cmd} should be watch-eligible");
         }
         // Nothing is marked watch-safe by default.
@@ -1281,7 +1281,7 @@ mod tests {
             serde_json::json!({"users":[
                 {"username":"operator","roles":[],"password":{"salt_b64":"","hash_b64":""},
                  "permissions":{"view_data":true,"send_commands":true},
-                 "command_access":{"allowed_commands":["Abort","Dump","Launch","Igniter","StartWritingNow"]}},
+                 "command_access":{"allowed_commands":["Abort","Dump","Launch","Igniter"]}},
                 {"username":"viewer","roles":[],"password":{"salt_b64":"","hash_b64":""},
                  "permissions":{"view_data":true}},
                 {"username":"speaker","roles":[],"password":{"salt_b64":"","hash_b64":""},
@@ -1473,7 +1473,6 @@ mod tests {
         assert!(principal.allows_command_name("Abort"));
         assert!(principal.allows_command_name("Dump"));
         assert!(!principal.allows_command_name("Launch"));
-        assert!(!principal.allows_command_name("StartWritingNow"));
         assert!(principal.roles.is_empty());
         assert!(!principal.calibration_access.edit && !principal.permissions.sign_checklists);
         assert_eq!(principal.session_type.as_deref(), Some("watch"));

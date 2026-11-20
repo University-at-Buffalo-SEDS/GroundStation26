@@ -255,7 +255,7 @@ async fn manual_origin_http_fresh_recording_command_works_with_retained_recovery
     let generation = crate::gse::automatic_generation(&state);
     assert!(crate::gse::claim_operator_dispatch(&state, generation).is_none());
     let old = crate::operator_queue::Token::capture(&state, 77);
-    let response = http(state.clone(), headers, "StartWritingNow").await;
+    let response = http(state.clone(), headers, "ToggleFlightBuzzer").await;
     assert_eq!(response.status(), StatusCode::OK);
     let TelemetryCommand::QueuedOperator {
         generation: queued_generation,
@@ -266,7 +266,7 @@ async fn manual_origin_http_fresh_recording_command_works_with_retained_recovery
     else {
         panic!("real HTTP must enqueue private operator envelope")
     };
-    assert!(matches!(*command, TelemetryCommand::StartWritingNow));
+    assert!(matches!(*command, TelemetryCommand::ToggleFlightBuzzer));
     assert!(recovery_origin.is_some());
     let claim =
         crate::gse::claim_manual_dispatch(&state, queued_generation, recovery_origin).unwrap();
@@ -455,7 +455,7 @@ async fn manual_origin_fill_exclusion_uses_ordered_actual_valve_sequence_not_ret
     crate::telemetry_task::apply_umbilical_status_at_ingress(&state, &packet("VB", base + 1, 1));
     assert!(state.operator_queue.fill_launch_active());
     assert!(!state.is_command_allowed(&TelemetryCommand::Nitrogen));
-    assert!(state.is_command_allowed(&TelemetryCommand::StartWritingNow));
+    assert!(state.is_command_allowed(&TelemetryCommand::Abort));
     crate::telemetry_task::apply_umbilical_status_at_ingress(&state, &packet("VB", base, 0));
     assert!(
         state.operator_queue.fill_launch_active(),

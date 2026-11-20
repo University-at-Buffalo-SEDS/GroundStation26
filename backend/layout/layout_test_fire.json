@@ -106,42 +106,6 @@
   "actions_tab": {
     "actions": [
       {
-        "label": "Start DB Now",
-        "cmd": "StartWritingNow",
-        "border": "#10b981",
-        "bg": "#06261d",
-        "fg": "#d1fae5",
-        "illuminated": true,
-        "group": "Recording"
-      },
-      {
-        "label": "Start DB Last 2 Min",
-        "cmd": "StartWritingLastTwoMinutes",
-        "border": "#14b8a6",
-        "bg": "#042f2e",
-        "fg": "#ccfbf1",
-        "illuminated": true,
-        "group": "Recording"
-      },
-      {
-        "label": "Pause DB",
-        "cmd": "PauseWritingDb",
-        "border": "#f59e0b",
-        "bg": "#3b2203",
-        "fg": "#fef3c7",
-        "illuminated": true,
-        "group": "Recording"
-      },
-      {
-        "label": "Stop DB",
-        "cmd": "StopWritingDb",
-        "border": "#ef4444",
-        "bg": "#3f0b13",
-        "fg": "#fee2e2",
-        "illuminated": true,
-        "group": "Recording"
-      },
-      {
         "label": "Postinit",
         "cmd": "Postinit",
         "border": "#38bdf8",

@@ -193,11 +193,17 @@ fn publish(
         service.report_error(error);
     }
     for event in events {
-        let intent = state.sequence_progress.lock().ok().and_then(|mut s| {
-            s.publish(event.snapshot, event.observed_at_ms)
-                .ok()
-                .flatten()
-        });
+        let observed = event.snapshot.clone();
+        let accepted = state
+            .sequence_progress
+            .lock()
+            .ok()
+            .and_then(|mut s| s.publish(event.snapshot, event.observed_at_ms).ok());
+        // Every accepted run start/end drives its protected event capture.
+        if accepted.is_some() {
+            crate::recording_store::observe_sequence(state, &observed);
+        }
+        let intent = accepted.flatten();
         if let Some(result) = intent {
             let warning = result.outcome != wire::Outcome::Passed;
             let id = state.add_temporary_notification(format!(

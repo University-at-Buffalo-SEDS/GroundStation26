@@ -882,6 +882,60 @@ const PROXIMITY: &[Spec] = &[
     },
 ];
 
+const RECORDING: &[Spec] = &[
+    Spec {
+        id: "recording-always-on",
+        title: "Recording is always on",
+        summary: "The station records every row from start-up into a rolling store of {recording.ring_budget_mb} MB (segments of {recording.segment_mb} MB); when it is full the oldest segment is deleted. There is no start, pause or stop: no operator action can turn the safety record off. Now: {recording.live}",
+        details: &[
+            "Each segment is a complete SQLite recording, closed cleanly when the next opens; a crash can affect only the open segment, whose journal is recovered at start-up.",
+            "Reset of the live history opens a new segment; nothing already written is deleted.",
+        ],
+        modes: ALL,
+        enforced_in: &[
+            "backend/src/telemetry_task/rolling.rs:start",
+            "backend/src/telemetry_task/rolling.rs:maintain",
+            "backend/src/recording_store.rs:plan_deletions",
+        ],
+        config_keys: &["recording.ring_budget_mb", "recording.segment_mb", "recording.live"],
+    },
+    Spec {
+        id: "recording-event-captures",
+        title: "Protected event captures",
+        summary: "Launch (HITL runs in HITL), every abort, every station sequence run (fill, nitrogen test, valve self-test, turbocharge, cold flow, igniter sequence), the integrated ground test, DAQ DAC sweeps and operator snapshots are copied out of the rolling store, with their pre-roll and post-roll, into their own folders with a manifest. Captures are never deleted automatically.",
+        details: &[
+            "Launch: from {recording.launch_pre_roll_s} s before Launch until Landed, Recovery, Aborted or Idle, plus {recording.launch_post_roll_s} s.",
+            "While a capture is pending, the rolling store keeps the segments it needs.",
+            "Only an administrator can delete a capture; each deletion is logged with the name.",
+        ],
+        modes: ALL,
+        enforced_in: &[
+            "backend/src/recording_store.rs:observe_flight_state",
+            "backend/src/recording_store.rs:observe_sequence",
+            "backend/src/recording_store.rs:materialize",
+        ],
+        config_keys: &["recording.launch_pre_roll_s", "recording.launch_post_roll_s"],
+    },
+    Spec {
+        id: "recording-disk-space",
+        title: "Low disk space",
+        summary: "Below {recording.warn_free_mb} MB free the station warns. Below {recording.critical_free_mb} MB the rolling store shrinks, oldest segment first; event captures are never deleted automatically.",
+        details: &[],
+        modes: ALL,
+        enforced_in: &["backend/src/recording_store.rs:maintain_ring"],
+        config_keys: &["recording.warn_free_mb", "recording.critical_free_mb"],
+    },
+    Spec {
+        id: "station-power",
+        title: "Station power off and reboot",
+        summary: "An administrator may power off or reboot the station host the app is connected to. Refused from Armed through landing (never overridable), and during a fill, a station sequence, an integrated ground test, the Aborted state or a launch capture unless the administrator explicitly forces it (logged). Captures and the current segment are closed first.",
+        details: &["Without the host helper installed the station reports \"not supported here\" and does nothing."],
+        modes: ALL,
+        enforced_in: &["backend/src/host_power.rs:blocker", "backend/src/host_power.rs:admit", "backend/src/host_power.rs:execute"],
+        config_keys: &[],
+    },
+];
+
 const SECTIONS: &[(&str, &str, &str, &[Spec])] = &[
     ("tank", "Tank pressure", "Overpressure relief and abort, overfill, and what the Valve Board does on its own.", TANK),
     ("failures", "When a sequence fails", "Which failures pause with every valve closed and which keep relieving.", FAILURES),
@@ -891,6 +945,7 @@ const SECTIONS: &[(&str, &str, &str, &[Spec])] = &[
     ("boards", "Board behaviour", "What each board does by itself: heartbeat and fault aborts, the abort latch, overpressure, watchdog resets and igniter timing. Entries marked reported can act after Launch.", BOARDS),
     ("phases", "Mission phases", "Startup, Idle, Fill, Launch, In flight and Landed, and who decides Landed.", PHASES),
     ("interlocks", "Interlocks", "Key, button and launch interlocks, ignition pair, igniter sense and checklists.", INTERLOCKS),
+    ("recording", "Recording and station power", "Always-on rolling recording, protected event captures, the disk policy and station power off / reboot.", RECORDING),
     ("proximity", "Personnel proximity lock", "The optional lock that refuses arming and pressurizing while participating devices report people near the rocket.", PROXIMITY),
     ("igt", "Integrated ground test", "Entering the ground test, LIVE PYRO, the IGT Launch gate, the ground-test image latch, mock wet dress, the HITL replay, the launch site and FC SD retry.", IGT_RULES),
 ];

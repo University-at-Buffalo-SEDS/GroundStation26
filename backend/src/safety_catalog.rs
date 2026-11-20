@@ -98,6 +98,7 @@ impl Sources {
         docs.insert("auto_zero".into(), crate::auto_zero::catalog_settings(state));
         docs.insert("station".into(), station_values(state));
         docs.insert("proximity".into(), proximity_values(state));
+        docs.insert("recording".into(), recording_values(state));
         Self { docs }
     }
     /// Resolve `document.key[.nested]`. None when the key no longer exists.
@@ -109,6 +110,27 @@ impl Sources {
         }
         Some(value.clone())
     }
+}
+
+/// The rolling store's settings and its live state.
+fn recording_values(state: &AppState) -> Value {
+    let settings = state.recording_store.settings();
+    let launch = settings.policy(crate::recording_store::EventKind::Launch);
+    let ring = state.recording_store.ring_status();
+    let live = if !state.recording_store.rolling_enabled() {
+        "not running".to_owned()
+    } else {
+        format!("{} segments, {} MB used{}", ring.segments, ring.bytes / (1024 * 1024), ring.warning.map(|w| format!("; {w}")).unwrap_or_default())
+    };
+    json!({
+        "ring_budget_mb": settings.ring_budget_mb,
+        "segment_mb": settings.segment_mb,
+        "warn_free_mb": settings.warn_free_mb,
+        "critical_free_mb": settings.critical_free_mb,
+        "launch_pre_roll_s": launch.pre_roll_s,
+        "launch_post_roll_s": launch.post_roll_s,
+        "live": live,
+    })
 }
 
 /// The proximity lock's settings and its live state, in words (names only).
@@ -323,6 +345,7 @@ mod tests {
             "igt-image-identification", "igt-image-latch", "igt-image-no-latch", "igt-image-mismatch",
             "igt-mock-wet-dress", "igt-hitl-replay", "igt-settings", "fc-sd-retry", "fc-launch-site",
             "proximity-lock", "proximity-privacy", "proximity-stale", "proximity-override",
+            "recording-always-on", "recording-event-captures", "recording-disk-space", "station-power",
         ] {
             assert!(ids.contains(required), "missing safety rule {required}");
         }

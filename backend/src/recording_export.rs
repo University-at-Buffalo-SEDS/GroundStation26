@@ -9,7 +9,6 @@ use axum::{
     routing::get,
 };
 use futures::stream;
-use serde::Serialize;
 use sqlx::{
     Row, SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
@@ -72,15 +71,9 @@ async fn integrated_ground_test(db: &SqlitePool) -> bool {
     .is_some_and(|value| value["mode"] == "integrated_ground_test" || value["igt_active"] == true)
 }
 
-#[derive(Serialize)]
-struct Recording {
-    id: String,
-    bytes: u64,
-    active: bool,
-}
-
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
+        .merge(crate::recording_store::api::routes())
         .route("/api/recordings/{id}/sd/imports", axum::routing::post(crate::recording_sd::init).layer(axum::extract::DefaultBodyLimit::max(2*1024*1024)))
         .route("/api/recordings/{id}/sd/imports/{token}", axum::routing::put(crate::recording_sd::upload).delete(crate::recording_sd::cancel).layer(axum::extract::DefaultBodyLimit::disable()))
         .route("/api/recordings/{id}/sd/sources",get(crate::recording_sd::sources))
@@ -122,25 +115,27 @@ pub(crate) fn directory(state: &AppState) -> PathBuf {
         .to_path_buf()
 }
 
+/// Legacy session files, rolling segments and event captures (see
+/// `recording_store::RecordingId`); never a path.
 pub(crate) fn valid_id(id: &str) -> bool {
-    id.strip_prefix("groundstation_recording_")
-        .and_then(|s| s.strip_suffix(".db"))
-        .is_some_and(|stamp| {
-            !stamp.is_empty()
-                && stamp
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || b == b'-' || b == b'_')
-        })
+    crate::recording_store::RecordingId::parse(id).is_some()
 }
 
 pub(crate) async fn recording_path(root: &FsPath, id: &str) -> Result<PathBuf, StatusCode> {
-    if !valid_id(id) {
+    let Some(parsed) = crate::recording_store::RecordingId::parse(id) else {
         return Err(StatusCode::BAD_REQUEST);
-    }
+    };
     let root = tokio::fs::canonicalize(root)
         .await
         .map_err(|_| StatusCode::NOT_FOUND)?;
-    let candidate = root.join(id);
+    let expected_dir = tokio::fs::canonicalize(root.join(parsed.relative_dir()))
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    // Every directory level must be the real one under the data root.
+    if expected_dir != root.join(parsed.relative_dir()) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let candidate = root.join(parsed.relative_path());
     let meta = tokio::fs::symlink_metadata(&candidate)
         .await
         .map_err(|_| StatusCode::NOT_FOUND)?;
@@ -150,7 +145,7 @@ pub(crate) async fn recording_path(root: &FsPath, id: &str) -> Result<PathBuf, S
     let resolved = tokio::fs::canonicalize(candidate)
         .await
         .map_err(|_| StatusCode::NOT_FOUND)?;
-    if resolved.parent() != Some(root.as_path()) {
+    if resolved.parent() != Some(expected_dir.as_path()) {
         return Err(StatusCode::BAD_REQUEST);
     }
     Ok(resolved)
@@ -162,49 +157,17 @@ async fn list(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respons
     {
         return response;
     }
-    let mut entries = match tokio::fs::read_dir(directory(&state)).await {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return recording_list_response(Vec::new());
-        }
-        Err(e) => {
-            log::error!("listing recordings: {e}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-    let active = state.recording_status_snapshot().db_path.and_then(|p| {
-        FsPath::new(&p)
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-    });
-    let mut recordings = Vec::new();
-    loop {
-        let entry = match entries.next_entry().await {
-            Ok(Some(entry)) => entry,
-            Ok(None) => break,
-            Err(e) => {
-                log::error!("reading recording entry: {e}");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        };
-        let id = entry.file_name().to_string_lossy().into_owned();
-        if !valid_id(&id) {
-            continue;
-        }
-        if let Ok(meta) = tokio::fs::symlink_metadata(entry.path()).await
-            && meta.is_file() && !meta.file_type().is_symlink() {
-                recordings.push(Recording {
-                    active: active.as_deref() == Some(&id),
-                    id,
-                    bytes: meta.len(),
-                });
-            }
-    }
-    recordings.sort_by(|a, b| b.id.cmp(&a.id));
+    let root = directory(&state);
+    let active = state.recording_status_snapshot().db_path.map(PathBuf::from);
+    let recordings = tokio::task::spawn_blocking(move || {
+        crate::recording_store::list_all(&root, active.as_deref())
+    })
+    .await
+    .unwrap_or_default();
     recording_list_response(recordings)
 }
 
-fn recording_list_response(recordings: Vec<Recording>) -> Response {
+fn recording_list_response(recordings: Vec<crate::recording_store::Listed>) -> Response {
     let mut response = Json(recordings).into_response();
     response
         .headers_mut()

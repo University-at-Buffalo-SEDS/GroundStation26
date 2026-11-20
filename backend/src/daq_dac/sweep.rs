@@ -255,6 +255,17 @@ async fn run_steps(
 
 pub(super) async fn run(state: Arc<AppState>, plan: Plan, cancel: Arc<AtomicBool>) {
     let started = crate::telemetry_task::get_current_timestamp_ms();
+    let capture_key = format!("sweep-{started}");
+    crate::recording_store::begin(
+        &state,
+        crate::recording_store::BeginRequest {
+            kind: crate::recording_store::EventKind::DaqDac,
+            key: &capture_key,
+            label: &format!("DAC sweep {} ch{}", plan.target.label, plan.channel),
+            operator: None,
+            details: serde_json::json!({"channel": plan.channel, "attenuation": plan.attenuation}),
+        },
+    );
     let model = plan.target.model(plan.attenuation, plan.polarity);
     let mut points = Vec::new();
     let result = run_steps(&state, &plan, model, &cancel, &mut points).await;
@@ -310,6 +321,12 @@ pub(super) async fn run(state: Arc<AppState>, plan: Plan, cancel: Arc<AtomicBool
             });
         }
     }
+    crate::recording_store::end(
+        &state,
+        crate::recording_store::EventKind::DaqDac,
+        &capture_key,
+        &format!("{outcome:?}{}", message.as_deref().map(|m| format!(": {m}")).unwrap_or_default()),
+    );
     let mut inner = state.daq_dac.inner.lock().unwrap();
     inner.sweep.state = outcome;
     inner.sweep.message = message;

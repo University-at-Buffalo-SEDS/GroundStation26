@@ -1,0 +1,6 @@
+[Unit]
+Description=Act on a GroundStation power off / reboot request
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/gs-host-power.sh @GS_DIR@/data/host-power

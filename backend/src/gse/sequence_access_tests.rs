@@ -44,7 +44,6 @@ fn unaffected_commands() -> Vec<TelemetryCommand> {
         TelemetryCommand::PauseFill,
         TelemetryCommand::CancelFill,
         TelemetryCommand::Postinit,
-        TelemetryCommand::StartWritingNow,
         TelemetryCommand::ToggleAvBayUnderglow,
         TelemetryCommand::AdvanceFlightState,
         TelemetryCommand::RewindFlightState,

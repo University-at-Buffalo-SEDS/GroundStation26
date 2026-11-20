@@ -24,6 +24,10 @@ independently.
   how to regenerate and run them.
 - [Station mode switch](backend/station-modes.md): switch build and simulation
   from the UI by a controlled restart, on the primary and the RRLS.
+- [Always-on recording](backend/rolling-recording.md): the rolling ring, protected
+  event captures, disk policy and the recordings API.
+- [Station power](backend/host-power.md): admin power off / reboot and the one-time
+  host helper setup.
 
 - `docs/frontend/api.md`
   Frontend-facing API contract, endpoint details, websocket message shapes, bootstrap flow, and backend expectations.

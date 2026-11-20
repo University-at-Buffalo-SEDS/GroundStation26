@@ -1355,10 +1355,6 @@ pub(crate) fn local_operation(name: &str) -> bool {
     matches!(
         name,
         "ResetTClock"
-            | "StartWritingNow"
-            | "StartWritingLastTwoMinutes"
-            | "PauseWritingDb"
-            | "StopWritingDb"
     )
 }
 #[cfg(test)]

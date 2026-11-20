@@ -36,6 +36,7 @@ mod periodic;
 pub(crate) mod procedure_clock;
 mod radio_io;
 pub(crate) mod recording_owner;
+mod rolling;
 pub(crate) mod recording_diagnostics;
 pub use radio_io::{CommsWorkerHandle, TransportTxActivity, TxQueueBudget,RecoveryFrameClassifier,register_radio_tx_budget,radio_tx_budget_diagnostics,set_radio_paced_bytes_per_s};
 pub(crate) use radio_io::{is_recovery_control_frame,RECOVERY_CONTROL_TYPES};
@@ -1471,22 +1472,6 @@ pub async fn telemetry_task(
                                 );
                                 gs_debug_println!("Nitrous explicit close command sent");
                             }
-                        TelemetryCommand::StartWritingNow => {
-                                let _ = state.db_queue_tx.send(DbQueueItem::Control(RecordingCommand::StartNow)).await;
-                                gs_debug_println!("DB recording started without backfill");
-                            }
-                        TelemetryCommand::StartWritingLastTwoMinutes => {
-                                let _ = state.db_queue_tx.send(DbQueueItem::Control(RecordingCommand::StartWithRecent)).await;
-                                gs_debug_println!("DB recording started with recent backfill");
-                            }
-                        TelemetryCommand::PauseWritingDb => {
-                                let _ = state.db_queue_tx.send(DbQueueItem::Control(RecordingCommand::Pause)).await;
-                                gs_debug_println!("DB recording paused");
-                            }
-                        TelemetryCommand::StopWritingDb => {
-                                let _ = state.db_queue_tx.send(DbQueueItem::Control(RecordingCommand::Stop)).await;
-                                gs_debug_println!("DB recording stopped");
-                            }
                         TelemetryCommand::ResetSim => {}
                         TelemetryCommand::ContinueFillSequence => {
                                 state.request_fill_sequence_continue();
@@ -2282,10 +2267,7 @@ async fn rotate_placeholder_db(state: &Arc<AppState>, mode: RecordingMode) {
     match open_in_memory_telemetry_db().await {
         Ok(db) => {
             state.replace_telemetry_db(db, "sqlite::memory:".to_string());
-            state.set_recording_status(RecordingStatusMsg {
-                mode: RecordingModeWire::from(mode),
-                db_path: None,
-            });
+            state.set_recording_status(RecordingStatusMsg::new(RecordingModeWire::from(mode), None));
         }
         Err(err) => {
             emit_warning(
@@ -6396,6 +6378,7 @@ mod tests {
             db: Arc::new(Mutex::new(db)),
             db_path: Arc::new(Mutex::new("sqlite::memory:".to_string())),
             placeholder_db_path: condition_runtime.test_placeholder_path(),
+            recording_store: Default::default(),
             db_queue_tx: db_tx,
             db_write_runtime: tokio::runtime::Handle::current(),
             auth_db,
@@ -6471,10 +6454,7 @@ mod tests {
             hitl_launch_interlock_enabled: Arc::new(AtomicBool::new(false)),
             hitl_safety_interlocks: crate::state::default_hitl_safety_interlocks(),
             hitl_physical_launch_uses_ground_station: Arc::new(AtomicBool::new(false)),
-            recording_status: Arc::new(Mutex::new(RecordingStatusMsg {
-                mode: RecordingModeWire::Idle,
-                db_path: None,
-            })),
+            recording_status: Arc::new(Mutex::new(RecordingStatusMsg::new(RecordingModeWire::Idle, None))),
             recording_status_tx,
             last_command_ms: Arc::new(Mutex::new(HashMap::new())),
             fill_sequence_continue_requests: Arc::new(AtomicU64::new(0)),

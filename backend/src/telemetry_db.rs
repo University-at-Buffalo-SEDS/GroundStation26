@@ -67,11 +67,17 @@ pub enum RecordingMode {
 
 #[derive(Debug, Clone, Copy)]
 pub enum RecordingCommand {
+    /// Legacy fixture-only session controls. The always-on rolling recorder
+    /// ignores StartNow and refuses Pause/Stop; no operator command reaches
+    /// them.
     StartNow,
-    StartWithRecent,
     Pause,
     Stop,
+    /// Clear the live history: the rolling recorder opens a fresh segment
+    /// instead of deleting rows.
     ResetAll,
+    /// Close the current segment cleanly and open the next (power off/reboot).
+    RotateSegment,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +117,18 @@ impl LaunchClockMsg {
 pub struct RecordingStatusMsg {
     pub mode: RecordingModeWire,
     pub db_path: Option<String>,
+    /// True while the always-on rolling recording owns the writer.
+    #[serde(default)]
+    pub always_on: bool,
+    /// Event captures in progress (owned by `recording_store`).
+    #[serde(default)]
+    pub captures: Vec<crate::recording_store::CaptureBrief>,
+}
+
+impl RecordingStatusMsg {
+    pub fn new(mode: RecordingModeWire, db_path: Option<String>) -> Self {
+        Self { mode, db_path, always_on: false, captures: Vec::new() }
+    }
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -358,7 +376,7 @@ pub fn session_db_path(base_dir: &Path, started_at_ms: i64) -> PathBuf {
     ))
 }
 
-fn human_readable_session_stamp(started_at_ms: i64) -> String {
+pub(crate) fn human_readable_session_stamp(started_at_ms: i64) -> String {
     static FORMAT: &[FormatItem<'static>] = time::macros::format_description!(
         "[year]-[month]-[day]_[hour]-[minute]-[second]_[subsecond digits:3]"
     );

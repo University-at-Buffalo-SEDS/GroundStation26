@@ -100,6 +100,8 @@ mod operator_phase;
 mod primary_mirror;
 mod qualification_requests;
 mod recording_export;
+mod recording_store;
+mod host_power;
 mod recovery_events;
 mod recording_range;
 mod recording_report;
@@ -1480,6 +1482,7 @@ async fn main() -> anyhow::Result<()> {
     telemetry_task::set_absolute_time_data_dir(&recordings_dir);
     let placeholder_db_path = recordings_dir.join(DEFAULT_TELEMETRY_DB_FILENAME);
     recover_sqlite_sidecars_in_dir(&recordings_dir).await?;
+    recording_store::remove_incomplete_captures(&recordings_dir);
     if placeholder_db_path.exists() {
         let _ = delete_sqlite_if_empty(&placeholder_db_path.to_string_lossy()).await;
     }
@@ -1640,6 +1643,7 @@ async fn main() -> anyhow::Result<()> {
         db: Arc::new(Mutex::new(db)),
         db_path: Arc::new(Mutex::new("sqlite::memory:".to_string())),
         placeholder_db_path: placeholder_db_path.to_string_lossy().to_string(),
+        recording_store: Default::default(),
         db_queue_tx,
         db_write_runtime: tokio::runtime::Handle::current(),
         auth_db,
@@ -1720,10 +1724,7 @@ async fn main() -> anyhow::Result<()> {
         hitl_launch_interlock_enabled: Arc::new(AtomicBool::new(false)),
         hitl_safety_interlocks: state::default_hitl_safety_interlocks(),
         hitl_physical_launch_uses_ground_station: Arc::new(AtomicBool::new(false)),
-        recording_status: Arc::new(Mutex::new(RecordingStatusMsg {
-            mode: RecordingModeWire::Idle,
-            db_path: None,
-        })),
+        recording_status: Arc::new(Mutex::new(RecordingStatusMsg::new(RecordingModeWire::Idle, None))),
         recording_status_tx,
         last_command_ms: Arc::new(Mutex::new(HashMap::new())),
         fill_sequence_continue_requests: Arc::new(AtomicU64::new(0)),
@@ -1741,6 +1742,9 @@ async fn main() -> anyhow::Result<()> {
         daq_dac: Default::default(),
         auth,
     });
+    // Recording is always on: the DB actor writes the rolling ring from start.
+    state.recording_store.enable_rolling();
+    state.set_recording_status(state.recording_status_snapshot());
     // Integrated ground test settings, the Launch latch and the FC launch site.
     crate::igt::load_persisted(&state);
     // The RFD modem check may enter command mode only outside flight and

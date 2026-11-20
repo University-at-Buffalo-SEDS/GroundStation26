@@ -624,6 +624,14 @@ pub(crate) fn recording_start_rows(state: &AppState) -> Vec<crate::telemetry_db:
 
 pub(crate) fn publish(state: &AppState) {
     sync_image_notice(state);
+    crate::recording_store::level(
+        state,
+        crate::recording_store::EventKind::GroundTest,
+        "igt",
+        igt_active(state),
+        "Integrated ground test",
+        "Left the integrated ground test",
+    );
     let Some(status) = state.igt.publish() else {
         return;
     };
