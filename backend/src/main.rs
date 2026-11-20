@@ -10,6 +10,7 @@ mod daq_input_health;
 mod over_range;
 mod daq_dac;
 mod daq_sd;
+mod radio_reject_test;
 mod radio_voice;
 mod recording_replay;
 // main.rs
@@ -3403,6 +3404,7 @@ async fn main() -> anyhow::Result<()> {
     station_mode_switch::start();
     let _launch_clock_sync = launch_clock_sync::start(state.clone());
     let _station_state = station_state::start(state.clone());
+    let _radio_reject_test = radio_reject_test::start(state.clone());
     let _command_proxy = command_proxy::start(state.clone());
     let _station_pairing = station_pairing::manage::start(state.clone());
 

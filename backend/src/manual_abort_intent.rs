@@ -39,6 +39,9 @@ impl ManualAbortIntent {
         self.request_with_wire(Some(WirePolicy::Untimed))
     }
     fn request_with_wire(&self, wire: Option<WirePolicy>) -> u64 {
+        // A radio test that rejects the direct AV-bay link decides first how
+        // this Abort leaves (lifted now when silent; radio_reject_test).
+        crate::radio_reject_test::note_operator_abort();
         let epoch = {
             let mut state = self.state.lock().unwrap();
             state.epoch = state.epoch.saturating_add(1);

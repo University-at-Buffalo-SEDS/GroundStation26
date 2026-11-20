@@ -26,6 +26,7 @@ fn body(
         clock_revision,
         clock_authority: 0x0123_4567,
         netvar: Some(0),
+        radio_test: (0, 0),
     }
 }
 
@@ -106,7 +107,7 @@ fn a_change_goes_at_once_then_two_copies_within_a_second_then_every_five_seconds
         u32::from_le_bytes(frame[6..10].try_into().unwrap()),
         revisions[0] + 1
     );
-    assert_eq!(frame[1], 1, "version");
+    assert_eq!(frame[1], VERSION, "version");
     assert_eq!(
         &frame[2..6],
         &SESSION.to_le_bytes(),
@@ -233,14 +234,14 @@ fn the_primary_capture_follows_its_flight_state_clock_and_phase() {
         },
         1,
     );
-    let before = StationState::from_parts(S::Idle, &phase, Mode::Normal, &record, Some(0b000_111));
+    let before = StationState::from_parts(S::Idle, &phase, Mode::Normal, &record, Some(0b000_111), (0, 0));
     assert_eq!(before.phase, MissionPhase::Fill);
     assert!(before.fill_activity);
     assert_eq!(before.clock_authority, authority_tag(&record.authority));
     // A T-clock reset: the next revision of the same authority.
     record.revision += 1;
     record.clock = LaunchClockMsg::idle();
-    let after = StationState::from_parts(S::Idle, &phase, Mode::Normal, &record, Some(0b000_111));
+    let after = StationState::from_parts(S::Idle, &phase, Mode::Normal, &record, Some(0b000_111), (0, 0));
     assert_ne!(before.encode(), after.encode());
     assert_eq!(after.clock_revision, before.clock_revision + 1);
 }

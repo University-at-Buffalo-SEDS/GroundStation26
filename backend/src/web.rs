@@ -548,6 +548,7 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .merge(crate::flight_review::routes())
         .merge(crate::fire_archive::routes())
         .merge(crate::proximity_lock::routes())
+        .merge(crate::radio_reject_test::routes())
         .merge(crate::station_pairing::manage::routes())
         .merge(crate::launch_history::api::routes())
         // anything that doesn’t match the above routes goes to the static files

@@ -907,6 +907,23 @@ fn apply_runtime_layout_overrides(layout: &mut LayoutConfig, mode: crate::statio
     if mode != crate::station_mode::Mode::TestFire {
         ensure_fc_sd_retry_action(layout);
     }
+    // Radio test mode (radio_reject_test): an HTTP action on the primary,
+    // listed under Testing in every mode.
+    if !crate::rrls::is_rrls()
+        && !layout
+            .actions_tab
+            .actions
+            .iter()
+            .any(|action| action.cmd == crate::radio_reject_test::COMMAND)
+    {
+        layout.actions_tab.actions.push(
+            serde_json::from_value(serde_json::json!({
+                "cmd": crate::radio_reject_test::COMMAND, "label": "Radio test: reject AV-bay link",
+                "group": "Radio test", "border": "#ef4444", "bg": "#450a0a", "fg": "#fee2e2"
+            }))
+            .expect("valid radio test action"),
+        );
+    }
     if mode != crate::station_mode::Mode::Testing {
         return;
     }
@@ -1220,7 +1237,7 @@ mod tests {
             names.extend(crate::types::client_command_names(mode));
         }
         names.extend(GSE_SEQUENCE_ACTIONS.iter().map(|(cmd, _)| *cmd));
-        names.extend(["ResetSim", "AutoColdFlow", "ResetFlightState", "ResetTClock", "RecoverStation"]);
+        names.extend(["ResetSim", "AutoColdFlow", "ResetFlightState", "ResetTClock", "RecoverStation", "RadioRejectTest"]);
         for name in &names {
             assert!(control_section(name).is_some(), "{name} has no Actions-tab section");
         }

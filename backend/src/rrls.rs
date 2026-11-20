@@ -870,6 +870,15 @@ impl Mesh {
         self.relay_changed_at = Some(now);
         self.relay_reason = Some(reason);
     }
+    /// Radio test escape (radio_reject_test): an Abort was not confirmed
+    /// through the relay, so the primary takes its direct path now instead of
+    /// waiting out RESTORE_MS. It may ask for the relay again only after
+    /// DIRECT_MIN_DWELL_MS, which covers the Abort's remaining retries.
+    pub(crate) fn force_direct(&mut self, now: u64) {
+        if self.role == Role::Primary && self.fallback {
+            self.set_relay(false, now, RelayReason::RadioTestAbortEscape);
+        }
+    }
     /// Test fixtures that model an RRLS which hears the AV bay throughout
     /// (the relay case) without feeding it direct AV-bay frames.
     #[cfg(test)]
@@ -2903,6 +2912,15 @@ impl Mesh {
                     // session, never an older revision than one already shown.
                     // A takeover shows this station's own state.
                     let (session, revision, body) = crate::station_state::parse(data)?;
+                    // The primary's radio test banner stays current through a
+                    // takeover (a silent-primary test causes one).
+                    if self.primary_session == Some(session)
+                        && self.station_state_seen.is_none_or(|(seen_session, seen)| {
+                            seen_session != session || revision.wrapping_sub(seen) <= i32::MAX as u32
+                        })
+                    {
+                        crate::station_state::observe_radio_test(body);
+                    }
                     if self.takeover || self.primary_session != Some(session) {
                         return None;
                     }
@@ -3189,10 +3207,15 @@ impl Mesh {
         Some(bytes)
     }
 }
+/// An RR envelope of `kind` (radio_reject_test fixtures).
+#[cfg(test)]
+pub(crate) fn rr_frame_for_test(kind: u8, payload: &[u8]) -> Vec<u8> {
+    encode(kind, payload)
+}
 /// A station-state frame with an arbitrary session and revision.
 #[cfg(test)]
 pub(crate) fn station_state_frame_for_test(session: u32, revision: u32, body: &[u8]) -> Vec<u8> {
-    let mut payload = vec![1];
+    let mut payload = vec![crate::station_state::VERSION];
     payload.extend_from_slice(&session.to_le_bytes());
     payload.extend_from_slice(&revision.to_le_bytes());
     payload.extend_from_slice(body);
@@ -3364,6 +3387,7 @@ mod envelope_tests {
 pub(crate) enum RelayReason {
     DirectLost { gap_ms: u64 },
     DirectRestored { continuous_ms: u64 },
+    RadioTestAbortEscape,
 }
 impl RelayReason {
     pub(crate) fn describe(self) -> String {
@@ -3376,6 +3400,9 @@ impl RelayReason {
                 "direct AV-bay frames continuous for {:.1} s",
                 continuous_ms as f64 / 1000.0
             ),
+            Self::RadioTestAbortEscape => {
+                "the radio test was lifted for an Abort the relay did not confirm".into()
+            }
         }
     }
 }

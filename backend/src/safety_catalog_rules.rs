@@ -392,6 +392,20 @@ const STOP: &[Spec] = &[
         config_keys: &[],
     },
     Spec {
+        id: "radio-reject-test",
+        title: "Radio test: reject the direct AV-bay link",
+        summary: "A ground test of the RRLS: the primary's radio driver drops what it hears from the AV bay and sends it nothing directly. Force relay keeps the RRLS link, so the relay engages; silent primary drops everything on the radio, so the RRLS takes over, and turning it off tests the hand-back. The umbilical is never affected.",
+        details: &[
+            "Administrator only (or an operator whose command list names RadioRejectTest), with a confirmation; anyone who may send commands may stop it. Only in Startup, Idle or PreFill; it ends by itself when the flight state leaves those, after its timeout (default 10 minutes, at most 60) and on a restart (never persisted).",
+            "Abort, silent primary: the silence is lifted before the Abort is sent, so it goes out on the direct link.",
+            "Abort, force relay: it goes through the relay when the relay is carrying the primary's uplink (otherwise the rejection is lifted at once). The test ends when RF, FC and PB read Aborted; if they do not within 4 s the rejection is lifted and the primary returns to its direct path at once, so the remaining retries of the same Abort and the station's re-sends go direct.",
+            "Shown in a banner on the primary and the RRLS (the state is in the station-state broadcast); every start and stop is logged, notified and recorded with its times in radio_reject_test.jsonl.",
+        ],
+        modes: ALL,
+        enforced_in: &["backend/src/radio_reject_test.rs:allowed_state", "backend/src/radio_reject_test.rs:note_abort", "backend/src/radio_reject_test.rs:tick", "backend/src/comms.rs:radio_test_wire"],
+        config_keys: &[],
+    },
+    Spec {
         id: "board-resync",
         title: "Resync a board",
         summary: "Resync sets one Actuator or Valve Board's state machine, phase and recovery epoch to the station's current phase. To a fill phase, Armed or (after landing) Landed no outputs move: it never commands, replays or restores valves, servos, supplies, igniter or stepper. To Startup or Idle (not in test fire) it brings the board back from any state, including Launch, without an Abort first: the board stops its own launch sequence and drives every output to its safe state (igniter and supplies off, valves safe, stepper asleep) before it changes state. To a fill phase, Armed or Landed the station refuses unless the board's outputs already read safe; to Startup or Idle the outputs need only read back valid and consistent, because the board drives them safe itself. Either way the station must not be Aborted, no tank overpressure may be latched, no operator work may be pending, and the fresh query and confirmation ticket bind the request.",

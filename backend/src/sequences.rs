@@ -1336,7 +1336,7 @@ pub enum ControlSection {
     AvBay,
     /// Returning the station to a known state.
     Recovery,
-    /// HITL bench interlocks and simulator controls.
+    /// HITL bench interlocks, simulator controls and the radio test mode.
     Testing,
 }
 
@@ -1367,6 +1367,8 @@ pub(crate) fn control_section(cmd: &str) -> Option<ControlSection> {
         | "TogglePlumbingDelayInterlock" | "ToggleChecklistInterlock" | "ToggleSupplyInterlock"
         | "ToggleBoardStateProofInterlock" | "TogglePhysicalLaunchMode" | "ResetLaunchLatch"
         | "ResetSim" => Testing,
+        // An HTTP action (radio_reject_test), listed beside the bench controls.
+        "RadioRejectTest" => Testing,
         _ => return None,
     })
 }

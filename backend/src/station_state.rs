@@ -33,10 +33,11 @@ use crate::{
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const VERSION: u8 = 1;
+/// 2: the radio test bytes (30, 31).
+pub(crate) const VERSION: u8 = 2;
 /// Version, HEALTH session, revision.
 const HEADER_LEN: usize = 9;
-pub(crate) const BODY_LEN: usize = 30;
+pub(crate) const BODY_LEN: usize = 32;
 pub(crate) const PAYLOAD_LEN: usize = HEADER_LEN + BODY_LEN;
 /// After a change: the frame now and two more copies, all within a second,
 /// so one lost copy costs at most 250-500 ms.
@@ -70,6 +71,10 @@ pub(crate) struct StationState {
     pub(crate) clock_authority: u32,
     /// The primary's underglow/buzzer view (primary_mirror netvar byte).
     pub(crate) netvar: Option<u8>,
+    /// The primary's radio test (radio_reject_test): variant code (0 off)
+    /// and whole minutes left. A minute boundary is a change, so this costs
+    /// three extra copies a minute while a test runs.
+    pub(crate) radio_test: (u8, u8),
 }
 
 fn mode_code(mode: Mode) -> u8 {
@@ -142,6 +147,8 @@ impl StationState {
         out[21..25].copy_from_slice(&self.clock_revision.to_le_bytes());
         out[25..29].copy_from_slice(&self.clock_authority.to_le_bytes());
         out[29] = self.netvar.unwrap_or(NETVAR_UNKNOWN);
+        out[30] = self.radio_test.0;
+        out[31] = self.radio_test.1;
         out
     }
     pub(crate) fn decode(bytes: &[u8]) -> Option<Self> {
@@ -151,6 +158,7 @@ impl StationState {
         };
         let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
         if bytes[2] & !(FLAG_REQUIRED_BOARDS_SEEN | FLAG_FILL_ACTIVITY | FLAG_FC_CONTACT_LOST) != 0
+            || (bytes[30] != 0 && crate::radio_reject_test::Variant::from_code(bytes[30]).is_none())
         {
             return None;
         }
@@ -174,6 +182,7 @@ impl StationState {
             clock_revision: u32_at(21),
             clock_authority: u32_at(25),
             netvar: Some(bytes[29]).filter(|b| *b != NETVAR_UNKNOWN),
+            radio_test: (bytes[30], bytes[31]),
         })
     }
     /// Primary: its current station state.
@@ -188,6 +197,7 @@ impl StationState {
             crate::station_mode::local_mode(),
             &record,
             Some(crate::primary_mirror::primary_netvar_byte()),
+            crate::radio_reject_test::wire_state(),
         )
     }
     pub(crate) fn from_parts(
@@ -196,6 +206,7 @@ impl StationState {
         mode: Mode,
         record: &crate::launch_history::ClockRecord,
         netvar: Option<u8>,
+        radio_test: (u8, u8),
     ) -> Self {
         Self {
             flight_state,
@@ -208,6 +219,7 @@ impl StationState {
             clock_revision: record.revision as u32,
             clock_authority: authority_tag(&record.authority),
             netvar,
+            radio_test,
         }
     }
     /// The primary's mission phase message, rebuilt from what it sent.
@@ -298,6 +310,13 @@ static CHANGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 fn view() -> std::sync::MutexGuard<'static, Option<View>> {
     VIEW.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// RRLS Mesh, takeover or not: the primary's radio test from a current copy.
+pub(crate) fn observe_radio_test(body: &[u8]) {
+    if let Some(state) = StationState::decode(body) {
+        crate::radio_reject_test::observe_primary(state.radio_test.0, state.radio_test.1);
+    }
 }
 
 /// RRLS Mesh, outside a takeover: an accepted copy (current session, not

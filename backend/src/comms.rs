@@ -1200,6 +1200,10 @@ impl UartComms {
                 if kind == RawUartFrameKind::Ascii {
                     continue;
                 }
+                // Radio test mode: a rejected frame was never heard.
+                if !crate::radio_reject_test::admit_rx(&payload) {
+                    continue;
+                }
                 note_heard_frame(&payload);
                 if let Some(frame) = mesh.incoming(kind == RawUartFrameKind::Command, &payload, now)
                 {
@@ -1608,21 +1612,24 @@ impl UartComms {
                 }
                 let mut accepted = 0;
                 #[cfg(target_os = "linux")]
-                let io_result = write_all_fd_with_poll_counted(
-                    self.inner.as_raw_fd(),
+                let io_result = write_radio_counted(
+                    self.recovery.is_some(),
                     &framed,
-                    UART_TX_POLL_TIMEOUT,
                     &mut accepted,
-                )
-                .and_then(|_| {
-                    drain_fd_with_timeout(
-                        self.inner.as_raw_fd(),
-                        uart_wire_timeout(framed.len(), self.baud_rate),
-                    )
-                });
+                    |wire, accepted| {
+                        write_all_fd_with_poll_counted(self.inner.as_raw_fd(), wire, UART_TX_POLL_TIMEOUT, accepted)
+                            .and_then(|_| drain_fd_with_timeout(self.inner.as_raw_fd(), uart_wire_timeout(wire.len(), self.baud_rate)))
+                    },
+                );
                 #[cfg(not(target_os = "linux"))]
-                let io_result = write_all_std_counted(&mut self.inner, &framed, &mut accepted)
-                    .and_then(|_| self.inner.flush());
+                let io_result = write_radio_counted(
+                    self.recovery.is_some(),
+                    &framed,
+                    &mut accepted,
+                    |wire, accepted| {
+                        write_all_std_counted(&mut self.inner, wire, accepted).and_then(|_| self.inner.flush())
+                    },
+                );
                 shared
                     .lock()
                     .unwrap()
@@ -2364,6 +2371,64 @@ fn unix_now_ms() -> u64 {
         Ok(d) => d.as_millis() as u64,
         Err(_) => 0,
     }
+}
+
+/// Radio test mode (radio_reject_test): `framed` without the raw-UART frames
+/// the test rejects, or None when it keeps them all (or the link carries no
+/// recovery mesh: only the primary's AV-bay radio is ever filtered).
+/// Unparseable bytes are dropped too while a test runs.
+fn radio_test_wire(recovery: bool, framed: &[u8]) -> Option<Vec<u8>> {
+    let filter = crate::radio_reject_test::active_filter();
+    if !recovery || filter == crate::radio_reject_test::FILTER_OFF {
+        return None;
+    }
+    radio_test_wire_with(framed, crate::radio_reject_test::admit_tx)
+}
+fn radio_test_wire_with(framed: &[u8], mut admit: impl FnMut(&[u8]) -> bool) -> Option<Vec<u8>> {
+    let mut kept = Vec::with_capacity(framed.len());
+    let mut at = 0;
+    while at < framed.len() {
+        let Some(header) = framed.get(at..at + RAW_UART_FRAME_HEADER_SIZE) else { break };
+        let sync = matches!(
+            (header[0], header[1]),
+            (RAW_UART_FRAME_SYNC_0, RAW_UART_FRAME_SYNC_1) | (RAW_UART_COMMAND_SYNC_0, RAW_UART_COMMAND_SYNC_1)
+        );
+        let end = at + RAW_UART_FRAME_HEADER_SIZE + usize::from(u16::from_le_bytes([header[2], header[3]]));
+        if !sync || end > framed.len() {
+            break;
+        }
+        if admit(&framed[at + RAW_UART_FRAME_HEADER_SIZE..end]) {
+            kept.extend_from_slice(&framed[at..end]);
+        }
+        at = end;
+    }
+    (kept.len() != framed.len()).then_some(kept)
+}
+/// Writes `framed` to the radio with `write`, minus what the radio test
+/// rejects. A rejected frame is lost on the air: on success every byte of
+/// `framed` counts as accepted, so pacing, packet contracts and SDK delivery
+/// see a frame that was sent and never arrived.
+fn write_radio_counted(
+    recovery: bool,
+    framed: &[u8],
+    accepted: &mut usize,
+    write: impl FnOnce(&[u8], &mut usize) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    write_radio_kept(radio_test_wire(recovery, framed), framed, accepted, write)
+}
+fn write_radio_kept(
+    kept: Option<Vec<u8>>,
+    framed: &[u8],
+    accepted: &mut usize,
+    write: impl FnOnce(&[u8], &mut usize) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let Some(kept) = kept else {
+        return write(framed, accepted);
+    };
+    let mut sent = 0;
+    let result = if kept.is_empty() { Ok(()) } else { write(&kept, &mut sent) };
+    *accepted = if result.is_ok() { framed.len() } else { sent.min(framed.len()) };
+    result
 }
 
 fn build_raw_uart_frame(payload: &[u8]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
@@ -3972,18 +4037,15 @@ impl UartComms {
             }
             start_write_leases(leases)?;
             let mut accepted = 0;
-            let result = write_all_fd_with_poll_counted(
-                self.inner.as_raw_fd(),
+            let result = write_radio_counted(
+                self.recovery.is_some(),
                 &bytes,
-                UART_TX_POLL_TIMEOUT,
                 &mut accepted,
-            )
-            .and_then(|_| {
-                drain_fd_with_timeout(
-                    self.inner.as_raw_fd(),
-                    uart_wire_timeout(bytes.len(), self.baud_rate),
-                )
-            });
+                |wire, accepted| {
+                    write_all_fd_with_poll_counted(self.inner.as_raw_fd(), wire, UART_TX_POLL_TIMEOUT, accepted)
+                        .and_then(|_| drain_fd_with_timeout(self.inner.as_raw_fd(), uart_wire_timeout(wire.len(), self.baud_rate)))
+                },
+            );
             // Even a failed partial write consumed physical capacity. Retain
             // all logical packets for same-ID retry, but never forgive bytes
             // already accepted by the UART or spend their close contracts.
@@ -4298,18 +4360,15 @@ impl UartComms {
                     }
                     maybe_log_raw_uart_tx(&framed, &self.protocol);
                     start_write_leases(leases)?;
-                    let result = write_all_fd_with_poll_counted(
-                        self.inner.as_raw_fd(),
+                    let result = write_radio_counted(
+                        self.recovery.is_some(),
                         &framed,
-                        UART_TX_POLL_TIMEOUT,
                         &mut accepted,
-                    )
-                    .and_then(|_| {
-                        drain_fd_with_timeout(
-                            self.inner.as_raw_fd(),
-                            uart_wire_timeout(framed.len(), self.baud_rate),
-                        )
-                    });
+                        |wire, accepted| {
+                            write_all_fd_with_poll_counted(self.inner.as_raw_fd(), wire, UART_TX_POLL_TIMEOUT, accepted)
+                                .and_then(|_| drain_fd_with_timeout(self.inner.as_raw_fd(), uart_wire_timeout(wire.len(), self.baud_rate)))
+                        },
+                    );
                     if let Some(now) = virtual_wire_now
                         && accepted > 0
                     {
@@ -4329,8 +4388,14 @@ impl UartComms {
                     }
                     maybe_log_raw_uart_tx(&framed, &self.protocol);
                     start_write_leases(leases)?;
-                    write_all_std_counted(&mut self.inner, &framed, &mut accepted)
-                        .and_then(|_| self.inner.flush())
+                    write_radio_counted(
+                        self.recovery.is_some(),
+                        &framed,
+                        &mut accepted,
+                        |wire, accepted| {
+                            write_all_std_counted(&mut self.inner, wire, accepted).and_then(|_| self.inner.flush())
+                        },
+                    )
                 }
             }
         };
@@ -4994,6 +5059,12 @@ impl CommsDevice for UartComms {
         let framed = build_raw_uart_command_frame(payload)?;
         let _guard = self.write_lock.lock().unwrap();
         maybe_log_raw_uart_tx(&framed, &self.protocol);
+        // Radio test mode: a rejected reply is lost on the air.
+        let kept = radio_test_wire(self.recovery.is_some(), &framed);
+        let framed = kept.unwrap_or(framed);
+        if framed.is_empty() {
+            return Ok(());
+        }
         #[cfg(target_os = "linux")]
         {
             write_all_fd_with_poll(self.inner.as_raw_fd(), &framed, UART_TX_POLL_TIMEOUT)?;
@@ -10857,3 +10928,64 @@ mod budget_writer_tests;
 #[cfg(test)]
 #[path = "comms/testing_recovery_tests.rs"]
 mod testing_recovery_tests;
+
+#[cfg(test)]
+mod radio_test_filter_tests {
+    //! The radio test mode's transmit filter at the raw-UART boundary.
+    use super::*;
+    use crate::radio_reject_test::{FILTER_RELAY, FILTER_SILENT, egress_rejected};
+
+    fn frames() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        // A direct AV-bay data frame (RR kind 5) and the primary's HEALTH (kind 0).
+        let direct = build_raw_uart_command_frame(&crate::rrls::rr_frame_for_test(5, b"sdk")).unwrap();
+        let health = build_raw_uart_command_frame(&crate::rrls::rr_frame_for_test(0, &[0; 9])).unwrap();
+        let mut both = direct.clone();
+        both.extend_from_slice(&health);
+        (direct, health, both)
+    }
+
+    #[test]
+    fn force_relay_keeps_the_rrls_frame_of_a_write_and_drops_the_av_bay_one() {
+        let (direct, health, both) = frames();
+        let kept = radio_test_wire_with(&both, |p| !egress_rejected(FILTER_RELAY, p));
+        assert_eq!(kept.as_deref(), Some(&health[..]));
+        assert_eq!(radio_test_wire_with(&health, |p| !egress_rejected(FILTER_RELAY, p)), None, "nothing rejected");
+        assert_eq!(radio_test_wire_with(&direct, |p| !egress_rejected(FILTER_RELAY, p)).as_deref(), Some(&[][..]));
+        let silent = radio_test_wire_with(&both, |p| !egress_rejected(FILTER_SILENT, p));
+        assert_eq!(silent.as_deref(), Some(&[][..]));
+        // A truncated or foreign tail is dropped, never written half-framed.
+        let mut junk = health.clone();
+        junk.extend_from_slice(&[0xA5, 0x5A, 200, 0, 1]);
+        assert_eq!(radio_test_wire_with(&junk, |_| true).as_deref(), Some(&health[..]));
+    }
+
+    #[test]
+    fn a_rejected_frame_counts_as_written_and_never_reaches_the_uart() {
+        let (_, health, both) = frames();
+        let mut written = Vec::new();
+        let mut accepted = 0;
+        write_radio_kept(Some(health.clone()), &both, &mut accepted, |wire, n| {
+            written.extend_from_slice(wire);
+            *n = wire.len();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(written, health);
+        assert_eq!(accepted, both.len(), "the dropped frame was sent, as far as pacing knows");
+        // Everything rejected: no write at all.
+        let mut accepted = 0;
+        write_radio_kept(Some(Vec::new()), &both, &mut accepted, |_, _| panic!("nothing to write")).unwrap();
+        assert_eq!(accepted, both.len());
+        // No test: the write is untouched.
+        let mut accepted = 0;
+        write_radio_kept(None, &both, &mut accepted, |wire, n| {
+            *n = wire.len() - 1;
+            Err(std::io::ErrorKind::WouldBlock.into())
+        })
+        .unwrap_err();
+        assert_eq!(accepted, both.len() - 1);
+        // Off, or not the recovery radio: nothing is filtered.
+        assert_eq!(radio_test_wire(true, &both), None);
+        assert_eq!(radio_test_wire(false, &both), None);
+    }
+}

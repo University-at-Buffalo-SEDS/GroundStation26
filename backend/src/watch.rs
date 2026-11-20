@@ -57,6 +57,7 @@ pub fn excluded_reason(cmd: &str) -> Option<&'static str> {
         }
         // An HTTP action with its own confirmation flow, not /api/command.
         "RecoverStation" => return Some("Recover station needs the full app."),
+        "RadioRejectTest" => return Some("The radio test needs the full app."),
         _ => {}
     }
     match control_section(cmd) {
@@ -1084,6 +1085,7 @@ mod tests {
             "ToggleLaunchInterlock",
             "TogglePhysicalLaunchMode",
             "RecoverStation",
+            "RadioRejectTest",
             "ToggleButtonInterlock",
             "NotACommand",
         ] {
