@@ -5,7 +5,7 @@ stand with the whole rocket powered as for flight. After Launch the flight
 computer (FC) stops using its real flight sensors and replays a recorded or
 generated flight from CSV files on its SD card. Its real Kalman filter, state
 machine and deployment logic run on that replayed data, and the drogue and
-main (line-cutter) events reach the real pyro channels. By default those
+main events reach the real pyro channels. By default those
 channels are dry-run (logged, not fired). With LIVE PYRO armed they fire.
 
 The test shows that the fill, the fire, the flight software and the recovery
@@ -21,17 +21,13 @@ hardware work together, without a launch.
 
 ## 1. Hardware and channel mapping
 
-The FC has two pyro outputs:
+The FC has exactly two pyro outputs, called **drogue** and **main** everywhere
+in the UI and the docs:
 
 | Event | FC command | Output | Flight trigger |
 | --- | --- | --- | --- |
-| Drogue (deploy parachute) | `Deploy_Parachute` | CO2, PB5 | `detect_descent` after apogee |
-| Main (line cutter releases the reefed main) | `Expand_Parachute` | REEF, PB6 | `detect_reefing` below `REEF_TARGET_ALT` |
-
-There is no third "line cutter" channel. On this vehicle the main is the reefed
-canopy that the line cutter (REEF output) releases, so "main" and "line cut"
-are the same event. If a separate line-cutter channel is added, it goes through
-the same gate (section 5).
+| Drogue | `Deploy_Parachute` | CO2, PB5 | `detect_descent` after apogee |
+| Main | `Expand_Parachute` | REEF, PB6 | `detect_reefing` below `REEF_TARGET_ALT` |
 
 ## 2. What runs for real and what is replayed
 
@@ -61,7 +57,8 @@ modes. The GS treats the mode as:
 
 - fill/fire like `test_fire`: the fill sequences, turbocharge, QD and
   overpressure handling, and the automatic test-fire CSV export on recording
-  close;
+  close. The **mock wet dress** setting (section 7.2) switches the fill to the
+  flight steps instead;
 - the AV bay like `normal`: FC, RF and PB are required and visible, FC
   warnings and refusal notices are shown, and the estimator is expected;
 - Launch like `normal` (`send_flight_computer_launch`: FC Launch and VB
@@ -85,7 +82,6 @@ checkpoint or the SD card. Any reset or power cycle starts in `Off`.
     │                                                 ▼
     │                                                Sim   (IMU/baro/GPS replayed, t = now − T0)
     │                                                 │  FC reaches Landed, or data ended + 30 s
-    │                                                 ├─ real baro > 50 m AGL for 10 samples ─▶ Fault(9)
     │                                                 ▼
     └──────────────────────────────────────────────  Done  (real sensors, real GPS)
 ```
@@ -96,9 +92,13 @@ checkpoint or the SD card. Any reset or power cycle starts in `Off`.
 | `IgtLivePyro` | 30 | `+ 18` | mode `Ready`, no Launch request | LIVE PYRO |
 | `IgtDryRun` | 31 | `+ 19` | always (it only makes things safer) | dry-run |
 | `IgtExit` | 32 | `+ 20` | any mode except `Sim` | `Off` |
+| `FcSdRetry` | 33 | `+ 21` | always (both images) | re-attempt the SD mount and log file; in the ground-test image a `Fault` with reason 1 or 2 re-runs the CSV validation |
 
 A flight build (option OFF) ignores bytes 29–32 and never sets the
-"supported" bit, so the GS refuses to send them.
+"supported" bit, so the GS refuses to send them. Both images accept byte 33.
+
+`IgtEnter` while the SD card is not ready (section 7.5) faults at once with
+reason 1 instead of waiting in `Validating`.
 
 The FC refuses replayed data unless all of these hold:
 
@@ -163,7 +163,7 @@ All files go in the `IGT` directory at the root of the FC's SD card (FAT,
   GPS 16) and keeps them topped up. No CSV text is parsed on the sensor path.
 - Pacing comes from the real sensors: every time a real IMU or baro sample
   arrives, its values are replaced with the replay interpolated linearly at
-  t = now − T0. The real sample is kept for telemetry and the motion guard.
+  t = now − T0. The real sample is kept for telemetry.
 - GPS is interpolated and delivered at 10 Hz in place of RF fixes. The rail
   reference moves to the replay's first fix, and the real one is restored when
   the replay ends.
@@ -192,8 +192,8 @@ dry-run:
 - `Parachute_Deployed` / `Parachute_Expanded` are still set, so the state
   machine runs exactly as it would after a real deployment;
 - an SD event `pyro_dry_run` is written, and status bits 10/11 are set;
-- the FC sends `IGT dry-run: drogue not fired` (or `main`) as an ordered
-  message.
+- the FC sends `IGT dry-run: drogue not fired` (or `main not fired`) as an
+  ordered message.
 
 Dry-run also covers the operator's manual Deploy/Expand while the mode is on.
 On the stand, "log only" means log only.
@@ -208,11 +208,10 @@ LIVE PYRO:
   the same ticket flow without a typed phrase; the caller needs the `IgtEnter`
   command permission. The plain command path refuses `IgtEnter` and
   `IgtLivePyro`, but accepts `IgtDryRun` and `IgtExit`.
-- **Real motion:** if the real barometer reads more than 50 m above the pad for
-  10 consecutive samples, the vehicle is really flying. The FC abandons the
-  replay (`Fault` 9), goes back to real sensors and **clears dry-run**, so a
-  genuine flight gets its parachutes. This is deliberate and listed as an open
-  question.
+
+There is no real-motion override. A ground-test image can never be launched
+for real, because the GS latches Launch closed in the flight modes while one is
+on the network (section 7.1).
 
 ## 6. Wire flags
 
@@ -225,16 +224,44 @@ when bit 7 is set.
 | Bits | Meaning |
 | --- | --- |
 | 4..6 | mode: 0 Off, 1 Validating, 2 Ready, 3 Sim, 4 Done, 5 Fault |
-| 7 | FC built with ground-test support |
+| 7 | FC built with ground-test support. The ground-test image sets it in every BOARD_HEALTH from boot; this is the image flag of section 7.1 |
 | 8 | LIVE PYRO armed (clear = dry-run) |
 | 9 | GPS simulated (the replay is feeding GPS) |
 | 10 | drogue dry-run event recorded |
 | 11 | main dry-run event recorded |
-| 12..15 | reason: 0 none, 1 SD unavailable, 2 file missing, 3 bad header, 4 parse error / line too long, 5 time not increasing, 6 value out of range, 7 too short, 8 not stationary at Launch, 9 real motion (replay abandoned), 10 ring underrun (info), 11 refused (wrong state), 12 data ended before landing (info) |
+| 12..15 | reason: 0 none, 1 SD unavailable, 2 file missing, 3 bad header, 4 parse error / line too long, 5 time not increasing, 6 value out of range, 7 too short, 8 not stationary at Launch, 9 unused (was real motion), 10 ring underrun (info), 11 refused (wrong state), 12 data ended before landing (info) |
 
 A change sends BOARD_HEALTH at once (at most every 250 ms) and again 1 s
 later, the same as an estimator phase change. Detail, such as the file and
 line of a CSV error, comes as ordered messages beginning `IGT `.
+
+### 6.1a FC SD state: BOARD_HEALTH word 6 bits 30..31 (both images)
+
+| Bit | Meaning |
+| --- | --- |
+| 30 | SD not ready: the card is not mounted, or the log file cannot be opened or written |
+| 31 | an `FcSdRetry` is pending, not yet taken by the SD task |
+
+The FC uses bits 0..23 for the watchdog task mask and bits 24..28 for the command
+gate. Bits 29..31 were unused.
+
+### 6.1b Launch site: `LAUNCH_SITE`
+
+`LAUNCH_SITE` is a new SEDSnet type: Static Float32 × 3 (lat_deg, lon_deg,
+alt_msl_m). The GS sends it to `FLIGHT_CONTROLLER`, and the FC echoes it to
+`GROUND_STATION`.
+
+- **FC:** on every `LAUNCH_SITE` it receives, from the station controller only
+  (the same admission as `ASCENT_BIASES`), the FC applies the site when all of
+  these hold:
+  - no Launch request, the flight state at Armed or earlier, and no replay
+    running;
+  - |lat| ≤ 90, |lon| ≤ 180, and alt within −500..9000 m.
+
+  Either way it echoes the site it now uses. The site is RAM only: a reset
+  returns to the compiled `LAUNCH_SITE_*`. It sets the centre of the ±1° GPS
+  acceptance window, the altitude window and the replay CSV checks.
+- **GS:** see section 7.4.
 
 ### 6.2 Simulated samples: `SIM_SAMPLE`
 
@@ -284,7 +311,102 @@ the FC reports mode `Sim`, or `Done` after a replay, and in IGT recordings.
   `Sim`, every notice is prefixed `SIMULATED input:`.
 - **API:** `GET /api/igt` and the websocket frame `IgtStatus`, both carrying
   `{supported, fc_mode, live_pyro, gps_simulated, drogue_dry_run,
-  main_dry_run, reason, reason_text, station_mode_igt, updated_ms}`.
+  main_dry_run, reason, reason_text, station_mode_igt, updated_ms}` plus:
+  - `fc_image`: `"ground_test"`, `"flight"` or `"unknown"`;
+  - `launch_latched` (bool) and `launch_latch_reason` (string or null);
+  - `image_notice`: `{level: "warning"|"info", text}` or null;
+  - `igt_active`: true in integrated_ground_test, or in HITL with `hitl_replay`
+    on;
+  - `mock_wet_dress` and `hitl_replay` (bools);
+  - `sd_ready` (bool or null) and `sd_retry_pending` (bool).
+- **Settings:** `GET /api/igt/settings` returns `{mock_wet_dress, hitl_replay}`.
+  `PUT` takes the same shape, partial fields allowed, Admin only.
+- **Launch site:** `GET /api/fc/launch-site` returns:
+
+  ```
+  {configured: {lat_deg, lon_deg, alt_msl_m} | null,
+   compiled_default: {lat_deg: 31.758, lon_deg: -102.046, alt_msl_m: 890.016},
+   fc_reported: {...} | null, confirmed: bool, pending: bool}
+  ```
+
+  `PUT` takes `{lat_deg, lon_deg, alt_msl_m}` or `{reset: true}`, Admin only.
+- **Commands:** `FcSdRetry` (FC byte 33) uses the normal command path.
+
+### 7.1 Ground-test image identification and the Launch latch
+
+Word 14 bit 7 (section 6.1) identifies an FC running the ground-test image. A
+flight image reports the tag with bits 4..15 clear.
+
+| Station mode | Ground-test image on the network | Flight image on the network |
+| --- | --- | --- |
+| normal / flight | **warning** + **Launch latch** | normal |
+| test fire | **warning** + **Launch latch** | normal |
+| HITL (with or without the HITL replay) | informational notification, no latch | normal; with the HITL replay on: **warning** "FC is running a flight image: integrated ground test unavailable, flash the ground-test image" |
+| integrated_ground_test | expected: informational indicator only | **warning**: the same text |
+
+- **Latch:** the Launch latch is set the first time a ground-test image is seen
+  in normal or test fire.
+  - It blocks Launch (and GroundStationLaunch) with the reason "FC is running a
+    ground-test image (dry-run capable): Launch is blocked until the FC reports
+    a flight image".
+  - It clears only when a fresh FC BOARD_HEALTH reports a flight image. A
+    missing or silent FC does not clear it.
+  - The reason appears in the action policy (the Actions tab and Launch
+    controls) and in the safety catalog.
+- **Warnings:** a warning appears as soon as the mismatch is seen, and clears
+  when it ends.
+
+### 7.2 Mock wet dress (admin setting)
+
+`mock_wet_dress` (default off) is an admin-only GS setting, shown in the Ground
+test section. When it is on, the integrated ground test runs the flight fill
+steps instead of the test-fire fill sequence: the nitrogen fill step and the
+normally-open checks. It persists with the other GS settings.
+
+### 7.3 HITL with the ground-test replay
+
+`hitl_replay` (default off) is an admin-only GS setting, available in HITL
+mode. When it is on, HITL keeps its own rules for the fill side, and the FC's
+CSV replay is the flight data source:
+
+- **Fill:** the HITL GSE path, HITL interlocks, and the bench or simulated plant.
+- **Ground test:** the Ground test section, the IGT commands, the IGT status,
+  SIMULATED labels and the replay recording, all as in `integrated_ground_test`.
+- **Launch:** goes to the FC and VB, and needs FC IGT `Ready`.
+- **Phase controls:** Advance and Rewind are refused while the FC reports
+  `Sim`, because the replayed flight drives the phase. They work again once it
+  reports `Done`.
+
+HITL itself simulates no flight sensors on the GS. The GS FlightSim exists only
+in Testing mode with Simulation on, so it never competes with the FC replay.
+
+### 7.4 Launch site (admin setting)
+
+- **Setting:** an admin sets the site as lat_deg, lon_deg, alt_msl_m, or resets
+  it to the FC's compiled default.
+- **Sending:** the GS persists the site and sends it as `LAUNCH_SITE` when:
+  - the setting changes;
+  - the FC is first seen or reboots;
+  - every 10 s, until the FC's echo matches.
+
+  This mirrors the other board config resyncs. With no setting, the GS sends
+  nothing, and the FC keeps its compiled site.
+- **Status:** the GS shows the site as confirmed or pending, with the FC's
+  reported values.
+
+### 7.5 FC SD card health and Retry SD
+
+This mirrors the DAQ's SD health and `DaqSdRetry`.
+
+- **Alert:** word 6 bit 30 raises the GS alert "FC SD card not mounted / not
+  writable". It clears when the bit clears.
+- **Retry:** `FcSdRetry` (FC byte 33) is in the Flight computer section, and also
+  in the Ground test section of the ground-test modes. It needs the
+  `FcSdRetry` command permission, has a 5 s cooldown, and is refused while
+  bit 31 shows a retry already pending.
+- **FC side:** the SD task re-attempts the mount and the log file. In the
+  ground-test image, a `Fault` caused by the card (reason 1 or 2) returns to
+  `Validating`, and the CSVs are checked again.
 
 ## 8. Recording and provenance
 
@@ -326,25 +448,27 @@ the FC reports mode `Sim`, or `Done` after a replay, and in IGT recordings.
 | Failure | Result |
 | --- | --- |
 | CSV missing, malformed or out of range | `Fault` with a reason code and an `IGT <file>:<line> <problem>` message. The GS refuses Launch until IGT is `Ready`. |
-| SD card missing or unreadable | `Fault` 1 |
+| SD card missing or unreadable | Word 6 bit 30 and the GS alert. `IgtEnter` faults at once with reason 1. `FcSdRetry` re-mounts and re-validates. |
 | Card read stalls during replay | Ring underrun: the last value is held, reported as info code 10 |
 | Data ends before landing | The last value is held. After 30 s the replay ends, the FC uses real sensors and detects Landed on the stand (code 12, info). |
 | Vehicle moving at Launch | `Fault` 8. No replay, normal FC logic on real data. |
-| Vehicle really leaves the stand | `Fault` 9. Real sensors, dry-run cleared, normal recovery. |
+| Ground-test image on the FC in normal or test fire | Warning and Launch latch, until the FC reports a flight image (section 7.1) |
+| Flight image on the FC in integrated_ground_test (or HITL with the replay) | Warning; IgtEnter and the IGT Launch gate refused |
 | FC reset or power cycle | Mode `Off`, no replay, resume rejected. Re-entry needs reset to Startup and a new `IgtEnter`. |
 | GS link lost | VB auto-vent countdown (section 9). The FC continues its replayed flight and gate on its own. |
 | Operator Abort at any point | Normal abort on every board. FC mode `Off`. |
 | Flight image on the FC | No IGT support bit. The GS refuses `IgtEnter` and the IGT Launch gate. |
-| Normal or HITL station mode | The IGT commands are not offered and are refused by policy. The FC rejects `IgtEnter` after Postinit or Launch in any case. |
+| Normal or test fire station mode | The IGT commands are not offered and are refused by policy. HITL offers them only with the HITL replay on. The FC rejects `IgtEnter` after Postinit or Launch in any case. |
 
 ## 11. Creating the CSV files
 
 `tools/igt_csv.py` (Python 3, standard library only):
 
 ```sh
-# From a parametric model (deterministic):
+# From a parametric model (deterministic). --site is the pad; the GPS track
+# drifts a few hundred metres downrange and with the wind:
 python3 tools/igt_csv.py model --out igt/ --apogee-m 900 --burn-s 3.5 \
-    --liftoff-ms 10000 --site 31.758,-102.046,890
+    --liftoff-ms 10000 --site 31.758,-102.046,890 --wind-mps 4 --wind-from-deg 270
 
 # From a GS recording CSV export (Settings > Recordings > CSV):
 python3 tools/igt_csv.py recording rec.csv --out igt/ --t0 launch
@@ -367,17 +491,20 @@ FAT32. Use 8.3 names; do not rename the folder.
 ## 12. Procedure
 
 1. Load an FC image built with `--ground-test`, and put the CSVs on the SD
-   card.
-2. In Settings > Station, switch the station to **Integrated ground test**
-   (Admin).
-3. Power the full stack, and wait for FC, RF and PB to show ready.
-4. Ground test > **Enter ground test** (confirm). Wait for FC IGT `Ready`; a
+   card. While this image is on the network, normal and test fire refuse
+   Launch.
+2. If the test site is not the FC's compiled launch site, set Settings >
+   Launch site (Admin). The replayed GPS must lie within ±1° of it.
+3. In Settings > Station, switch the station to **Integrated ground test**
+   (Admin), or use HITL with the HITL replay on.
+4. Power the full stack, and wait for FC, RF and PB to show ready.
+5. Ground test > **Enter ground test** (confirm). Wait for FC IGT `Ready`; a
    CSV problem shows as a fault with its file and line.
-5. Optional: Ground test > **LIVE PYRO** (Admin, typed confirmation). Otherwise
+6. Optional: Ground test > **LIVE PYRO** (Admin, typed confirmation). Otherwise
    it stays DRY-RUN.
-6. Fill as in a test fire. Postinit/arm as in flight.
-7. Launch. The motor fires for real. The FC runs the replayed flight, and the
+7. Fill as in a test fire, or with the flight steps if **Mock wet dress** is on.
+8. Launch. The motor fires for real. The FC runs the replayed flight, and the
    UI shows the SIMULATED banner, phase and track.
-8. Drogue and main events happen (dry-run or live). At landing the GPS switches
+9. Drogue and main events happen (dry-run or live). At landing the GPS switches
    to real.
-9. Close the recording. Afterwards, IgtExit or reset the FC to Startup.
+10. Close the recording. Afterwards, IgtExit or reset the FC to Startup.
