@@ -29,8 +29,9 @@ using captured packets only. They do not trigger hardware outputs.
 ## Integrated ground test controls
 
 The integrated ground test (`docs/integrated-ground-test.md`) adds four FC
-commands on the same one-byte protocol. They exist only in the
-`integrated_ground_test` station mode (Actions > Ground test) and are refused
+commands on the same one-byte protocol. They exist in the
+`integrated_ground_test` station mode (Actions > Ground test) and in HITL,
+where they are refused unless the HITL replay setting is on. They are refused
 and not offered in every other mode. A flight FC image ignores them.
 
 | Control | Command | Wire byte | FC compat name | Station path |
@@ -42,3 +43,14 @@ and not offered in every other mode. A flight FC image ignores them.
 
 The plain command path (`POST /api/command`, the RRLS proxy) refuses
 `IgtEnter` and `IgtLivePyro`.
+
+## Retry FC SD
+
+`FcSdRetry` (FC byte 33, FC compat name `Compat_SD_Retry`) asks the FC to
+re-attempt its SD mount and log file. Both FC images accept it. It is offered
+in every station mode with an FC (normal, testing, HITL and the integrated
+ground test; not test fire) in the Flight computer section, on the plain
+command path. It needs the `FcSdRetry` command permission and a fresh FC
+BOARD_HEALTH, has a 5 s cooldown, and is refused while word 6 bit 31 shows a
+retry already pending. Word 6 bit 30 raises the alert "FC SD card not mounted
+/ not writable" until it clears.

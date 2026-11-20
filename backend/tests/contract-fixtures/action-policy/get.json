@@ -171,6 +171,13 @@
       "enabled": true
     },
     {
+      "actuated": null,
+      "blink": "none",
+      "cmd": "FcSdRetry",
+      "disabled_reason": "No recent FC BOARD_HEALTH; Retry FC SD needs the FC's current SD status.",
+      "enabled": false
+    },
+    {
       "actuated": false,
       "blink": "none",
       "cmd": "Turbocharge",

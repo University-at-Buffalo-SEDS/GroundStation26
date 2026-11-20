@@ -766,8 +766,14 @@ fn apply_runtime_layout_overrides(layout: &mut LayoutConfig) {
             );
         }
     }
-    if mode == crate::station_mode::Mode::IntegratedGroundTest {
+    // HITL lists the Ground test controls too; they are refused (and the
+    // client hides them) unless the HITL replay is on (IgtStatus.igt_active).
+    if matches!(mode, crate::station_mode::Mode::IntegratedGroundTest | crate::station_mode::Mode::Hitl) {
         ensure_igt_actions(layout);
+    }
+    // Retry FC SD wherever the FC is present (every mode but test fire).
+    if mode != crate::station_mode::Mode::TestFire {
+        ensure_fc_sd_retry_action(layout);
     }
     if mode != crate::station_mode::Mode::Testing {
         return;
@@ -822,6 +828,29 @@ fn ensure_igt_actions(layout: &mut LayoutConfig) {
             .expect("valid ground test action"),
         );
     }
+}
+
+/// `FcSdRetry` after the last Flight computer action, in its group.
+fn ensure_fc_sd_retry_action(layout: &mut LayoutConfig) {
+    let actions = &mut layout.actions_tab.actions;
+    if actions.iter().any(|action| action.cmd == "FcSdRetry") {
+        return;
+    }
+    let last_fc = actions.iter().rposition(|action| {
+        crate::sequences::control_section(&action.cmd) == Some(crate::sequences::ControlSection::FlightComputer)
+    });
+    let (index, group) = match last_fc {
+        Some(index) => (index + 1, actions[index].group.clone()),
+        None => (actions.len(), "Flight controls".to_string()),
+    };
+    actions.insert(
+        index,
+        serde_json::from_value(serde_json::json!({
+            "cmd": "FcSdRetry", "label": "Retry FC SD", "group": group,
+            "border": "#38bdf8", "bg": "#082f49", "fg": "#e0f2fe"
+        }))
+        .expect("valid FC SD retry action"),
+    );
 }
 
 const IGT_ACTIONS: [(&str, &str); 4] = [

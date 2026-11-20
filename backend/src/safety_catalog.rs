@@ -289,7 +289,9 @@ mod tests {
             "valve-freshness", "supply-interlock", "fill-limits", "qd-settle", "igniter-sense",
             "stale-data", "connectivity-loss", "mission-phases", "fc-owns-landing", "board-heartbeat-abort", "board-vb-post-launch-vent", "board-vb-overpressure", "board-abort-latch", "board-fc-vigilant",
             "igt-mode-entry", "igt-enter", "igt-live-pyro", "igt-plain-path", "igt-launch-gate", "igt-replay-admission",
-            "igt-reset-exits", "igt-dry-run-default", "igt-pyro-gate", "igt-vb-auto-vent", "igt-abort",
+            "igt-reset-exits", "igt-dry-run-default", "igt-vb-auto-vent", "igt-abort",
+            "igt-image-identification", "igt-image-latch", "igt-image-no-latch", "igt-image-mismatch",
+            "igt-mock-wet-dress", "igt-hitl-replay", "igt-settings", "fc-sd-retry", "fc-launch-site",
         ] {
             assert!(ids.contains(required), "missing safety rule {required}");
         }
@@ -300,7 +302,23 @@ mod tests {
             section["rules"].as_array().unwrap().iter().all(|rule| rule["modes"]["igt"].is_boolean())
         }));
         let igt = catalog.sections.iter().find(|s| s.id == "igt").expect("igt section");
-        assert!(igt.rules.iter().all(|r| r.modes == IGT));
+        // Every rule of the section applies in the integrated ground test,
+        // except the Launch latch (normal and test fire) and the HITL replay.
+        assert!(igt.rules.iter().all(|r| r.modes.igt != matches!(r.id, "igt-image-latch" | "igt-hitl-replay")));
+        let latch = all.iter().find(|r| r.id == "igt-image-latch").unwrap();
+        assert!(latch.modes.flight && latch.modes.test_fire && !latch.modes.hitl && !latch.modes.igt);
+        assert!(latch.summary.contains(crate::igt::LAUNCH_LATCH_REASON), "{}", latch.summary);
+        let no_latch = all.iter().find(|r| r.id == "igt-image-no-latch").unwrap();
+        assert!(no_latch.modes.hitl && no_latch.modes.igt && !no_latch.modes.flight);
+        let mismatch = all.iter().find(|r| r.id == "igt-image-mismatch").unwrap();
+        assert!(mismatch.summary.contains(crate::igt::FLIGHT_IMAGE_WARNING));
+        // There is no real-motion override any more.
+        assert!(!ids.contains("igt-pyro-gate"));
+        for rule in &all {
+            let text = format!("{} {} {}", rule.title, rule.summary, rule.details.join(" ")).to_lowercase();
+            assert!(!text.contains("real motion") && !text.contains("real-motion"), "{}", rule.id);
+            assert!(!text.contains("line cutter") && !text.contains("line-cutter"), "{}", rule.id);
+        }
     }
 
     #[tokio::test]

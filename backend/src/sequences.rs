@@ -1179,6 +1179,7 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         TelemetryCommand::IgtLivePyro => "IgtLivePyro",
         TelemetryCommand::IgtDryRun => "IgtDryRun",
         TelemetryCommand::IgtExit => "IgtExit",
+        TelemetryCommand::FcSdRetry => "FcSdRetry",
     }
 }
 
@@ -1196,16 +1197,17 @@ pub fn all_command_names() -> Vec<&'static str> {
     }
 }
 
-/// The integrated ground test: the flight catalog (FC Launch, FC setup) plus
-/// the Ground test controls. GroundStationLaunch and the phase steps stay
-/// HITL/test-fire only.
+/// The integrated ground test: the flight catalog (FC Launch, FC setup,
+/// FcSdRetry) plus the Ground test controls. GroundStationLaunch and the
+/// phase steps stay HITL/test-fire only.
 fn all_command_names_igt() -> Vec<&'static str> {
     let mut names = IGT_COMMANDS.to_vec();
     names.extend(all_command_names_default());
     names
 }
 
-/// The Ground test section (integrated ground test only).
+/// The Ground test section: integrated ground test, and HITL (where the
+/// controls are refused unless the HITL replay is on).
 pub(crate) const IGT_COMMANDS: [&str; 4] = ["IgtEnter", "IgtLivePyro", "IgtDryRun", "IgtExit"];
 
 fn all_command_names_default() -> Vec<&'static str> {
@@ -1236,6 +1238,7 @@ fn all_command_names_default() -> Vec<&'static str> {
         "RevokeResetFailures",
         "ValidateMeasms",
         "RevokeValidateMeasms",
+        "FcSdRetry",
     ];
     if crate::flight_sim::sim_mode_enabled() {
         names.push("ResetSim");
@@ -1300,6 +1303,12 @@ fn all_command_names_hitl() -> Vec<&'static str> {
         "ReinitAfter15",
         "ReinitAfter30",
         "ReinitAfter50",
+        "FcSdRetry",
+        // The Ground test controls, refused unless the HITL replay is on.
+        "IgtEnter",
+        "IgtLivePyro",
+        "IgtDryRun",
+        "IgtExit",
     ]
 }
 
@@ -1392,7 +1401,7 @@ pub(crate) fn control_section(cmd: &str) -> Option<ControlSection> {
         | "RevokeMonitorAltitude" | "ConsecutiveSamples" | "RevokeConsecutiveSamples"
         | "ResetFailures" | "RevokeResetFailures" | "ValidateMeasms" | "RevokeValidateMeasms"
         | "AbortAfter100" | "AbortAfter40" | "AbortAfter250" | "ReinitAfter15"
-        | "ReinitAfter30" | "ReinitAfter50" => FlightComputer,
+        | "ReinitAfter30" | "ReinitAfter50" | "FcSdRetry" => FlightComputer,
         "ToggleAvBayUnderglow" | "ToggleFlightBuzzer" => AvBay,
         "IgtEnter" | "IgtLivePyro" | "IgtDryRun" | "IgtExit" => GroundTest,
         // RecoverStation is an HTTP action (board_recovery::coordinator::station_recover),
@@ -1561,8 +1570,8 @@ fn sequence_expects_normally_open(step: SequenceStep) -> bool {
     )
 }
 
-fn sequence_expects_normally_closed(step: SequenceStep) -> bool {
-    if crate::runtime_mode::is_test_fire_or_igt() {
+fn sequence_expects_normally_closed(step: SequenceStep, test_fire_fill: bool) -> bool {
+    if test_fire_fill {
         return false;
     }
     matches!(
@@ -1587,8 +1596,8 @@ fn sequence_blocks_until_normally_open(step: SequenceStep) -> bool {
     )
 }
 
-fn sequence_blocks_until_normally_closed(step: SequenceStep) -> bool {
-    if crate::runtime_mode::is_test_fire_or_igt() {
+fn sequence_blocks_until_normally_closed(step: SequenceStep, test_fire_fill: bool) -> bool {
+    if test_fire_fill {
         return false;
     }
     matches!(
@@ -1615,8 +1624,8 @@ fn dump_open_fails_nitrous_step(step: SequenceStep) -> bool {
     )
 }
 
-fn first_fill_step_after_setup() -> SequenceStep {
-    if crate::runtime_mode::is_test_fire_or_igt() {
+fn first_fill_step_after_setup(test_fire_fill: bool) -> SequenceStep {
+    if test_fire_fill {
         SequenceStep::OpenNitrous
     } else {
         SequenceStep::NitrogenFill
@@ -1631,13 +1640,13 @@ fn nitrous_close_accepted_for_vent_prompt(valves: ValveSnapshot) -> bool {
     valves.actuated_for_cmd("Nitrous") == Some(false)
 }
 
-fn setup_valves_ready(valves: ValveSnapshot) -> bool {
+fn setup_valves_ready(valves: ValveSnapshot, test_fire_fill: bool) -> bool {
     valves.dump_open == Some(false)
-        && (crate::runtime_mode::is_test_fire_or_igt() || valves.normally_open == Some(false))
+        && (test_fire_fill || valves.normally_open == Some(false))
 }
 
-fn mass_is_vented(current_mass_kg: Option<f32>, cfg: &SequenceConfig) -> bool {
-    if crate::runtime_mode::is_test_fire_or_igt() {
+fn mass_is_vented(current_mass_kg: Option<f32>, cfg: &SequenceConfig, test_fire_fill: bool) -> bool {
+    if test_fire_fill {
         return true;
     }
     current_mass_kg
@@ -1649,9 +1658,10 @@ fn tank_is_vented(
     pressure_psi: Option<f32>,
     current_mass_kg: Option<f32>,
     cfg: &SequenceConfig,
+    test_fire_fill: bool,
 ) -> bool {
     pressure_psi.is_some_and(|p| p <= cfg.dump_pressure_max_psi)
-        && mass_is_vented(current_mass_kg, cfg)
+        && mass_is_vented(current_mass_kg, cfg, test_fire_fill)
 }
 
 fn fill_sequence_calibration_issue(
@@ -1825,6 +1835,9 @@ fn update_sequence_runtime(
     current_mass_kg: Option<f32>,
     now: Instant,
 ) {
+    // Test fire, and the integrated ground test unless mock wet dress runs
+    // the flight fill steps.
+    let test_fire_fill = crate::igt::test_fire_fill(state);
     let at_or_above = |p: Option<f32>, threshold: f32| p.is_some_and(|x| x >= threshold);
     let dismiss_leak_fail_notification = |state: &AppState, runtime: &mut SequenceRuntime| {
         if let Some(id) = runtime.leak_fail_notification_id.take() {
@@ -1879,7 +1892,7 @@ fn update_sequence_runtime(
         }
         return;
     }
-    if sequence_blocks_until_normally_closed(runtime.step) && valves.normally_open == Some(true) {
+    if sequence_blocks_until_normally_closed(runtime.step, test_fire_fill) && valves.normally_open == Some(true) {
         if !runtime.notified_reopen_normally_open {
             state.add_notification(
                 "Vent valve must be closed for this step. Close the vent valve before continuing the fill sequence.",
@@ -1889,7 +1902,7 @@ fn update_sequence_runtime(
         return;
     }
     if (sequence_blocks_until_normally_open(runtime.step) && valves.normally_open == Some(true))
-        || (sequence_blocks_until_normally_closed(runtime.step)
+        || (sequence_blocks_until_normally_closed(runtime.step, test_fire_fill)
             && valves.normally_open == Some(false))
     {
         runtime.notified_reopen_normally_open = false;
@@ -1926,8 +1939,8 @@ fn update_sequence_runtime(
 
     match runtime.step {
         SequenceStep::SetupValves => {
-            if setup_valves_ready(valves) {
-                runtime.step = first_fill_step_after_setup();
+            if setup_valves_ready(valves, test_fire_fill) {
+                runtime.step = first_fill_step_after_setup(test_fire_fill);
             }
         }
         SequenceStep::NitrogenFill => {
@@ -2066,7 +2079,7 @@ fn update_sequence_runtime(
                 }
             }
             let mass_warning_active =
-                !crate::runtime_mode::is_test_fire_or_igt() && mass_shift_kg > cfg.max_leak_mass_delta_kg;
+                !test_fire_fill && mass_shift_kg > cfg.max_leak_mass_delta_kg;
             if mass_warning_active && !runtime.warned_mass_shift {
                 runtime.warned_mass_shift = true;
                 if runtime.mass_shift_notification_id.is_none() {
@@ -2085,7 +2098,7 @@ fn update_sequence_runtime(
             }
 
             let pressure_ok = current >= baseline - allowed_pressure_drop;
-            let mass_ok = crate::runtime_mode::is_test_fire_or_igt()
+            let mass_ok = test_fire_fill
                 || current_mass_kg.is_none()
                 || mass_shift_kg <= allowed_mass_shift;
 
@@ -2115,7 +2128,7 @@ fn update_sequence_runtime(
             }
         }
         SequenceStep::DumpNitrogen => {
-            if valves.dump_open == Some(true) && tank_is_vented(pressure_psi, current_mass_kg, cfg)
+            if valves.dump_open == Some(true) && tank_is_vented(pressure_psi, current_mass_kg, cfg, test_fire_fill)
             {
                 runtime.step = SequenceStep::CloseDump;
             }
@@ -2171,7 +2184,7 @@ fn update_sequence_runtime(
                 }
                 return;
             }
-            if tank_is_vented(pressure_psi, current_mass_kg, cfg) {
+            if tank_is_vented(pressure_psi, current_mass_kg, cfg, test_fire_fill) {
                 runtime.notified_nitrogen_recovery_close_dump = false;
                 runtime.step = SequenceStep::RecoverNitrogenCloseDump;
             }
@@ -2360,7 +2373,7 @@ fn update_sequence_runtime(
                 }
                 return;
             }
-            if tank_is_vented(pressure_psi, current_mass_kg, cfg) {
+            if tank_is_vented(pressure_psi, current_mass_kg, cfg, test_fire_fill) {
                 runtime.notified_nitrous_recovery_close_dump = false;
                 runtime.step = SequenceStep::RecoverNitrousCloseDump;
             }
@@ -2401,7 +2414,7 @@ fn update_sequence_runtime(
         }
         SequenceStep::RetractFillLines => {
             if !runtime.notified_retract_fill_lines {
-                if crate::runtime_mode::is_test_fire_or_igt() {
+                if test_fire_fill {
                     state.add_notification("Retract fill lines.");
                 } else {
                     state.add_notification("Vent valve closed. Retract fill lines.");
@@ -2414,7 +2427,7 @@ fn update_sequence_runtime(
         }
         SequenceStep::ArmedReady => {
             if !runtime.notified_armed {
-                if crate::runtime_mode::is_test_fire_or_igt() {
+                if test_fire_fill {
                     state.add_notification(
                         "Fill sequence complete: nitrous closed and fill lines removed. Launch state is ready.",
                     );
@@ -2562,6 +2575,7 @@ fn build_policy(
     runtime: &SequenceRuntime,
     inputs: PolicyInputs,
 ) -> ActionPolicyMsg {
+    let test_fire_fill = crate::igt::test_fire_fill(state);
     if !inputs.key_enabled {
         let mut policy = policy_with_overrides(
             false,
@@ -2616,7 +2630,7 @@ fn build_policy(
         }
         // In Idle, make the first fill-transition action the only illuminated action.
         // All other controls remain available (dimmed client-side when not blinking).
-        if !crate::runtime_mode::is_test_fire_or_igt()
+        if !test_fire_fill
             && inputs.flight_state == FlightState::Idle
             && let Some(blink) = command_prompt_blink(
                 state,
@@ -2629,7 +2643,7 @@ fn build_policy(
         {
             enabled.insert("NormallyOpen", blink);
         }
-        if !crate::runtime_mode::is_test_fire_or_igt()
+        if !test_fire_fill
             && inputs.flight_state == FlightState::Idle
             && let Some(blink) =
                 command_prompt_blink(state, cfg, inputs.valves, "Dump", false, inputs.now_ms)
@@ -2664,7 +2678,7 @@ fn build_policy(
     {
         recommended.insert("NormallyOpen", blink);
     }
-    if sequence_expects_normally_closed(runtime.step)
+    if sequence_expects_normally_closed(runtime.step, test_fire_fill)
         && let Some(blink) = command_prompt_blink(
             state,
             cfg,
@@ -2679,7 +2693,7 @@ fn build_policy(
 
     match runtime.step {
         SequenceStep::SetupValves => {
-            if !crate::runtime_mode::is_test_fire_or_igt()
+            if !test_fire_fill
                 && let Some(blink) = command_prompt_blink(
                     state,
                     cfg,
@@ -3257,25 +3271,21 @@ mod tests {
     #[test]
     fn test_fire_sequence_starts_with_nitrous_fill_after_setup() {
         crate::mode_suite!(TestFire);
-        assert_eq!(first_fill_step_after_setup(), SequenceStep::OpenNitrous);
+        assert_eq!(first_fill_step_after_setup(true), SequenceStep::OpenNitrous);
     }
 
     #[test]
     fn test_fire_setup_does_not_require_closing_vent_valve() {
         crate::mode_suite!(TestFire);
-        assert!(!sequence_expects_normally_closed(SequenceStep::SetupValves));
-        assert!(!sequence_blocks_until_normally_closed(
-            SequenceStep::SetupValves
-        ));
-        assert!(!sequence_expects_normally_closed(SequenceStep::NitrousSoak));
-        assert!(!sequence_blocks_until_normally_closed(
-            SequenceStep::NitrousSoak
-        ));
+        assert!(!sequence_expects_normally_closed(SequenceStep::SetupValves, true));
+        assert!(!sequence_blocks_until_normally_closed(SequenceStep::SetupValves, true));
+        assert!(!sequence_expects_normally_closed(SequenceStep::NitrousSoak, true));
+        assert!(!sequence_blocks_until_normally_closed(SequenceStep::NitrousSoak, true));
         assert!(setup_valves_ready(ValveSnapshot {
             normally_open: Some(true),
             dump_open: Some(false),
             ..ValveSnapshot::default()
-        }));
+        }, true));
     }
 
     #[test]
@@ -3308,7 +3318,7 @@ mod tests {
     #[test]
     fn normal_sequence_starts_with_nitrogen_fill_after_setup() {
         crate::mode_suite!(Normal, Hitl, Testing);
-        assert_eq!(first_fill_step_after_setup(), SequenceStep::NitrogenFill);
+        assert_eq!(first_fill_step_after_setup(false), SequenceStep::NitrogenFill);
     }
 
     #[test]

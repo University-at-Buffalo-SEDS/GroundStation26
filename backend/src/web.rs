@@ -527,6 +527,7 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .merge(crate::station_mode::routes())
         .merge(crate::station_mode_switch::routes())
         .merge(crate::igt::routes())
+        .merge(crate::launch_site::routes())
         .merge(crate::station_pairing::manage::routes())
         .merge(crate::launch_history::api::routes())
         // anything that doesn’t match the above routes goes to the static files
@@ -3010,6 +3011,22 @@ async fn dispatch_command_inner(
             return (StatusCode::CONFLICT, message);
         }
     }
+    // The ground-test image Launch latch, the IGT Launch gate and the HITL
+    // replay's GroundStationLaunch refusal (docs/integrated-ground-test.md 7.1, 7.3).
+    if let Some(reason) = crate::igt::launch_command_refusal(&state, &cmd) {
+        let message = format!("{cmd_name}: {reason}");
+        emit_notification_warning(&state, &message);
+        return (StatusCode::FORBIDDEN, message);
+    }
+    // HITL with the replay: the replayed flight drives the phase while the FC
+    // reports Sim (docs/integrated-ground-test.md 7.3).
+    if matches!(cmd, TelemetryCommand::AdvanceFlightState | TelemetryCommand::RewindFlightState | TelemetryCommand::OperatorPhase { .. })
+        && let Some(reason) = crate::igt::phase_step_refusal(&state)
+    {
+        let message = format!("{cmd_name}: {reason}");
+        emit_notification_warning(&state, &message);
+        return (StatusCode::FORBIDDEN, message);
+    }
     // Phase-step gates read shared state with try_lock; a lock that is merely
     // busy at this instant must not refuse a valid step. Re-check briefly.
     let mut allowed=command_allowed_waiting_out_core(&state,&cmd).await;
@@ -3029,13 +3046,6 @@ async fn dispatch_command_inner(
     // policy. Refuse the press here with that reason instead of answering
     // "ok" and dropping it at send time.
     if let Some(reason) = launch_press_block(&state, &cmd) {
-        let message = format!("{cmd_name}: {reason}");
-        emit_notification_warning(&state, &message);
-        return (StatusCode::FORBIDDEN, message);
-    }
-    if matches!(cmd, TelemetryCommand::Launch)
-        && let Some(reason) = crate::igt::launch_refusal(&state)
-    {
         let message = format!("{cmd_name}: {reason}");
         emit_notification_warning(&state, &message);
         return (StatusCode::FORBIDDEN, message);
@@ -5416,12 +5426,12 @@ async fn handle_ws(
             return;
         }
         igt_rx.borrow_and_update();
-        // Sent at connect only in an integrated ground test; changes always.
-        if crate::runtime_mode::is_igt()
-            && ws_out_tx
-                .send(serde_json::to_string(&WsOutMsg::IgtStatus(state_for_send.igt.status())).unwrap_or_default())
-                .await
-                .is_err()
+        // Sent at connect in every mode (the image notice and the Launch
+        // latch matter in normal and test fire too), and on every change.
+        if ws_out_tx
+            .send(serde_json::to_string(&WsOutMsg::IgtStatus(state_for_send.igt.status())).unwrap_or_default())
+            .await
+            .is_err()
         {
             return;
         }

@@ -86,6 +86,8 @@ pub enum TelemetryCommand {
     IgtLivePyro,
     IgtDryRun,
     IgtExit,
+    /// Re-attempt the FC's SD mount and log file (FC byte 33, both images).
+    FcSdRetry,
     /// Original physical EDGE identity only; never deserialized from a client.
     #[serde(skip)]
     ColdFlowPanelRelease {
@@ -154,7 +156,7 @@ const NORMAL_CLIENT_COMMANDS: &[&str] = &[
     "ConsecutiveSamples", "RevokeConsecutiveSamples", "ResetFailures", "RevokeResetFailures",
     "ValidateMeasms", "RevokeValidateMeasms", "ToggleAvBayUnderglow", "ToggleFlightBuzzer",
     "ResetTClock", "StartFill", "PauseFill", "CancelFill", "ValveSelfTest", "NitrogenTest",
-    "Turbocharge",
+    "Turbocharge", "FcSdRetry",
 ];
 const IGT_CLIENT_COMMANDS: &[&str] = &[
     "Postinit", "Launch", "Dump", "Abort", "NormallyOpen", "Pilot", "Igniter",
@@ -164,7 +166,7 @@ const IGT_CLIENT_COMMANDS: &[&str] = &[
     "ConsecutiveSamples", "RevokeConsecutiveSamples", "ResetFailures", "RevokeResetFailures",
     "ValidateMeasms", "RevokeValidateMeasms", "ToggleAvBayUnderglow", "ToggleFlightBuzzer",
     "ResetTClock", "StartFill", "PauseFill", "CancelFill", "ValveSelfTest", "NitrogenTest",
-    "Turbocharge", "IgtEnter", "IgtLivePyro", "IgtDryRun", "IgtExit",
+    "Turbocharge", "IgtEnter", "IgtLivePyro", "IgtDryRun", "IgtExit", "FcSdRetry",
 ];
 const TEST_FIRE_CLIENT_COMMANDS: &[&str] = &[
     "Postinit", "Launch", "Dump", "Abort", "NormallyOpen", "Pilot", "Igniter",
@@ -192,6 +194,7 @@ const HITL_CLIENT_COMMANDS: &[&str] = &[
     "AdvanceFlightState", "RewindFlightState", "AbortAfter100", "AbortAfter40",
     "AbortAfter250", "ReinitAfter15", "ReinitAfter30", "ReinitAfter50", "StartFill",
     "PauseFill", "CancelFill", "ValveSelfTest", "NitrogenTest", "Turbocharge",
+    "IgtEnter", "IgtLivePyro", "IgtDryRun", "IgtExit", "FcSdRetry",
 ];
 pub(crate) fn client_command_names(mode: crate::station_mode::Mode) -> &'static [&'static str] {
     use crate::station_mode::Mode;
@@ -214,7 +217,9 @@ impl TelemetryCommand {
             TelemetryCommand::IgtEnter
             | TelemetryCommand::IgtLivePyro
             | TelemetryCommand::IgtDryRun
-            | TelemetryCommand::IgtExit => mode == Mode::IntegratedGroundTest,
+            | TelemetryCommand::IgtExit => matches!(mode, Mode::IntegratedGroundTest | Mode::Hitl),
+            // The FC is present in every mode but test fire.
+            TelemetryCommand::FcSdRetry => mode != Mode::TestFire,
             TelemetryCommand::OperatorPhase { .. }
             | TelemetryCommand::IgniterSequence
             | TelemetryCommand::ToggleButtonInterlock

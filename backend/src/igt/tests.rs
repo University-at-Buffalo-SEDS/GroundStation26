@@ -46,7 +46,7 @@ fn word_14_decodes_every_igt_field() {
     assert_eq!(r, Report { supported: true, mode: FcMode::Ready, live_pyro: true, gps_simulated: false, drogue_dry_run: true, main_dry_run: false, reason: 0 });
     let r = decode(&health(bits(5, false, true, false, true, 9))).unwrap();
     assert_eq!((r.mode, r.gps_simulated, r.main_dry_run, r.reason), (FcMode::Fault, true, true, 9));
-    assert_eq!(reason_text(9), "real motion: replay abandoned, real sensors and dry-run cleared");
+    assert_eq!(reason_text(9), "unused reason code 9");
     for (wire, mode) in [(0, FcMode::Off), (1, FcMode::Validating), (3, FcMode::Sim), (4, FcMode::Done)] {
         assert_eq!(decode(&health(bits(wire, false, false, false, false, 0))).unwrap().mode, mode);
     }
@@ -83,7 +83,8 @@ async fn status_json_has_exactly_the_contract_fields() {
     let keys: std::collections::BTreeSet<_> = json.as_object().unwrap().keys().cloned().collect();
     let expected: std::collections::BTreeSet<String> = [
         "supported", "fc_mode", "live_pyro", "gps_simulated", "drogue_dry_run", "main_dry_run", "reason",
-        "reason_text", "station_mode_igt", "updated_ms",
+        "reason_text", "station_mode_igt", "updated_ms", "fc_image", "launch_latched", "launch_latch_reason",
+        "image_notice", "igt_active", "mock_wet_dress", "hitl_replay", "sd_ready", "sd_retry_pending",
     ]
     .map(str::to_owned)
     .into();
@@ -153,7 +154,7 @@ async fn simulated_follows_sim_and_done_after_a_replay_only() {
 
 #[tokio::test]
 async fn ground_test_commands_exist_only_in_integrated_ground_test_mode() {
-    for mode in [Mode::Normal, Mode::Hitl, Mode::TestFire, Mode::Testing] {
+    for mode in [Mode::Normal, Mode::TestFire, Mode::Testing] {
         let _mode = thread_mode(mode);
         let state = crate::state::tests::test_app_state().await;
         for name in IGT_COMMANDS_FOR_TEST {
@@ -464,7 +465,10 @@ async fn recording_start_rows_name_the_station_mode() {
         })
         .collect();
     assert_eq!(kinds[0].0, "GS_STATION_MODE");
-    assert_eq!(kinds[0].1, r#"{"mode":"integrated_ground_test"}"#);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&kinds[0].1).unwrap(),
+        json!({"mode": "integrated_ground_test", "igt_active": true, "mock_wet_dress": false, "hitl_replay": false})
+    );
     assert_eq!(kinds[0].2, "GS");
     assert_eq!(kinds[1].0, "GS_IGT");
     assert_eq!(serde_json::from_str::<serde_json::Value>(&kinds[1].1).unwrap()["fc_mode"], "off");
@@ -496,4 +500,363 @@ async fn igt_fills_like_test_fire_but_requires_and_shows_the_av_bay() {
     let _tf = thread_mode(Mode::TestFire);
     assert!(!state.board_required_for_progression(Board::FlightComputer));
     assert!(!crate::fc_estimator::fc_expected_for_test(&state));
+}
+
+// ---------------------------------------------------------------------------
+// Round 2: image identification and the Launch latch, settings, HITL replay,
+// FC SD retry (docs/integrated-ground-test.md 7.1..7.5).
+
+/// A ground-test image's BOARD_HEALTH (bit 7 set, mode Off).
+fn ground_test_health() -> [u32; 24] {
+    health(bits(0, false, false, false, false, 0))
+}
+
+/// A flight image's BOARD_HEALTH: the tag with bits 4..15 clear.
+fn flight_health() -> [u32; 24] {
+    health(0)
+}
+
+fn launch_control(state: &AppState) -> crate::sequences::ActionControl {
+    let mut policy = crate::sequences::default_action_policy();
+    for control in &mut policy.controls {
+        control.enabled = true;
+    }
+    decorate_policy(state, &mut policy);
+    policy.controls.into_iter().find(|c| c.cmd == "Launch").unwrap()
+}
+
+#[test]
+fn the_image_is_word_14_bit_7_and_unknown_before_a_report() {
+    assert!(decode(&ground_test_health()).unwrap().supported);
+    assert!(!decode(&flight_health()).unwrap().supported);
+    let tracker = Tracker::default();
+    assert_eq!(tracker.fc_image(), FcImage::Unknown);
+    assert_eq!(serde_json::to_value(tracker.status()).unwrap()["fc_image"], "unknown");
+    tracker.observe(decode(&ground_test_health()).unwrap(), Instant::now(), 1);
+    assert_eq!(tracker.fc_image(), FcImage::GroundTest);
+    tracker.observe(decode(&flight_health()).unwrap(), Instant::now(), 2);
+    assert_eq!(tracker.fc_image(), FcImage::Flight);
+    assert_eq!(serde_json::to_value(tracker.status()).unwrap()["fc_image"], "flight");
+}
+
+#[tokio::test]
+async fn a_ground_test_image_latches_launch_in_normal_and_test_fire_until_a_flight_image() {
+    for mode in [Mode::Normal, Mode::TestFire] {
+        let _mode = thread_mode(mode);
+        let state = crate::state::tests::test_app_state().await;
+        assert!(launch_refusal(&state).is_none(), "{mode:?}");
+        // The real ingest path: test fire hides the AV bay, but the FC's
+        // BOARD_HEALTH still identifies the image.
+        observe_health(&state, &ground_test_health());
+        assert!(state.igt.latched(), "{mode:?}");
+        assert_eq!(launch_refusal(&state).as_deref(), Some(LAUNCH_LATCH_REASON));
+        assert_eq!(
+            launch_command_refusal(&state, &TelemetryCommand::GroundStationLaunch).as_deref(),
+            Some(LAUNCH_LATCH_REASON)
+        );
+        let launch = launch_control(&state);
+        assert!(!launch.enabled && launch.disabled_reason.as_deref() == Some(LAUNCH_LATCH_REASON));
+        let status = serde_json::to_value(state.igt.status()).unwrap();
+        assert_eq!(status["launch_latched"], true);
+        assert_eq!(status["launch_latch_reason"], LAUNCH_LATCH_REASON);
+        assert_eq!(status["image_notice"], json!({"level": "warning", "text": LAUNCH_LATCH_REASON}));
+        assert_eq!(status["fc_image"], "ground_test");
+        assert!(!state.is_command_allowed(&TelemetryCommand::Launch));
+        // The plain command path refuses Launch with the reason.
+        let (code, message) = crate::web::dispatch_authorized_command(
+            state.clone(),
+            principal(true, &[]),
+            TelemetryCommand::Launch,
+            0,
+            None,
+            crate::board_abort::capture_launch_revision_named(&state, "Launch"),
+        )
+        .await;
+        assert_ne!(code, StatusCode::OK, "{message}");
+        assert!(message.contains(LAUNCH_LATCH_REASON), "{mode:?}: {message}");
+        // The FC goes silent: the latch holds.
+        {
+            let mut inner = state.igt.inner.lock().unwrap();
+            inner.at = Some(Instant::now() - Duration::from_secs(600));
+            inner.sd = None;
+        }
+        tick(&state);
+        assert!(state.igt.fresh_report(Instant::now()).is_none());
+        assert_eq!(launch_refusal(&state).as_deref(), Some(LAUNCH_LATCH_REASON), "silence never clears it");
+        // A non-FC-tagged report (older firmware or another board) does not clear it either.
+        let mut untagged = flight_health();
+        untagged[14] &= 0xFFFF;
+        observe_health(&state, &untagged);
+        assert!(state.igt.latched());
+        // Only a fresh flight-image report clears it.
+        observe_health(&state, &flight_health());
+        assert!(!state.igt.latched());
+        assert!(launch_refusal(&state).is_none());
+        assert!(launch_control(&state).disabled_reason.is_none());
+        let status = state.igt.status();
+        assert!(!status.launch_latched && status.image_notice.is_none() && status.launch_latch_reason.is_none());
+    }
+}
+
+#[tokio::test]
+async fn the_latch_is_set_on_entering_a_latching_mode_and_persists() {
+    let _mode = thread_mode(Mode::Hitl);
+    let state = crate::state::tests::test_app_state().await;
+    load_persisted(&state);
+    observe_health(&state, &ground_test_health());
+    assert!(!state.igt.latched(), "HITL never latches");
+    let _normal = thread_mode(Mode::Normal);
+    tick(&state);
+    assert!(state.igt.latched(), "the last image is the ground-test one");
+    // A station restart reads the latch back.
+    state.igt.inner.lock().unwrap().latched = false;
+    load_persisted(&state);
+    assert!(state.igt.latched());
+    observe_health(&state, &flight_health());
+    state.igt.inner.lock().unwrap().latched = false;
+    load_persisted(&state);
+    assert!(!state.igt.latched(), "the cleared latch is saved too");
+}
+
+#[tokio::test]
+async fn hitl_only_notifies_a_ground_test_image_and_never_latches() {
+    for replay in [false, true] {
+        let _mode = thread_mode(Mode::Hitl);
+        let state = crate::state::tests::test_app_state().await;
+        state.igt.inner.lock().unwrap().settings.hitl_replay = replay;
+        observe_health(&state, &ground_test_health());
+        assert!(!state.igt.latched());
+        let status = state.igt.status();
+        assert!(!status.launch_latched);
+        let notice = status.image_notice.expect("informational notice");
+        assert_eq!(notice.level, NoticeLevel::Info);
+        assert!(notice.text.contains("ground-test image"));
+        assert_eq!(serde_json::to_value(&notice).unwrap()["level"], "info");
+        assert!(latch_refusal(&state).is_none());
+        assert!(launch_command_refusal(&state, &TelemetryCommand::Launch).is_none_or(|r| !r.contains("dry-run capable")));
+        if !replay {
+            assert!(launch_refusal(&state).is_none(), "plain HITL allows Launch");
+        }
+        let notifications = state.notifications_snapshot();
+        assert!(notifications.iter().any(|n| n.message.contains("HITL does not block Launch")), "a notification is raised");
+    }
+}
+
+#[tokio::test]
+async fn igt_mode_expects_the_ground_test_image_and_warns_on_a_flight_image() {
+    let _mode = thread_mode(Mode::IntegratedGroundTest);
+    let state = crate::state::tests::test_app_state().await;
+    observe_health(&state, &ground_test_health());
+    let status = state.igt.status();
+    assert!(!status.launch_latched && !state.igt.latched());
+    assert_eq!(status.image_notice.as_ref().unwrap().level, NoticeLevel::Info);
+    assert!(
+        state.notifications_snapshot().iter().all(|n| !n.message.contains("ground-test image")),
+        "an indicator only"
+    );
+    observe_health(&state, &flight_health());
+    let notice = state.igt.status().image_notice.unwrap();
+    assert_eq!((notice.level, notice.text.as_str()), (NoticeLevel::Warning, FLIGHT_IMAGE_WARNING));
+    assert!(state.notifications_snapshot().iter().any(|n| n.message == FLIGHT_IMAGE_WARNING));
+    assert!(!state.igt.latched(), "IGT never latches");
+    observe_health(&state, &ground_test_health());
+    assert_eq!(state.igt.status().image_notice.unwrap().level, NoticeLevel::Info);
+    assert!(
+        state.notifications_snapshot().iter().all(|n| n.message != FLIGHT_IMAGE_WARNING),
+        "the warning clears when a ground-test image appears"
+    );
+}
+
+#[tokio::test]
+async fn hitl_replay_warns_on_a_flight_image() {
+    let _mode = thread_mode(Mode::Hitl);
+    let state = crate::state::tests::test_app_state().await;
+    observe_health(&state, &flight_health());
+    assert!(state.igt.status().image_notice.is_none(), "plain HITL: a flight image is normal");
+    state.igt.inner.lock().unwrap().settings.hitl_replay = true;
+    tick(&state);
+    let notice = state.igt.status().image_notice.unwrap();
+    assert_eq!((notice.level, notice.text.as_str()), (NoticeLevel::Warning, FLIGHT_IMAGE_WARNING));
+    assert!(state.notifications_snapshot().iter().any(|n| n.message == FLIGHT_IMAGE_WARNING));
+    observe_health(&state, &ground_test_health());
+    assert_eq!(state.igt.status().image_notice.unwrap().level, NoticeLevel::Info);
+    assert!(state.notifications_snapshot().iter().all(|n| n.message != FLIGHT_IMAGE_WARNING));
+}
+
+#[tokio::test]
+async fn mock_wet_dress_switches_the_igt_fill_to_the_flight_steps() {
+    let _mode = thread_mode(Mode::IntegratedGroundTest);
+    let state = crate::state::tests::test_app_state().await;
+    assert!(test_fire_fill(&state));
+    state.igt.inner.lock().unwrap().settings.mock_wet_dress = true;
+    assert!(!test_fire_fill(&state), "mock wet dress runs the flight fill steps");
+    // The QD and the rest of the stand handling stay as in the IGT.
+    assert!(crate::runtime_mode::is_test_fire_or_igt());
+    for (mode, expected) in [(Mode::TestFire, true), (Mode::Normal, false), (Mode::Hitl, false), (Mode::Testing, false)] {
+        let _m = thread_mode(mode);
+        assert_eq!(test_fire_fill(&state), expected, "{mode:?} ignores mock wet dress");
+    }
+}
+
+#[tokio::test]
+async fn settings_are_admin_only_partial_persisted_and_refused_unless_idle() {
+    let _mode = thread_mode(Mode::Hitl);
+    let state = crate::state::tests::test_app_state().await;
+    load_persisted(&state);
+    assert_eq!(state.igt.settings(), Settings::default());
+    let operator = principal(false, &["IgtEnter"]);
+    assert_eq!(settings::update(&state, &operator, br#"{"hitl_replay":true}"#).unwrap_err().0, StatusCode::FORBIDDEN);
+    let admin = principal(true, &[]);
+    assert_eq!(settings::update(&state, &admin, br#"{"bogus":true}"#).unwrap_err().0, StatusCode::BAD_REQUEST);
+    let saved = settings::update(&state, &admin, br#"{"hitl_replay":true}"#).unwrap();
+    assert_eq!(saved, Settings { mock_wet_dress: false, hitl_replay: true });
+    let saved = settings::update(&state, &admin, br#"{"mock_wet_dress":true}"#).unwrap();
+    assert_eq!(saved, Settings { mock_wet_dress: true, hitl_replay: true }, "partial PUT keeps the other field");
+    let status = state.igt.status();
+    assert!(status.hitl_replay && status.mock_wet_dress && status.igt_active);
+    // Persisted: a restart reads them back.
+    state.igt.inner.lock().unwrap().settings = Settings::default();
+    load_persisted(&state);
+    assert_eq!(state.igt.settings(), Settings { mock_wet_dress: true, hitl_replay: true });
+    // Refused unless idle.
+    state.set_local_flight_state(FlightState::Armed);
+    let (code, error) = settings::update(&state, &admin, br#"{"hitl_replay":false}"#).unwrap_err();
+    assert_eq!(code, StatusCode::CONFLICT);
+    assert!(error.contains("Armed"), "{error}");
+    state.set_local_flight_state(FlightState::Idle);
+    state.set_launch_indicator_latched(true);
+    assert_eq!(settings::update(&state, &admin, br#"{"hitl_replay":false}"#).unwrap_err().0, StatusCode::CONFLICT);
+    state.set_launch_indicator_latched(false);
+    assert!(!settings::update(&state, &admin, br#"{"hitl_replay":false}"#).unwrap().hitl_replay);
+    assert!(!state.igt.status().igt_active);
+}
+
+#[tokio::test]
+async fn hitl_replay_routes_launch_to_the_fc_and_holds_phase_steps_during_sim() {
+    let _mode = thread_mode(Mode::Hitl);
+    let state = crate::state::tests::test_app_state().await;
+    // Ground test controls need the replay.
+    assert!(command_gate(&state, &TelemetryCommand::IgtDryRun).unwrap().unwrap_err().contains("HITL replay"));
+    assert!(launch_command_refusal(&state, &TelemetryCommand::GroundStationLaunch).is_none());
+    state.igt.inner.lock().unwrap().settings.hitl_replay = true;
+    assert!(igt_active(&state));
+    assert_eq!(command_gate(&state, &TelemetryCommand::IgtDryRun), Some(Ok(())));
+    // Launch takes the FC path (FC Launch and VB Sequence) and needs IGT Ready.
+    assert!(crate::telemetry_task::launch_goes_to_flight_computer());
+    assert!(launch_refusal(&state).unwrap().contains("IGT Ready"));
+    observe(&state, report(FcMode::Ready));
+    assert!(launch_refusal(&state).is_none());
+    // GroundStationLaunch (HITL's VB-only path) is refused while the replay is on.
+    let refusal = launch_command_refusal(&state, &TelemetryCommand::GroundStationLaunch).unwrap();
+    assert!(refusal.contains("HITL replay"), "{refusal}");
+    assert!(!state.is_command_allowed(&TelemetryCommand::GroundStationLaunch));
+    // Advance and Rewind are refused while the FC reports Sim.
+    assert!(phase_step_refusal(&state).is_none());
+    observe(&state, report(FcMode::Sim));
+    assert!(state.igt.simulated() && crate::mission_phase::flight_simulated(&state));
+    let reason = phase_step_refusal(&state).unwrap();
+    for cmd in [TelemetryCommand::AdvanceFlightState, TelemetryCommand::RewindFlightState] {
+        assert!(!state.is_command_allowed(&cmd));
+    }
+    assert!(crate::operator_phase::refusal_reason(&state, true).contains("replay"));
+    let mut policy = crate::sequences::default_action_policy();
+    for control in &mut policy.controls {
+        control.enabled = true;
+    }
+    decorate_policy(&state, &mut policy);
+    for cmd in ["AdvanceFlightState", "RewindFlightState", "GroundStationLaunch"] {
+        let control = policy.controls.iter().find(|c| c.cmd == cmd).unwrap();
+        assert!(!control.enabled, "{cmd}");
+    }
+    assert_eq!(
+        policy.controls.iter().find(|c| c.cmd == "AdvanceFlightState").unwrap().disabled_reason.as_deref(),
+        Some(reason.as_str())
+    );
+    observe(&state, report(FcMode::Done));
+    assert!(phase_step_refusal(&state).is_none(), "they work again at Done");
+    // The recording carries the replay's provenance.
+    let rows = recording_start_rows(&state);
+    assert_eq!(rows.len(), 2);
+    // Fill semantics stay HITL's own.
+    assert!(!test_fire_fill(&state));
+}
+
+#[tokio::test]
+async fn fc_sd_alert_and_retry_gate() {
+    use crate::igt::fc_sd;
+    let _mode = thread_mode(Mode::Normal);
+    let state = crate::state::tests::test_app_state().await;
+    let now = Instant::now();
+    let retry = TelemetryCommand::FcSdRetry;
+    assert_eq!(crate::sequences::command_name(&retry), "FcSdRetry");
+    assert_eq!(crate::rocket_commands::FlightComputerCommands::FcSdRetry as u8, 33);
+    assert_eq!(crate::sequences::control_section("FcSdRetry"), Some(crate::sequences::ControlSection::FlightComputer));
+    assert!(fc_sd::retry_gate(&state, now).unwrap_err().contains("No recent FC BOARD_HEALTH"), "stale health");
+    assert!(state.igt.status().sd_ready.is_none());
+    // Bit 30: the alert, until it clears.
+    fc_sd::observe_for_test(&state, fc_sd::NOT_READY, now);
+    assert!(state.notifications_snapshot().iter().any(|n| n.message == fc_sd::ALERT));
+    assert_eq!(state.igt.status().sd_ready, Some(false));
+    assert_eq!(fc_sd::retry_gate(&state, now), Ok(()));
+    assert!(state.is_command_allowed(&retry));
+    // Bit 31: a retry is pending.
+    fc_sd::observe_for_test(&state, fc_sd::NOT_READY | fc_sd::RETRY_PENDING, now);
+    assert!(state.igt.status().sd_retry_pending);
+    assert!(fc_sd::retry_gate(&state, now).unwrap_err().contains("already pending"));
+    assert!(!state.is_command_allowed(&retry));
+    // Five seconds between requests.
+    fc_sd::observe_for_test(&state, fc_sd::NOT_READY, now);
+    fc_sd::note_retry_for_test(&state, now);
+    assert!(fc_sd::retry_gate(&state, now + Duration::from_secs(4)).unwrap_err().contains("five seconds"));
+    assert_eq!(fc_sd::retry_gate(&state, now + Duration::from_secs(5)), Ok(()));
+    // The bits age out with the report.
+    assert!(fc_sd::retry_gate(&state, now + Duration::from_secs(13)).is_err());
+    fc_sd::observe_for_test(&state, 0, now);
+    assert!(state.notifications_snapshot().iter().all(|n| n.message != fc_sd::ALERT), "cleared with the bit");
+    assert_eq!(state.igt.status().sd_ready, Some(true));
+    // The command gate bits (24..28) and watchdog mask do not read as SD bits.
+    let mut words = [0u32; 24];
+    words[6] = (0x1F << 24) | 0x00FF_FFFF;
+    assert_eq!(fc_sd::bits_from_health(&words), Some(0));
+    assert_eq!(crate::fc_command_gate::bits_from_word6(3 << 30), 0, "the FC command gate ignores bits 30..31");
+    // Absent in test fire; offered with the FC in every other mode.
+    let _tf = thread_mode(Mode::TestFire);
+    assert!(fc_sd::retry_gate(&state, now).is_err());
+    assert!(serde_json::from_value::<TelemetryCommand>(json!("FcSdRetry")).is_err());
+    for mode in [Mode::Normal, Mode::Hitl, Mode::Testing, Mode::IntegratedGroundTest] {
+        let _m = thread_mode(mode);
+        assert!(serde_json::from_value::<TelemetryCommand>(json!("FcSdRetry")).is_ok(), "{mode:?}");
+        assert!(crate::sequences::all_command_names().contains(&"FcSdRetry"), "{mode:?}");
+        let layout = crate::layout::load_layout().unwrap();
+        assert!(layout.actions_tab.actions.iter().any(|a| a.cmd == "FcSdRetry"), "{mode:?}");
+    }
+}
+
+#[tokio::test]
+async fn igt_status_reaches_clients_in_every_mode_when_it_changes() {
+    let _mode = thread_mode(Mode::Normal);
+    let state = crate::state::tests::test_app_state().await;
+    let mut rx = state.igt.subscribe();
+    rx.borrow_and_update();
+    observe_health(&state, &ground_test_health());
+    assert!(rx.has_changed().unwrap());
+    let status = rx.borrow_and_update().clone();
+    assert!(status.launch_latched && status.fc_image == FcImage::GroundTest && !status.igt_active);
+    assert_eq!(status.sd_ready, Some(true));
+}
+
+#[tokio::test]
+async fn hitl_offers_the_ground_test_controls_refused_without_the_replay() {
+    let _mode = thread_mode(Mode::Hitl);
+    let state = crate::state::tests::test_app_state().await;
+    for name in IGT_COMMANDS_FOR_TEST {
+        assert!(serde_json::from_value::<TelemetryCommand>(json!(name)).is_ok(), "{name}");
+        assert!(crate::sequences::all_command_names().contains(&name), "{name}");
+    }
+    let layout = crate::layout::load_layout().unwrap();
+    let cmds: Vec<_> = layout.actions_tab.actions.iter().map(|a| a.cmd.as_str()).collect();
+    assert_eq!(&cmds[..4], &IGT_COMMANDS_FOR_TEST);
+    assert!(!state.is_command_allowed(&TelemetryCommand::IgtExit));
+    let body = br#"{"action":"enter"}"#;
+    assert_eq!(prepare(&state, &principal(true, &[]), None, body).unwrap_err().0, StatusCode::CONFLICT);
 }

@@ -624,7 +624,7 @@ fn launched(state: &crate::state::AppState) -> bool {
 }
 
 fn raise(state: &crate::state::AppState, notices: Vec<Notice>) {
-    let simulated = crate::runtime_mode::is_igt() && state.igt.simulated();
+    let simulated = crate::igt::igt_active(state) && state.igt.simulated();
     for notice in notices {
         let notice = if simulated { simulated_input(notice) } else { notice };
         match notice {

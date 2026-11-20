@@ -57,7 +57,8 @@ impl Provenance {
     }
 }
 
-/// The recording was made in an integrated ground test (its GS_STATION_MODE row).
+/// The recording was made in an integrated ground test, or in HITL with the
+/// ground-test replay (its GS_STATION_MODE row: `igt_active`).
 async fn integrated_ground_test(db: &SqlitePool) -> bool {
     sqlx::query_scalar::<_, Option<String>>(
         "SELECT payload_json FROM telemetry WHERE data_type='GS_STATION_MODE' ORDER BY id LIMIT 1",
@@ -68,7 +69,7 @@ async fn integrated_ground_test(db: &SqlitePool) -> bool {
     .flatten()
     .flatten()
     .and_then(|payload| serde_json::from_str::<serde_json::Value>(&payload).ok())
-    .is_some_and(|value| value["mode"] == "integrated_ground_test")
+    .is_some_and(|value| value["mode"] == "integrated_ground_test" || value["igt_active"] == true)
 }
 
 #[derive(Serialize)]

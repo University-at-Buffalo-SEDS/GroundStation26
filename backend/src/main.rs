@@ -84,6 +84,7 @@ mod mission_phase;
 mod fc_phase;
 mod fc_estimator;
 mod igt;
+mod launch_site;
 mod valve_report_health;
 mod mission_sync;
 mod fc_command_gate;
@@ -1738,6 +1739,8 @@ async fn main() -> anyhow::Result<()> {
         daq_dac: Default::default(),
         auth,
     });
+    // Integrated ground test settings, the Launch latch and the FC launch site.
+    crate::igt::load_persisted(&state);
     // The RFD modem check may enter command mode only outside flight and
     // with no launch or sequence running. Seed it from the restored state
     // before the radio opens, then keep it current.

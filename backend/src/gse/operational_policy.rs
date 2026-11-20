@@ -84,15 +84,16 @@ pub(super) fn operational_launch_allowed(state: &AppState, rt: &Runtime) -> bool
         && launch_route_ready(state)
 }
 /// The flight-computer part of the Launch gate. Test fire has no AV bay. The
-/// integrated ground test needs the FC routes and the FC reporting ground
-/// test Ready instead of an RF GPS fix (the vehicle stays on the stand).
+/// integrated ground test (and HITL with the ground-test replay) needs the FC
+/// routes and the FC reporting ground test Ready instead of an RF GPS fix
+/// (the vehicle stays on the stand or the bench).
 // Safety catalog (About safety): igt-launch-gate. Keep backend/src/safety_catalog_rules.rs in step.
 fn launch_route_ready(state: &AppState) -> bool {
     if crate::runtime_mode::is_test_fire() {
         return true;
     }
     flight_routes(state)
-        && if crate::runtime_mode::is_igt() {
+        && if crate::igt::igt_active(state) {
             crate::igt::launch_ready(state)
         } else {
             crate::antenna::rocket_launch_fix_locked()

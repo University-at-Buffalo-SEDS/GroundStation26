@@ -15,7 +15,13 @@
 //! - the ticketed `POST /api/igt/prepare` / `POST /api/igt/confirm` flow,
 //!   the only way `IgtEnter` and `IgtLivePyro` reach the FC;
 //! - `SIM_SAMPLE` decoding into separate `SIM_*` series, so replayed data
-//!   never feeds the real IMU/barometer/GPS/estimator series.
+//!   never feeds the real IMU/barometer/GPS/estimator series;
+//! - the FC image identification and the Launch latch (doc section 7.1);
+//! - the admin settings `mock_wet_dress` and `hitl_replay` (sections 7.2,
+//!   7.3, `GET/PUT /api/igt/settings`), and [`igt_active`]: integrated ground
+//!   test mode, or HITL with the replay on;
+//! - the FC SD health and `FcSdRetry` (section 7.5, [`fc_sd`]);
+//! - the configured launch site (section 7.4, `crate::launch_site`).
 use crate::auth::{AuthPrincipal, Permission};
 use crate::fc_estimator::Notice;
 use crate::state::AppState;
@@ -30,9 +36,14 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
+
+pub(crate) mod fc_sd;
+mod settings;
+pub(crate) use settings::Settings;
 
 /// FC BOARD_HEALTH word 14 tag (bits 16..31), shared with the cosmetic
 /// output bits 0..3 (network_variables).
@@ -51,6 +62,64 @@ pub(crate) const TICKET_TTL: Duration = Duration::from_secs(15);
 pub(crate) const LIVE_PYRO_PHRASE: &str = "LIVE PYRO";
 /// Prefix of every estimator notice while the FC flies replayed data.
 pub(crate) const SIMULATED_INPUT_PREFIX: &str = "SIMULATED input: ";
+/// Why Launch is latched closed (doc section 7.1).
+pub(crate) const LAUNCH_LATCH_REASON: &str =
+    "FC is running a ground-test image (dry-run capable): Launch is blocked until the FC reports a flight image";
+/// A flight image where the ground-test image is needed (doc section 7.1).
+pub(crate) const FLIGHT_IMAGE_WARNING: &str =
+    "FC is running a flight image: integrated ground test unavailable, flash the ground-test image";
+const HITL_IMAGE_NOTICE: &str =
+    "FC is running a ground-test image (dry-run capable). HITL does not block Launch.";
+const IGT_IMAGE_NOTICE: &str = "FC is running the ground-test image.";
+const LATCH_CLEARED: &str = "FC reports a flight image: the ground-test image Launch block is cleared.";
+
+/// Which FC image is on the network (word 14 bit 7 of the FC's BOARD_HEALTH).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FcImage {
+    GroundTest,
+    Flight,
+    #[default]
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoticeLevel {
+    Warning,
+    Info,
+}
+
+/// The image indicator shown with the IGT status (doc section 7.1).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ImageNotice {
+    pub level: NoticeLevel,
+    pub text: String,
+}
+
+/// Normal (and testing) and test fire latch Launch closed on a ground-test
+/// image; HITL and the integrated ground test never do.
+// Safety catalog (About safety): igt-image-latch. Keep backend/src/safety_catalog_rules.rs in step.
+pub(crate) fn latch_mode() -> bool {
+    use crate::station_mode::Mode;
+    matches!(crate::runtime_mode::current(), Mode::Normal | Mode::TestFire | Mode::Testing)
+}
+
+/// The integrated ground test behaviour (Ground test controls, IGT status,
+/// SIMULATED labels and recording rows, the IGT Launch gate) is on: the
+/// integrated ground test mode, or HITL with the HITL replay on.
+pub(crate) fn igt_active(state: &AppState) -> bool {
+    crate::runtime_mode::is_igt() || (crate::runtime_mode::is_hitl() && state.igt.settings().hitl_replay)
+}
+
+/// The fill follows test fire: test fire, and the integrated ground test
+/// unless mock wet dress runs the flight fill steps (nitrogen fill step and
+/// the normally-open checks). HITL keeps its own (flight) fill.
+// Safety catalog (About safety): igt-mock-wet-dress. Keep backend/src/safety_catalog_rules.rs in step.
+pub(crate) fn test_fire_fill(state: &AppState) -> bool {
+    crate::runtime_mode::is_test_fire()
+        || (crate::runtime_mode::is_igt() && !state.igt.settings().mock_wet_dress)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -147,7 +216,7 @@ pub fn reason_text(code: u8) -> &'static str {
         6 => "value out of range",
         7 => "replay data too short",
         8 => "vehicle not stationary at Launch",
-        9 => "real motion: replay abandoned, real sensors and dry-run cleared",
+        9 => "unused reason code 9",
         10 => "SD ring underrun (last value held)",
         11 => "refused (wrong state)",
         12 => "replay data ended before landing",
@@ -174,11 +243,28 @@ pub struct Status {
     pub station_mode_igt: bool,
     /// Wall time of the last FC report; null before the first one.
     pub updated_ms: Option<u64>,
+    /// The last FC image reported (doc section 7.1).
+    pub fc_image: FcImage,
+    /// Launch is latched closed by a ground-test image (normal, testing and
+    /// test fire only).
+    pub launch_latched: bool,
+    pub launch_latch_reason: Option<&'static str>,
+    pub image_notice: Option<ImageNotice>,
+    /// Integrated ground test mode, or HITL with the HITL replay on.
+    pub igt_active: bool,
+    pub mock_wet_dress: bool,
+    pub hitl_replay: bool,
+    /// FC BOARD_HEALTH word 6 bit 30 clear; null without a fresh FC report.
+    pub sd_ready: Option<bool>,
+    /// Word 6 bit 31 in a fresh FC report.
+    pub sd_retry_pending: bool,
 }
 
 impl Status {
-    fn from_report(report: Option<Report>, updated_ms: Option<u64>) -> Self {
-        let r = report.unwrap_or(Report::UNSUPPORTED);
+    fn of(inner: &Inner, now: Instant) -> Self {
+        let r = inner.report.unwrap_or(Report::UNSUPPORTED);
+        let launch_latched = inner.latched && latch_mode();
+        let sd = fc_sd::fresh_bits(inner, now);
         Status {
             supported: r.supported,
             fc_mode: r.mode,
@@ -189,8 +275,37 @@ impl Status {
             reason: r.reason,
             reason_text: reason_text(r.reason),
             station_mode_igt: crate::runtime_mode::is_igt(),
-            updated_ms,
+            updated_ms: inner.updated_ms,
+            fc_image: inner.image,
+            launch_latched,
+            launch_latch_reason: launch_latched.then_some(LAUNCH_LATCH_REASON),
+            image_notice: image_notice(inner),
+            igt_active: active(&inner.settings),
+            mock_wet_dress: inner.settings.mock_wet_dress,
+            hitl_replay: inner.settings.hitl_replay,
+            sd_ready: sd.map(|bits| bits & fc_sd::NOT_READY == 0),
+            sd_retry_pending: sd.is_some_and(|bits| bits & fc_sd::RETRY_PENDING != 0),
         }
+    }
+}
+
+fn active(settings: &Settings) -> bool {
+    crate::runtime_mode::is_igt() || (crate::runtime_mode::is_hitl() && settings.hitl_replay)
+}
+
+/// What the station shows about the FC image now (doc section 7.1).
+fn image_notice(inner: &Inner) -> Option<ImageNotice> {
+    use crate::station_mode::Mode;
+    let notice = |level, text: &str| Some(ImageNotice { level, text: text.into() });
+    if latch_mode() {
+        return if inner.latched { notice(NoticeLevel::Warning, LAUNCH_LATCH_REASON) } else { None };
+    }
+    let active = active(&inner.settings);
+    match (crate::runtime_mode::current(), inner.image) {
+        (_, FcImage::Flight) if active => notice(NoticeLevel::Warning, FLIGHT_IMAGE_WARNING),
+        (Mode::Hitl, FcImage::GroundTest) => notice(NoticeLevel::Info, HITL_IMAGE_NOTICE),
+        (Mode::IntegratedGroundTest, FcImage::GroundTest) => notice(NoticeLevel::Info, IGT_IMAGE_NOTICE),
+        _ => None,
     }
 }
 
@@ -224,10 +339,25 @@ struct Ticket {
 }
 
 #[derive(Default)]
-struct Inner {
+pub(crate) struct Inner {
     report: Option<Report>,
     at: Option<Instant>,
     updated_ms: Option<u64>,
+    /// The last image reported; never reset by silence.
+    image: FcImage,
+    /// The Launch latch (doc section 7.1): set by a ground-test image seen in
+    /// normal, testing or test fire, cleared only by a flight-image report.
+    latched: bool,
+    settings: Settings,
+    /// Where the settings and the latch persist (the GS data directory);
+    /// none until [`load_persisted`].
+    data_dir: Option<PathBuf>,
+    /// The image notice raised as a notification, with its id.
+    shown: Option<(ImageNotice, Option<u64>)>,
+    /// FC BOARD_HEALTH word 6 bits 30..31 and when they arrived.
+    sd: Option<(u32, Instant)>,
+    sd_alert: Option<u64>,
+    sd_last_retry: Option<Instant>,
     /// The FC has been in Sim since it last left Off/Validating: a Done that
     /// follows is still the end of a simulated flight.
     replayed: bool,
@@ -239,13 +369,16 @@ struct Inner {
 pub struct Tracker {
     inner: Mutex<Inner>,
     tx: watch::Sender<Status>,
+    /// The configured FC launch site (doc section 7.4).
+    pub(crate) launch_site: crate::launch_site::Runtime,
 }
 
 impl Default for Tracker {
     fn default() -> Self {
         Self {
             inner: Mutex::new(Inner::default()),
-            tx: watch::channel(Status::from_report(None, None)).0,
+            tx: watch::channel(Status::of(&Inner::default(), Instant::now())).0,
+            launch_site: Default::default(),
         }
     }
 }
@@ -257,7 +390,26 @@ impl Tracker {
 
     pub fn status(&self) -> Status {
         let inner = self.inner.lock().unwrap();
-        Status::from_report(inner.report, inner.updated_ms)
+        Status::of(&inner, Instant::now())
+    }
+
+    pub fn settings(&self) -> Settings {
+        self.inner.lock().unwrap().settings
+    }
+
+    pub fn fc_image(&self) -> FcImage {
+        self.inner.lock().unwrap().image
+    }
+
+    /// The Launch latch is set (whatever the mode; it is enforced only in
+    /// [`latch_mode`]).
+    pub fn latched(&self) -> bool {
+        self.inner.lock().unwrap().latched
+    }
+
+    /// The last report says Sim (fresh or not: a silent FC may still fly).
+    fn reports_sim(&self) -> bool {
+        self.inner.lock().unwrap().report.is_some_and(|r| r.supported && r.mode == FcMode::Sim)
     }
 
     /// Republish when anything shown changed (a report's content, or the
@@ -315,6 +467,13 @@ impl Tracker {
         inner.report = Some(report);
         inner.at = Some(now);
         inner.updated_ms = Some(wall_ms);
+        inner.image = if report.supported { FcImage::GroundTest } else { FcImage::Flight };
+        // Only a fresh flight-image report clears the latch.
+        if !report.supported && inner.latched {
+            inner.latched = false;
+            settings::persist(&inner);
+        }
+        Self::latch_if_due(&mut inner);
         match report.mode {
             FcMode::Sim => inner.replayed = true,
             FcMode::Off | FcMode::Validating | FcMode::Ready => {
@@ -323,16 +482,26 @@ impl Tracker {
             }
             FcMode::Done | FcMode::Fault => {}
         }
+        let active = active(&inner.settings);
         drop(inner);
-        transition_notices(previous, report, crate::runtime_mode::is_igt())
+        transition_notices(previous, report, active)
+    }
+
+    /// Sets the latch while the last image is the ground-test one and the
+    /// station is in a latching mode (a report, or a switch into the mode).
+    fn latch_if_due(inner: &mut Inner) {
+        if !inner.latched && inner.image == FcImage::GroundTest && latch_mode() {
+            inner.latched = true;
+            settings::persist(inner);
+        }
     }
 }
 
 /// What changed between two reports, as operator notices.
-fn transition_notices(previous: Option<Report>, next: Report, station_igt: bool) -> Vec<Notice> {
+fn transition_notices(previous: Option<Report>, next: Report, igt_active: bool) -> Vec<Notice> {
     let mut notices = Vec::new();
     let prev = previous.unwrap_or(Report::UNSUPPORTED);
-    if !station_igt {
+    if !igt_active {
         // An FC in ground-test mode under a flight station is never expected.
         if next.supported && next.mode != FcMode::Off && (prev.mode != next.mode || !prev.supported) {
             notices.push(Notice::Warning(format!(
@@ -343,15 +512,7 @@ fn transition_notices(previous: Option<Report>, next: Report, station_igt: bool)
         }
         return notices;
     }
-    if next.supported != prev.supported && previous.is_some() {
-        notices.push(if next.supported {
-            Notice::Info("FC reports integrated ground test support.".into())
-        } else {
-            Notice::Warning(
-                "FC reports no integrated ground test support (flight image); Ground test controls and the IGT Launch are refused.".into(),
-            )
-        });
-    }
+    // The image itself is shown by the image notice (sync_image_notice).
     if !next.supported {
         return notices;
     }
@@ -433,25 +594,36 @@ pub(crate) fn status_row(status: &Status) -> crate::telemetry_db::DbWrite {
     }
 }
 
-/// Rows written at the start of every recording: the station mode, and in an
-/// integrated ground test the FC status the recording starts from.
+/// Rows written at the start of every recording: the station mode (with
+/// `igt_active` and the IGT settings), and while the integrated ground test is
+/// active (IGT mode, or HITL with the replay) the FC status the recording
+/// starts from.
 pub(crate) fn recording_start_rows(state: &AppState) -> Vec<crate::telemetry_db::DbWrite> {
     let mode = crate::runtime_mode::current();
+    let settings = state.igt.settings();
+    let active = igt_active(state);
     let mut rows = vec![crate::telemetry_db::DbWrite::Telemetry {
         timestamp_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
         source_timestamp_ms: None,
         data_type: "GS_STATION_MODE".into(),
         sender_id: "GS".into(),
         values_json: None,
-        payload_json: json!({"mode": crate::station_mode_switch::mode_id(mode)}).to_string(),
+        payload_json: json!({
+            "mode": crate::station_mode_switch::mode_id(mode),
+            "igt_active": active,
+            "mock_wet_dress": settings.mock_wet_dress,
+            "hitl_replay": settings.hitl_replay,
+        })
+        .to_string(),
     }];
-    if mode == crate::station_mode::Mode::IntegratedGroundTest {
+    if active {
         rows.push(status_row(&state.igt.status()));
     }
     rows
 }
 
-fn publish(state: &AppState) {
+pub(crate) fn publish(state: &AppState) {
+    sync_image_notice(state);
     let Some(status) = state.igt.publish() else {
         return;
     };
@@ -464,9 +636,59 @@ fn publish(state: &AppState) {
     crate::mission_phase::refresh(state);
 }
 
+/// Raises or clears the image notification when the image notice changes
+/// (doc section 7.1): a warning as soon as a mismatch is seen, cleared when
+/// it ends. The integrated ground test's expected-image indicator is shown in
+/// the status only.
+fn sync_image_notice(state: &AppState) {
+    use crate::station_mode::Mode;
+    let mut inner = state.igt.inner.lock().unwrap();
+    Tracker::latch_if_due(&mut inner);
+    let wanted = image_notice(&inner);
+    if inner.shown.as_ref().map(|(notice, _)| notice) == wanted.as_ref() {
+        return;
+    }
+    let previous = inner.shown.take();
+    let quiet = |notice: &ImageNotice| {
+        notice.level == NoticeLevel::Info && crate::runtime_mode::current() == Mode::IntegratedGroundTest
+    };
+    let cleared_latch = previous.as_ref().is_some_and(|(notice, _)| notice.text == LAUNCH_LATCH_REASON)
+        && !inner.latched
+        && inner.image == FcImage::Flight;
+    // Notifications are raised outside the tracker lock.
+    drop(inner);
+    if let Some((_, Some(id))) = previous {
+        let _ = state.dismiss_notification(id);
+    }
+    let id = match &wanted {
+        Some(notice) if !quiet(notice) => {
+            let id = match notice.level {
+                NoticeLevel::Warning => {
+                    log::warn!("{}", notice.text);
+                    crate::web::emit_warning(state, notice.text.clone());
+                    state.add_notification(notice.text.clone())
+                }
+                NoticeLevel::Info => {
+                    log::info!("{}", notice.text);
+                    state.add_notification(notice.text.clone())
+                }
+            };
+            Some(id)
+        }
+        _ => None,
+    };
+    if cleared_latch {
+        log::info!("{LATCH_CLEARED}");
+        state.add_temporary_notification(LATCH_CLEARED);
+    }
+    state.igt.inner.lock().unwrap().shown = wanted.map(|notice| (notice, id));
+}
+
 /// An FC BOARD_HEALTH report arrived.
 pub(crate) fn observe_health(state: &AppState, words: &[u32]) {
+    fc_sd::observe_health(state, words);
     let Some(report) = decode(words) else {
+        publish(state);
         return;
     };
     let notices = state.igt.observe(report, Instant::now(), crate::telemetry_task::get_current_timestamp_ms());
@@ -490,10 +712,44 @@ fn launched(state: &AppState) -> bool {
             && state.local_flight_state_snapshot() != FlightState::Aborted
 }
 
-/// Why the IGT Launch is refused now (integrated ground test only). The FC
-/// must report ground-test mode Ready in a fresh BOARD_HEALTH.
+/// The Launch latch refusal, in the modes that enforce it (doc section 7.1).
+pub(crate) fn latch_refusal(state: &AppState) -> Option<String> {
+    (latch_mode() && state.igt.latched()).then(|| LAUNCH_LATCH_REASON.to_string())
+}
+
+/// Why `Launch` or `GroundStationLaunch` is refused by the ground-test rules:
+/// the Launch latch, the IGT Launch gate ([`launch_refusal`]), and
+/// GroundStationLaunch while the HITL replay is on (Launch must go to the FC).
+// Safety catalog (About safety): igt-hitl-replay. Keep backend/src/safety_catalog_rules.rs in step.
+pub(crate) fn launch_command_refusal(state: &AppState, cmd: &TelemetryCommand) -> Option<String> {
+    match cmd {
+        TelemetryCommand::Launch => launch_refusal(state),
+        TelemetryCommand::GroundStationLaunch => latch_refusal(state).or_else(|| {
+            (crate::runtime_mode::is_hitl() && state.igt.settings().hitl_replay).then(|| {
+                "GroundStationLaunch is refused while the HITL replay is on: use Launch, which goes to the FC and the Valve Board and needs FC ground test Ready.".to_string()
+            })
+        }),
+        _ => None,
+    }
+}
+
+/// Advance and Rewind are refused in HITL with the replay on while the FC
+/// reports Sim: the replayed flight drives the phase (doc section 7.3).
+pub(crate) fn phase_step_refusal(state: &AppState) -> Option<String> {
+    (crate::runtime_mode::is_hitl() && state.igt.settings().hitl_replay && state.igt.reports_sim()).then(|| {
+        "The FC is flying the ground-test replay (IGT Sim): the replayed flight drives the phase. Advance and Rewind work again once the FC reports Done.".to_string()
+    })
+}
+
+/// Why Launch is refused now by the ground-test rules: the Launch latch in
+/// normal, testing and test fire; while the integrated ground test is active
+/// (IGT mode, or HITL with the replay) the FC must report ground-test mode
+/// Ready in a fresh BOARD_HEALTH.
 pub(crate) fn launch_refusal(state: &AppState) -> Option<String> {
-    if !crate::runtime_mode::is_igt() {
+    if let Some(reason) = latch_refusal(state) {
+        return Some(reason);
+    }
+    if !igt_active(state) {
         return None;
     }
     match state.igt.fresh_report(Instant::now()) {
@@ -508,9 +764,14 @@ pub(crate) fn launch_refusal(state: &AppState) -> Option<String> {
     }
 }
 
-/// Test fixtures: the FC reports ground test Ready now.
+/// Test fixtures: the FC reports ground test Ready now, while the
+/// integrated ground test is active (elsewhere a ground-test image would
+/// latch Launch closed, so the fixture leaves the FC unreported).
 #[cfg(test)]
 pub(crate) fn ready_for_test(state: &AppState) {
+    if !igt_active(state) {
+        return;
+    }
     let ready = Report { mode: FcMode::Ready, ..Report::UNSUPPORTED };
     state.igt.observe(Report { supported: true, ..ready }, Instant::now(), 1);
 }
@@ -537,6 +798,9 @@ pub(crate) fn requires_ticket(cmd: &TelemetryCommand) -> bool {
 
 /// The station-side gate of a Ground test control. `None` for other commands.
 pub(crate) fn command_gate(state: &AppState, cmd: &TelemetryCommand) -> Option<Result<(), String>> {
+    if matches!(cmd, TelemetryCommand::FcSdRetry) {
+        return Some(fc_sd::retry_gate(state, Instant::now()));
+    }
     if !is_igt_command(cmd) {
         return None;
     }
@@ -544,7 +808,13 @@ pub(crate) fn command_gate(state: &AppState, cmd: &TelemetryCommand) -> Option<R
 }
 
 fn gate(state: &AppState, cmd: &TelemetryCommand, now: Instant) -> Result<(), String> {
-    if !crate::runtime_mode::is_igt() {
+    if crate::runtime_mode::is_hitl() && !state.igt.settings().hitl_replay {
+        return Err(format!(
+            "{} needs the HITL replay: an administrator turns it on under Ground test settings.",
+            crate::sequences::command_name(cmd)
+        ));
+    }
+    if !igt_active(state) {
         return Err(crate::runtime_mode::unavailable(crate::sequences::command_name(cmd)));
     }
     if crate::rrls::is_rrls() {
@@ -597,26 +867,47 @@ fn gate(state: &AppState, cmd: &TelemetryCommand, now: Instant) -> Result<(), St
     }
 }
 
-/// Sets the Ground test controls' state and the IGT Launch refusal in the
-/// action policy (integrated ground test only).
+/// Sets the Ground test controls' state, FcSdRetry, the Launch latch, the
+/// IGT Launch refusal and the HITL replay's GroundStationLaunch and phase-step
+/// refusals in the action policy.
 pub(crate) fn decorate_policy(state: &AppState, policy: &mut crate::sequences::ActionPolicyMsg) {
-    if !crate::runtime_mode::is_igt() {
-        return;
-    }
     let now = Instant::now();
     let report = state.igt.fresh_report(now);
-    let launch = launch_refusal(state);
+    let launch = launch_command_refusal(state, &TelemetryCommand::Launch);
+    let ground_station_launch = launch_command_refusal(state, &TelemetryCommand::GroundStationLaunch);
+    let phase_step = phase_step_refusal(state);
+    let disable = |control: &mut crate::sequences::ActionControl, reason: &Option<String>| {
+        if let Some(reason) = reason {
+            control.enabled = false;
+            control.disabled_reason = Some(reason.clone());
+            control.blink = crate::sequences::BlinkMode::None;
+        }
+    };
     for control in &mut policy.controls {
         let cmd = match control.cmd.as_str() {
             "IgtEnter" => TelemetryCommand::IgtEnter,
             "IgtLivePyro" => TelemetryCommand::IgtLivePyro,
             "IgtDryRun" => TelemetryCommand::IgtDryRun,
             "IgtExit" => TelemetryCommand::IgtExit,
-            "Launch" => {
-                if let Some(reason) = &launch {
-                    control.enabled = false;
-                    control.disabled_reason = Some(reason.clone());
+            "FcSdRetry" => {
+                let result = fc_sd::retry_gate(state, now);
+                control.enabled = control.enabled && result.is_ok();
+                if let Err(reason) = result {
+                    control.disabled_reason = Some(reason);
                 }
+                control.blink = crate::sequences::BlinkMode::None;
+                continue;
+            }
+            "Launch" => {
+                disable(control, &launch);
+                continue;
+            }
+            "GroundStationLaunch" => {
+                disable(control, &ground_station_launch);
+                continue;
+            }
+            "AdvanceFlightState" | "RewindFlightState" => {
+                disable(control, &phase_step);
                 continue;
             }
             _ => continue,
@@ -800,6 +1091,17 @@ pub(crate) fn confirm(
     Ok(ticket.action.command())
 }
 
+/// The persisted settings and the latch are read from the GS data directory
+/// (beside the station database). Called once at start.
+pub(crate) fn load_persisted(state: &AppState) {
+    let dir = std::path::Path::new(&state.placeholder_db_path)
+        .parent()
+        .map(|dir| dir.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    settings::load(state, dir.clone());
+    crate::launch_site::load(state, dir);
+}
+
 async fn get_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Err(response) = crate::web::authorize_headers(&state, &headers, Permission::ViewData).await {
         return response;
@@ -860,6 +1162,7 @@ pub(crate) fn routes() -> Router<Arc<AppState>> {
         .route("/api/igt", get(get_status))
         .route("/api/igt/prepare", post(post_prepare))
         .route("/api/igt/confirm", post(post_confirm))
+        .route("/api/igt/settings", get(settings::get_settings).put(settings::put_settings))
 }
 
 // ---------------------------------------------------------------------------

@@ -53,6 +53,7 @@
     "Compat_IGT_Enter",
     "Compat_IGT_Live_Pyro",
     "Compat_IGT_Dry_Run",
-    "Compat_IGT_Exit"
+    "Compat_IGT_Exit",
+    "Compat_SD_Retry"
   ]
 }

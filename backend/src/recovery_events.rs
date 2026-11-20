@@ -202,7 +202,7 @@ pub fn notify(
     }
     // In an integrated ground test the FC deploys on its replayed flight; the
     // real altitude telemetry is the stand's.
-    let simulated = crate::runtime_mode::is_igt() && state.igt.simulated();
+    let simulated = crate::igt::igt_active(state) && state.igt.simulated();
     let evidence = match evidence {
         Evidence::State { altitude_m: None } => Evidence::State {
             altitude_m: if simulated {

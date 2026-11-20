@@ -436,7 +436,7 @@ fn fc_contact_lost(state: &crate::state::AppState) -> bool {
 
 /// Integrated ground test with the FC flying (or done flying) replayed data.
 pub fn flight_simulated(state: &crate::state::AppState) -> bool {
-    crate::runtime_mode::is_igt() && state.igt.simulated()
+    crate::igt::igt_active(state) && state.igt.simulated()
 }
 
 /// Recompute and publish the phase now. Returns the published message.

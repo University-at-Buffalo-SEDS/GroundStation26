@@ -2438,9 +2438,20 @@ impl AppState {
         if crate::sequence_access::refusal(self, cmd).is_some() {
             return false;
         }
-        // Ground test controls: integrated ground test only, own gates.
+        // Ground test controls (integrated ground test, or HITL with the
+        // replay) and FcSdRetry: own gates.
         if let Some(gate) = crate::igt::command_gate(self, cmd) {
             return gate.is_ok();
+        }
+        // The ground-test image Launch latch, the IGT Launch gate, and the HITL
+        // replay's GroundStationLaunch and phase-step refusals.
+        if crate::igt::launch_command_refusal(self, cmd).is_some() {
+            return false;
+        }
+        if matches!(cmd, TelemetryCommand::AdvanceFlightState | TelemetryCommand::RewindFlightState | TelemetryCommand::OperatorPhase { .. })
+            && crate::igt::phase_step_refusal(self).is_some()
+        {
+            return false;
         }
         if self.operator_queue.fill_launch_active()
             && crate::sequences::is_fill_system_control(command_name(cmd)) {

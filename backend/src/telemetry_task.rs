@@ -1774,6 +1774,11 @@ pub async fn telemetry_task(
                                 None => {}
                             }
                         }
+                        TelemetryCommand::FcSdRetry => {
+                            if let Err(error) = crate::igt::fc_sd::send(&state, &router) {
+                                emit_notification_warning(&state, format!("FcSdRetry: {error}"));
+                            }
+                        }
                         // Enter and LIVE PYRO are sent only by the ticketed
                         // review (igt::confirm), never from the queue.
                         TelemetryCommand::IgtEnter | TelemetryCommand::IgtLivePyro => emit_notification_warning(
@@ -2858,6 +2863,7 @@ async fn handle_packet_inner(
                     crate::network_variables::observe_fc_health_outputs(&words);
                     crate::fc_estimator::observe_health(state, &words, Some(pkt.timestamp()));
                     crate::igt::observe_health(state, &words);
+                    crate::launch_site::observe_fc_health(state, &words);
                 }
                 if crate::types::canonical_sender_id(sender_id.trim()) == "AB" {
                     crate::ab_command_gate::observe(state, &words);
@@ -3226,6 +3232,15 @@ async fn handle_packet_inner(
             }).await;
         }
         return crate::igt::sim_rows(state, &sender_id, ts_ms, &values);
+    }
+
+    // The FC's LAUNCH_SITE echo (docs/integrated-ground-test.md 7.4); the row
+    // is recorded like any other.
+    if pkt.data_type() == crate::telemetry_schema::data_type("LAUNCH_SITE")
+        && crate::types::canonical_sender_id(sender_id.trim()) == "FC"
+        && let Some(values) = telemetry_f32_values(&pkt)
+    {
+        crate::launch_site::observe_echo(state, &values);
     }
 
     if pkt.data_type() == crate::telemetry_schema::data_type("GPS_SATELLITE_NUMBER") {

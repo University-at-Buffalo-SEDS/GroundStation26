@@ -135,6 +135,7 @@ fn local_admission(state: &AppState) -> Admission {
             .shutdown_requested
             .load(std::sync::atomic::Ordering::Acquire)
         || state.abort_indicator_latched()
+        || crate::igt::phase_step_refusal(state).is_some()
     {
         return Admission::Invalid;
     }
@@ -159,6 +160,9 @@ pub(crate) fn refusal_reason(state: &AppState, forward: bool) -> String {
     }
     if state.shutdown_requested.load(std::sync::atomic::Ordering::Acquire) {
         return "The station is shutting down.".into();
+    }
+    if let Some(reason) = crate::igt::phase_step_refusal(state) {
+        return reason;
     }
     if state.abort_indicator_latched() {
         return "An Abort indicator is latched. Use Reset all boards first.".into();
@@ -273,7 +277,9 @@ pub(crate) fn project(state: &AppState, policy: &mut crate::sequences::ActionPol
     // Say why stepping is held, in the order an operator can fix it. An
     // aborted board blocks it only while present and part of this mode (as
     // for Launch): a powered-off AV bay must not lock HITL phase control.
-    let reason: Option<String> = if !policy.key_enabled {
+    let reason: Option<String> = if let Some(reason) = crate::igt::phase_step_refusal(state) {
+        Some(reason)
+    } else if !policy.key_enabled {
         Some("GroundStation key control is disabled.".into())
     } else if !policy.software_buttons_enabled {
         Some("Software controls are disabled by GroundStation.".into())

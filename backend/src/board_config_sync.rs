@@ -570,6 +570,8 @@ pub(crate) fn tick(state: &Arc<AppState>, now: Instant) {
     if crate::rrls::is_rrls() || state.topology_router.get().is_none() {
         return;
     }
+    // The FC launch site follows the same reboot-driven resync.
+    crate::launch_site::tick(state, now);
     // Follow a drive change first (check, re-send or give up), so the
     // drive item below sees its current state.
     crate::actuator_plumbing::service_drive_set(state, now);

@@ -35,6 +35,8 @@ pub enum FlightComputerCommands {
     IgtLivePyro = 30,
     IgtDryRun = 31,
     IgtExit = 32,
+    /// Re-attempt the SD mount and log file (FC `SD_Retry`, both images).
+    FcSdRetry = 33,
 }
 
 #[repr(u8)]
@@ -116,6 +118,7 @@ mod flight_command_wire_tests {
             (IgtLivePyro, "Compat_IGT_Live_Pyro"),
             (IgtDryRun, "Compat_IGT_Dry_Run"),
             (IgtExit, "Compat_IGT_Exit"),
+            (FcSdRetry, "Compat_SD_Retry"),
         ]);
         for (command, expected) in cases {
             assert_eq!(contract["remote_commands_compat"][command as usize], expected);
