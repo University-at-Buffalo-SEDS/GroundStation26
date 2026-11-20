@@ -102,12 +102,21 @@ class Model:
     site_msl: float = 890.016
     noise: float = 0.0
     seed: int = 1
+    wind_from_deg: float = 300.0   # meteorological: the direction the wind blows from
+    tilt_deg: float = 5.0          # launch rail angle from vertical
+    azimuth_deg: float = 60.0      # downrange bearing of the rail tilt
 
     def fly(self, step_ms: int = 1):
-        """Yield (t_ms, h, v, specific_force_z, east_m) at 1 ms."""
+        """Yield (t_ms, h, v, specific_force_z, north_m, east_m, apogee) at 1 ms.
+
+        Altitude carries the motion; the ground track moves less: downrange
+        along the rail tilt during ascent, then with the wind under canopy."""
         area = math.pi * (self.diameter_m / 2.0) ** 2
         dt = step_ms / 1000.0
-        h = v = east = 0.0
+        h = v = north = east = 0.0
+        tilt = math.tan(math.radians(self.tilt_deg))
+        az = math.radians(self.azimuth_deg)
+        to = math.radians(self.wind_from_deg + 180.0)
         t = 0
         phase = 'pad'
         landed_at = None
@@ -128,6 +137,9 @@ class Model:
                     phase = 'coast'
                 v += a * dt
                 h += v * dt
+                if v > 0.0:
+                    north += v * tilt * math.cos(az) * dt
+                    east += v * tilt * math.sin(az) * dt
                 if phase == 'coast' and v <= 0.0:
                     phase = 'drogue'
                     apogee = h
@@ -140,7 +152,8 @@ class Model:
                 force = a + G
                 v += a * dt
                 h += v * dt
-                east += self.wind_mps * dt
+                north += self.wind_mps * math.cos(to) * dt
+                east += self.wind_mps * math.sin(to) * dt
                 if phase == 'drogue' and h <= self.reef_alt_m:
                     phase = 'main'
                 if h <= 0.0:
@@ -151,7 +164,7 @@ class Model:
                 force = G
                 if t - landed_at >= self.rest_after_s * 1000.0:
                     return
-            yield t, h, v, force, east, apogee
+            yield t, h, v, force, north, east, apogee
             t += step_ms
 
     def rows(self, imu_hz: int, baro_hz: int, gps_hz: int):
@@ -160,8 +173,10 @@ class Model:
         imu_step, baro_step, gps_step = 1000 // imu_hz, 1000 // baro_hz, 1000 // gps_hz
         out = {'IMU': [], 'BARO': [], 'GPS': []}
         summary = {'apogee_m': 0.0, 'landed_ms': 0}
+        lat_m = 111320.0
         lon_m = 111320.0 * math.cos(math.radians(self.site_lat))
-        for t, h, v, force, east, apogee in self.fly():
+        summary['track_m'] = 0.0
+        for t, h, v, force, north, east, apogee in self.fly():
             summary['apogee_m'] = max(summary['apogee_m'], h)
             summary['landed_ms'] = t
             if t % imu_step == 0:
@@ -173,8 +188,9 @@ class Model:
                 msl = self.site_msl + h
                 out['BARO'].append([t, alt, isa_pressure(msl), 15.0 - 0.0065 * msl])
             if t % gps_step == 0:
-                out['GPS'].append([t, self.site_lat, self.site_lon + east / lon_m,
+                out['GPS'].append([t, self.site_lat + north / lat_m, self.site_lon + east / lon_m,
                                    self.site_msl + h + rng.gauss(0, 1.0 * n)])
+                summary['track_m'] = max(summary['track_m'], math.hypot(north, east))
         return out, summary
 
 
@@ -183,7 +199,7 @@ def tune_thrust(model: Model, apogee_m: float) -> Model:
     for _ in range(40):
         model.thrust_n = (lo + hi) / 2.0
         top = 0.0
-        for _, h, v, _, _, _ in model.fly(step_ms=5):
+        for _, h, v, _, _, _, _ in model.fly(step_ms=5):
             top = max(top, h)
             if v < 0 and h > 1:
                 break
@@ -400,6 +416,9 @@ def main(argv: list[str] | None = None) -> int:
     m.add_argument('--main-mps', type=float, default=Model.main_mps)
     m.add_argument('--reef-alt-m', type=float, default=Model.reef_alt_m)
     m.add_argument('--wind-mps', type=float, default=Model.wind_mps)
+    m.add_argument('--wind-from-deg', type=float, default=Model.wind_from_deg, help='bearing the wind blows from (default 300)')
+    m.add_argument('--tilt-deg', type=float, default=Model.tilt_deg, help='launch rail angle from vertical (default 5)')
+    m.add_argument('--azimuth-deg', type=float, default=Model.azimuth_deg, help='downrange bearing of the tilt (default 60)')
     m.add_argument('--liftoff-ms', type=int, default=Model.liftoff_ms)
     m.add_argument('--rest-after-s', type=float, default=Model.rest_after_s)
     m.add_argument('--site', default='31.758,-102.046,890.016', help='lat,lon,msl of the replayed pad')
@@ -423,14 +442,16 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument('folder', type=Path)
 
     for p in (m, r, c):
-        p.add_argument('--fc-site', default='31.758,-102.046,890.016',
-                       help="the FC image's LAUNCH_SITE lat,lon,msl (GPS validator range)")
+        p.add_argument('--fc-site', default=None,
+                       help="the FC's launch site lat,lon,msl: the station's Launch site setting, else the "
+                            "compiled 31.758,-102.046,890.016 (model: defaults to --site)")
     args = parser.parse_args(argv)
     if args.cmd == 'model':
         lat, lon, msl = (float(x) for x in args.site.split(','))
         model = Model(args.thrust_n, args.burn_s, args.wet_kg, args.dry_kg, args.cd, args.diameter_m,
                       args.drogue_mps, args.main_mps, args.reef_alt_m, args.wind_mps, args.liftoff_ms,
-                      args.rest_after_s, lat, lon, msl, args.noise, args.seed)
+                      args.rest_after_s, lat, lon, msl, args.noise, args.seed,
+                      args.wind_from_deg, args.tilt_deg, args.azimuth_deg)
         if args.apogee_m:
             tune_thrust(model, args.apogee_m)
         rows, summary = model.rows(args.imu_hz, args.baro_hz, args.gps_hz)
@@ -438,12 +459,14 @@ def main(argv: list[str] | None = None) -> int:
             rows['GPS'] = []
         write_set(args.out, rows, args.segment_s)
         print(f"thrust {model.thrust_n:.0f} N, apogee {summary['apogee_m']:.0f} m, "
+              f"ground track {summary['track_m']:.0f} m, "
               f"landed and rested by t={summary['landed_ms'] / 1000:.1f} s")
     elif args.cmd == 'recording':
         rows = from_recording(args.csv, args.t0, args.fc_sender, args.gps_sender)
         write_set(args.out, rows, args.segment_s)
     folder = args.out if args.cmd != 'check' else args.folder
-    lat, lon, msl = (float(x) for x in args.fc_site.split(','))
+    fc_site = args.fc_site or (args.site if args.cmd == 'model' else '31.758,-102.046,890.016')
+    lat, lon, msl = (float(x) for x in fc_site.split(','))
     limits = Limits(lat, lon, msl)
     problems = check_set(folder, limits)
     for p in problems:

@@ -57,6 +57,23 @@ class ModelTests(unittest.TestCase):
             self.assertAlmostEqual(sum(drogue) / len(drogue), -25, delta=1.5)
             self.assertAlmostEqual(sum(main) / len(main), -6, delta=0.5)
 
+    def test_gps_track_moves_in_lat_and_lon_by_a_few_hundred_metres(self):
+        import math
+        with tempfile.TemporaryDirectory() as tmp:
+            igt_csv.main(['model', '--out', tmp, '--apogee-m', '600', '--site', '43.003556,-78.768556,182'])
+            _, gps = read_rows(Path(tmp) / 'IGT/GPS0.CSV')
+            north = [(g[1] - 43.003556) * 111320 for g in gps]
+            east = [(g[2] + 78.768556) * 111320 * math.cos(math.radians(43.003556)) for g in gps]
+            track = max(math.hypot(n, e) for n, e in zip(north, east))
+            self.assertTrue(150 < track < 1000, track)
+            self.assertGreater(max(map(abs, north)), 50)    # latitude moves
+            self.assertGreater(max(map(abs, east)), 50)     # and longitude
+            self.assertAlmostEqual(max(g[3] for g in gps) - 182, 600, delta=15)  # altitude carries the motion
+            self.assertTrue(all(abs(n) < 1 and abs(e) < 1 for n, e, g in zip(north, east, gps) if g[0] < 10000))
+            # Checked against the model's own site by default (the station's Launch site setting).
+            self.assertEqual(igt_csv.check_set(Path(tmp), igt_csv.Limits(43.003556, -78.768556, 182)), [])
+            self.assertTrue(igt_csv.check_set(Path(tmp), igt_csv.Limits()))
+
     def test_segments(self):
         with tempfile.TemporaryDirectory() as tmp:
             igt_csv.main(['model', '--out', tmp, '--apogee-m', '500', '--segment-s', '40'])
