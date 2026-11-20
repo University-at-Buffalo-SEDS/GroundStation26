@@ -268,7 +268,9 @@ async fn prepare_selected_reset(f: &Fixture) -> Value {
     let required: Vec<Board> = match crate::station_mode::local_mode() {
         crate::station_mode::Mode::Hitl => Vec::new(),
         crate::station_mode::Mode::TestFire => FILL.to_vec(),
-        crate::station_mode::Mode::Testing | crate::station_mode::Mode::Normal => BOARDS.to_vec(),
+        crate::station_mode::Mode::Testing
+        | crate::station_mode::Mode::Normal
+        | crate::station_mode::Mode::IntegratedGroundTest => BOARDS.to_vec(),
     };
     let expected: Vec<_> = BOARDS.iter().filter(|board| required.contains(board) || FILL.contains(board))
         .map(|board| board.sender_id()).collect();

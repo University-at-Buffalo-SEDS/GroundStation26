@@ -153,7 +153,10 @@ async fn snapshot_follows_the_ui_v2_contract_with_server_fenced_transitions() {
     assert_eq!(s["permissions"]["can_change"], true);
     assert_eq!(s["principal_context"], "user:administrator");
     let ids: Vec<_> = s["options"].as_array().unwrap().iter().map(|o| o["id"].as_str().unwrap().to_owned()).collect();
-    assert_eq!(ids, ["normal", "hitl", "test_fire", "testing", "testing-simulation"]);
+    assert_eq!(
+        ids,
+        ["normal", "hitl", "test_fire", "testing", "testing-simulation", "integrated_ground_test"]
+    );
     for option in s["options"].as_array().unwrap() {
         assert_eq!(option["transition_kind"], "restart");
         assert_eq!(option["available"], true);
@@ -161,7 +164,9 @@ async fn snapshot_follows_the_ui_v2_contract_with_server_fenced_transitions() {
         assert_eq!(option["in_process"], option["simulation"] == false, "{option}");
         assert!(s["modes"].as_array().unwrap().iter().any(|m| m["id"] == option["mode_id"]));
     }
-    assert_eq!(s["modes"].as_array().unwrap().len(), 4);
+    assert_eq!(s["modes"].as_array().unwrap().len(), 5);
+    let igt = s["modes"].as_array().unwrap().iter().find(|m| m["id"] == "integrated_ground_test").unwrap();
+    assert_eq!(igt["label"], "Integrated ground test");
     assert!(s["policy_epoch"].as_str().unwrap().ends_with(&format!(":epoch-{}", crate::runtime_mode::epoch())));
     // Same installation across restarts; a new epoch per process.
     let again = Switch::new(f.switch.config.clone(), Arc::new(RestartSignal::default()));
@@ -697,9 +702,27 @@ async fn normal_is_never_entered_while_a_link_is_a_stand_in() {
     let (status, body) = f.prepare("administrator", "normal").await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert!(body["error"].as_str().unwrap().contains("stand-in"), "{body}");
+    // The integrated ground test drives the real AV bay and fill box too.
+    let igt = s["options"].as_array().unwrap().iter().find(|o| o["id"] == "integrated_ground_test").unwrap();
+    assert_eq!(igt["available"], false);
+    assert!(igt["reason"].as_str().unwrap().contains("Integrated ground test mode needs every configured link"), "{igt}");
     // Other modes used stand-ins before too.
     switch_in_process(&f, "administrator", "test_fire").await;
     assert_eq!(crate::runtime_mode::current(), Mode::TestFire);
+}
+
+#[tokio::test]
+async fn integrated_ground_test_is_an_in_process_switch_with_its_own_layout() {
+    let _mode = thread_mode(Mode::Normal);
+    let f = fixture().await;
+    switch_in_process(&f, "administrator", "integrated_ground_test").await;
+    assert_eq!(crate::runtime_mode::current(), Mode::IntegratedGroundTest);
+    let layout = crate::layout::load_layout().unwrap();
+    assert!(layout.igt_mode && !layout.test_fire_mode);
+    assert_eq!(layout.actions_tab.actions[0].cmd, "IgtEnter");
+    assert_eq!(f.selection().unwrap().mode, "integrated_ground_test");
+    switch_in_process(&f, "administrator", "test_fire").await;
+    assert!(crate::layout::load_layout().unwrap().actions_tab.actions.iter().all(|a| !a.cmd.starts_with("Igt")));
 }
 
 #[tokio::test]

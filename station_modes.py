@@ -31,7 +31,7 @@ from typing import Callable, Mapping
 RESTART_EXIT_CODE = 75
 # Mode ids (backend station_mode::Mode, snake_case), passed to the backend as
 # GS_STATION_MODE. Every mode is in the one binary.
-MODES = ("normal", "hitl", "test_fire", "testing")
+MODES = ("normal", "hitl", "test_fire", "testing", "integrated_ground_test")
 BINARY = "groundstation_backend"
 SELECTION_FILE = "selection.json"
 # Mirrors backend rrls_sim_primary::ISOLATED. A simulated-primary RRLS keeps
@@ -59,8 +59,10 @@ def parse_modes(text: str) -> list[str]:
     modes = []
     for item in text.split(","):
         item = item.strip().replace("-", "_")
-        if item in ("hitl_mode", "test_fire_mode"):
+        if item in ("hitl_mode", "test_fire_mode", "integrated_ground_test_mode"):
             item = item.removesuffix("_mode")
+        if item in ("igt", "igt_mode"):
+            item = "integrated_ground_test"
         if item not in MODES:
             raise ValueError(f"unknown station mode {item!r}; choose from {', '.join(MODES)} or all")
         if item not in modes:

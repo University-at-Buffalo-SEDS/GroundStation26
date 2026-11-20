@@ -74,6 +74,7 @@ fn mode_byte(mode: Mode) -> u8 {
         Mode::Hitl => 1,
         Mode::TestFire => 2,
         Mode::Testing => 3,
+        Mode::IntegratedGroundTest => 4,
     }
 }
 fn mode(value: u8) -> Result<Mode> {
@@ -82,6 +83,7 @@ fn mode(value: u8) -> Result<Mode> {
         1 => Mode::Hitl,
         2 => Mode::TestFire,
         3 => Mode::Testing,
+        4 => Mode::IntegratedGroundTest,
         _ => bail!("Unknown primary mode"),
     })
 }
@@ -599,5 +601,18 @@ mod plumbing_compatibility_tests {
             );
             assert!(open(&primary, &wire, "rrls").is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod igt_mode_code_tests {
+    use super::*;
+    #[test]
+    fn every_mode_round_trips_and_igt_is_wire_code_4() {
+        assert_eq!(mode_byte(Mode::IntegratedGroundTest), 4);
+        for mode in [Mode::Normal, Mode::Hitl, Mode::TestFire, Mode::Testing, Mode::IntegratedGroundTest] {
+            assert_eq!(super::mode(mode_byte(mode)).unwrap(), mode);
+        }
+        assert!(super::mode(5).is_err());
     }
 }

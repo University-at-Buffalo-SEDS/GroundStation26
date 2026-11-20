@@ -25,3 +25,20 @@ commands. Existing deployment, launch and HITL interlock behavior is unchanged.
 
 Tests cover every visible flight command's payload and discovered destination
 using captured packets only. They do not trigger hardware outputs.
+
+## Integrated ground test controls
+
+The integrated ground test (`docs/integrated-ground-test.md`) adds four FC
+commands on the same one-byte protocol. They exist only in the
+`integrated_ground_test` station mode (Actions > Ground test) and are refused
+and not offered in every other mode. A flight FC image ignores them.
+
+| Control | Command | Wire byte | FC compat name | Station path |
+| --- | --- | --- | --- | --- |
+| Enter ground test | `IgtEnter` | 29 | `Compat_IGT_Enter` | review only: `POST /api/igt/prepare` then `/api/igt/confirm` |
+| LIVE PYRO | `IgtLivePyro` | 30 | `Compat_IGT_Live_Pyro` | review only, Admin, typed `LIVE PYRO` |
+| Dry-run | `IgtDryRun` | 31 | `Compat_IGT_Dry_Run` | plain command |
+| Exit ground test | `IgtExit` | 32 | `Compat_IGT_Exit` | plain command |
+
+The plain command path (`POST /api/command`, the RRLS proxy) refuses
+`IgtEnter` and `IgtLivePyro`.

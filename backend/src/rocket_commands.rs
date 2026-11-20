@@ -30,6 +30,11 @@ pub enum FlightComputerCommands {
     ReinitAfter15 = 26,
     ReinitAfter30 = 27,
     ReinitAfter50 = 28,
+    // Integrated ground test (FC fc_msg Actionable_Decrees + 17..20).
+    IgtEnter = 29,
+    IgtLivePyro = 30,
+    IgtDryRun = 31,
+    IgtExit = 32,
 }
 
 #[repr(u8)]
@@ -107,6 +112,10 @@ mod flight_command_wire_tests {
             (ReinitAfter15, "Compat_Reinit_After_15"),
             (ReinitAfter30, "Compat_Reinit_After_30"),
             (ReinitAfter50, "Compat_Reinit_After_50"),
+            (IgtEnter, "Compat_IGT_Enter"),
+            (IgtLivePyro, "Compat_IGT_Live_Pyro"),
+            (IgtDryRun, "Compat_IGT_Dry_Run"),
+            (IgtExit, "Compat_IGT_Exit"),
         ]);
         for (command, expected) in cases {
             assert_eq!(contract["remote_commands_compat"][command as usize], expected);

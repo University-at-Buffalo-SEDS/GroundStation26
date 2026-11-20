@@ -16,12 +16,17 @@ pub const DERIVED_WEIGHT_DATA_TYPE: &str = "LOADCELL_WEIGHT_KG";
 pub const DERIVED_FILL_PERCENT_DATA_TYPE: &str = "LOADCELL_FILL_PERCENT";
 pub const DERIVED_PRESSURE_TRANSDUCER_CALIBRATED_DATA_TYPE: &str = "PRESSURE_TRANSDUCER_CALIBRATED";
 fn default_loadcell_calibration_filename() -> &'static str {
-    if crate::runtime_mode::is_testing() {
-        "loadcell_calibration_testing.json"
-    } else if crate::runtime_mode::is_test_fire() {
-        "loadcell_calibration_test_fire.json"
-    } else {
-        "loadcell_calibration.json"
+    calibration_filename_for(crate::runtime_mode::current())
+}
+
+/// The calibration file a station mode uses. The integrated ground test
+/// fires on the test stand's load cell, so it shares test fire's file.
+pub(crate) fn calibration_filename_for(mode: crate::station_mode::Mode) -> &'static str {
+    use crate::station_mode::Mode;
+    match mode {
+        Mode::Testing => "loadcell_calibration_testing.json",
+        Mode::TestFire | Mode::IntegratedGroundTest => "loadcell_calibration_test_fire.json",
+        Mode::Normal | Mode::Hitl => "loadcell_calibration.json",
     }
 }
 

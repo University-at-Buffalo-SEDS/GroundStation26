@@ -602,6 +602,11 @@ fn fc_expected(state: &crate::state::AppState) -> bool {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn fc_expected_for_test(state: &crate::state::AppState) -> bool {
+    fc_expected(state)
+}
+
 fn launched(state: &crate::state::AppState) -> bool {
     use crate::types::FlightState as F;
     let flying = |s: F| {
@@ -619,7 +624,9 @@ fn launched(state: &crate::state::AppState) -> bool {
 }
 
 fn raise(state: &crate::state::AppState, notices: Vec<Notice>) {
+    let simulated = crate::runtime_mode::is_igt() && state.igt.simulated();
     for notice in notices {
+        let notice = if simulated { simulated_input(notice) } else { notice };
         match notice {
             Notice::Info(text) => {
                 log::info!("{text}");
@@ -631,6 +638,16 @@ fn raise(state: &crate::state::AppState, notices: Vec<Notice>) {
                 state.add_temporary_notification(text);
             }
         }
+    }
+}
+
+/// While the FC flies replayed data in an integrated ground test, every
+/// estimator notice says so.
+pub(crate) fn simulated_input(notice: Notice) -> Notice {
+    let prefix = |text: String| format!("{}{text}", crate::igt::SIMULATED_INPUT_PREFIX);
+    match notice {
+        Notice::Info(text) => Notice::Info(prefix(text)),
+        Notice::Warning(text) => Notice::Warning(prefix(text)),
     }
 }
 
@@ -676,6 +693,7 @@ pub(crate) fn tick(state: &crate::state::AppState) {
     let notices = state.fc_estimator.tick(now, Context { launched: launched(state), expected: fc_expected(state) });
     raise(state, notices);
     publish(state, now);
+    crate::igt::tick(state);
 }
 
 #[cfg(test)]

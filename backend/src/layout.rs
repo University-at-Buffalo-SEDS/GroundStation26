@@ -12,6 +12,9 @@ pub struct LayoutConfig {
     pub flight_phase_version: u8,
     #[serde(default)]
     pub test_fire_mode: bool,
+    /// Integrated ground test (served layout only; omitted when false).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub igt_mode: bool,
     pub version: u32,
     #[serde(default)]
     pub branding: BrandingConfig,
@@ -732,6 +735,7 @@ fn normalize_flight_phases(layout: &mut LayoutConfig) -> Result<(), String> {
 fn apply_runtime_layout_overrides(layout: &mut LayoutConfig) {
     let mode = presentation_mode();
     layout.test_fire_mode = mode == crate::station_mode::Mode::TestFire;
+    layout.igt_mode = mode == crate::station_mode::Mode::IntegratedGroundTest;
     if crate::rrls::is_rrls() {
         layout.branding.app_name = Some("RRLS".into());
         layout.branding.dashboard_title = Some("RRLS".into());
@@ -761,6 +765,9 @@ fn apply_runtime_layout_overrides(layout: &mut LayoutConfig) {
                 .expect("valid operator recovery action"),
             );
         }
+    }
+    if mode == crate::station_mode::Mode::IntegratedGroundTest {
+        ensure_igt_actions(layout);
     }
     if mode != crate::station_mode::Mode::Testing {
         return;
@@ -793,6 +800,36 @@ fn apply_runtime_layout_overrides(layout: &mut LayoutConfig) {
         },
     );
 }
+
+/// The integrated ground test uses the flight layout (AV bay, FC, recovery
+/// and fill content) with the Ground test controls added first.
+fn ensure_igt_actions(layout: &mut LayoutConfig) {
+    for (index, (cmd, label)) in IGT_ACTIONS.into_iter().enumerate() {
+        if layout.actions_tab.actions.iter().any(|action| action.cmd == cmd) {
+            continue;
+        }
+        let (border, bg, fg) = if cmd == "IgtLivePyro" {
+            ("#ef4444", "#450a0a", "#fee2e2")
+        } else {
+            ("#f97316", "#431407", "#ffedd5")
+        };
+        layout.actions_tab.actions.insert(
+            index,
+            serde_json::from_value(serde_json::json!({
+                "cmd": cmd, "label": label, "group": "Ground test",
+                "border": border, "bg": bg, "fg": fg, "illuminated": true
+            }))
+            .expect("valid ground test action"),
+        );
+    }
+}
+
+const IGT_ACTIONS: [(&str, &str); 4] = [
+    ("IgtEnter", "Enter ground test"),
+    ("IgtLivePyro", "LIVE PYRO"),
+    ("IgtDryRun", "Dry-run"),
+    ("IgtExit", "Exit ground test"),
+];
 
 const GSE_SEQUENCE_ACTIONS: [(&str, &str); 6] = [
     ("StartFill", "Start fill"),
@@ -976,7 +1013,7 @@ mod tests {
         use crate::sequences::{ControlSection, control_section};
         use crate::station_mode::Mode;
         let mut names: Vec<&str> = crate::sequences::every_mode_catalog().concat();
-        for mode in [Mode::Normal, Mode::Hitl, Mode::TestFire, Mode::Testing] {
+        for mode in [Mode::Normal, Mode::Hitl, Mode::TestFire, Mode::Testing, Mode::IntegratedGroundTest] {
             names.extend(crate::types::client_command_names(mode));
         }
         names.extend(GSE_SEQUENCE_ACTIONS.iter().map(|(cmd, _)| *cmd));
@@ -992,7 +1029,7 @@ mod tests {
             names.iter().filter(|n| **n == "Abort").count()
         );
         // The served layout of every mode assigns each action its section.
-        for mode in [Mode::Normal, Mode::Hitl, Mode::TestFire, Mode::Testing] {
+        for mode in [Mode::Normal, Mode::Hitl, Mode::TestFire, Mode::Testing, Mode::IntegratedGroundTest] {
             let _mode = crate::runtime_mode::test_support::thread_mode(mode);
             let layout = load_layout().expect("layout should parse");
             for action in &layout.actions_tab.actions {

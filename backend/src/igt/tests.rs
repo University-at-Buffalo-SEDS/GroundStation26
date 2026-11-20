@@ -1,0 +1,499 @@
+use super::*;
+use crate::auth::{CalibrationAccess, CommandAccess, Permissions, StreamRole};
+use crate::runtime_mode::test_support::thread_mode;
+use crate::station_mode::Mode;
+
+/// An FC BOARD_HEALTH with word 14 carrying `igt` in bits 4..15.
+fn health(igt: u32) -> [u32; 24] {
+    let mut words = [0u32; 24];
+    words[0] = 1;
+    words[1] = 2 | 16 | 128;
+    words[4] = 1000;
+    words[14] = (TAG << 16) | (igt << 4) | 0b0101;
+    words
+}
+
+/// Word 14 bits 4..15 (shifted down by 4).
+fn bits(mode: u32, live: bool, gps: bool, drogue: bool, main: bool, reason: u32) -> u32 {
+    mode | 1 << 3 | u32::from(live) << 4 | u32::from(gps) << 5 | u32::from(drogue) << 6 | u32::from(main) << 7
+        | reason << 8
+}
+
+fn report(mode: FcMode) -> Report {
+    Report { supported: true, mode, live_pyro: false, gps_simulated: false, drogue_dry_run: false, main_dry_run: false, reason: 0 }
+}
+
+fn principal(admin: bool, allowed: &[&str]) -> AuthPrincipal {
+    AuthPrincipal {
+        roles: if admin { vec![StreamRole::Admin] } else { Vec::new() },
+        username: Some(if admin { "admin" } else { "operator" }.into()),
+        permissions: Permissions { view_data: true, send_commands: true, ..Default::default() },
+        expires_at_ms: None,
+        anonymous: false,
+        session_type: Some("session".into()),
+        command_access: CommandAccess { allowed_commands: allowed.iter().map(|s| s.to_string()).collect() },
+        calibration_access: CalibrationAccess::default(),
+    }
+}
+
+fn observe(state: &AppState, report: Report) {
+    state.igt.observe(report, Instant::now(), 1);
+}
+
+#[test]
+fn word_14_decodes_every_igt_field() {
+    let r = decode(&health(bits(2, true, false, true, false, 0))).unwrap();
+    assert_eq!(r, Report { supported: true, mode: FcMode::Ready, live_pyro: true, gps_simulated: false, drogue_dry_run: true, main_dry_run: false, reason: 0 });
+    let r = decode(&health(bits(5, false, true, false, true, 9))).unwrap();
+    assert_eq!((r.mode, r.gps_simulated, r.main_dry_run, r.reason), (FcMode::Fault, true, true, 9));
+    assert_eq!(reason_text(9), "real motion: replay abandoned, real sensors and dry-run cleared");
+    for (wire, mode) in [(0, FcMode::Off), (1, FcMode::Validating), (3, FcMode::Sim), (4, FcMode::Done)] {
+        assert_eq!(decode(&health(bits(wire, false, false, false, false, 0))).unwrap().mode, mode);
+    }
+    // Bit 7 clear: a flight image. Every other bit is ignored.
+    let flight = decode(&health(2 | 1 << 4)).unwrap();
+    assert!(!flight.supported);
+    assert_eq!(flight.mode, FcMode::Off);
+    assert!(!flight.live_pyro);
+    // Untagged word 14 (older firmware or another board): nothing.
+    let mut words = health(bits(2, false, false, false, false, 0));
+    words[14] &= 0xFFFF;
+    assert!(decode(&words).is_none());
+    let mut words = health(bits(2, false, false, false, false, 0));
+    words[1] |= 8;
+    assert!(decode(&words).is_none());
+    assert!(decode(&health(bits(6, false, false, false, false, 0))).is_none(), "unknown mode");
+    // The cosmetic output bits 0..3 still decode alongside.
+    assert_eq!(
+        crate::network_variables::fc_outputs_from_health(&health(bits(3, false, false, false, false, 0))),
+        [Some(true), None]
+    );
+}
+
+#[tokio::test]
+async fn status_json_has_exactly_the_contract_fields() {
+    let _mode = thread_mode(Mode::IntegratedGroundTest);
+    let state = crate::state::tests::test_app_state().await;
+    let before = serde_json::to_value(state.igt.status()).unwrap();
+    assert_eq!(before["fc_mode"], "off");
+    assert_eq!(before["supported"], false);
+    assert!(before["updated_ms"].is_null());
+    state.igt.observe(decode(&health(bits(3, false, true, false, false, 10))).unwrap(), Instant::now(), 1234);
+    let json = serde_json::to_value(state.igt.status()).unwrap();
+    let keys: std::collections::BTreeSet<_> = json.as_object().unwrap().keys().cloned().collect();
+    let expected: std::collections::BTreeSet<String> = [
+        "supported", "fc_mode", "live_pyro", "gps_simulated", "drogue_dry_run", "main_dry_run", "reason",
+        "reason_text", "station_mode_igt", "updated_ms",
+    ]
+    .map(str::to_owned)
+    .into();
+    assert_eq!(keys, expected);
+    assert_eq!(json["fc_mode"], "sim");
+    assert_eq!(json["gps_simulated"], true);
+    assert_eq!(json["reason"], 10);
+    assert_eq!(json["reason_text"], "SD ring underrun (last value held)");
+    assert_eq!(json["station_mode_igt"], true);
+    assert_eq!(json["updated_ms"], 1234);
+    assert!(state.igt.simulated());
+    // A repeated identical report republishes nothing.
+    assert!(state.igt.publish().is_some());
+    state.igt.observe(decode(&health(bits(3, false, true, false, false, 10))).unwrap(), Instant::now(), 5000);
+    assert!(state.igt.publish().is_none());
+    assert_eq!(state.igt.status().updated_ms, Some(5000));
+}
+
+#[test]
+fn transitions_raise_one_notice_each() {
+    let _mode = thread_mode(Mode::IntegratedGroundTest);
+    let text = |n: &Notice| match n {
+        Notice::Info(t) | Notice::Warning(t) => t.clone(),
+    };
+    let off = report(FcMode::Off);
+    assert!(transition_notices(None, off, true).is_empty(), "first report Off is quiet");
+    let entered = transition_notices(Some(off), report(FcMode::Validating), true);
+    assert!(text(&entered[0]).contains("entered"));
+    let ready = transition_notices(Some(report(FcMode::Validating)), report(FcMode::Ready), true);
+    assert!(text(&ready[0]).contains("Ready") && text(&ready[0]).contains("DRY-RUN"));
+    let live = transition_notices(Some(report(FcMode::Ready)), Report { live_pyro: true, ..report(FcMode::Ready) }, true);
+    assert!(matches!(&live[0], Notice::Warning(t) if t.contains("LIVE PYRO armed")));
+    let sim = transition_notices(Some(report(FcMode::Ready)), Report { gps_simulated: true, ..report(FcMode::Sim) }, true);
+    assert!(text(&sim[0]).contains("SIMULATED flight started"));
+    let gps = transition_notices(
+        Some(Report { gps_simulated: true, ..report(FcMode::Sim) }),
+        report(FcMode::Done),
+        true,
+    );
+    assert!(gps.iter().any(|n| text(n).contains("done")));
+    assert!(gps.iter().any(|n| text(n) == "FC ground test: GPS switched to real."));
+    let fault = transition_notices(Some(report(FcMode::Ready)), Report { reason: 8, ..report(FcMode::Fault) }, true);
+    assert!(matches!(&fault[0], Notice::Warning(t) if t.contains("not stationary at Launch")));
+    let reset = transition_notices(Some(report(FcMode::Sim)), off, true);
+    assert!(matches!(&reset[0], Notice::Warning(t) if t.contains("left") && t.contains("reset")));
+    // Outside an integrated ground test an FC in the mode is a warning only.
+    let stray = transition_notices(Some(off), report(FcMode::Ready), false);
+    assert_eq!(stray.len(), 1);
+    assert!(matches!(&stray[0], Notice::Warning(t) if t.contains("while the station is in")));
+    assert!(transition_notices(Some(off), off, false).is_empty());
+}
+
+#[tokio::test]
+async fn simulated_follows_sim_and_done_after_a_replay_only() {
+    let _mode = thread_mode(Mode::IntegratedGroundTest);
+    let state = crate::state::tests::test_app_state().await;
+    observe(&state, report(FcMode::Ready));
+    assert!(!state.igt.simulated());
+    observe(&state, report(FcMode::Sim));
+    assert!(state.igt.simulated());
+    observe(&state, report(FcMode::Done));
+    assert!(state.igt.simulated(), "Done after a replay still describes the simulated flight");
+    observe(&state, report(FcMode::Off));
+    observe(&state, report(FcMode::Done));
+    assert!(!state.igt.simulated(), "Done without a replay is not simulated");
+}
+
+#[tokio::test]
+async fn ground_test_commands_exist_only_in_integrated_ground_test_mode() {
+    for mode in [Mode::Normal, Mode::Hitl, Mode::TestFire, Mode::Testing] {
+        let _mode = thread_mode(mode);
+        let state = crate::state::tests::test_app_state().await;
+        for name in IGT_COMMANDS_FOR_TEST {
+            assert!(serde_json::from_value::<TelemetryCommand>(json!(name)).is_err(), "{mode:?} {name}");
+            assert!(!crate::sequences::all_command_names().contains(&name), "{mode:?} {name}");
+        }
+        assert!(matches!(command_gate(&state, &TelemetryCommand::IgtDryRun), Some(Err(_))));
+        assert!(!state.is_command_allowed(&TelemetryCommand::IgtExit));
+        assert!(launch_refusal(&state).is_none(), "{mode:?} has no IGT Launch gate");
+        let layout = crate::layout::load_layout().unwrap();
+        assert!(layout.actions_tab.actions.iter().all(|a| !a.cmd.starts_with("Igt")), "{mode:?}");
+        assert!(!serde_json::to_value(&layout).unwrap().as_object().unwrap().contains_key("igt_mode"));
+        let policy = crate::sequences::default_action_policy();
+        assert!(policy.controls.iter().all(|c| !c.cmd.starts_with("Igt")));
+    }
+    let _mode = thread_mode(Mode::IntegratedGroundTest);
+    for name in IGT_COMMANDS_FOR_TEST {
+        let cmd: TelemetryCommand = serde_json::from_value(json!(name)).unwrap();
+        assert_eq!(crate::sequences::command_name(&cmd), name);
+        assert_eq!(crate::sequences::control_section(name), Some(crate::sequences::ControlSection::GroundTest));
+    }
+    assert_eq!(&crate::sequences::all_command_names()[..4], &IGT_COMMANDS_FOR_TEST);
+    assert!(!crate::sequences::all_command_names().contains(&"GroundStationLaunch"));
+    assert!(serde_json::from_value::<TelemetryCommand>(json!("GroundStationLaunch")).is_err());
+    assert!(serde_json::from_value::<TelemetryCommand>(json!("AdvanceFlightState")).is_err());
+    let layout = crate::layout::load_layout().unwrap();
+    let cmds: Vec<_> = layout.actions_tab.actions.iter().map(|a| a.cmd.as_str()).collect();
+    assert_eq!(&cmds[..4], &IGT_COMMANDS_FOR_TEST);
+    assert!(cmds.contains(&"Launch") && !cmds.contains(&"GroundStationLaunch"));
+    assert!(layout.igt_mode && !layout.test_fire_mode);
+    let boards = layout.network_tab.expected_boards.clone();
+    for board in ["FC", "RF", "PB"] {
+        assert!(boards.iter().any(|b| b == board), "IGT layout expects {board}");
+    }
+}
+
+const IGT_COMMANDS_FOR_TEST: [&str; 4] = ["IgtEnter", "IgtLivePyro", "IgtDryRun", "IgtExit"];
+
+#[test]
+fn fc_command_bytes_follow_the_contract() {
+    assert_eq!(fc_byte(&TelemetryCommand::IgtEnter), Some(29));
+    assert_eq!(fc_byte(&TelemetryCommand::IgtLivePyro), Some(30));
+    assert_eq!(fc_byte(&TelemetryCommand::IgtDryRun), Some(31));
+    assert_eq!(fc_byte(&TelemetryCommand::IgtExit), Some(32));
+    assert_eq!(crate::telemetry_task::hitl_flight_command_id(&TelemetryCommand::IgtExit), Some(32));
+    assert!(requires_ticket(&TelemetryCommand::IgtEnter) && requires_ticket(&TelemetryCommand::IgtLivePyro));
+    assert!(!requires_ticket(&TelemetryCommand::IgtDryRun) && !requires_ticket(&TelemetryCommand::IgtExit));
+}
+
+#[tokio::test]
+async fn enter_is_gated_by_mode_state_and_fc_status() {
+    let _mode = thread_mode(Mode::IntegratedGroundTest);
+    let state = crate::state::tests::test_app_state().await;
+    let enter = TelemetryCommand::IgtEnter;
+    let refused = |state: &AppState| command_gate(state, &enter).unwrap().unwrap_err();
+    assert!(refused(&state).contains("No recent FC ground-test status"));
+    observe(&state, Report::UNSUPPORTED);
+    assert!(refused(&state).contains("no ground-test support"));
+    observe(&state, report(FcMode::Off));
+    assert!(refused(&state).contains("FC phase is unknown"));
+    crate::fc_phase::observe(&state, 6, crate::fc_phase::Source::FcFlightState, 1);
+    assert!(refused(&state).contains("only in Startup"));
+    crate::fc_phase::observe(&state, 0, crate::fc_phase::Source::FcFlightState, 2);
+    assert_eq!(command_gate(&state, &enter), Some(Ok(())));
+    assert!(state.is_command_allowed(&enter));
+    observe(&state, report(FcMode::Ready));
+    assert!(refused(&state).contains("already Ready"));
+    observe(&state, report(FcMode::Fault));
+    assert_eq!(command_gate(&state, &enter), Some(Ok(())), "a fault may be retried");
+    state.set_local_flight_state(FlightState::Armed);
+    assert!(refused(&state).contains("before Armed"));
+    state.set_local_flight_state(FlightState::Idle);
+    state.set_launch_indicator_latched(true);
+    assert!(refused(&state).contains("after a Launch"));
+    state.set_launch_indicator_latched(false);
+    // Dry-run and exit stay available.
+    assert_eq!(command_gate(&state, &TelemetryCommand::IgtDryRun), Some(Ok(())));
+    assert_eq!(command_gate(&state, &TelemetryCommand::IgtExit), Some(Ok(())));
+    let _normal = thread_mode(Mode::Normal);
+    assert!(refused(&state).contains("unavailable in Normal mode"));
+}
+
+#[tokio::test]
+async fn live_pyro_needs_ready_before_launch() {
+    let _mode = thread_mode(Mode::IntegratedGroundTest);
+    let state = crate::state::tests::test_app_state().await;
+    let live = TelemetryCommand::IgtLivePyro;
+    observe(&state, report(FcMode::Validating));
+    assert!(command_gate(&state, &live).unwrap().unwrap_err().contains("Ready"));
+    observe(&state, report(FcMode::Ready));
+    assert_eq!(command_gate(&state, &live), Some(Ok(())));
+    state.set_launch_indicator_latched(true);
+    assert!(command_gate(&state, &live).unwrap().unwrap_err().contains("before Launch"));
+}
+
+#[tokio::test]
+async fn plain_command_path_refuses_enter_and_live_pyro() {
+    let _mode = thread_mode(Mode::IntegratedGroundTest);
+    let state = crate::state::tests::test_app_state().await;
+    observe(&state, report(FcMode::Ready));
+    crate::fc_phase::observe(&state, 0, crate::fc_phase::Source::FcFlightState, 1);
+    for cmd in [TelemetryCommand::IgtEnter, TelemetryCommand::IgtLivePyro] {
+        let (status, message) = crate::web::dispatch_authorized_command(
+            state.clone(), principal(true, &[]), cmd.clone(), 0, None, None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{cmd:?}: {message}");
+        assert!(message.contains("/api/igt/prepare"), "{message}");
+    }
+    // The RRLS proxy path ends in the same dispatcher.
+    let (status, _) = crate::web::dispatch_proxied_command(state.clone(), principal(true, &[]), TelemetryCommand::IgtLivePyro, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn live_pyro_review_needs_an_admin_and_the_typed_phrase() {
+    let _mode = thread_mode(Mode::IntegratedGroundTest);
+    let state = crate::state::tests::test_app_state().await;
+    observe(&state, report(FcMode::Ready));
+    let admin = principal(true, &[]);
+    let operator = principal(false, &[]);
+    let body = br#"{"action":"live_pyro"}"#;
+    let (status, error) = prepare(&state, &operator, None, body).unwrap_err();
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(error.contains("administrator"));
+    let mut anonymous = principal(true, &[]);
+    anonymous.anonymous = true;
+    assert_eq!(prepare(&state, &anonymous, None, body).unwrap_err().0, StatusCode::FORBIDDEN);
+
+    let ticket = prepare(&state, &admin, Some("s1".into()), body).unwrap();
+    assert_eq!(ticket["required_confirmation"], "LIVE PYRO");
+    assert!(ticket["expires_ms"].as_u64().unwrap() > 0);
+    let id = ticket["ticket"].as_str().unwrap().to_owned();
+    // Wrong phrase: refused, and the ticket is spent.
+    let wrong = json!({"ticket": id, "confirmation": "live pyro"}).to_string();
+    assert_eq!(confirm(&state, &admin, Some("s1".into()), wrong.as_bytes()).unwrap_err().0, StatusCode::BAD_REQUEST);
+    let right = json!({"ticket": id, "confirmation": "LIVE PYRO"}).to_string();
+    assert!(confirm(&state, &admin, Some("s1".into()), right.as_bytes()).unwrap_err().1.contains("already used"));
+
+    // Another session cannot use the ticket.
+    let id = prepare(&state, &admin, Some("s1".into()), body).unwrap()["ticket"].as_str().unwrap().to_owned();
+    let right = json!({"ticket": id, "confirmation": "LIVE PYRO"}).to_string();
+    assert!(confirm(&state, &admin, Some("s2".into()), right.as_bytes()).unwrap_err().1.contains("another session"));
+
+    // Gates are checked again at confirm.
+    let id = prepare(&state, &admin, Some("s1".into()), body).unwrap()["ticket"].as_str().unwrap().to_owned();
+    observe(&state, report(FcMode::Sim));
+    let right = json!({"ticket": id, "confirmation": "LIVE PYRO"}).to_string();
+    assert_eq!(confirm(&state, &admin, Some("s1".into()), right.as_bytes()).unwrap_err().0, StatusCode::CONFLICT);
+
+    observe(&state, report(FcMode::Ready));
+    let id = prepare(&state, &admin, Some("s1".into()), body).unwrap()["ticket"].as_str().unwrap().to_owned();
+    let right = json!({"ticket": id, "confirmation": " LIVE PYRO "}).to_string();
+    assert!(matches!(confirm(&state, &admin, Some("s1".into()), right.as_bytes()), Ok(TelemetryCommand::IgtLivePyro)));
+}
+
+#[tokio::test]
+async fn enter_review_needs_the_igt_enter_command_and_no_phrase() {
+    let _mode = thread_mode(Mode::IntegratedGroundTest);
+    let state = crate::state::tests::test_app_state().await;
+    observe(&state, report(FcMode::Off));
+    crate::fc_phase::observe(&state, 0, crate::fc_phase::Source::FcFlightState, 1);
+    let body = br#"{"action":"enter"}"#;
+    let restricted = principal(false, &["Launch"]);
+    assert_eq!(prepare(&state, &restricted, None, body).unwrap_err().0, StatusCode::FORBIDDEN);
+    let operator = principal(false, &["IgtEnter"]);
+    let ticket = prepare(&state, &operator, None, body).unwrap();
+    assert!(ticket["required_confirmation"].is_null());
+    let confirmation = json!({"ticket": ticket["ticket"]}).to_string();
+    assert!(matches!(confirm(&state, &operator, None, confirmation.as_bytes()), Ok(TelemetryCommand::IgtEnter)));
+    // Not offered at all outside the mode.
+    let _normal = thread_mode(Mode::Normal);
+    assert_eq!(prepare(&state, &operator, None, body).unwrap_err().0, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn igt_launch_needs_fc_ground_test_ready_and_goes_to_the_fc() {
+    let _mode = thread_mode(Mode::IntegratedGroundTest);
+    let state = crate::state::tests::test_app_state().await;
+    assert!(crate::telemetry_task::launch_goes_to_flight_computer());
+    assert!(launch_refusal(&state).unwrap().contains("no recent FC ground-test status"));
+    observe(&state, Report::UNSUPPORTED);
+    assert!(launch_refusal(&state).unwrap().contains("no ground-test support"));
+    observe(&state, Report { reason: 3, ..report(FcMode::Fault) });
+    let refusal = launch_refusal(&state).unwrap();
+    assert!(refusal.contains("Fault, not Ready") && refusal.contains("bad CSV header"), "{refusal}");
+    observe(&state, report(FcMode::Ready));
+    assert!(launch_refusal(&state).is_none());
+    // The action policy shows the refusal on Launch.
+    observe(&state, report(FcMode::Validating));
+    let mut policy = crate::sequences::default_action_policy();
+    for control in &mut policy.controls {
+        control.enabled = true;
+    }
+    decorate_policy(&state, &mut policy);
+    let launch = policy.controls.iter().find(|c| c.cmd == "Launch").unwrap();
+    assert!(!launch.enabled && launch.disabled_reason.as_deref().unwrap().contains("Validating"));
+    let dry = policy.controls.iter().find(|c| c.cmd == "IgtDryRun").unwrap();
+    assert!(dry.enabled);
+    let _tf = thread_mode(Mode::TestFire);
+    assert!(!crate::telemetry_task::launch_goes_to_flight_computer());
+}
+
+#[test]
+fn sim_samples_decode_to_separate_series() {
+    let sample = |kind: f32, rest: [f32; 7]| {
+        let mut v = vec![Some(kind)];
+        v.extend(rest.map(Some));
+        v
+    };
+    let imu = decode_sim_sample(&sample(1.0, [12.5, 0.1, 0.2, 9.8, 1.0, 2.0, 3.0])).unwrap();
+    assert_eq!((imu.series, imu.t_s, imu.values.len()), ("SIM_IMU_DATA", 12.5, 6));
+    assert_eq!(imu.values, vec![0.1, 0.2, 9.8, 1.0, 2.0, 3.0]);
+    let baro = decode_sim_sample(&sample(2.0, [1.0, 812.0, 90000.0, 15.0, 0.0, 0.0, 0.0])).unwrap();
+    assert_eq!((baro.series, baro.values.clone()), ("SIM_BAROMETER_DATA", vec![812.0, 90000.0, 15.0]));
+    assert_eq!(decode_sim_sample(&sample(3.0, [0.0; 7])).unwrap().series, "SIM_GPS_DATA");
+    assert_eq!(decode_sim_sample(&sample(4.0, [0.0; 7])).unwrap().values.len(), 6);
+    let descent = decode_sim_sample(&sample(5.0, [0.0; 7])).unwrap();
+    assert_eq!((descent.series, descent.values.len()), ("SIM_DESCENT_STATE", 4));
+    for bad in [0.0, 6.0, 1.5, f32::NAN] {
+        assert!(decode_sim_sample(&sample(bad, [0.0; 7])).is_none());
+    }
+    assert!(decode_sim_sample(&[Some(1.0); 6]).is_none());
+    for kind in 1..=5 {
+        let (series, _) = sim_series(kind).unwrap();
+        assert!(series.starts_with("SIM_"), "never a real series name");
+    }
+}
+
+#[tokio::test]
+async fn sim_rows_come_only_from_the_fc_and_track_the_replayed_altitude() {
+    let _mode = thread_mode(Mode::IntegratedGroundTest);
+    let state = crate::state::tests::test_app_state().await;
+    let values: Vec<Option<f32>> = [2.0, 4.0, 640.0, 93000.0, 12.0, 0.0, 0.0, 0.0].map(Some).to_vec();
+    assert!(sim_rows(&state, "RF", 1, &values).is_empty());
+    let rows = sim_rows(&state, "FC", 1, &values);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].data_type, "SIM_BAROMETER_DATA");
+    assert_eq!(rows[0].values, vec![Some(640.0), Some(93000.0), Some(12.0)]);
+    assert_eq!(state.igt.sim_altitude_m(), Some(640.0));
+}
+
+#[tokio::test]
+async fn estimator_notices_are_prefixed_while_the_fc_flies_replayed_data() {
+    let notice = crate::fc_estimator::simulated_input(Notice::Warning("FC flight estimator diverged".into()));
+    assert_eq!(notice, Notice::Warning("SIMULATED input: FC flight estimator diverged".into()));
+    let _mode = thread_mode(Mode::IntegratedGroundTest);
+    let state = crate::state::tests::test_app_state().await;
+    observe(&state, report(FcMode::Sim));
+    assert!(crate::mission_phase::flight_simulated(&state));
+    let _normal = thread_mode(Mode::Normal);
+    assert!(!crate::mission_phase::flight_simulated(&state), "only in an integrated ground test");
+}
+
+#[tokio::test]
+async fn deployments_in_a_replayed_flight_are_labelled_simulated() {
+    use crate::recovery_events::{Deployment, Evidence, notification_text_igt, notify};
+    let dry = notification_text_igt(Deployment::Drogue, Evidence::Message { altitude_m: 812.4 }, 0, Some(20_100), false);
+    assert!(dry.starts_with("SIMULATED flight: drogue DRY-RUN (not fired) at 812 m"), "{dry}");
+    assert!(dry.contains("T+20.1 s"));
+    let live = notification_text_igt(Deployment::Main, Evidence::Message { altitude_m: 240.0 }, 0, None, true);
+    assert!(live.starts_with("SIMULATED flight: LIVE main fired at 240 m"), "{live}");
+
+    let _mode = thread_mode(Mode::IntegratedGroundTest);
+    let state = crate::state::tests::test_app_state().await;
+    observe(&state, report(FcMode::Sim));
+    state.igt.note_sim_altitude(700.0);
+    let text = notify(&state, Deployment::Drogue, Evidence::State { altitude_m: None }, 0).unwrap();
+    assert!(text.starts_with("SIMULATED flight: drogue DRY-RUN (not fired) at 700 m (latest simulated telemetry)"), "{text}");
+    observe(&state, Report { live_pyro: true, ..report(FcMode::Sim) });
+    let text = crate::recovery_events::observe_fc_message(&state, "PR approx altitude: 250", 0).unwrap();
+    assert!(text.starts_with("SIMULATED flight: LIVE main fired at 250 m"), "{text}");
+    // Real flight (FC not replaying): the normal text.
+    let _normal = thread_mode(Mode::Normal);
+    let state = crate::state::tests::test_app_state().await;
+    let text = crate::recovery_events::observe_fc_message(&state, "PD approx altitude: 812", 0).unwrap();
+    assert!(text.starts_with("Drogue parachute deployed"), "{text}");
+}
+
+#[tokio::test]
+async fn mission_phase_marks_in_flight_simulated() {
+    let _mode = thread_mode(Mode::IntegratedGroundTest);
+    let state = crate::state::tests::test_app_state().await;
+    let msg = crate::mission_phase::refresh(&state);
+    assert!(!msg.simulated);
+    assert!(serde_json::to_value(&msg).unwrap().get("simulated").is_none(), "omitted when false");
+    observe(&state, report(FcMode::Sim));
+    let msg = crate::mission_phase::refresh(&state);
+    assert!(msg.simulated);
+    assert_eq!(serde_json::to_value(&msg).unwrap()["simulated"], true);
+    let wire = crate::web::FlightStateWire::new(FlightState::InFlight, &state);
+    assert!(wire.simulated);
+    assert_eq!(crate::mission_phase::PhaseMode::current(), crate::mission_phase::PhaseMode::Flight, "no test-fire collapse");
+}
+
+#[tokio::test]
+async fn recording_start_rows_name_the_station_mode() {
+    let _mode = thread_mode(Mode::IntegratedGroundTest);
+    let state = crate::state::tests::test_app_state().await;
+    let rows = recording_start_rows(&state);
+    let kinds: Vec<_> = rows
+        .iter()
+        .map(|row| match row {
+            crate::telemetry_db::DbWrite::Telemetry { data_type, payload_json, sender_id, .. } => {
+                (data_type.clone(), payload_json.clone(), sender_id.clone())
+            }
+            other => panic!("unexpected {other:?}"),
+        })
+        .collect();
+    assert_eq!(kinds[0].0, "GS_STATION_MODE");
+    assert_eq!(kinds[0].1, r#"{"mode":"integrated_ground_test"}"#);
+    assert_eq!(kinds[0].2, "GS");
+    assert_eq!(kinds[1].0, "GS_IGT");
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&kinds[1].1).unwrap()["fc_mode"], "off");
+    let _normal = thread_mode(Mode::Normal);
+    let rows = recording_start_rows(&state);
+    assert_eq!(rows.len(), 1, "only an IGT recording carries the FC ground-test status");
+}
+
+#[tokio::test]
+async fn igt_fills_like_test_fire_but_requires_and_shows_the_av_bay() {
+    use crate::types::Board;
+    assert_eq!(
+        crate::loadcell::calibration_filename_for(Mode::IntegratedGroundTest),
+        crate::loadcell::calibration_filename_for(Mode::TestFire)
+    );
+    let _mode = thread_mode(Mode::IntegratedGroundTest);
+    assert!(crate::runtime_mode::is_test_fire_or_igt());
+    let state = crate::state::tests::test_app_state().await;
+    for board in [Board::FlightComputer, Board::RFBoard, Board::PowerBoard, Board::ValveBoard] {
+        assert!(state.board_required_for_progression(board), "{board:?} required in IGT");
+    }
+    let shown: Vec<Board> = state.board_status_snapshot(1).boards.iter().map(|b| b.board).collect();
+    assert!(shown.contains(&Board::FlightComputer) && shown.contains(&Board::RFBoard));
+    assert_eq!(crate::safety_catalog::build_mode(), "igt");
+    // Board recovery and abort cover the AV bay, as in flight.
+    assert_eq!(crate::board_recovery::scope::mode_scope(Mode::IntegratedGroundTest), 0x7f);
+    assert_eq!(crate::board_abort::required_unknown_mask(&state, 0x7f), 0x7f);
+    assert!(crate::fc_estimator::fc_expected_for_test(&state), "the estimator is expected in IGT");
+    let _tf = thread_mode(Mode::TestFire);
+    assert!(!state.board_required_for_progression(Board::FlightComputer));
+    assert!(!crate::fc_estimator::fc_expected_for_test(&state));
+}

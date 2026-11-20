@@ -698,7 +698,8 @@ pub(crate) fn persist_settings(config: &Config) -> Result<(), String> {
 /// feature, enabled only by the test-fire build).
 fn station_engine() -> Engine {
     let mut engine = Engine::default();
-    engine.legacy_resume_deadband = crate::runtime_mode::is_test_fire();
+    // The integrated ground test fills like a test fire.
+    engine.legacy_resume_deadband = crate::runtime_mode::is_test_fire_or_igt();
     engine
 }
 pub fn initialize(state: &AppState) {
@@ -929,7 +930,7 @@ pub fn command_allowed(state: &AppState, cmd: &TelemetryCommand) -> Option<bool>
                 && interlock(state, &policy)
                 && operational_launch_allowed(state, &rt)
                 && (crate::sequences::command_name(cmd) == "RetractPlumbing"
-                    || crate::runtime_mode::is_test_fire()
+                    || crate::runtime_mode::is_test_fire_or_igt()
                     || !matches!(
                         rt.operational.qd.status(rt.now()),
                         QdStatus::NotStarted | QdStatus::AckTimedOut
@@ -1126,7 +1127,7 @@ pub fn decorate_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
             ) {
                 control.enabled = ready
                     && (control.cmd == "RetractPlumbing"
-                        || crate::runtime_mode::is_test_fire()
+                        || crate::runtime_mode::is_test_fire_or_igt()
                         || !matches!(
                             rt.operational.qd.status(rt.now()),
                             QdStatus::NotStarted | QdStatus::AckTimedOut
@@ -5287,7 +5288,7 @@ pub(crate) fn commit_fire_intent_for_pressed_launch(
     {
         return Err("Fire prerequisites changed; launch was not dispatched".into());
     }
-    if !crate::runtime_mode::is_test_fire()
+    if !crate::runtime_mode::is_test_fire_or_igt()
         && !matches!(rt.operational.qd.status(rt.now()), QdStatus::Ready)
     {
         return Err("Quick disconnect is not acknowledged and settled".into());
@@ -5376,6 +5377,8 @@ fn armed_fixture_network_for_test(state:&Arc<AppState>,router:&Arc<sedsnet::rout
             sender_id: "RF".into(),
             values: vec![Some(43.0), Some(-78.0), Some(150.0)],
         });
+        // An integrated ground test launches on the FC's ground test Ready.
+        crate::igt::ready_for_test(state);
     }
     let path =
         std::env::temp_dir().join(format!("gse-armed-fixture-{}.json", rand::random::<u128>()));

@@ -1,7 +1,7 @@
 # Station modes
 
-One backend binary holds every station mode: `normal`, `hitl`, `test_fire`
-and `testing`. Exactly one mode is in force at a time
+One backend binary holds every station mode: `normal`, `hitl`, `test_fire`,
+`testing` and `integrated_ground_test`. Exactly one mode is in force at a time
 (`backend/src/runtime_mode.rs`). Each mode behaves exactly as its old
 separate build did: launch gates, abort scope, test fire ignoring the AV bay,
 HITL manual-only phase controls, overpressure handling and recovery. The same
@@ -11,15 +11,16 @@ applies on the primary ground station and on the RRLS.
 
 ## Mode at start
 
-1. `GS_STATION_MODE`: `normal`, `hitl`, `test_fire` or `testing`. The old
-   spellings `hitl_mode`, `test_fire_mode`, `hitl-mode` and `test-fire-mode`
-   are accepted too.
+1. `GS_STATION_MODE`: `normal`, `hitl`, `test_fire`, `testing` or
+   `integrated_ground_test`. The old spellings `hitl_mode`, `test_fire_mode`,
+   `hitl-mode` and `test-fire-mode` are accepted too, and `igt` for the
+   integrated ground test.
 2. Otherwise the saved selection `<GS_STATION_MODE_DIR>/selection.json`
    (default `data/station-mode`), if its role (`primary` or `rrls`) matches.
 3. Otherwise `normal`.
 
 `run_groundstation.py` always sets `GS_STATION_MODE` (`normal` unless
-`--testing|--hitl-mode|--test-fire-mode` is given), so the launcher's flag
+`--testing|--hitl-mode|--test-fire-mode|--igt-mode` is given), so the launcher's flag
 wins. The supervisor (`--switchable-modes`, systemd) sets it from the saved
 selection, so a confirmed switch survives a restart there. A switch on a
 backend started without the supervisor lasts until that backend stops.
@@ -28,7 +29,7 @@ backend started without the supervisor lasts until that backend stops.
 
 1. Settings > Station shows **Operating mode and Simulation**. The UI reads
    `GET /api/station-modes` (wire V2, see the UI's `station_mode_contract.rs`).
-   It lists all four modes, the Simulation flag where it is supported, and why
+   It lists all five modes, the Simulation flag where it is supported, and why
    a change is refused right now.
 2. **Review mode change** calls `POST /api/station-modes/prepare` with the
    status it read (instance, policy epoch, revision, current and target). The
@@ -76,12 +77,15 @@ The rule is: whatever a fresh start in the new mode would have.
 - Turbocharge evidence and its binding are cleared.
 - The sequence step starts over. The testing-mode modeled retraction is
   dropped.
-- The load-cell calibration is reloaded when the switch enters or leaves
-  testing, since testing uses `backend/calibration/loadcell_calibration_testing.json`.
-  The reloaded calibration is then published to the DAQ.
+- The load-cell calibration is reloaded when the switch changes the
+  calibration file: testing uses `loadcell_calibration_testing.json`, test fire
+  and the integrated ground test share `loadcell_calibration_test_fire.json`,
+  and normal and HITL use `loadcell_calibration.json` (all in
+  `backend/calibration/`). The reloaded calibration is then published to the DAQ.
 - The action policy is re-derived for the new mode.
 - Mode-specific tasks follow the mode epoch on their own:
-  - The safety task idles in HITL and test fire and restarts fresh otherwise.
+  - The safety task idles in HITL and test fire and restarts fresh otherwise
+    (normal, testing and the integrated ground test).
   - The sequence task runs the HITL loop or the automatic loop.
   - The paired settings and shared checklist workers pause in HITL.
 - Connected UIs receive a websocket
@@ -107,12 +111,36 @@ before.
   - on an RRLS, not relaying recovery traffic.
 
   The same check runs at review, at confirm and at the switch itself.
-- Normal is never entered while a link uses a DummyComms stand-in. Normal
-  refuses to start without its configured links. Fix the link and restart.
+- Normal and the integrated ground test are never entered while a link uses a
+  DummyComms stand-in, and both refuse to start without their configured
+  links. Fix the link and restart.
 - A Simulation change needs the supervisor. A backend started directly can
   still switch modes in process.
 - An isolated FlightSim session cannot switch.
 - An RRLS switches only itself. The primary's mode is never changed from it.
+
+## Integrated ground test
+
+`integrated_ground_test` (wire code 4; label "Integrated ground test") is a
+real fill and motor fire on the stand with the whole rocket powered, the FC
+replaying a flight from its SD card after Launch. The contract is
+[../integrated-ground-test.md](../integrated-ground-test.md). In the backend:
+
+- Fill and fire follow test fire (`runtime_mode::is_test_fire_or_igt`): the
+  test-fire fill sequence, turbocharge, QD and overpressure handling, the
+  test-fire load-cell calibration, the DAQ launch log and load-cell zero at
+  Launch, and the test-fire CSV on recording close.
+- The AV bay follows normal (`runtime_mode::is_test_fire` stays test fire
+  only): FC, RF and PB are required and shown, FC warnings and refusals are
+  raised, the estimator is expected, the safety task runs, board recovery and
+  abort scopes are 0x7f, and the mission phase shows In flight and Landed
+  (with `simulated: true` while the FC replays).
+- Launch sends FC Launch and the Valve Board Sequence. It needs the FC routes
+  and the FC reporting ground test Ready (BOARD_HEALTH word 14), not an RF GPS
+  fix. GroundStationLaunch and the phase steps are not offered.
+- The served layout is `layout.json` with the Ground test actions first and
+  `igt_mode: true`. `GET /api/igt`, the websocket `IgtStatus` frame and
+  `POST /api/igt/prepare|confirm` live in `backend/src/igt.rs`.
 
 ## What stays fixed at start
 

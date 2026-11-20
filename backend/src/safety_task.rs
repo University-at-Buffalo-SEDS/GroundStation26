@@ -287,7 +287,9 @@ pub(crate) fn check_baro_thresholds(values: &[f32], warnings: &mut HashSet<&'sta
 fn mode_runs_safety_task(mode: crate::station_mode::Mode) -> bool {
     matches!(
         mode,
-        crate::station_mode::Mode::Normal | crate::station_mode::Mode::Testing
+        crate::station_mode::Mode::Normal
+            | crate::station_mode::Mode::Testing
+            | crate::station_mode::Mode::IntegratedGroundTest
     )
 }
 

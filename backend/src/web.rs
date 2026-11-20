@@ -526,6 +526,7 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .merge(crate::mission_sync::routes())
         .merge(crate::station_mode::routes())
         .merge(crate::station_mode_switch::routes())
+        .merge(crate::igt::routes())
         .merge(crate::station_pairing::manage::routes())
         .merge(crate::launch_history::api::routes())
         // anything that doesn’t match the above routes goes to the static files
@@ -643,6 +644,8 @@ pub enum WsOutMsg {
     FlightMaxima(crate::flight_maxima::FlightMaxima),
     /// The FC's Kalman filter status (`fc_estimator`).
     FcEstimator(crate::fc_estimator::Status),
+    /// The FC's integrated ground test status (`igt`).
+    IgtStatus(crate::igt::Status),
     LaunchClock(LaunchClockMsg),
     Error(ErrorMsg),
     AlertAckState(AlertAckStateMsg),
@@ -680,6 +683,10 @@ pub struct FlightStateWire {
     pub fill_phase: Option<FlightState>,
     pub fill_phase_label: Option<&'static str>,
     pub fc_phase: Option<crate::fc_phase::FcPhaseDto>,
+    /// Integrated ground test: FC flight states come from a replayed flight
+    /// (FC ground test Sim, or Done after a replay). Omitted when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub simulated: bool,
 }
 
 impl FlightStateWire {
@@ -694,6 +701,7 @@ impl FlightStateWire {
             fill_phase,
             fill_phase_label: fill_phase.map(crate::mission_phase::detailed_label),
             fc_phase: state.fc_phase.dto(crate::telemetry_task::get_current_timestamp_ms()),
+            simulated: crate::mission_phase::flight_simulated(state),
         }
     }
 }
@@ -2721,6 +2729,9 @@ fn launch_press_block(state: &AppState, cmd: &TelemetryCommand) -> Option<&'stat
 /// flight command here with that reason instead of answering "ok" and
 /// dropping it at send time. This reports the existing rule; it does not
 /// decide whether the command should be allowed after an Abort.
+pub(crate) fn abort_fence_reason(state: &AppState, cmd: &TelemetryCommand) -> Option<String> {
+    abort_fence_block(state, cmd)
+}
 fn abort_fence_block(state: &AppState, cmd: &TelemetryCommand) -> Option<String> {
     if !state.abort_indicator_latched() || crate::rrls::is_rrls() {
         return None;
@@ -2961,6 +2972,16 @@ async fn dispatch_command_inner(
         );
         return (StatusCode::FORBIDDEN, "command not allowed".into());
     }
+    // Enter ground test and LIVE PYRO go only through the ticketed review
+    // (POST /api/igt/prepare, then /api/igt/confirm).
+    if crate::igt::requires_ticket(&cmd) {
+        let message = format!(
+            "{cmd_name} needs the ground test review: use Ground test > {} (POST /api/igt/prepare, then /api/igt/confirm).",
+            if matches!(cmd, TelemetryCommand::IgtLivePyro) { "LIVE PYRO" } else { "Enter ground test" }
+        );
+        emit_notification_warning(&state, &message);
+        return (StatusCode::FORBIDDEN, message);
+    }
     // Permission is resolved, but no ordinary-queue/GSE/disk wait may precede
     // retention of a new manual emergency stop. The primary owns execution.
     if matches!(cmd, TelemetryCommand::Abort) && !crate::rrls::is_rrls() {
@@ -3008,6 +3029,13 @@ async fn dispatch_command_inner(
     // policy. Refuse the press here with that reason instead of answering
     // "ok" and dropping it at send time.
     if let Some(reason) = launch_press_block(&state, &cmd) {
+        let message = format!("{cmd_name}: {reason}");
+        emit_notification_warning(&state, &message);
+        return (StatusCode::FORBIDDEN, message);
+    }
+    if matches!(cmd, TelemetryCommand::Launch)
+        && let Some(reason) = crate::igt::launch_refusal(&state)
+    {
         let message = format!("{cmd_name}: {reason}");
         emit_notification_warning(&state, &message);
         return (StatusCode::FORBIDDEN, message);
@@ -5312,6 +5340,7 @@ async fn handle_ws(
     let mut mission_phase_rx = crate::mission_phase::subscribe();
     let mut flight_maxima_rx = crate::flight_maxima::subscribe();
     let mut fc_estimator_rx = state.fc_estimator.subscribe();
+    let mut igt_rx = state.igt.subscribe();
     let mut station_mode_rx = crate::runtime_mode::subscribe();
     station_mode_rx.borrow_and_update();
 
@@ -5383,6 +5412,16 @@ async fn handle_ws(
             .send(serde_json::to_string(&WsOutMsg::FcEstimator(initial_estimator)).unwrap_or_default())
             .await
             .is_err()
+        {
+            return;
+        }
+        igt_rx.borrow_and_update();
+        // Sent at connect only in an integrated ground test; changes always.
+        if crate::runtime_mode::is_igt()
+            && ws_out_tx
+                .send(serde_json::to_string(&WsOutMsg::IgtStatus(state_for_send.igt.status())).unwrap_or_default())
+                .await
+                .is_err()
         {
             return;
         }
@@ -5577,6 +5616,16 @@ async fn handle_ws(
                     }
                     let status = fc_estimator_rx.borrow_and_update().clone();
                     let text = serde_json::to_string(&WsOutMsg::FcEstimator(status)).unwrap_or_default();
+                    if ws_out_tx.send(text).await.is_err() {
+                        break;
+                    }
+                }
+                changed = igt_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let status = igt_rx.borrow_and_update().clone();
+                    let text = serde_json::to_string(&WsOutMsg::IgtStatus(status)).unwrap_or_default();
                     if ws_out_tx.send(text).await.is_err() {
                         break;
                     }

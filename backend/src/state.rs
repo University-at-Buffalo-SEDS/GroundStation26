@@ -367,6 +367,8 @@ pub struct AppState {
     pub fc_phase: Arc<crate::fc_phase::Tracker>,
     /// The FC's Kalman filter status from its BOARD_HEALTH (fc_estimator).
     pub fc_estimator: Arc<crate::fc_estimator::Tracker>,
+    /// The FC's integrated ground test status from its BOARD_HEALTH (igt).
+    pub igt: Arc<crate::igt::Tracker>,
 
     pub hitl_button_interlock_enabled: Arc<AtomicBool>,
 
@@ -2317,6 +2319,7 @@ impl AppState {
             }
         }
         crate::gse::decorate_policy(self, &mut policy);
+        crate::igt::decorate_policy(self, &mut policy);
         // Expose idempotent supply closes using their backend command gate
         // before unknown feedback disables ambiguous toggles.
         for (toggle, close) in [("Nitrogen", "NitrogenClose"), ("Nitrous", "NitrousClose")] {
@@ -2434,6 +2437,10 @@ impl AppState {
     pub fn is_command_allowed(&self, cmd: &TelemetryCommand) -> bool {
         if crate::sequence_access::refusal(self, cmd).is_some() {
             return false;
+        }
+        // Ground test controls: integrated ground test only, own gates.
+        if let Some(gate) = crate::igt::command_gate(self, cmd) {
+            return gate.is_ok();
         }
         if self.operator_queue.fill_launch_active()
             && crate::sequences::is_fill_system_control(command_name(cmd)) {
@@ -4570,6 +4577,7 @@ pub(crate) mod tests {
             abort_indicator_latched: Arc::new(AtomicBool::new(false)),
             fc_phase: Default::default(),
             fc_estimator: Default::default(),
+            igt: Default::default(),
             hitl_button_interlock_enabled: Arc::new(AtomicBool::new(false)),
             hitl_launch_interlock_enabled: Arc::new(AtomicBool::new(false)),
             hitl_safety_interlocks: default_hitl_safety_interlocks(),

@@ -79,6 +79,13 @@ pub enum TelemetryCommand {
     ValveSelfTest,
     NitrogenTest,
     Turbocharge,
+    /// Integrated ground test only (docs/integrated-ground-test.md). Enter
+    /// and LIVE PYRO are deserializable so the refusal names them, but only
+    /// the ticketed `/api/igt/confirm` flow sends them.
+    IgtEnter,
+    IgtLivePyro,
+    IgtDryRun,
+    IgtExit,
     /// Original physical EDGE identity only; never deserialized from a client.
     #[serde(skip)]
     ColdFlowPanelRelease {
@@ -149,6 +156,16 @@ const NORMAL_CLIENT_COMMANDS: &[&str] = &[
     "ResetTClock", "StartFill", "PauseFill", "CancelFill", "ValveSelfTest", "NitrogenTest",
     "Turbocharge",
 ];
+const IGT_CLIENT_COMMANDS: &[&str] = &[
+    "Postinit", "Launch", "Dump", "Abort", "NormallyOpen", "Pilot", "Igniter",
+    "RetractPlumbing", "Nitrogen", "NitrogenClose", "Nitrous", "NitrousClose",
+    "StartWritingNow", "StartWritingLastTwoMinutes", "PauseWritingDb", "StopWritingDb",
+    "ResetSim", "ContinueFillSequence", "MonitorAltitude", "RevokeMonitorAltitude",
+    "ConsecutiveSamples", "RevokeConsecutiveSamples", "ResetFailures", "RevokeResetFailures",
+    "ValidateMeasms", "RevokeValidateMeasms", "ToggleAvBayUnderglow", "ToggleFlightBuzzer",
+    "ResetTClock", "StartFill", "PauseFill", "CancelFill", "ValveSelfTest", "NitrogenTest",
+    "Turbocharge", "IgtEnter", "IgtLivePyro", "IgtDryRun", "IgtExit",
+];
 const TEST_FIRE_CLIENT_COMMANDS: &[&str] = &[
     "Postinit", "Launch", "Dump", "Abort", "NormallyOpen", "Pilot", "Igniter",
     "RetractPlumbing", "Nitrogen", "NitrogenClose", "Nitrous", "NitrousClose",
@@ -182,6 +199,7 @@ pub(crate) fn client_command_names(mode: crate::station_mode::Mode) -> &'static 
         Mode::Hitl => HITL_CLIENT_COMMANDS,
         Mode::TestFire => TEST_FIRE_CLIENT_COMMANDS,
         Mode::Normal | Mode::Testing => NORMAL_CLIENT_COMMANDS,
+        Mode::IntegratedGroundTest => IGT_CLIENT_COMMANDS,
     }
 }
 
@@ -193,6 +211,10 @@ impl TelemetryCommand {
             TelemetryCommand::GroundStationLaunch
             | TelemetryCommand::AdvanceFlightState
             | TelemetryCommand::RewindFlightState => matches!(mode, Mode::Hitl | Mode::TestFire),
+            TelemetryCommand::IgtEnter
+            | TelemetryCommand::IgtLivePyro
+            | TelemetryCommand::IgtDryRun
+            | TelemetryCommand::IgtExit => mode == Mode::IntegratedGroundTest,
             TelemetryCommand::OperatorPhase { .. }
             | TelemetryCommand::IgniterSequence
             | TelemetryCommand::ToggleButtonInterlock

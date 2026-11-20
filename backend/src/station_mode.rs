@@ -28,6 +28,7 @@ pub enum Mode {
     Hitl,
     TestFire,
     Testing,
+    IntegratedGroundTest,
 }
 /// The station mode in force now (see [`crate::runtime_mode`]).
 pub fn local_mode() -> Mode {
@@ -513,6 +514,7 @@ fn display_frame(session: u32, nonce: u128, mode: Option<Mode>) -> Vec<u8> {
             Mode::Hitl => 1,
             Mode::TestFire => 2,
             Mode::Testing => 3,
+            Mode::IntegratedGroundTest => 4,
         });
     }
     wire
@@ -576,6 +578,7 @@ impl DisplayRuntime {
                 1 => Mode::Hitl,
                 2 => Mode::TestFire,
                 3 => Mode::Testing,
+                4 => Mode::IntegratedGroundTest,
                 _ => anyhow::bail!("Invalid display mode"),
             };
             if !self.persisted || self.mode != Some(mode) {

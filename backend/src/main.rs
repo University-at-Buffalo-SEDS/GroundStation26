@@ -83,6 +83,7 @@ mod media_runtime;
 mod mission_phase;
 mod fc_phase;
 mod fc_estimator;
+mod igt;
 mod valve_report_health;
 mod mission_sync;
 mod fc_command_gate;
@@ -1394,7 +1395,7 @@ fn open_rocket_comms(link: &CommsLinkConfig) -> (Arc<Mutex<Box<dyn CommsDevice>>
             // start without them; the other modes use a stand-in, and a later
             // switch into Normal is refused while a stand-in exists
             // (comms::dummy_links).
-            if runtime_mode::is_normal() {
+            if runtime_mode::is_normal() || runtime_mode::is_igt() {
                 panic!("Rocket comms missing and testing mode not enabled")
             }
             (
@@ -1421,7 +1422,7 @@ fn open_umbilical_comms(link: &CommsLinkConfig) -> (Arc<Mutex<Box<dyn CommsDevic
             // start without them; the other modes use a stand-in, and a later
             // switch into Normal is refused while a stand-in exists
             // (comms::dummy_links).
-            if runtime_mode::is_normal() {
+            if runtime_mode::is_normal() || runtime_mode::is_igt() {
                 panic!("Umbilical comms missing and testing mode not enabled")
             }
             (
@@ -1711,6 +1712,7 @@ async fn main() -> anyhow::Result<()> {
         abort_indicator_latched: Arc::new(AtomicBool::new(false)),
         fc_phase: Default::default(),
         fc_estimator: Default::default(),
+        igt: Default::default(),
         hitl_button_interlock_enabled: Arc::new(AtomicBool::new(false)),
         hitl_launch_interlock_enabled: Arc::new(AtomicBool::new(false)),
         hitl_safety_interlocks: state::default_hitl_safety_interlocks(),

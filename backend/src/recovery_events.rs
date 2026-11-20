@@ -147,6 +147,39 @@ pub fn notification_text(
     )
 }
 
+/// An integrated ground test's deployment during the replayed flight: the FC
+/// pulse was dry-run (logged, not fired) unless LIVE PYRO was armed.
+/// "SIMULATED flight: drogue DRY-RUN (not fired) at 812 m, 12:00:05 UTC, T+20.1 s".
+pub fn notification_text_igt(
+    kind: Deployment,
+    evidence: Evidence,
+    event_ms: i64,
+    t_plus_ms: Option<i64>,
+    live_pyro: bool,
+) -> String {
+    let altitude = match evidence {
+        Evidence::Message { altitude_m } => format!("at {altitude_m:.0} m"),
+        Evidence::State {
+            altitude_m: Some(altitude_m),
+        } => format!("at {altitude_m:.0} m (latest simulated telemetry)"),
+        Evidence::State { altitude_m: None } => "at unknown altitude".into(),
+    };
+    let t_plus = t_plus_ms
+        .filter(|ms| *ms >= 0)
+        .map(|ms| format!(", T+{:.1} s", ms as f64 / 1000.0))
+        .unwrap_or_default();
+    let name = match kind {
+        Deployment::Drogue => "drogue",
+        Deployment::Main => "main",
+    };
+    let event = if live_pyro {
+        format!("LIVE {name} fired")
+    } else {
+        format!("{name} DRY-RUN (not fired)")
+    };
+    format!("SIMULATED flight: {event} {altitude}, {}{t_plus}", format_utc(event_ms))
+}
+
 fn t_plus_ms(state: &AppState, event_ms: i64) -> Option<i64> {
     let clock = state.launch_clock_snapshot();
     (clock.kind == crate::telemetry_db::LaunchClockKind::TPlus)
@@ -167,13 +200,24 @@ pub fn notify(
     if !claim(state, kind) {
         return None;
     }
+    // In an integrated ground test the FC deploys on its replayed flight; the
+    // real altitude telemetry is the stand's.
+    let simulated = crate::runtime_mode::is_igt() && state.igt.simulated();
     let evidence = match evidence {
         Evidence::State { altitude_m: None } => Evidence::State {
-            altitude_m: crate::flight_maxima::latest_altitude_m(),
+            altitude_m: if simulated {
+                state.igt.sim_altitude_m()
+            } else {
+                crate::flight_maxima::latest_altitude_m()
+            },
         },
         other => other,
     };
-    let text = notification_text(kind, evidence, event_ms, t_plus_ms(state, event_ms));
+    let text = if simulated {
+        notification_text_igt(kind, evidence, event_ms, t_plus_ms(state, event_ms), state.igt.live_pyro())
+    } else {
+        notification_text(kind, evidence, event_ms, t_plus_ms(state, event_ms))
+    };
     log::info!("{text}");
     state.add_notification_with_persistence(text.clone(), true);
     crate::web::persist_message_db_only(state, text.clone());

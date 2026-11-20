@@ -33,6 +33,7 @@ class SelectionTests(unittest.TestCase):
     def test_parse_modes_accepts_launcher_spellings(self):
         self.assertEqual(sm.parse_modes("all"), list(sm.MODES))
         self.assertEqual(sm.parse_modes("hitl-mode,test-fire-mode,hitl"), ["hitl", "test_fire"])
+        self.assertEqual(sm.parse_modes("igt,integrated-ground-test"), ["integrated_ground_test"])
         with self.assertRaises(ValueError):
             sm.parse_modes("flight")
 

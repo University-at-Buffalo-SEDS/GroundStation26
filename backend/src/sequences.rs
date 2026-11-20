@@ -1175,6 +1175,10 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         TelemetryCommand::ReinitAfter15 => "ReinitAfter15",
         TelemetryCommand::ReinitAfter30 => "ReinitAfter30",
         TelemetryCommand::ReinitAfter50 => "ReinitAfter50",
+        TelemetryCommand::IgtEnter => "IgtEnter",
+        TelemetryCommand::IgtLivePyro => "IgtLivePyro",
+        TelemetryCommand::IgtDryRun => "IgtDryRun",
+        TelemetryCommand::IgtExit => "IgtExit",
     }
 }
 
@@ -1185,10 +1189,24 @@ pub fn all_command_names() -> Vec<&'static str> {
         all_command_names_hitl()
     } else if crate::runtime_mode::is_test_fire() {
         all_command_names_test_fire()
+    } else if crate::runtime_mode::is_igt() {
+        all_command_names_igt()
     } else {
         all_command_names_default()
     }
 }
+
+/// The integrated ground test: the flight catalog (FC Launch, FC setup) plus
+/// the Ground test controls. GroundStationLaunch and the phase steps stay
+/// HITL/test-fire only.
+fn all_command_names_igt() -> Vec<&'static str> {
+    let mut names = IGT_COMMANDS.to_vec();
+    names.extend(all_command_names_default());
+    names
+}
+
+/// The Ground test section (integrated ground test only).
+pub(crate) const IGT_COMMANDS: [&str; 4] = ["IgtEnter", "IgtLivePyro", "IgtDryRun", "IgtExit"];
 
 fn all_command_names_default() -> Vec<&'static str> {
     let mut names = vec![
@@ -1338,6 +1356,9 @@ pub(crate) fn is_fill_system_control(name: &str) -> bool {
 pub enum ControlSection {
     /// Abort. Always first and never collapsed.
     Safety,
+    /// Integrated ground test controls (enter, LIVE PYRO, dry-run, exit).
+    /// Listed first after Safety, and only in that mode.
+    GroundTest,
     /// Manual GSE valves and the QD / fill-line retraction.
     FillSystem,
     /// Fill, test and cold-flow sequences, ignition, Launch and the T-clock.
@@ -1373,6 +1394,7 @@ pub(crate) fn control_section(cmd: &str) -> Option<ControlSection> {
         | "AbortAfter100" | "AbortAfter40" | "AbortAfter250" | "ReinitAfter15"
         | "ReinitAfter30" | "ReinitAfter50" => FlightComputer,
         "ToggleAvBayUnderglow" | "ToggleFlightBuzzer" => AvBay,
+        "IgtEnter" | "IgtLivePyro" | "IgtDryRun" | "IgtExit" => GroundTest,
         // RecoverStation is an HTTP action (board_recovery::coordinator::station_recover),
         // listed in the Actions tab beside the other recovery controls.
         "ResetFlightState" | "RecoverStation" => Recovery,
@@ -1388,8 +1410,13 @@ pub(crate) fn control_section(cmd: &str) -> Option<ControlSection> {
 }
 
 #[cfg(test)]
-pub(crate) fn every_mode_catalog() -> [Vec<&'static str>; 3] {
-    [all_command_names_default(), all_command_names_hitl(), all_command_names_test_fire()]
+pub(crate) fn every_mode_catalog() -> [Vec<&'static str>; 4] {
+    [
+        all_command_names_default(),
+        all_command_names_hitl(),
+        all_command_names_test_fire(),
+        all_command_names_igt(),
+    ]
 }
 
 pub fn default_action_policy() -> ActionPolicyMsg {
@@ -1535,7 +1562,7 @@ fn sequence_expects_normally_open(step: SequenceStep) -> bool {
 }
 
 fn sequence_expects_normally_closed(step: SequenceStep) -> bool {
-    if crate::runtime_mode::is_test_fire() {
+    if crate::runtime_mode::is_test_fire_or_igt() {
         return false;
     }
     matches!(
@@ -1561,7 +1588,7 @@ fn sequence_blocks_until_normally_open(step: SequenceStep) -> bool {
 }
 
 fn sequence_blocks_until_normally_closed(step: SequenceStep) -> bool {
-    if crate::runtime_mode::is_test_fire() {
+    if crate::runtime_mode::is_test_fire_or_igt() {
         return false;
     }
     matches!(
@@ -1589,7 +1616,7 @@ fn dump_open_fails_nitrous_step(step: SequenceStep) -> bool {
 }
 
 fn first_fill_step_after_setup() -> SequenceStep {
-    if crate::runtime_mode::is_test_fire() {
+    if crate::runtime_mode::is_test_fire_or_igt() {
         SequenceStep::OpenNitrous
     } else {
         SequenceStep::NitrogenFill
@@ -1606,11 +1633,11 @@ fn nitrous_close_accepted_for_vent_prompt(valves: ValveSnapshot) -> bool {
 
 fn setup_valves_ready(valves: ValveSnapshot) -> bool {
     valves.dump_open == Some(false)
-        && (crate::runtime_mode::is_test_fire() || valves.normally_open == Some(false))
+        && (crate::runtime_mode::is_test_fire_or_igt() || valves.normally_open == Some(false))
 }
 
 fn mass_is_vented(current_mass_kg: Option<f32>, cfg: &SequenceConfig) -> bool {
-    if crate::runtime_mode::is_test_fire() {
+    if crate::runtime_mode::is_test_fire_or_igt() {
         return true;
     }
     current_mass_kg
@@ -2039,7 +2066,7 @@ fn update_sequence_runtime(
                 }
             }
             let mass_warning_active =
-                !crate::runtime_mode::is_test_fire() && mass_shift_kg > cfg.max_leak_mass_delta_kg;
+                !crate::runtime_mode::is_test_fire_or_igt() && mass_shift_kg > cfg.max_leak_mass_delta_kg;
             if mass_warning_active && !runtime.warned_mass_shift {
                 runtime.warned_mass_shift = true;
                 if runtime.mass_shift_notification_id.is_none() {
@@ -2058,7 +2085,7 @@ fn update_sequence_runtime(
             }
 
             let pressure_ok = current >= baseline - allowed_pressure_drop;
-            let mass_ok = crate::runtime_mode::is_test_fire()
+            let mass_ok = crate::runtime_mode::is_test_fire_or_igt()
                 || current_mass_kg.is_none()
                 || mass_shift_kg <= allowed_mass_shift;
 
@@ -2374,7 +2401,7 @@ fn update_sequence_runtime(
         }
         SequenceStep::RetractFillLines => {
             if !runtime.notified_retract_fill_lines {
-                if crate::runtime_mode::is_test_fire() {
+                if crate::runtime_mode::is_test_fire_or_igt() {
                     state.add_notification("Retract fill lines.");
                 } else {
                     state.add_notification("Vent valve closed. Retract fill lines.");
@@ -2387,7 +2414,7 @@ fn update_sequence_runtime(
         }
         SequenceStep::ArmedReady => {
             if !runtime.notified_armed {
-                if crate::runtime_mode::is_test_fire() {
+                if crate::runtime_mode::is_test_fire_or_igt() {
                     state.add_notification(
                         "Fill sequence complete: nitrous closed and fill lines removed. Launch state is ready.",
                     );
@@ -2589,7 +2616,7 @@ fn build_policy(
         }
         // In Idle, make the first fill-transition action the only illuminated action.
         // All other controls remain available (dimmed client-side when not blinking).
-        if !crate::runtime_mode::is_test_fire()
+        if !crate::runtime_mode::is_test_fire_or_igt()
             && inputs.flight_state == FlightState::Idle
             && let Some(blink) = command_prompt_blink(
                 state,
@@ -2602,7 +2629,7 @@ fn build_policy(
         {
             enabled.insert("NormallyOpen", blink);
         }
-        if !crate::runtime_mode::is_test_fire()
+        if !crate::runtime_mode::is_test_fire_or_igt()
             && inputs.flight_state == FlightState::Idle
             && let Some(blink) =
                 command_prompt_blink(state, cfg, inputs.valves, "Dump", false, inputs.now_ms)
@@ -2652,7 +2679,7 @@ fn build_policy(
 
     match runtime.step {
         SequenceStep::SetupValves => {
-            if !crate::runtime_mode::is_test_fire()
+            if !crate::runtime_mode::is_test_fire_or_igt()
                 && let Some(blink) = command_prompt_blink(
                     state,
                     cfg,

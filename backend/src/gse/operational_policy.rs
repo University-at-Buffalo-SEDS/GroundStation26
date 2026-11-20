@@ -81,8 +81,22 @@ pub(super) fn operational_launch_allowed(state: &AppState, rt: &Runtime) -> bool
             .valves
             .iter()
             .all(|v| v.is_some_and(|v| !v.open && v.at_ms <= now && now - v.at_ms <= 2_000))
-        && (crate::runtime_mode::is_test_fire()
-            || (flight_routes(state) && crate::antenna::rocket_launch_fix_locked()))
+        && launch_route_ready(state)
+}
+/// The flight-computer part of the Launch gate. Test fire has no AV bay. The
+/// integrated ground test needs the FC routes and the FC reporting ground
+/// test Ready instead of an RF GPS fix (the vehicle stays on the stand).
+// Safety catalog (About safety): igt-launch-gate. Keep backend/src/safety_catalog_rules.rs in step.
+fn launch_route_ready(state: &AppState) -> bool {
+    if crate::runtime_mode::is_test_fire() {
+        return true;
+    }
+    flight_routes(state)
+        && if crate::runtime_mode::is_igt() {
+            crate::igt::launch_ready(state)
+        } else {
+            crate::antenna::rocket_launch_fix_locked()
+        }
 }
 fn topology(state: &AppState) -> (bool, String) {
     let required = [
@@ -444,7 +458,7 @@ pub(super) fn handle_operational_command(
     launch_revision: Option<u64>,
 ) -> bool {
     let name = crate::sequences::command_name(cmd);
-    if name == "RetractPlumbing" && !crate::runtime_mode::is_test_fire() {
+    if name == "RetractPlumbing" && !crate::runtime_mode::is_test_fire_or_igt() {
         if let Err(message) = crate::actuator_plumbing::motion_ready(state) {
             state.add_notification(message);
             return true;
@@ -490,7 +504,7 @@ pub(super) fn handle_operational_command(
         }
         return true;
     }
-    if matches!(name, "Launch" | "GroundStationLaunch") && !crate::runtime_mode::is_test_fire() {
+    if matches!(name, "Launch" | "GroundStationLaunch") && !crate::runtime_mode::is_test_fire_or_igt() {
         let mut rt = state.gse.lock().unwrap();
         let now = rt.now();
         if !matches!(rt.operational.qd.status(now), QdStatus::Ready) {
@@ -1666,6 +1680,7 @@ mod tests {
             sender_id: "RF".into(),
             values: vec![Some(43.0), Some(-78.0), Some(150.0)],
         });
+        crate::igt::ready_for_test(&state);
         assert!(operational_launch_allowed(
             &state,
             &state.gse.lock().unwrap()

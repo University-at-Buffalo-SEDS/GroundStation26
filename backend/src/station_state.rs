@@ -78,6 +78,7 @@ fn mode_code(mode: Mode) -> u8 {
         Mode::Hitl => 1,
         Mode::TestFire => 2,
         Mode::Testing => 3,
+        Mode::IntegratedGroundTest => 4,
     }
 }
 fn mode_from(code: u8) -> Option<Mode> {
@@ -86,6 +87,7 @@ fn mode_from(code: u8) -> Option<Mode> {
         1 => Mode::Hitl,
         2 => Mode::TestFire,
         3 => Mode::Testing,
+        4 => Mode::IntegratedGroundTest,
         _ => return None,
     })
 }
@@ -101,7 +103,7 @@ fn phase_mode(mode: Mode) -> PhaseMode {
     match mode {
         Mode::Hitl => PhaseMode::Hitl,
         Mode::TestFire => PhaseMode::TestFire,
-        Mode::Normal | Mode::Testing => PhaseMode::Flight,
+        Mode::Normal | Mode::Testing | Mode::IntegratedGroundTest => PhaseMode::Flight,
     }
 }
 fn clock_kind_code(kind: LaunchClockKind) -> u8 {
@@ -457,3 +459,17 @@ pub(crate) fn received_for_test() -> Option<StationState> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod igt_mode_code_tests {
+    use super::*;
+    #[test]
+    fn every_mode_round_trips_and_igt_is_wire_code_4() {
+        assert_eq!(mode_code(Mode::IntegratedGroundTest), 4);
+        for mode in [Mode::Normal, Mode::Hitl, Mode::TestFire, Mode::Testing, Mode::IntegratedGroundTest] {
+            assert_eq!(mode_from(mode_code(mode)), Some(mode));
+        }
+        assert_eq!(mode_from(5), None);
+        assert_eq!(phase_mode(Mode::IntegratedGroundTest), PhaseMode::Flight);
+    }
+}

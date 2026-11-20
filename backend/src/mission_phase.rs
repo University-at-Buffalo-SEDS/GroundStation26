@@ -294,6 +294,10 @@ pub struct MissionPhaseMsg {
     pub comms_loss_landed: bool,
     /// Wall time of the last phase change.
     pub since_ms: i64,
+    /// Integrated ground test: the FC flies (or flew) replayed data, so In
+    /// flight and Landed are SIMULATED. Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub simulated: bool,
 }
 
 impl MissionPhaseMsg {
@@ -322,6 +326,7 @@ impl MissionPhaseMsg {
                     ..*inputs
                 }) != MissionPhase::Landed,
             since_ms,
+            simulated: false,
         }
     }
 }
@@ -429,6 +434,11 @@ fn fc_contact_lost(state: &crate::state::AppState) -> bool {
     fc_contact_lost_after_flight(t_plus, silence)
 }
 
+/// Integrated ground test with the FC flying (or done flying) replayed data.
+pub fn flight_simulated(state: &crate::state::AppState) -> bool {
+    crate::runtime_mode::is_igt() && state.igt.simulated()
+}
+
 /// Recompute and publish the phase now. Returns the published message.
 pub fn refresh(state: &crate::state::AppState) -> MissionPhaseMsg {
     let current = CHANNEL.borrow().clone();
@@ -455,8 +465,9 @@ pub fn refresh(state: &crate::state::AppState) -> MissionPhaseMsg {
     } else {
         crate::telemetry_task::get_current_timestamp_ms() as i64
     };
-    let next = MissionPhaseMsg::from_inputs(&inputs, since_ms)
+    let mut next = MissionPhaseMsg::from_inputs(&inputs, since_ms)
         .with_fc_phase(state.fc_phase.dto(crate::telemetry_task::get_current_timestamp_ms()));
+    next.simulated = flight_simulated(state);
     if next.comms_loss_landed && !current.comms_loss_landed {
         let text = "FC contact lost for 2.5 min after T+5 min; marking Landed.";
         log::warn!("{text}");

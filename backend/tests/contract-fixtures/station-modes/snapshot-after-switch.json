@@ -31,6 +31,10 @@
     {
       "id": "testing",
       "label": "Testing"
+    },
+    {
+      "id": "integrated_ground_test",
+      "label": "Integrated ground test"
     }
   ],
   "options": [
@@ -87,6 +91,17 @@
       "output_domain": "Simulated rocket telemetry and actions from testing mode's internal flight model",
       "reason": null,
       "simulation": true,
+      "transition_kind": "restart"
+    },
+    {
+      "available": true,
+      "id": "integrated_ground_test",
+      "in_process": true,
+      "label": "Integrated ground test · live outputs",
+      "mode_id": "integrated_ground_test",
+      "output_domain": "Physical station links and outputs as defined by Integrated ground test mode",
+      "reason": null,
+      "simulation": false,
       "transition_kind": "restart"
     }
   ],

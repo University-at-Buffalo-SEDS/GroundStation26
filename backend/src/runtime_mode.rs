@@ -59,6 +59,7 @@ fn code(mode: Mode) -> u64 {
         Mode::Hitl => 2,
         Mode::TestFire => 3,
         Mode::Testing => 4,
+        Mode::IntegratedGroundTest => 5,
     }
 }
 fn decode(code: u64) -> Mode {
@@ -66,6 +67,7 @@ fn decode(code: u64) -> Mode {
         2 => Mode::Hitl,
         3 => Mode::TestFire,
         4 => Mode::Testing,
+        5 => Mode::IntegratedGroundTest,
         _ => Mode::Normal,
     }
 }
@@ -80,6 +82,9 @@ pub fn parse(id: &str) -> Option<Mode> {
         "hitl" | "hitl_mode" => Some(Mode::Hitl),
         "test_fire" | "test_fire_mode" | "testfire" => Some(Mode::TestFire),
         "testing" => Some(Mode::Testing),
+        "integrated_ground_test" | "igt" | "igt_mode" | "integrated_ground_test_mode" => {
+            Some(Mode::IntegratedGroundTest)
+        }
         _ => None,
     }
 }
@@ -173,6 +178,20 @@ pub fn is_test_fire() -> bool {
 pub fn is_testing() -> bool {
     current() == Mode::Testing
 }
+/// Integrated ground test: a real fill and fire on the stand with the whole
+/// rocket powered, the FC replaying a flight from its SD card after Launch.
+#[inline]
+pub fn is_igt() -> bool {
+    current() == Mode::IntegratedGroundTest
+}
+/// Test fire or integrated ground test: the modes that fill and fire on the
+/// stand (test-fire fill sequence, turbocharge, QD and overpressure handling,
+/// test-fire CSV export). Only test fire also drops the AV bay; use
+/// [`is_test_fire`] for that.
+#[inline]
+pub fn is_test_fire_or_igt() -> bool {
+    matches!(current(), Mode::TestFire | Mode::IntegratedGroundTest)
+}
 /// HITL or test fire: the two modes that used to replace normal flight policy.
 #[inline]
 pub fn is_hitl_or_test_fire() -> bool {
@@ -219,6 +238,7 @@ pub fn label(mode: Mode) -> &'static str {
         Mode::Hitl => "HITL",
         Mode::TestFire => "Test fire",
         Mode::Testing => "Testing",
+        Mode::IntegratedGroundTest => "Integrated ground test",
     }
 }
 
@@ -382,12 +402,36 @@ mod tests {
     }
 
     #[test]
+    fn igt_predicates_fill_like_test_fire_but_keep_the_av_bay() {
+        let _mode = test_support::thread_mode(Mode::IntegratedGroundTest);
+        assert!(is_igt());
+        assert!(is_test_fire_or_igt());
+        assert!(!is_test_fire());
+        assert!(!is_hitl_or_test_fire());
+        assert!(!is_normal());
+        assert_eq!(label(current()), "Integrated ground test");
+        let _tf = test_support::thread_mode(Mode::TestFire);
+        assert!(is_test_fire_or_igt() && !is_igt());
+        let _normal = test_support::thread_mode(Mode::Normal);
+        assert!(!is_test_fire_or_igt() && !is_igt());
+    }
+
+    #[test]
     fn ids_parse() {
         assert_eq!(parse("test-fire"), Some(Mode::TestFire));
         assert_eq!(parse("hitl_mode"), Some(Mode::Hitl));
         assert_eq!(parse("Normal"), Some(Mode::Normal));
         assert_eq!(parse("flight"), None);
-        for mode in [Mode::Normal, Mode::Hitl, Mode::TestFire, Mode::Testing] {
+        assert_eq!(parse("integrated_ground_test"), Some(Mode::IntegratedGroundTest));
+        assert_eq!(parse("integrated-ground-test"), Some(Mode::IntegratedGroundTest));
+        assert_eq!(parse("IGT"), Some(Mode::IntegratedGroundTest));
+        for mode in [
+            Mode::Normal,
+            Mode::Hitl,
+            Mode::TestFire,
+            Mode::Testing,
+            Mode::IntegratedGroundTest,
+        ] {
             assert_eq!(decode(pack(mode, 77)), mode);
         }
     }

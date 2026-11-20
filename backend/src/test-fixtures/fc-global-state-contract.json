@@ -49,6 +49,10 @@
     "Compat_Abort_After_250",
     "Compat_Reinit_After_15",
     "Compat_Reinit_After_30",
-    "Compat_Reinit_After_50"
+    "Compat_Reinit_After_50",
+    "Compat_IGT_Enter",
+    "Compat_IGT_Live_Pyro",
+    "Compat_IGT_Dry_Run",
+    "Compat_IGT_Exit"
   ]
 }

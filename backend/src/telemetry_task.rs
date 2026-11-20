@@ -106,6 +106,13 @@ fn command_at_dispatch_with_manual_origin(
     }
 }
 
+/// Launch sends FC Launch and the Valve Board Sequence
+/// (`send_flight_computer_launch`) in every mode with an AV bay, including the
+/// integrated ground test; only a test fire launches the Valve Board alone.
+pub(crate) fn launch_goes_to_flight_computer() -> bool {
+    !crate::runtime_mode::is_test_fire()
+}
+
 pub(crate) fn hitl_flight_command_id(cmd: &TelemetryCommand) -> Option<u8> {
     Some(match cmd {
         TelemetryCommand::DeployParachute => FlightComputerCommands::DeployParachute as u8,
@@ -126,6 +133,10 @@ pub(crate) fn hitl_flight_command_id(cmd: &TelemetryCommand) -> Option<u8> {
         TelemetryCommand::ReinitAfter15 => FlightComputerCommands::ReinitAfter15 as u8,
         TelemetryCommand::ReinitAfter30 => FlightComputerCommands::ReinitAfter30 as u8,
         TelemetryCommand::ReinitAfter50 => FlightComputerCommands::ReinitAfter50 as u8,
+        TelemetryCommand::IgtEnter
+        | TelemetryCommand::IgtLivePyro
+        | TelemetryCommand::IgtDryRun
+        | TelemetryCommand::IgtExit => return crate::igt::fc_byte(cmd),
         _ => return None,
     })
 }
@@ -823,7 +834,7 @@ async fn send_flight_computer_launch(
         );
         return;
     }
-    if crate::runtime_mode::is_hitl_or_test_fire() {
+    if crate::runtime_mode::is_hitl_or_test_fire() || crate::runtime_mode::is_igt() {
         state.begin_daq_launch_log();
     }
     log_command_dispatch(
@@ -842,7 +853,7 @@ async fn send_flight_computer_launch(
     let flight_command_sent = true;
     let valve_command_sent = true;
     if flight_command_sent || valve_command_sent {
-        if crate::runtime_mode::is_hitl_or_test_fire() && pressed.is_none() {
+        if (crate::runtime_mode::is_hitl_or_test_fire() || crate::runtime_mode::is_igt()) && pressed.is_none() {
             crate::auto_zero::launch(&state);
         }
         state.set_launch_indicator_latched(true);
@@ -978,7 +989,7 @@ async fn send_held_launch(state: Arc<AppState>, router: Arc<Router>, held: HeldL
     held_launch_tests::before_send(&state);
     match cmd {
         TelemetryCommand::Launch => {
-            if crate::runtime_mode::is_test_fire() {
+            if !launch_goes_to_flight_computer() {
                 send_local_ground_station_launch(state, router, held.launch_revision, Some(held.pressed)).await;
             } else {
                 send_flight_computer_launch(state, router, held.launch_revision, Some(held.pressed)).await;
@@ -1500,7 +1511,7 @@ pub async fn telemetry_task(
                                     pressed: crate::gse::LaunchAdmission::capture(&state),
                                     _launch_hold: launch_hold.clone(),
                                 }) { continue; }
-                                if crate::runtime_mode::is_test_fire() {
+                                if !launch_goes_to_flight_computer() {
                                     handle_local_ground_station_launch_command(state.clone(), router.clone(),launch_revision).await;
                                 } else {
                                     handle_flight_computer_launch_command(state.clone(), router.clone(),launch_revision).await;
@@ -1749,6 +1760,29 @@ pub async fn telemetry_task(
                                 gs_debug_println!("HITL flight command sent: {:?} ({cmd_id})", cmd);
                             }
                         }
+                        TelemetryCommand::IgtDryRun | TelemetryCommand::IgtExit => {
+                            match crate::igt::command_gate(&state, &cmd) {
+                                Some(Ok(())) => {
+                                    if let Err(error) = crate::igt::send(&state, &router, &cmd) {
+                                        emit_notification_warning(&state, error);
+                                    }
+                                }
+                                Some(Err(reason)) => emit_notification_warning(
+                                    &state,
+                                    format!("{}: {reason}", crate::sequences::command_name(&cmd)),
+                                ),
+                                None => {}
+                            }
+                        }
+                        // Enter and LIVE PYRO are sent only by the ticketed
+                        // review (igt::confirm), never from the queue.
+                        TelemetryCommand::IgtEnter | TelemetryCommand::IgtLivePyro => emit_notification_warning(
+                            &state,
+                            format!(
+                                "{} refused: it needs the ground test review (POST /api/igt/prepare, then /api/igt/confirm).",
+                                crate::sequences::command_name(&cmd)
+                            ),
+                        ),
                         // Mode-only commands are refused at deserialization
                         // outside their mode; anything else is reported here.
                         _ => emit_notification_warning(
@@ -2284,7 +2318,9 @@ async fn clear_telemetry_tables(db: &sqlx::SqlitePool) -> Result<(), sqlx::Error
 }
 
 async fn export_test_fire_csv_if_enabled(state: &Arc<AppState>, db_path: &str) {
-    if !crate::runtime_mode::is_test_fire() {
+    // The integrated ground test fires the motor on the stand: its GSE CSV
+    // is exported as in a test fire.
+    if !crate::runtime_mode::is_test_fire_or_igt() {
         return;
     }
     let csv_path = test_fire_csv::csv_path_for_db_path(db_path);
@@ -2821,6 +2857,7 @@ async fn handle_packet_inner(
                 if crate::types::canonical_sender_id(sender_id.trim()) == "FC" {
                     crate::network_variables::observe_fc_health_outputs(&words);
                     crate::fc_estimator::observe_health(state, &words, Some(pkt.timestamp()));
+                    crate::igt::observe_health(state, &words);
                 }
                 if crate::types::canonical_sender_id(sender_id.trim()) == "AB" {
                     crate::ab_command_gate::observe(state, &words);
@@ -3172,6 +3209,23 @@ async fn handle_packet_inner(
             }
         }
         return rows;
+    }
+
+    // Integrated ground test: replayed data is recorded under its own type and
+    // feeds only the separate SIM_* live series, never the real ones.
+    if pkt.data_type() == crate::telemetry_schema::data_type("SIM_SAMPLE") {
+        let values = telemetry_f32_values(&pkt).unwrap_or_default();
+        if should_persist_telemetry_sample(&data_type_str, &sender_id, ts_ms) {
+            queue_db_write(state, db_tx, db_overflow, DbWrite::Telemetry {
+                timestamp_ms: ts_ms,
+                source_timestamp_ms: Some(pkt.timestamp() as i64),
+                data_type: data_type_str.clone(),
+                sender_id: sender_id.clone(),
+                values_json: telemetry_values_json(&values),
+                payload_json: payload_json.clone(),
+            }).await;
+        }
+        return crate::igt::sim_rows(state, &sender_id, ts_ms, &values);
     }
 
     if pkt.data_type() == crate::telemetry_schema::data_type("GPS_SATELLITE_NUMBER") {
@@ -6396,6 +6450,7 @@ mod tests {
             abort_indicator_latched: Arc::new(AtomicBool::new(false)),
             fc_phase: Default::default(),
             fc_estimator: Default::default(),
+            igt: Default::default(),
             hitl_button_interlock_enabled: Arc::new(AtomicBool::new(false)),
             hitl_launch_interlock_enabled: Arc::new(AtomicBool::new(false)),
             hitl_safety_interlocks: crate::state::default_hitl_safety_interlocks(),
@@ -8487,5 +8542,73 @@ mod tests {
     mod recording_diagnostic_capture {
         use super::*;
         include!("telemetry_task/recording_diagnostic_tests.rs");
+    }
+
+    mod igt_ingress_tests {
+        use super::*;
+        use crate::station_mode::Mode;
+
+        #[tokio::test]
+        async fn sim_samples_are_recorded_raw_and_never_feed_the_real_series() {
+            let _mode = crate::runtime_mode::test_support::thread_mode(Mode::IntegratedGroundTest);
+            let (db_tx, mut db_rx) = mpsc::channel(8);
+            let state = test_app_state(db_tx.clone()).await;
+            let db_overflow = test_db_overflow();
+            let sample = [1.0_f32, 12.5, 0.1, 0.2, 9.8, 1.0, 2.0, 3.0];
+            let pkt = Packet::new(
+                crate::telemetry_schema::data_type("SIM_SAMPLE"),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                Board::FlightComputer.sender_id(),
+                234_567,
+                f32_payload(&sample),
+            )
+            .expect("failed to build SIM_SAMPLE packet");
+            let rows = handle_packet(&state, &db_tx, &db_overflow, pkt).await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].data_type, "SIM_IMU_DATA");
+            assert_eq!(rows[0].values, [0.1, 0.2, 9.8, 1.0, 2.0, 3.0].map(Some).to_vec());
+            assert!(rows.iter().all(|row| !matches!(
+                row.data_type.as_str(),
+                "IMU_DATA" | "ACCEL_DATA" | "GYRO_DATA" | "BAROMETER_DATA" | "GPS_DATA" | "ASCENT_STATE" | "DESCENT_STATE"
+            )));
+            match db_rx.recv().await.expect("SIM_SAMPLE should queue a DB write") {
+                DbQueueItem::Write(DbWrite::Telemetry { data_type, values_json, .. }) => {
+                    assert_eq!(data_type, "SIM_SAMPLE");
+                    let values: Vec<f32> = serde_json::from_str(values_json.as_deref().unwrap()).unwrap();
+                    assert_eq!(values, sample.to_vec());
+                }
+                other => panic!("unexpected DB item for SIM_SAMPLE: {other:?}"),
+            }
+            assert!(db_rx.try_recv().is_err(), "no real-series rows are recorded");
+        }
+
+        #[tokio::test]
+        async fn an_fc_ground_test_change_is_recorded_as_a_gs_igt_row() {
+            let _mode = crate::runtime_mode::test_support::thread_mode(Mode::IntegratedGroundTest);
+            let (db_tx, mut db_rx) = mpsc::channel(8);
+            let state = test_app_state(db_tx).await;
+            let mut words = [0u32; 24];
+            words[0] = 1;
+            words[4] = 1000;
+            words[14] = (crate::igt::TAG << 16) | ((2 | 1 << 3) << 4);
+            crate::igt::observe_health(&state, &words);
+            let row = loop {
+                match db_rx.recv().await.expect("a GS_IGT row") {
+                    DbQueueItem::Write(DbWrite::Telemetry { data_type, payload_json, .. }) if data_type == "GS_IGT" => {
+                        break payload_json;
+                    }
+                    _ => {}
+                }
+            };
+            let status: serde_json::Value = serde_json::from_str(&row).unwrap();
+            assert_eq!(status["fc_mode"], "ready");
+            assert_eq!(status["supported"], true);
+            // The same report again changes nothing and records nothing.
+            crate::igt::observe_health(&state, &words);
+            assert!(!std::iter::from_fn(|| db_rx.try_recv().ok()).any(|item| matches!(
+                item,
+                DbQueueItem::Write(DbWrite::Telemetry { ref data_type, .. }) if data_type == "GS_IGT"
+            )));
+        }
     }
 }

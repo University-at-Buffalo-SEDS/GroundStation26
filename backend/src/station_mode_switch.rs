@@ -61,7 +61,13 @@ const VALID_FOR_MS: u64 = 10_000;
 const RESTART_DELAY: Duration = Duration::from_millis(600);
 /// Gives the Confirm receipt time to reach the client before the mode changes.
 const SWITCH_DELAY: Duration = Duration::from_millis(200);
-const ALL_MODES: [Mode; 4] = [Mode::Normal, Mode::Hitl, Mode::TestFire, Mode::Testing];
+const ALL_MODES: [Mode; 5] = [
+    Mode::Normal,
+    Mode::Hitl,
+    Mode::TestFire,
+    Mode::Testing,
+    Mode::IntegratedGroundTest,
+];
 /// Operators other than administrators need this command name allowed.
 pub(crate) const COMMAND_NAME: &str = "StationMode";
 
@@ -71,6 +77,7 @@ pub(crate) fn mode_id(mode: Mode) -> &'static str {
         Mode::Hitl => "hitl",
         Mode::TestFire => "test_fire",
         Mode::Testing => "testing",
+        Mode::IntegratedGroundTest => "integrated_ground_test",
     }
 }
 fn parse_mode(id: &str) -> Option<Mode> {
@@ -82,6 +89,7 @@ fn mode_label(mode: Mode) -> &'static str {
         Mode::Hitl => "HITL",
         Mode::TestFire => "Test fire",
         Mode::Testing => "Testing",
+        Mode::IntegratedGroundTest => "Integrated ground test",
     }
 }
 
@@ -225,23 +233,32 @@ impl Config {
         if !self.in_process(target) && !self.supervised {
             return Err("Changing Simulation restarts the backend, and this backend was started directly, not by the station mode supervisor. Start it with run_groundstation.py --switchable-modes or the station-mode systemd unit.".into());
         }
-        if self.in_process(target) && target.mode == Mode::Normal && !self.rrls {
-            normal_links_present((self.stand_in_links)())?;
+        if self.in_process(target)
+            && matches!(target.mode, Mode::Normal | Mode::IntegratedGroundTest)
+            && !self.rrls
+        {
+            normal_links_present(target.mode, (self.stand_in_links)())?;
         }
         Ok(())
     }
 }
 
-/// Normal mode refuses to start without its configured links (it never used
-/// stand-ins), so it is never entered while a link is a DummyComms stand-in.
-fn normal_links_present(stand_ins: usize) -> Result<(), String> {
+/// Normal and integrated ground test refuse to start without their configured
+/// links (they never use stand-ins), so they are never entered while a link is
+/// a DummyComms stand-in.
+fn normal_links_present(mode: Mode, stand_ins: usize) -> Result<(), String> {
     if stand_ins == 0 {
         Ok(())
     } else {
         Err(format!(
-            "Normal mode needs every configured link, but {stand_ins} link(s) failed to open at start and use a stand-in. Fix the link and restart the station."
+            "{} mode needs every configured link, but {stand_ins} link(s) failed to open at start and use a stand-in. Fix the link and restart the station.",
+            mode_label(mode)
         ))
     }
+}
+
+fn calibration_file_changes(from: Mode, to: Mode) -> bool {
+    crate::loadcell::calibration_filename_for(from) != crate::loadcell::calibration_filename_for(to)
 }
 
 /// Bumped by every in-process switch so connected UIs refetch /api/layout.
@@ -818,8 +835,8 @@ impl Switch {
                     mode_id(token.mode),
                     token.epoch
                 );
-                if station_resets && (from == Mode::Testing) != (token.mode == Mode::Testing) {
-                    // The calibration file differs in testing mode; the DAQ
+                if station_resets && calibration_file_changes(from, token.mode) {
+                    // The calibration file differs between these modes; the DAQ
                     // gets the reloaded one as after an operator save.
                     let calibration = state.loadcell_calibration.lock().unwrap().clone();
                     if let Err(error) = crate::web::publish_daq_calibration(state, &calibration) {
@@ -911,8 +928,9 @@ fn apply_switch(state: &Arc<AppState>, from: Mode, token: crate::runtime_mode::M
         // Qualification state (outside HITL), HITL phase control and
         // turbocharge evidence, rebuilt as at start.
         crate::gse::mode_switch::reset_for_mode_switch(state);
-        if (from == Mode::Testing) != (token.mode == Mode::Testing) {
-            // Testing mode keeps its own calibration file.
+        if calibration_file_changes(from, token.mode) {
+            // Testing, and test fire with the integrated ground test, keep
+            // their own calibration files.
             *state.loadcell_calibration.lock().unwrap() = crate::loadcell::load_or_default();
         }
     } else {

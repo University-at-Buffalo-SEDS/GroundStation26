@@ -152,6 +152,9 @@ impl PendingEnsure {
                     return Err(error);
                 }
                 state.set_recording_status(RecordingStatusMsg { mode: RecordingModeWire::Recording, db_path: Some(path_string.clone()) });
+                if let Err(err) = insert_db_batch_with_retry(pool, &crate::igt::recording_start_rows(state)).await {
+                    eprintln!("Failed to write recording start rows: {err}");
+                }
                 old_pool.close().await;
                 Ok(Receipt { instance: *instance, path: path_string })
             }
@@ -395,6 +398,16 @@ pub(crate) async fn run(
                                 mode: RecordingModeWire::Recording,
                                 db_path: Some(new_path.clone()),
                             });
+                            // The station mode (and an IGT's FC status) the
+                            // recording starts in; the CSV export reads it.
+                            if let Err(err) = insert_db_batch_with_retry(
+                                &new_pool,
+                                &crate::igt::recording_start_rows(&state),
+                            )
+                            .await
+                            {
+                                eprintln!("Failed to write recording start rows: {err}");
+                            }
                             active_recording = Some(ActiveRecording {
                                 pool: new_pool,
                                 path: new_path,
@@ -555,10 +568,13 @@ mod tests {
         assert_ne!(third.instance, first.instance);
         assert!(!state.fill_recording.current(&first));
         assert!(state.fill_recording.current(&third));
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM telemetry")
-            .fetch_one(&active.as_ref().unwrap().pool)
-            .await
-            .unwrap();
+        // Besides the recording-start rows (station mode, IGT status).
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM telemetry WHERE data_type NOT IN ('GS_STATION_MODE','GS_IGT')",
+        )
+        .fetch_one(&active.as_ref().unwrap().pool)
+        .await
+        .unwrap();
         assert_eq!(count, 1);
         assert_eq!(
             std::fs::read_dir(&directory)

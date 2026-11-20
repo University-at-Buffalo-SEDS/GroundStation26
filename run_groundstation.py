@@ -86,8 +86,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "mode",
         nargs="?",
-        choices=["testing", "hitl-mode", "test-fire-mode", "flight-sim", "debug"],
-        help="Legacy positional mode. Use 'testing', 'hitl-mode', 'test-fire-mode', or 'debug'.",
+        choices=["testing", "hitl-mode", "test-fire-mode", "igt-mode", "flight-sim", "debug"],
+        help="Legacy positional mode. Use 'testing', 'hitl-mode', 'test-fire-mode', 'igt-mode', or 'debug'.",
     )
     parser.add_argument("--flight-sim", action="store_true", help="Run isolated FlightSim models; no physical transports or outputs.")
     parser.add_argument("--flight-sim-users", type=Path, help="Explicit read-only users.json snapshot for this isolated session; sessions/proofs are never copied.")
@@ -108,6 +108,12 @@ def parse_args() -> argparse.Namespace:
         help="Start the backend in test-fire mode (GS_STATION_MODE=test_fire).",
     )
     parser.add_argument(
+        "--igt-mode",
+        "--integrated-ground-test",
+        action="store_true",
+        help="Start the backend in integrated ground test mode (GS_STATION_MODE=integrated_ground_test).",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Build and run in debug mode for faster compile times.",
@@ -119,7 +125,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--rrls", action="store_true", help="Run the headless recovery receiver/relay with local web and mobile access.")
     parser.add_argument("--frontend-dev", "--frontend_dev", action="store_true", help="Build the WebUI from the frontend dev branch (also accepts frontend_dev, like build.py).")
-    parser.add_argument("--switchable-modes", metavar="MODES", help="Supervise the backend so a Simulation change from the UI can restart it (other mode switches happen in process). MODES (normal,hitl,test_fire,testing or all) is accepted for older callers; one binary holds every mode. The usual mode flag picks the default when no switch was saved.")
+    parser.add_argument("--switchable-modes", metavar="MODES", help="Supervise the backend so a Simulation change from the UI can restart it (other mode switches happen in process). MODES (normal,hitl,test_fire,testing,integrated_ground_test or all) is accepted for older callers; one binary holds every mode. The usual mode flag picks the default when no switch was saved.")
     parser.add_argument("--pairing", type=Path, metavar="FILE", help="Station pairing.json from pair_stations.py (sets GS_STATION_PAIRING_FILE). Without it, a pairing made in the UI is used.")
     arguments=["--frontend-dev" if argument in {"frontend_dev", "frontend-dev"} else argument for argument in sys.argv[1:]]
     args=parser.parse_args(arguments)
@@ -134,9 +140,10 @@ def main() -> None:
     testing_mode = args.testing or args.mode == "testing"
     hitl_mode = args.hitl_mode or args.mode == "hitl-mode"
     test_fire_mode = args.test_fire_mode or args.mode == "test-fire-mode"
+    igt_mode = args.igt_mode or args.mode == "igt-mode"
     debug_mode = args.debug or args.mode == "debug"
-    if sum([testing_mode, hitl_mode, test_fire_mode, flight_sim_mode]) > 1:
-        print("Error: testing, hitl-mode, test-fire-mode, and flight-sim are mutually exclusive.", file=sys.stderr)
+    if sum([testing_mode, hitl_mode, test_fire_mode, igt_mode, flight_sim_mode]) > 1:
+        print("Error: testing, hitl-mode, test-fire-mode, igt-mode, and flight-sim are mutually exclusive.", file=sys.stderr)
         sys.exit(2)
 
     if flight_sim_mode and args.rrls:
@@ -156,7 +163,7 @@ def main() -> None:
     if args.switchable_modes:
         if flight_sim_mode:
             raise ValueError("FlightSim is an isolated session; it does not use switchable station modes")
-        return run_switchable(args, testing_mode, hitl_mode, test_fire_mode, debug_mode)
+        return run_switchable(args, testing_mode, hitl_mode, test_fire_mode, debug_mode, igt_mode)
     cmd = ["cargo", "run"]
     if not debug_mode:
         cmd.append("--release")
@@ -166,7 +173,7 @@ def main() -> None:
         features.append("raspberry_pi")
     # One binary holds every mode; the flag picks the boot mode and wins over
     # a selection saved by an earlier in-process switch.
-    boot_mode = boot_mode_for(testing_mode or flight_sim_mode, hitl_mode, test_fire_mode)
+    boot_mode = boot_mode_for(testing_mode or flight_sim_mode, hitl_mode, test_fire_mode, igt_mode)
     os.environ["GS_STATION_MODE"] = boot_mode
     print(f"Station mode at start: {boot_mode}")
     if features:
@@ -212,18 +219,26 @@ def build_frontend(args: argparse.Namespace, repo_root: Path, debug_mode: bool) 
     prepare_browser_asset_source(repo_root, frontend_dev=args.frontend_dev, refresh=False)
 
 
-def boot_mode_for(testing_mode: bool, hitl_mode: bool, test_fire_mode: bool) -> str:
-    return "testing" if testing_mode else "hitl" if hitl_mode else "test_fire" if test_fire_mode else "normal"
+def boot_mode_for(testing_mode: bool, hitl_mode: bool, test_fire_mode: bool, igt_mode: bool = False) -> str:
+    if testing_mode:
+        return "testing"
+    if hitl_mode:
+        return "hitl"
+    if test_fire_mode:
+        return "test_fire"
+    if igt_mode:
+        return "integrated_ground_test"
+    return "normal"
 
 
-def run_switchable(args: argparse.Namespace, testing_mode: bool, hitl_mode: bool, test_fire_mode: bool, debug_mode: bool) -> None:
+def run_switchable(args: argparse.Namespace, testing_mode: bool, hitl_mode: bool, test_fire_mode: bool, debug_mode: bool, igt_mode: bool = False) -> None:
     """Build the backend once, then supervise it. Mode switches happen inside
     the backend; a confirmed Simulation change exits it with
     station_modes.RESTART_EXIT_CODE and the selection starts. Without a saved
     selection the usual mode runs."""
     import station_modes
 
-    default_mode = boot_mode_for(testing_mode, hitl_mode, test_fire_mode)
+    default_mode = boot_mode_for(testing_mode, hitl_mode, test_fire_mode, igt_mode)
     modes = station_modes.parse_modes(args.switchable_modes)  # validated, then ignored
     if default_mode not in modes:
         modes.insert(0, default_mode)
