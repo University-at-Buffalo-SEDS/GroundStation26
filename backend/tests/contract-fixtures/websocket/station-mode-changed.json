@@ -1,0 +1,9 @@
+{
+  "data": {
+    "label": "HITL",
+    "layout_revision": 1,
+    "mode": "hitl",
+    "policy_epoch": "boot-fixture:epoch-2"
+  },
+  "ty": "StationModeChanged"
+}

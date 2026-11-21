@@ -14,7 +14,6 @@ pub(super) use crate::telemetry_db::{
     RecordingModeWire, RecordingStatusMsg, close_and_finalize_sqlite, delete_sqlite_if_empty,
     open_in_memory_telemetry_db, open_telemetry_db, prune_recent_writes, session_db_path,
 };
-#[cfg(feature = "test_fire_mode")]
 pub(super) use crate::test_fire_csv;
 pub(super) use crate::types::{
     Board, FlightState, TelemetryCommand, TelemetryRow, canonical_sender_id, u8_to_flight_state,

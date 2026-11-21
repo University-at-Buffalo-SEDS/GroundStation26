@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct Rundown {
+    #[serde(default)]
+    pub flight_phase_version: u8,
     pub profiles: BTreeMap<String, Profile>,
     pub phase_profiles: BTreeMap<String, String>,
 }
@@ -131,6 +133,7 @@ impl Default for Rundown {
             ..Default::default()
         };
         Self {
+            flight_phase_version: crate::types::FLIGHT_PHASE_VERSION,
             profiles: BTreeMap::from([
                 ("ground".into(), profile("Fill and preparation", fill)),
                 ("flight".into(), profile("Flight", flight.clone())),
@@ -162,6 +165,11 @@ pub(super) fn valid_scene(scene: &str) -> bool {
     .contains(&scene)
 }
 impl Rundown {
+    pub(super) fn normalize_flight_phases(&mut self) -> Result<(), &'static str> {
+        crate::types::normalize_phase_map(&mut self.phase_profiles, self.flight_phase_version)?;
+        self.flight_phase_version = crate::types::FLIGHT_PHASE_VERSION;
+        Ok(())
+    }
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.profiles.len() > 8
             || ["ground", "flight", "recovery", "test_fire"]
@@ -222,9 +230,22 @@ impl Rundown {
         Ok(())
     }
     pub fn profile(&self, phase: FlightState, test_fire: bool) -> (&str, &Profile) {
+        self.profile_with_fc(phase, None, test_fire)
+    }
+    /// Profile keys are FlightState names. In flight or landed, the FC's own
+    /// detailed phase (Ascent..Reefing, Recovery) is tried first, then the
+    /// station's state (InFlight, Landed, or a fill sub-phase), then the
+    /// default for that state.
+    pub fn profile_with_fc(&self, phase: FlightState, fc: Option<FlightState>, test_fire: bool) -> (&str, &Profile) {
+        let detailed = fc
+            .filter(|_| matches!(phase, FlightState::InFlight | FlightState::Landed))
+            .filter(|fc| fc.network() == phase.network())
+            .map(|fc| format!("{fc:?}"));
         let phase = format!("{phase:?}");
         let id = if test_fire {
             "test_fire"
+        } else if let Some(id) = detailed.as_ref().and_then(|name| self.phase_profiles.get(name)) {
+            id.as_str()
         } else if let Some(id) = self.phase_profiles.get(&phase) {
             id.as_str()
         } else {
@@ -275,6 +296,20 @@ impl From<BroadcastStat> for Stat {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_rundown_phase_assignments_keep_their_wire_meaning() {
+        let mut rundown: super::Rundown = serde_json::from_value(serde_json::json!({
+            "phase_profiles": {"ParachuteDeploy":"flight", "Descent":"recovery"}
+        })).unwrap();
+        assert_eq!(rundown.flight_phase_version, 0);
+        rundown.normalize_flight_phases().unwrap();
+        rundown.validate().unwrap();
+        assert_eq!(rundown.phase_profiles["Descent"], "flight");
+        assert_eq!(rundown.phase_profiles["Reefing"], "recovery");
+        assert_eq!(rundown.flight_phase_version, 1);
+        rundown.normalize_flight_phases().unwrap();
+        assert_eq!(rundown.phase_profiles["Descent"], "flight");
+    }
     use super::*;
     #[test]
     fn default_profiles_keep_fill_out_of_flight_and_thrust_in_test_fire() {
@@ -306,6 +341,25 @@ mod tests {
         );
         assert_eq!(r.profile(FlightState::Recovery, false).0, "recovery");
     }
+    /// After the state split the station is InFlight while the FC reports
+    /// its detailed phase: a Descent profile still applies, then InFlight.
+    #[test]
+    fn in_flight_profiles_follow_the_fc_detailed_phase() {
+        let mut r = Rundown::default();
+        r.phase_profiles.insert("Descent".into(), "recovery".into());
+        r.validate().unwrap();
+        assert_eq!(r.profile_with_fc(FlightState::InFlight, Some(FlightState::Descent), false).0, "recovery");
+        assert_eq!(r.profile_with_fc(FlightState::InFlight, Some(FlightState::Ascent), false).0, "flight");
+        assert_eq!(r.profile_with_fc(FlightState::InFlight, None, false).0, "flight");
+        r.phase_profiles.insert("InFlight".into(), "ground".into());
+        r.validate().unwrap();
+        assert_eq!(r.profile_with_fc(FlightState::InFlight, Some(FlightState::Ascent), false).0, "ground");
+        assert_eq!(r.profile_with_fc(FlightState::InFlight, Some(FlightState::Descent), false).0, "recovery");
+        assert_eq!(r.profile_with_fc(FlightState::Landed, Some(FlightState::Recovery), false).0, "recovery");
+        assert_eq!(r.profile_with_fc(FlightState::NitrousFill, Some(FlightState::Descent), false).0, "ground",
+            "the FC phase never applies on the ground");
+    }
+
     #[test]
     fn edits_roundtrip_and_invalid_bounds_fail() {
         let mut r = Rundown::default();
@@ -358,10 +412,81 @@ mod persistence_tests {
             hls_segments: Mutex::new(Default::default()),
             preview_sessions: Mutex::new(Vec::new()),
             publishers: Mutex::new(Vec::new()),
+            publish_offer: Mutex::new(()),
             transcoding: Mutex::default(),
             recorded_vehicle_cache: Mutex::new(Default::default()),
         })
     }
+    #[tokio::test]
+    async fn old_ui_phase_writes_are_rejected_without_changing_saved_settings() {
+        use axum::{body::{Body, to_bytes}, http::{Request, StatusCode}};
+        use tower::ServiceExt;
+        let root = crate::recording_export::tests::TestDirectory::new();
+        let mut app = crate::recording_export::tests::export_state(&root.0, true).await;
+        let users = root.0.join("phase-users.json");
+        std::fs::write(&users, serde_json::json!({
+            "anonymous":{"view_data":false}, "users":[{
+                "username":"operator", "roles":["admin"],
+                "password":{"salt_b64":"","hash_b64":""},
+                "permissions":{"view_data":true,"send_commands":true}
+            }]
+        }).to_string()).unwrap();
+        Arc::get_mut(&mut app).unwrap().auth = Arc::new(crate::auth::AuthManager::new(users));
+        sqlx::query("INSERT INTO auth_sessions(token,username,session_type,can_view_data,can_send_commands,created_at_ms,expires_at_ms) VALUES('phase-fixture','operator','session',1,1,0,9999999999999)")
+            .execute(&app.auth_db).await.unwrap();
+        let state = media(app, &root.0);
+        let seed = serde_json::from_value(serde_json::json!({
+            "vehicle":{"phase_animations":{"ParachuteDeploy":"drogue","Descent":"main"}},
+            "broadcast":{"rundown":{"phase_profiles":{"ParachuteDeploy":"flight","Descent":"recovery"}}}
+        })).unwrap();
+        contract::write_presentation(&state, &seed).await.unwrap();
+        let saved_path = state.models.join("_presentation.json");
+        let original = std::fs::read(&saved_path).unwrap();
+        let router = contract::routes().with_state(state);
+        let request = |method: &str, path: &str, body: Body| Request::builder()
+            .method(method).uri(path).header("authorization", "Bearer phase-fixture")
+            .header("content-type", "application/json").body(body).unwrap();
+        let response = router.clone().oneshot(request("GET", "/api/vehicle_visualization", Body::empty())).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut vehicle: serde_json::Value = serde_json::from_slice(&to_bytes(response.into_body(), 1_000_000).await.unwrap()).unwrap();
+        assert_eq!(vehicle["flight_phase_version"], 1);
+        assert_eq!(vehicle["phase_animations"]["Descent"], "drogue");
+        assert_eq!(vehicle["phase_animations"]["Reefing"], "main");
+        vehicle.as_object_mut().unwrap().remove("flight_phase_version");
+        for method in ["PUT", "POST"] {
+            let response = router.clone().oneshot(request(method, "/api/vehicle_visualization", Body::from(vehicle.to_string()))).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let error = to_bytes(response.into_body(), 4096).await.unwrap();
+            assert!(String::from_utf8_lossy(&error).contains("Reload the updated UI"));
+            assert_eq!(std::fs::read(&saved_path).unwrap(), original);
+        }
+        let response = router.clone().oneshot(request("GET", "/api/live_streams", Body::empty())).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let live: serde_json::Value = serde_json::from_slice(&to_bytes(response.into_body(), 1_000_000).await.unwrap()).unwrap();
+        let mut broadcast = live["broadcast"].clone();
+        assert_eq!(broadcast["rundown"]["flight_phase_version"], 1);
+        assert_eq!(broadcast["revision"], 0);
+        broadcast["rundown"].as_object_mut().unwrap().remove("flight_phase_version");
+        broadcast["comms_audio_enabled"] = serde_json::json!(true);
+        let response = router.clone().oneshot(request("POST", "/api/live_streams/control", Body::from(broadcast.to_string()))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error = to_bytes(response.into_body(), 4096).await.unwrap();
+        assert!(String::from_utf8_lossy(&error).contains("Reload the updated UI"));
+        assert_eq!(std::fs::read(&saved_path).unwrap(), original);
+        broadcast.as_object_mut().unwrap().remove("rundown");
+        let response = router.clone().oneshot(request("POST", "/api/live_streams/control", Body::from(broadcast.to_string()))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(std::fs::read(&saved_path).unwrap(), original);
+        let mut future_broadcast = live["broadcast"].clone();
+        future_broadcast["rundown"]["flight_phase_version"] = serde_json::json!(2);
+        let response = router.clone().oneshot(request("POST", "/api/live_streams/control", Body::from(future_broadcast.to_string()))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        vehicle["flight_phase_version"] = serde_json::json!(2);
+        let response = router.oneshot(request("PUT", "/api/vehicle_visualization", Body::from(vehicle.to_string()))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(std::fs::read(&saved_path).unwrap(), original);
+    }
+
     #[tokio::test]
     async fn operator_rundown_persists_reloads_and_rejects_stale_or_unauthorized_edits() {
         use crate::recording_export::tests::{TestDirectory, export_state};

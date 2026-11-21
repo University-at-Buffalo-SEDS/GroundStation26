@@ -32,17 +32,22 @@ fn binding() -> &'static Mutex<BindingState> {
     BINDING.get_or_init(Default::default)
 }
 pub(crate) fn preflight() {
-    if cfg!(feature = "hitl_mode") {
+    // Decided once, the first time the station is outside HITL: at boot, or
+    // from mission_sync::start after a switch out of HITL.
+    if crate::runtime_mode::is_hitl() {
         return;
     }
     PREFLIGHT.get_or_init(|| {
-        if !matches!(crate::station_pairing::Pairing::load(), Ok(None)) {
+        // A broken pairing runs unpaired: it must not leave Launch blocked on
+        // shared checklists that can never start.
+        if crate::station_pairing::Pairing::load_or_unpaired("shared checklists").is_some() {
             REQUESTED.store(true, Ordering::Release);
         }
     });
 }
 pub(crate) fn requested() -> bool {
-    REQUESTED.load(Ordering::Acquire)
+    // HITL never had shared checklists.
+    !crate::runtime_mode::is_hitl() && REQUESTED.load(Ordering::Acquire)
 }
 pub(crate) fn ready() -> bool {
     READY.load(Ordering::Acquire)
@@ -95,6 +100,9 @@ enum Input {
     Event(CompletionEvent),
 }
 pub(crate) fn receive_wire(wire: Vec<u8>) -> bool {
+    if crate::runtime_mode::is_hitl() {
+        return false;
+    }
     INBOX
         .get()
         .is_some_and(|sender| sender.try_send(Input::Wire(wire)).is_ok())
@@ -230,6 +238,7 @@ fn projected(
 ) {
     let mut document = Document {
         revision: 0,
+        signoffs: Vec::new(),
         completion_events: Vec::new(),
         enforce_before_launch: projection.policy.enforce_before_launch,
         checklists: Vec::new(),
@@ -401,20 +410,22 @@ impl Service {
         })
     }
     async fn publish(&mut self) -> Result<Document, String> {
-        self.document.revision = self.storage.next_revision(self.document.revision).await?;
-        let next = self.document.clone();
+        let revision =
+            access(|store| Ok(store.document.revision)).unwrap_or(self.document.revision);
+        self.document.revision = self
+            .storage
+            .next_revision(revision.max(self.document.revision))
+            .await?;
         let mut global = store().lock().map_err(|_| "Checklist store unavailable")?;
-        let path = match global.as_ref() {
-            Ok(store) => store.path.clone(),
-            Err(_) => std::env::var_os("GS_CHECKLISTS_FILE")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("backend/data/checklists.json")),
-        };
-        *global = Ok(Store {
-            path,
-            document: next.clone(),
-        });
-        Ok(next)
+        let mut next = self.document.clone();
+        let store = global.as_mut().map_err(|error| error.clone())?;
+        next.preserve_signoffs(
+            &store.document,
+            crate::telemetry_task::get_current_timestamp_ms() as i64,
+        );
+        let saved = store.persist(next)?;
+        self.document = saved.clone();
+        Ok(saved)
     }
     async fn refresh_progress(
         &mut self,
@@ -679,9 +690,18 @@ impl Service {
             .map_err(anyhow::Error::msg)?;
         next_document.revision = self
             .storage
-            .next_revision(self.document.revision)
+            .next_revision(
+                access(|store| Ok(store.document.revision))
+                    .unwrap_or(self.document.revision)
+                    .max(self.document.revision),
+            )
             .await
             .map_err(anyhow::Error::msg)?;
+        let old = access(|store| Ok(store.document.clone())).map_err(anyhow::Error::msg)?;
+        next_document.preserve_signoffs(
+            &old,
+            crate::telemetry_task::get_current_timestamp_ms() as i64,
+        );
         let global_document = next_document.clone();
         let next_generations = prepared.generations.clone();
         let legacy_path = access(|store| Ok(store.path.clone())).unwrap_or_else(|_| {
@@ -727,6 +747,7 @@ impl Service {
         }
         // Retiring old allocations and directory durability never hold GSE locks.
         drop(retired);
+        access(|store| store.persist(store.document.clone())).map_err(anyhow::Error::msg)?;
         self.finish_selection(&snapshot).await
     }
     async fn stage_template(&mut self, request: Document) -> Result<(), String> {
@@ -787,6 +808,44 @@ impl Service {
             self.activate(state).await?;
         }
         Ok(())
+    }
+}
+
+#[derive(Default)]
+struct Startup {
+    published: bool,
+    ready: bool,
+}
+impl Startup {
+    async fn advance(&mut self, service: &mut Service, state: &Arc<AppState>) -> bool {
+        let result: anyhow::Result<()> = async {
+            if !self.published {
+                service.publish().await.map_err(anyhow::Error::msg)?;
+                self.published = true;
+            }
+            // Reconcile the entire recovered journal before granting readiness.
+            // A pending definition is published as a block; uncertain selection
+            // remains unready and retries on this same owner's500ms cadence.
+            service.activate(state).await?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            READY.store(false, Ordering::Release);
+            let mut status = binding().lock().unwrap();
+            status.durability_pending = true;
+            status.error = Some(format!("Shared checklist initialization deferred: {error}"));
+            return false;
+        }
+        let mut status = binding().lock().unwrap();
+        status.digest = Some(service.selector.digest.clone());
+        status.durability_pending =
+            service.selection_pending || !service.failed_progress.is_empty();
+        status.error = None;
+        drop(status);
+        self.ready = true;
+        READY.store(true, Ordering::Release);
+        true
     }
 }
 
@@ -864,15 +923,7 @@ pub(crate) fn start(
         };
         let service = Arc::new(tokio::sync::Mutex::new(service));
         let _ = SERVICE.set(service.clone());
-        {
-            let mut service = service.lock().await;
-            if let Err(error) = service.publish().await {
-                binding().lock().unwrap().error = Some(error);
-                return;
-            }
-            binding().lock().unwrap().digest = Some(service.selector.digest.clone());
-        }
-        READY.store(true, Ordering::Release);
+        let mut startup = Startup::default();
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut shutdown = state.shutdown_subscribe();
@@ -880,7 +931,20 @@ pub(crate) fn start(
             tokio::select! {
                 _ = shutdown.recv() => break,
                 _ = interval.tick() => {
+                    if crate::runtime_mode::is_hitl() {
+                        // HITL has no shared checklists: pause and discard
+                        // radio input until the station leaves HITL.
+                        while let Ok(input) = receiver.try_recv() {
+                            if let Input::Event(event) = input {
+                                binding().lock().unwrap().queued_events.remove(&event.id);
+                            }
+                        }
+                        continue;
+                    }
                     let mut service = service.lock().await;
+                    if !startup.ready && !startup.advance(&mut service, &state).await {
+                        continue;
+                    }
                     let now = mesh.lock().unwrap().now();
                     let mut error = None;
                     for _ in 0..8 {
@@ -928,6 +992,20 @@ pub(crate) fn start(
             }
         }
     })
+}
+pub(super) async fn sign(request: &Sign, actor: &str, now: i64) -> Result<Document, String> {
+    let mut service = SERVICE
+        .get()
+        .ok_or("Shared checklists are initializing")?
+        .lock()
+        .await;
+    if let Some(reason) = extra_launch_block() {
+        return Err(reason);
+    }
+    let document = access(|store| store.update(|doc| doc.sign(request, actor, now)))?;
+    service.document.signoffs = document.signoffs.clone();
+    service.document.revision = document.revision;
+    Ok(document)
 }
 pub(super) async fn check(request: &Check, actor: &str, now: i64) -> Result<Document, String> {
     let service = SERVICE.get().ok_or("Shared checklists are initializing")?;

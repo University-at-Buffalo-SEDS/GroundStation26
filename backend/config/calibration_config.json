@@ -18,7 +18,7 @@
       "data_type": "KG1000",
       "channel": "ch1",
       "fit_color": "#22d3ee",
-      "raw_label": "Raw",
+      "raw_label": "V",
       "expected_label": "kg",
       "formatter": {
         "precision": 7
@@ -41,7 +41,7 @@
       "data_type": "KG50",
       "channel": "kg50",
       "fit_color": "#f59e0b",
-      "raw_label": "Raw",
+      "raw_label": "V",
       "expected_label": "kg",
       "formatter": {
         "precision": 7

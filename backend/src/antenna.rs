@@ -65,6 +65,9 @@ struct TimedFix {
     received: Instant,
     received_model_ms: Option<u64>,
     publication_ms: Option<u64>,
+    /// Time-base epoch of `publication_ms`: publications order by
+    /// (epoch, timestamp).
+    publication_epoch: u16,
 }
 impl TimedFix {
     fn snapshot(&self) -> Fix {
@@ -89,6 +92,7 @@ impl TimedFix {
 #[derive(Clone, Copy)]
 struct NoFix {
     publication_ms: u64,
+    publication_epoch: u16,
     network_utc_ms: Option<u64>,
 }
 fn comparable_publications(left: u64, right: u64) -> bool {
@@ -97,9 +101,9 @@ fn comparable_publications(left: u64, right: u64) -> bool {
     left >= UTC_FLOOR_MS && right >= UTC_FLOOR_MS
 }
 impl NoFix {
-    fn precedes(self, publication_ms: u64) -> bool {
+    fn precedes(self, publication_ms: u64, epoch: u16) -> bool {
         if comparable_publications(self.publication_ms, publication_ms) {
-            return publication_ms > self.publication_ms;
+            return (epoch, publication_ms) > (self.publication_epoch, self.publication_ms);
         }
         // RF can acquire GPS UTC after starting with a boot-relative clock.
         // Order that transition only against a known UTC receipt bound; never
@@ -140,49 +144,78 @@ fn source_fix_age_ms(source_ms: Option<u64>, network_utc_ms: Option<u64>) -> Opt
     }
 }
 
-pub(crate) fn observe_source_gps(row: &TelemetryRow, source_ms: u64) {
-    let network_utc_ms =
-        crate::telemetry_task::recording_network_utc_ms().and_then(|value| value.try_into().ok());
-    observe_at(row, Some(source_ms), network_utc_ms);
+/// Station network time at receipt in the source stamp's own time base, so
+/// `now - source` is the fix's true age across network clock steps.
+fn receipt_utc_ms(source: crate::network_stamp::Stamp) -> Option<u64> {
+    crate::telemetry_task::recording_network_utc_ms()
+        .map(|now| crate::network_stamp::receipt_ms_for(source, now))
+        .and_then(|value| value.try_into().ok())
+}
+
+pub(crate) fn observe_source_gps(row: &TelemetryRow, source: crate::network_stamp::Stamp) {
+    observe_at_epoch(row, u64::try_from(source.ms).ok(), source.epoch, receipt_utc_ms(source));
 }
 
 /// A positive satellite count alone never establishes a receiver lock.
 /// RF publishes zero when its satellite solution is absent or stale.
-pub(crate) fn observe_source_satellites(sender: &str, count: u8, source_ms: u64) {
-    let network_utc_ms =
-        crate::telemetry_task::recording_network_utc_ms().and_then(|value| value.try_into().ok());
-    observe_satellites_at(sender, count, source_ms, network_utc_ms);
+pub(crate) fn observe_source_satellites(sender: &str, count: u8, source: crate::network_stamp::Stamp) {
+    let Ok(source_ms) = u64::try_from(source.ms) else {
+        return;
+    };
+    observe_satellites_at_epoch(sender, count, source_ms, source.epoch, receipt_utc_ms(source));
 }
+#[cfg(test)]
 fn observe_satellites_at(sender: &str, count: u8, source_ms: u64, network_utc_ms: Option<u64>) {
+    observe_satellites_at_epoch(sender, count, source_ms, 0, network_utc_ms);
+}
+fn observe_satellites_at_epoch(
+    sender: &str,
+    count: u8,
+    source_ms: u64,
+    epoch: u16,
+    network_utc_ms: Option<u64>,
+) {
     if sender != "RF" || count != 0 || source_fix_age_ms(Some(source_ms), network_utc_ms).is_none()
     {
         return;
     }
     let mut cache = cache().lock().unwrap();
-    let older_than =
-        |previous| comparable_publications(source_ms, previous) && source_ms < previous;
+    let older_than = |previous: u64, previous_epoch: u16| {
+        comparable_publications(source_ms, previous) && (epoch, source_ms) < (previous_epoch, previous)
+    };
     if cache.rocket[0]
         .as_ref()
-        .and_then(|fix| fix.publication_ms)
-        .is_some_and(older_than)
+        .and_then(|fix| fix.publication_ms.map(|ms| (ms, fix.publication_epoch)))
+        .is_some_and(|(ms, e)| older_than(ms, e))
         || cache
             .rf_no_fix
-            .is_some_and(|lost| older_than(lost.publication_ms))
+            .is_some_and(|lost| older_than(lost.publication_ms, lost.publication_epoch))
     {
         return;
     }
     cache.rocket[0] = None;
     cache.rf_no_fix = Some(NoFix {
         publication_ms: source_ms,
+        publication_epoch: epoch,
         network_utc_ms: network_utc_ms.filter(|now| *now >= UTC_FLOOR_MS),
     });
 }
 
 pub fn observe(row: &TelemetryRow) {
-    observe_at(row, None, None);
+    observe_at_epoch(row, None, 0, None);
 }
 
+#[cfg(test)]
 fn observe_at(row: &TelemetryRow, source_ms: Option<u64>, network_utc_ms: Option<u64>) {
+    observe_at_epoch(row, source_ms, 0, network_utc_ms);
+}
+
+fn observe_at_epoch(
+    row: &TelemetryRow,
+    source_ms: Option<u64>,
+    epoch: u16,
+    network_utc_ms: Option<u64>,
+) {
     if row.data_type == "GPS_DATA" {
         let index = match row.sender_id.as_str() {
             "RF" => 0,
@@ -223,7 +256,7 @@ fn observe_at(row: &TelemetryRow, source_ms: Option<u64>, network_utc_ms: Option
                         lost.network_utc_ms = network_utc_ms;
                         cache.rf_no_fix = Some(lost);
                     }
-                    if !source_ms.is_some_and(|source| lost.precedes(source)) {
+                    if !source_ms.is_some_and(|source| lost.precedes(source, epoch)) {
                         return;
                     }
                 }
@@ -231,9 +264,12 @@ fn observe_at(row: &TelemetryRow, source_ms: Option<u64>, network_utc_ms: Option
                     && source_ms.is_some_and(|source| {
                         cache.rocket[0]
                             .as_ref()
-                            .and_then(|previous| previous.publication_ms)
-                            .is_some_and(|previous| {
-                                comparable_publications(source, previous) && source < previous
+                            .and_then(|previous| {
+                                previous.publication_ms.map(|ms| (ms, previous.publication_epoch))
+                            })
+                            .is_some_and(|(previous, previous_epoch)| {
+                                comparable_publications(source, previous)
+                                    && (epoch, source) < (previous_epoch, previous)
                             })
                     })
                 {
@@ -244,14 +280,15 @@ fn observe_at(row: &TelemetryRow, source_ms: Option<u64>, network_utc_ms: Option
                     received: Instant::now(),
                     received_model_ms: crate::simulation_clock_ms(),
                     publication_ms: source_ms,
+                    publication_epoch: epoch,
                 });
             }
         }
     } else if matches!(
         row.data_type.as_str(),
         "RSSI_DBM" | "RFD_RSSI_DBM" | "RSSI" | "RFD_RSSI"
-    ) {
-        if let Some(value) = row
+    )
+        && let Some(value) = row
             .values
             .first()
             .copied()
@@ -274,7 +311,19 @@ fn observe_at(row: &TelemetryRow, source_ms: Option<u64>, network_utc_ms: Option
                 Instant::now(),
             ));
         }
+}
+/// What this station tells the other one where it is: its live GPS fix, or
+/// else its own administrator-saved position.
+pub fn advertised_fix() -> Option<Fix> {
+    // The saved-position store is process-wide; unit-test mesh ticks must not
+    // pick up positions other tests saved (the codec has its own test).
+    if cfg!(test) {
+        return local_fix();
     }
+    local_fix().filter(|fix| !fix.stale).or_else(|| {
+        let (gs, rrls) = positions::fallbacks();
+        if crate::rrls::is_rrls() { rrls } else { gs }
+    })
 }
 pub fn local_fix() -> Option<Fix> {
     cache()
@@ -288,10 +337,11 @@ pub fn accept_remote_fix(mut fix: Fix) {
     if !fix.valid() || fix.age_ms > FIX_FRESH_MS {
         return;
     }
-    fix.source = if crate::rrls::is_rrls() {
-        "GroundStation GPS"
-    } else {
-        "RRLS GPS"
+    fix.source = match (crate::rrls::is_rrls(), fix.manual) {
+        (true, false) => "GroundStation GPS",
+        (false, false) => "RRLS GPS",
+        (true, true) => "GroundStation saved position (via radio)",
+        (false, true) => "RRLS saved position (via radio)",
     }
     .to_string();
     cache().lock().unwrap().remote = Some(TimedFix {
@@ -299,6 +349,7 @@ pub fn accept_remote_fix(mut fix: Fix) {
         received: Instant::now(),
         received_model_ms: None,
         publication_ms: None,
+        publication_epoch: 0,
     });
 }
 pub fn snapshot() -> Snapshot {
@@ -326,20 +377,23 @@ pub fn snapshot() -> Snapshot {
     });
     drop(cache);
     let (saved_gs, saved_rrls) = positions::fallbacks();
-    let choose = |live: Option<Fix>, saved: Option<Fix>| {
-        live.as_ref()
-            .filter(|f| !f.stale)
-            .cloned()
-            .or(saved)
-            .or(live)
-    };
     Snapshot {
         rocket,
-        ground_station: choose(ground_station, saved_gs),
-        rrls: choose(rrls, saved_rrls),
+        ground_station: station_position(ground_station, saved_gs),
+        rrls: station_position(rrls, saved_rrls),
         rssi,
         gpsd_configured: std::env::var_os("GS_GPSD_ADDR").is_some(),
     }
+}
+
+/// Fresh station GPS wins; the administrator-saved position is only a fallback
+/// for an absent or stale fix, and a stale fix is shown only when nothing is saved.
+fn station_position(live: Option<Fix>, saved: Option<Fix>) -> Option<Fix> {
+    live.as_ref()
+        .filter(|f| !f.stale)
+        .cloned()
+        .or(saved)
+        .or(live)
 }
 
 fn gpsd_fix(line: &[u8]) -> Option<Fix> {
@@ -435,6 +489,7 @@ pub fn start_gpsd(
                                     received: Instant::now(),
                                     received_model_ms: None,
                                     publication_ms: None,
+                                    publication_epoch: 0,
                                 });
                             }
                             line.clear();
@@ -458,12 +513,14 @@ pub fn start_gpsd(
 
 // Fixed-size application-level RRLS position exchange. Age is relative, so
 // different host UTC offsets cannot silently turn an old fix into a fresh one.
+/// Version 1 is a live GPS fix; version 2 an administrator-saved position, so
+/// a station with no GPS still shows where it is on the other station's map.
 pub fn encode_position(fix: &Fix) -> Option<[u8; 38]> {
-    if !fix.valid() || fix.manual || fix.age_ms > FIX_FRESH_MS {
+    if !fix.valid() || (!fix.manual && fix.age_ms > FIX_FRESH_MS) {
         return None;
     }
     let mut out = [0; 38];
-    out[0] = 1;
+    out[0] = if fix.manual { 2 } else { 1 };
     out[1..9].copy_from_slice(&fix.latitude.to_le_bytes());
     out[9..17].copy_from_slice(&fix.longitude.to_le_bytes());
     out[17..25].copy_from_slice(&fix.altitude_m.unwrap_or(f64::NAN).to_le_bytes());
@@ -474,11 +531,11 @@ pub fn encode_position(fix: &Fix) -> Option<[u8; 38]> {
     };
     out[26..30].copy_from_slice(&(fix.accuracy_m.unwrap_or(f64::NAN) as f32).to_le_bytes());
     out[30..34].copy_from_slice(&(fix.geoid_separation_m.unwrap_or(f64::NAN) as f32).to_le_bytes());
-    out[34..38].copy_from_slice(&(fix.age_ms as u32).to_le_bytes());
+    out[34..38].copy_from_slice(&(if fix.manual { 0 } else { fix.age_ms } as u32).to_le_bytes());
     Some(out)
 }
 pub fn decode_position(data: &[u8]) -> Option<Fix> {
-    if data.len() != 38 || data[0] != 1 {
+    if data.len() != 38 || !matches!(data[0], 1 | 2) {
         return None;
     }
     let f64_at = |i| Some(f64::from_le_bytes(data.get(i..i + 8)?.try_into().ok()?));
@@ -498,10 +555,28 @@ pub fn decode_position(data: &[u8]) -> Option<Fix> {
         age_ms: u32::from_le_bytes(data[34..38].try_into().ok()?) as u64,
         stale: false,
         source: "Radio GPS".into(),
-        manual: false,
+        manual: data[0] == 2,
     };
     (fix.valid() && fix.age_ms <= FIX_FRESH_MS).then_some(fix)
+}/// RF only emits GPS_DATA when gps_has_fix() is true. FC's GPS_DATA contains
+/// filtered/relative coordinates and cannot prove a current receiver lock.
+pub fn rocket_launch_fix_locked() -> bool {
+    cache().lock().unwrap().rocket[0]
+        .as_ref()
+        .is_some_and(|value| {
+            let fix = value.snapshot();
+            fix.valid() && !fix.stale && fix.altitude_m.is_some()
+        })
 }
+
+#[cfg(test)]
+pub(crate) fn clear_rocket_fix_for_test() {
+    let mut cache = cache().lock().unwrap();
+    cache.rocket[0] = None;
+    cache.rf_no_fix = None;
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,6 +608,7 @@ mod tests {
             received: Instant::now() - Duration::from_secs(11),
             received_model_ms: None,
             publication_ms: None,
+            publication_epoch: 0,
         };
         assert!(timed.snapshot().stale);
     }
@@ -560,6 +636,7 @@ mod tests {
             received: wall,
             received_model_ms: Some(1000),
             publication_ms: None,
+            publication_epoch: 0,
         };
         timed.fix.age_ms = 1200;
         assert_eq!(
@@ -701,6 +778,22 @@ mod tests {
         observe_at(&row, Some(now + 1), Some(now));
         assert!(locked(), "a comparable UTC bridge permits valid recovery");
 
+        // A network clock step back: a fix published in the newer epoch is
+        // newer than the cached one despite its lower timestamp; a late
+        // no-fix from before the step cannot revoke it.
+        clear_rocket_fix_for_test();
+        observe_at_epoch(&row, Some(now), 3, Some(now));
+        assert!(locked());
+        let after = now - 4 * 3_600_000;
+        observe_at_epoch(&row, Some(after), 4, Some(after));
+        assert!(locked(), "post-step fix accepted");
+        observe_satellites_at_epoch("RF", 0, now - 1, 3, Some(now));
+        assert!(locked(), "a pre-step no-fix is older than the post-step fix");
+        observe_satellites_at_epoch("RF", 0, after + 1, 4, Some(after + 1));
+        assert!(!locked(), "a post-step no-fix revokes it");
+        observe_at_epoch(&row, Some(now), 3, Some(now + 1));
+        assert!(!locked(), "a pre-step fix cannot revive it");
+
         clear_rocket_fix_for_test();
         observe_at(&row, Some(9_990), Some(now));
         assert!(
@@ -761,8 +854,9 @@ mod tests {
         let decoded = decode_position(&encoded).unwrap();
         assert_eq!(decoded.latitude, 43.0);
         assert_eq!(decoded.altitude_reference, AltitudeReference::MeanSeaLevel);
+        assert!(!decoded.manual);
         let mut bad = encoded;
-        bad[0] = 2;
+        bad[0] = 3;
         assert!(decode_position(&bad).is_none());
         bad = encoded;
         bad[25] = 3;
@@ -774,23 +868,19 @@ mod tests {
         bad[34..38].copy_from_slice(&15_001u32.to_le_bytes());
         assert!(decode_position(&bad).is_none());
     }
-}
 
-/// RF only emits GPS_DATA when gps_has_fix() is true. FC's GPS_DATA contains
-/// filtered/relative coordinates and cannot prove a current receiver lock.
-#[cfg(not(feature = "hitl_mode"))]
-pub fn rocket_launch_fix_locked() -> bool {
-    cache().lock().unwrap().rocket[0]
-        .as_ref()
-        .is_some_and(|value| {
-            let fix = value.snapshot();
-            fix.valid() && !fix.stale && fix.altitude_m.is_some()
-        })
-}
-
-#[cfg(test)]
-pub(crate) fn clear_rocket_fix_for_test() {
-    let mut cache = cache().lock().unwrap();
-    cache.rocket[0] = None;
-    cache.rf_no_fix = None;
+    /// A station with no GPS still shows on the other station's map: its saved
+    /// position travels as version 2 and arrives marked saved, not live.
+    #[test]
+    fn a_saved_position_travels_marked_saved() {
+        let mut fix = gpsd_fix(br#"{"class":"TPV","mode":3,"lat":43,"lon":-78,"altMSL":150}"#).unwrap();
+        fix.manual = true;
+        fix.age_ms = u64::MAX;
+        let encoded = encode_position(&fix).expect("a saved position has no age limit");
+        assert_eq!(encoded[0], 2);
+        let decoded = decode_position(&encoded).unwrap();
+        assert!(decoded.manual);
+        assert_eq!(decoded.age_ms, 0);
+        assert_eq!(decoded.longitude, -78.0);
+    }
 }

@@ -236,8 +236,8 @@ fn load_or_default_unlocked() -> FlightSetupConfig {
                 "WARNING: invalid flight setup config at {}: {err}. Falling back to defaults.",
                 path.display()
             );
-            let cfg = FlightSetupConfig::default();
-            cfg
+
+            FlightSetupConfig::default()
         }
     }
 }

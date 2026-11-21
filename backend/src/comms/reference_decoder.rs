@@ -1,6 +1,13 @@
 //! Test-only adapter: reference radio scenarios must use the production stream
 //! decoder rather than assume every modem burst is one application frame.
 use super::*;
+
+/// Use the maintained raw-UART builder for test-only data frames.
+#[cfg(test)]
+pub(crate) fn frame_data(bytes: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    build_raw_uart_frame(bytes)
+}
+
 #[derive(Default)]
 pub(crate) struct Decoder {
     buffer: Vec<u8>,
@@ -9,6 +16,10 @@ pub(crate) struct Decoder {
     pub(crate) peak_bytes: usize,
 }
 impl Decoder {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn pending_bytes(&self) -> usize {
+        self.buffer.len()
+    }
     pub(crate) fn push(&mut self, bytes: &[u8], now_ms: u64) -> Vec<(bool, Vec<u8>)> {
         self.buffer.extend_from_slice(bytes);
         self.peak_bytes = self.peak_bytes.max(self.buffer.len());
@@ -81,5 +92,75 @@ mod tests {
         let frames = decoder.push(&bytes, 0);
         assert_eq!(frames, vec![(false, good)]);
         assert_eq!(decoder.rejected, 1);
+    }
+    fn rr(kind: u8, payload: &[u8]) -> Vec<u8> {
+        let mut body = vec![b'R', b'R', 1, kind];
+        body.extend_from_slice(payload);
+        body.extend_from_slice(&crc32fast::hash(&body).to_le_bytes());
+        body
+    }
+    fn nested_revoke() -> Vec<u8> {
+        use crate::rrls::budget_negotiation::{Context, Message, Nonce, encode};
+        build_raw_uart_command_frame(
+            encode(Message::Revoke(Context {
+                session: 7,
+                seq: 1,
+                nonce: Nonce::new([8; 16]).unwrap(),
+            }))
+            .wire(),
+        )
+        .unwrap()
+    }
+    #[test]
+    fn valid_rr_parent_never_exposes_nested_valid_protocol_frame() {
+        let nested = nested_revoke();
+        let parent = rr(10, &nested);
+        for wire in [
+            build_raw_uart_frame(&parent).unwrap(),
+            build_raw_uart_command_frame(&parent).unwrap(),
+        ] {
+            let command = wire[..2] == [0xa6, 0x5b];
+            let mut decoder = Decoder::default();
+            let frames = decoder.push(&wire, 0);
+            assert_eq!(frames, vec![(command, parent.clone())]);
+            assert_eq!(decoder.rejected, 0);
+            assert!(decoder.buffer.is_empty());
+        }
+    }
+    #[test]
+    fn unexpired_incomplete_rr_parent_never_scans_nested_protocol() {
+        let parent = rr(10, &nested_revoke());
+        let wire = build_raw_uart_command_frame(&parent).unwrap();
+        let split = wire.len() - 2;
+        let mut decoder = Decoder::default();
+        assert!(decoder.push(&wire[..split], 0).is_empty());
+        assert!(decoder.push(&[], 1).is_empty());
+        assert_eq!(decoder.rejected, 0);
+        assert_eq!(decoder.push(&wire[split..], 2), vec![(true, parent)]);
+        assert!(decoder.buffer.is_empty());
+    }
+    #[test]
+    fn rejected_rr_parent_preserves_complete_valid_rr_anchors_inside_failed_span() {
+        let next = nested_revoke();
+        let retry_body = rr(10, &[0x77; 80]);
+        let retry = build_raw_uart_command_frame(&retry_body).unwrap();
+        for parent in [build_raw_uart_frame(&retry_body).unwrap(), retry.clone()] {
+            let wire = [parent[..7].to_vec(), next.clone(), retry.clone()].concat();
+            let mut decoder = Decoder::default();
+            let mut frames = Vec::new();
+            for (i, part) in wire.chunks(7).enumerate() {
+                frames.extend(decoder.push(part, i as u64 * 5));
+            }
+            let next_len = u16::from_le_bytes(next[2..4].try_into().unwrap()) as usize;
+            assert_eq!(
+                frames,
+                vec![
+                    (true, next[4..4 + next_len].to_vec()),
+                    (true, retry_body.clone())
+                ]
+            );
+            assert_eq!(decoder.rejected, 1);
+            assert!(decoder.buffer.is_empty());
+        }
     }
 }

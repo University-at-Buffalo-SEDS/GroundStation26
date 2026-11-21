@@ -1,18 +1,17 @@
 use std::collections::VecDeque;
 
-// Live control state is applied at ingress. The bulk worker only persists
-// its arrival-time snapshot, so a delayed recording cannot roll it back.
+// Status decisions are fixed at ingress. AppliedStatus carries either a live
+// VALVE_STATE snapshot or an unconfirmed raw-status snapshot with no values.
+// The bulk worker only persists it; discovery/recording cannot re-admit it.
 pub enum ReceivedPacket {
-    Telemetry(sedsnet::packet::Packet),
+    Telemetry {
+        packet: sedsnet::packet::Packet,
+        ingress_generation: u64,
+    },
     AppliedStatus {
         packet: sedsnet::packet::Packet,
         row: crate::types::TelemetryRow,
     },
-}
-impl From<sedsnet::packet::Packet> for ReceivedPacket {
-    fn from(packet: sedsnet::packet::Packet) -> Self {
-        Self::Telemetry(packet)
-    }
 }
 
 pub struct RingBuffer<T> {

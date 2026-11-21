@@ -16,6 +16,18 @@ independently.
 - [Model animations](backend/model-animations.md): single-stage default and backend
   binding configuration; custom multi-stage profiles remain supported.
 - [GSE sequences](backend/gse-sequences.md): grouped control and equipment scene.
+- [Per-account client settings](backend/client-settings.md): watch companion preferences
+  synced to the signed-in account.
+- [Watch direct link](backend/watch-direct.md): watch tokens, the compact watch status and
+  watch-eligible page actions.
+- [Frontend contract fixtures](backend/contract-fixtures.md): real replies the UI decodes;
+  how to regenerate and run them.
+- [Station mode switch](backend/station-modes.md): switch build and simulation
+  from the UI by a controlled restart, on the primary and the RRLS.
+- [Always-on recording](backend/rolling-recording.md): the rolling ring, protected
+  event captures, disk policy and the recordings API.
+- [Station power](backend/host-power.md): admin power off / reboot and the one-time
+  host helper setup.
 
 - `docs/frontend/api.md`
   Frontend-facing API contract, endpoint details, websocket message shapes, bootstrap flow, and backend expectations.
@@ -39,6 +51,7 @@ independently.
 5. Use `docs/backend/i2c.md` when changing the Linux-to-Pico I2C transport.
 
 - [Application administration](application-administration.md): account roles, permissions and session revocation.
+- [Personnel proximity lock](proximity-lock.md): opt-in lock on arming and filling while people are near the rocket; on-device geofencing, stale policy, override, RRLS.
 - [Optional RRLS radio voice](rrls-radio-voice.md): opt-in push-to-talk and radio budget.
 - [Pico-Fi over Ethernet](picofi-ethernet.md): TCP client/server setup.
 

@@ -3,14 +3,14 @@
 mod contract;
 #[path = "media/publishing.rs"]
 mod publishing;
-#[path = "media/transcoding.rs"]
-mod transcoding;
 #[path = "media/recorded_vehicle.rs"]
 mod recorded_vehicle;
 #[path = "media/recordings.rs"]
 mod recordings;
 #[path = "media/rundown.rs"]
 mod rundown;
+#[path = "media/transcoding.rs"]
+mod transcoding;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
@@ -47,6 +47,7 @@ struct MediaState {
     hls_segments: Mutex<std::collections::HashMap<(String, String), u64>>,
     preview_sessions: Mutex<Vec<(String, String, String)>>,
     publishers: Mutex<Vec<publishing::Publisher>>,
+    publish_offer: Mutex<()>,
     transcoding: Mutex<transcoding::Registry>,
     recorded_vehicle_cache: Mutex<recorded_vehicle::SceneCache>,
 }
@@ -80,6 +81,7 @@ pub fn router(
         hls_segments: Mutex::new(std::collections::HashMap::new()),
         preview_sessions: Mutex::new(Vec::new()),
         publishers: Mutex::new(Vec::new()),
+        publish_offer: Mutex::new(()),
         transcoding: Mutex::default(),
         recorded_vehicle_cache: Mutex::new(Default::default()),
         models: std::env::var_os("GS_STAGE_MODELS_DIR")
@@ -99,7 +101,10 @@ pub fn router(
         .merge(transcoding::routes())
         .merge(recorded_vehicle::routes())
         .route("/api/video/streams", get(list_streams))
-        .route("/api/video/streams/{id}/name",post(contract::rename_camera).layer(DefaultBodyLimit::max(1024)))
+        .route(
+            "/api/video/streams/{id}/name",
+            post(contract::rename_camera).layer(DefaultBodyLimit::max(1024)),
+        )
         .route(
             "/api/video/streams/{id}/whep",
             post(whep_offer).layer(DefaultBodyLimit::max(64 * 1024)),
@@ -140,6 +145,7 @@ fn valid_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 fn check_id(id: &str) -> ApiResult<()> {
     if valid_id(id) {
         Ok(())
@@ -151,6 +157,7 @@ fn check_id(id: &str) -> ApiResult<()> {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn authorize(
     state: &MediaState,
     headers: &HeaderMap,
@@ -177,19 +184,29 @@ struct StreamInfo {
     live: bool,
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn list_streams(
     State(state): State<Arc<MediaState>>,
     headers: HeaderMap,
 ) -> ApiResult<axum::Json<Vec<StreamInfo>>> {
     contract::authorize_preview(&state, &headers).await?;
-    let mut streams=fetch_streams(&state).await?.0;
-    let presentation=contract::read_presentation(&state).await?;
-    for stream in &mut streams{let logical=stream.id.strip_prefix("transcoded-").unwrap_or(&stream.id);if let Some(label)=presentation.stream_labels.get(logical){stream.name=label.clone();}}
+    let mut streams = fetch_streams(&state).await?.0;
+    let presentation = contract::read_presentation(&state).await?;
+    for stream in &mut streams {
+        let logical = stream.id.strip_prefix("transcoded-").unwrap_or(&stream.id);
+        if let Some(label) = presentation.stream_labels.get(logical) {
+            stream.name = label.clone();
+        }
+    }
     Ok(axum::Json(streams))
 }
-async fn fetch_streams(state:&MediaState)->ApiResult<axum::Json<Vec<StreamInfo>>>{
-    Ok(axum::Json(transcoding::choose(state,fetch_streams_raw(state).await?.0).await))
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
+async fn fetch_streams(state: &MediaState) -> ApiResult<axum::Json<Vec<StreamInfo>>> {
+    Ok(axum::Json(
+        transcoding::choose(state, fetch_streams_raw(state).await?.0).await,
+    ))
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn fetch_streams_raw(state: &MediaState) -> ApiResult<axum::Json<Vec<StreamInfo>>> {
     let response = state
         .client
@@ -204,7 +221,13 @@ async fn fetch_streams_raw(state: &MediaState) -> ApiResult<axum::Json<Vec<Strea
         .error_for_status()
         .map_err(upstream_error)?;
     let body: serde_json::Value = response.json().await.map_err(upstream_error)?;
-    let labels: std::collections::HashMap<_,_> = state.publishers.lock().await.iter().map(|p|(p.id.clone(),p.label.clone())).collect();
+    let labels: std::collections::HashMap<_, _> = state
+        .publishers
+        .lock()
+        .await
+        .iter()
+        .map(|p| (p.id.clone(), p.label.clone()))
+        .collect();
     let streams = body["items"]
         .as_array()
         .into_iter()
@@ -213,7 +236,7 @@ async fn fetch_streams_raw(state: &MediaState) -> ApiResult<axum::Json<Vec<Strea
             let id = item["name"].as_str()?;
             valid_id(id).then(|| StreamInfo {
                 id: id.into(),
-                name: labels.get(id).cloned().unwrap_or_else(||id.to_owned()),
+                name: labels.get(id).cloned().unwrap_or_else(|| id.to_owned()),
                 live: item["ready"].as_bool().unwrap_or(false),
             })
         })
@@ -226,6 +249,7 @@ fn session_id(location: &str) -> Option<&str> {
     valid_id(id).then_some(id)
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn whep_offer(
     State(state): State<Arc<MediaState>>,
     Path(id): Path<String>,
@@ -306,6 +330,7 @@ async fn whep_offer(
         .into_response())
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn whep_delete(
     State(state): State<Arc<MediaState>>,
     Path((id, session)): Path<(String, String)>,
@@ -364,6 +389,7 @@ fn valid_glb(bytes: &[u8]) -> bool {
     offset == bytes.len()
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 fn model_path(state: &MediaState, stage: &str, name: &str) -> ApiResult<PathBuf> {
     check_id(stage)?;
     check_id(name)?;
@@ -382,6 +408,7 @@ fn io_error(err: std::io::Error) -> Response {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn upload_model(
     State(state): State<Arc<MediaState>>,
     Path((stage, name)): Path<(String, String)>,
@@ -410,6 +437,7 @@ async fn upload_model(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn download_model(
     State(state): State<Arc<MediaState>>,
     Path((stage, name)): Path<(String, String)>,
@@ -435,6 +463,7 @@ struct ModelInfo {
     size_bytes: u64,
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn list_models(
     State(state): State<Arc<MediaState>>,
     headers: HeaderMap,
@@ -495,9 +524,16 @@ mod tests {
             ("publisher", vec![]),
             ("operator", vec![]),
         ];
-        let mut verifier=[0u8;32];ring::pbkdf2::derive(ring::pbkdf2::PBKDF2_HMAC_SHA256,std::num::NonZeroU32::new(10000).unwrap(),b"fixture-media-salt",b"fixture-only-password",&mut verifier);
+        let mut verifier = [0u8; 32];
+        ring::pbkdf2::derive(
+            ring::pbkdf2::PBKDF2_HMAC_SHA256,
+            std::num::NonZeroU32::new(10000).unwrap(),
+            b"fixture-media-salt",
+            b"fixture-only-password",
+            &mut verifier,
+        );
         use base64::Engine;
-        let password=serde_json::json!({"algorithm":"pbkdf2_sha256","iterations":10000,"salt_b64":base64::engine::general_purpose::STANDARD.encode(b"fixture-media-salt"),"hash_b64":base64::engine::general_purpose::STANDARD.encode(verifier)});
+        let password = serde_json::json!({"algorithm":"pbkdf2_sha256","iterations":10000,"salt_b64":base64::engine::general_purpose::STANDARD.encode(b"fixture-media-salt"),"hash_b64":base64::engine::general_purpose::STANDARD.encode(verifier)});
         let users:Vec<_>=accounts.iter().map(|(name,roles)|serde_json::json!({"username":name,"roles":roles,"password":password,"permissions":{"view_data":true,"send_commands":*name=="operator","voice_transmit":*name=="producer","camera_publish":*name=="producer"||*name=="publisher"}})).collect();
         std::fs::write(&path,serde_json::to_vec(&serde_json::json!({"anonymous":{"view_data":true,"send_commands":false},"users":users})).unwrap()).unwrap();
         let mut app = crate::state::tests::test_app_state().await;
@@ -516,8 +552,8 @@ mod tests {
             voice.clone(),
         )
         .merge(crate::voice::routes(app.clone(), voice))
-        .route("/api/auth/challenge",post(crate::web::login_challenge))
-        .route("/api/auth/login",post(crate::web::login))
+        .route("/api/auth/challenge", post(crate::web::login_challenge))
+        .route("/api/auth/login", post(crate::web::login))
         .with_state(app);
         let address: std::net::SocketAddr = std::env::var("GS_MEDIA_TEST_BIND")
             .unwrap_or_else(|_| "127.0.0.1:19090".into())

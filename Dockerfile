@@ -59,9 +59,9 @@ RUN chmod +x entrypoint.sh
 RUN cargo update && cargo fetch
 
 # Build args:
-# - PI_BUILD="pi_build" -> ./build.py pi_build
-# - TESTING="testing"  -> ./build.py testing
-# - both set           -> ./build.py pi_build testing
+# - PI_BUILD="TRUE" -> ./build.py pi_build (raspberry_pi feature)
+# - TESTING="TRUE"  -> the image starts in testing mode (GS_STATION_MODE=testing);
+#   the binary is the same, it holds every station mode
 ARG FRONTEND_SOURCE_REVISION=""
 RUN set -e; \
     echo "Frontend cache revision: ${FRONTEND_SOURCE_REVISION}"; \
@@ -98,6 +98,11 @@ RUN cargo build --release -p map_downloader
 FROM debian:stable-slim
 
 LABEL authors="Rylan Meiluits"
+
+# Station mode at start; TESTING=TRUE selects testing mode. A mode switched
+# from the UI is saved and wins on the next start.
+ARG TESTING=""
+ENV GS_STATION_MODE=${TESTING:+testing}
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \

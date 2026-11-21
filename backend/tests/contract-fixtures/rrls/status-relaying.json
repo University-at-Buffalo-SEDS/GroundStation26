@@ -1,0 +1,12 @@
+{
+  "direct_age_ms": 1500,
+  "dropped_frames": 0,
+  "enabled": true,
+  "forwarded_frames": 40,
+  "forwarding": true,
+  "queued_frames": 2,
+  "relay_envelope_bytes": 960,
+  "relay_requested": true,
+  "relayed_frames": 12,
+  "role": "rrls"
+}

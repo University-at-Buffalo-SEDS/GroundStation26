@@ -47,24 +47,30 @@ async fn open(path: &Path) -> Result<SqlitePool, sqlx::Error> {
         .await
 }
 async fn snapshots(root: &Path, range: Range) -> anyhow::Result<Vec<Snapshot>> {
-    let mut entries = match tokio::fs::read_dir(root).await {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e.into()),
-    };
+    // The ring and legacy files; captures are copies of ring data and would
+    // duplicate rows in a date-range export.
+    let root_owned = root.to_path_buf();
+    let sources = tokio::task::spawn_blocking(move || crate::recording_store::primary_sources(&root_owned)).await?;
     let mut result = Vec::new();
-    while let Some(entry) = entries.next_entry().await? {
-        let id = entry.file_name().to_string_lossy().into_owned();
+    for source in sources {
+        let id = source.id;
         if !valid_id(&id) {
             continue;
         }
-        let meta = entry.file_type().await?;
-        if !meta.is_file() || meta.is_symlink() {
+        if let Some(end) = source.end_ms
+            && end < range.start_ms.saturating_sub(60_000)
+        {
             continue;
         }
-        let path = recording_path(root, &id)
-            .await
-            .map_err(|e| anyhow::anyhow!("Recording changed during export: {id}: {e}"))?;
+        if source.start_ms.is_some_and(|start| start > range.end_ms.saturating_add(60_000)) {
+            continue;
+        }
+        let path = match recording_path(root, &id).await {
+            Ok(path) => path,
+            // A rolling segment may be removed by the ring between listing and opening.
+            Err(_) if source.kind == crate::recording_store::ListedKind::Rolling => continue,
+            Err(e) => return Err(anyhow::anyhow!("Recording changed during export: {id}: {e}")),
+        };
         let db = open(&path).await?;
         let upper: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id),0) FROM telemetry WHERE timestamp_ms >= ? AND timestamp_ms < ?")
             .bind(range.start_ms).bind(range.end_ms).fetch_one(&db).await?;

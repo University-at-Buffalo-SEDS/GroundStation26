@@ -1,0 +1,17 @@
+{
+  "accepted": true,
+  "authority_id": "station-mode-switch/primary",
+  "backend_instance": "primary-contractfixture0001",
+  "current_id": "normal",
+  "policy_epoch": "boot-fixture:epoch-1",
+  "principal_context": "user:operator",
+  "target_id": "hitl",
+  "transition": {
+    "error": null,
+    "id": "switch-fixture-3",
+    "phase": "Switching to HITL · live outputs",
+    "state": "pending",
+    "target_id": "hitl"
+  },
+  "version": 2
+}

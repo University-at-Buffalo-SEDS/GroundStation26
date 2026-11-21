@@ -1,0 +1,7 @@
+{
+  "algorithm": "pbkdf2_sha256",
+  "challenge_id": "fixture-challenge_id",
+  "iterations": 1,
+  "salt_b64": "Zml4dHVyZQ==",
+  "server_nonce_b64": "Zml4dHVyZQ=="
+}

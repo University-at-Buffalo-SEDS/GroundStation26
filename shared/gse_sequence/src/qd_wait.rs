@@ -16,13 +16,20 @@ pub struct QdWait {
     ack_ms: Option<u64>,
     queued: bool,
     timed_out: bool,
+    completion_timeout_ms: u64,
 }
 impl QdWait {
     pub const SETTLE_MS: u64 = 5_000;
     pub const ACK_TIMEOUT_MS: u64 = 5_000;
     pub fn dispatched(&mut self, now_ms: u64) {
+        self.dispatched_with_timeout(now_ms, Self::ACK_TIMEOUT_MS);
+    }
+    /// A timed electrical retract must finish before its positive readback.
+    /// This changes the completion deadline, never grants launch authority.
+    pub fn dispatched_with_timeout(&mut self, now_ms: u64, timeout_ms: u64) {
         *self = Self {
             sent_ms: Some(now_ms),
+            completion_timeout_ms: timeout_ms.clamp(Self::ACK_TIMEOUT_MS, 605_000),
             ..Self::default()
         };
     }
@@ -33,7 +40,7 @@ impl QdWait {
         if self.ack_ms.is_some() || self.timed_out || received_ms < sent {
             return false;
         }
-        if received_ms - sent >= Self::ACK_TIMEOUT_MS {
+        if received_ms - sent >= self.completion_timeout_ms {
             self.timed_out = true;
             self.queued = false;
             return false;
@@ -56,7 +63,7 @@ impl QdWait {
                     QdStatus::Ready
                 }
             }
-            (Some(sent), _) if now_ms.saturating_sub(sent) >= Self::ACK_TIMEOUT_MS => {
+            (Some(sent), _) if now_ms.saturating_sub(sent) >= self.completion_timeout_ms => {
                 QdStatus::AckTimedOut
             }
             (Some(_), _) => QdStatus::AwaitingAck,
@@ -72,6 +79,11 @@ impl QdWait {
                 Ok(())
             }
         }
+    }
+    /// Cancel only the pending operator intent; do not fabricate or discard
+    /// actuator acknowledgement/settling evidence.
+    pub fn cancel_launch(&mut self) {
+        self.queued = false;
     }
     pub fn queued(&self) -> bool {
         self.queued
@@ -96,6 +108,38 @@ impl QdWait {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn timed_auxiliary_completion_waits_45_seconds_then_settles_without_replaying_launch() {
+        let mut q = QdWait::default();
+        q.dispatched_with_timeout(100, 50_000);
+        q.queue_launch(101).unwrap();
+        assert_eq!(q.status(45_099), QdStatus::AwaitingAck);
+        assert!(!q.take_ready_launch(45_099));
+        assert!(q.confirm(45_100));
+        assert!(!q.confirm(46_100));
+        assert_eq!(q.status(50_099), QdStatus::Settling { remaining_ms: 1 });
+        assert!(q.take_ready_launch(50_100));
+        assert!(!q.take_ready_launch(50_101));
+        q.dispatched_with_timeout(100, 50_000);
+        q.queue_launch(101).unwrap();
+        assert_eq!(q.status(50_100), QdStatus::AckTimedOut);
+        assert!(!q.take_ready_launch(50_100));
+        assert!(!q.queued());
+    }
+    #[test]
+    fn cancelling_pending_intent_preserves_real_ack_and_never_replays_launch() {
+        let mut q = QdWait::default();
+        q.dispatched(100);
+        q.queue_launch(101).unwrap();
+        q.confirm(1100);
+        q.cancel_launch();
+        assert!(!q.queued());
+        assert_eq!(q.status(6100), QdStatus::Ready);
+        assert!(!q.take_ready_launch(6100));
+        q.queue_launch(6101).unwrap();
+        assert!(q.take_ready_launch(6101));
+        assert!(!q.take_ready_launch(6102));
+    }
     #[test]
     fn five_seconds_begin_at_ack_and_duplicate_reports_do_not_restart_time() {
         let mut q = QdWait::default();

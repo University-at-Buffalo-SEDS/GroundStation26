@@ -56,8 +56,7 @@ async fn rrls_http_cannot_clear_abort_or_mutate_operational_qualification() {
     state.topology_router.set(router.clone()).unwrap();
     // Seed a received state without enqueueing a fixture-originated update.
     *state.state.lock().unwrap() = FlightState::Aborted;
-    #[cfg(not(feature = "hitl_mode"))]
-    let saved_before = {
+    let saved_before = (!crate::runtime_mode::is_hitl()).then(|| {
         let mut runtime = state.gse.lock().unwrap();
         runtime.operational.path = Some(root.0.join("qualification.json"));
         runtime
@@ -66,7 +65,7 @@ async fn rrls_http_cannot_clear_abort_or_mutate_operational_qualification() {
             .save(runtime.operational.path.as_ref().unwrap())
             .unwrap();
         std::fs::read(root.0.join("qualification.json")).unwrap()
-    };
+    });
     let mut headers = HeaderMap::new();
     headers.insert(
         axum::http::header::AUTHORIZATION,
@@ -79,12 +78,11 @@ async fn rrls_http_cannot_clear_abort_or_mutate_operational_qualification() {
     assert!(principal.allows_command_name("NitrogenTest"));
     assert!(crate::rrls::is_rrls());
     assert!(!state.is_command_allowed(&TelemetryCommand::Abort));
-    assert_eq!(
-        clear_abort(State(state.clone()), headers.clone())
-            .await
-            .status(),
-        StatusCode::FORBIDDEN
-    );
+    // RRLS never clears locally. It may only ask a connected primary over the
+    // signed proxy; with no primary link that request is refused outright.
+    let refused = clear_abort(State(state.clone()), headers.clone()).await;
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(*state.state.lock().unwrap(), FlightState::Aborted);
     assert_eq!(
         self_test_confirmation(
             State(state.clone()),
@@ -128,11 +126,12 @@ async fn rrls_http_cannot_clear_abort_or_mutate_operational_qualification() {
             .config
             .dry_self_test_confirmed
     );
-    #[cfg(not(feature = "hitl_mode"))]
-    assert_eq!(
-        std::fs::read(root.0.join("qualification.json")).unwrap(),
-        saved_before
-    );
+    if let Some(saved_before) = saved_before {
+        assert_eq!(
+            std::fs::read(root.0.join("qualification.json")).unwrap(),
+            saved_before
+        );
+    }
     assert!(
         !root.0.join("variables.json").exists(),
         "No managed-variable cache mutation"
@@ -189,7 +188,7 @@ async fn bulk_settings_cannot_grant_dry_consent_but_preserve_or_revoke_existing_
     let mut request = state.gse.lock().unwrap().engine.config.clone();
     request.dry_self_test_confirmed = true;
     assert_eq!(
-        save_config(State(state.clone()), headers.clone(), Json(request.clone()))
+        save_config(State(state.clone()), headers.clone(), Json(serde_json::to_value(&request).unwrap()))
             .await
             .status(),
         StatusCode::FORBIDDEN
@@ -210,7 +209,7 @@ async fn bulk_settings_cannot_grant_dry_consent_but_preserve_or_revoke_existing_
     request.dry_self_test_confirmed = false;
     request.maximum_zero_offset_psi = Some(12.0);
     assert_eq!(
-        save_config(State(state.clone()), headers.clone(), Json(request.clone()))
+        save_config(State(state.clone()), headers.clone(), Json(serde_json::to_value(&request).unwrap()))
             .await
             .status(),
         StatusCode::OK,
@@ -229,7 +228,7 @@ async fn bulk_settings_cannot_grant_dry_consent_but_preserve_or_revoke_existing_
     assert_eq!(dedicated.status(), StatusCode::OK);
     request.dry_self_test_confirmed = true;
     assert_eq!(
-        save_config(State(state.clone()), headers.clone(), Json(request.clone()))
+        save_config(State(state.clone()), headers.clone(), Json(serde_json::to_value(&request).unwrap()))
             .await
             .status(),
         StatusCode::OK
@@ -246,7 +245,7 @@ async fn bulk_settings_cannot_grant_dry_consent_but_preserve_or_revoke_existing_
     // Current frontend can POST a stale false; retain its explicit revocation.
     request.dry_self_test_confirmed = false;
     assert_eq!(
-        save_config(State(state.clone()), headers.clone(), Json(request.clone()))
+        save_config(State(state.clone()), headers.clone(), Json(serde_json::to_value(&request).unwrap()))
             .await
             .status(),
         StatusCode::OK
@@ -298,7 +297,7 @@ async fn bulk_settings_cannot_grant_dry_consent_but_preserve_or_revoke_existing_
     let mut stale = state.gse.lock().unwrap().engine.config.clone();
     stale.dry_self_test_confirmed = true;
     assert_eq!(
-        save_config(State(state), headers, Json(stale))
+        save_config(State(state), headers, Json(serde_json::to_value(&stale).unwrap()))
             .await
             .status(),
         StatusCode::FORBIDDEN,

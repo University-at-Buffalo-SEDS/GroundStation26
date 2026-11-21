@@ -1,0 +1,6 @@
+timestamp_ms,monotonic_ms,sensor,value,raw_adc_code,raw_value,calibrated_value,time_source,adc_temperature_c,adc_temperature_code,uptime_ticks,uptime_frequency_hz,record_sequence
+# calibration,kg50_c0=1.00000000e+00,kg50_tare=2.00000000e+00
+1700000000000,100,kg50_raw,,-123,1.25000000e+00,-2.50000000e+00,network,2.45000000e+01,-200,100,1000,1
+101,101,gyroscope_sample,"-1.25 0.5 3.0","-32768 2 32767","-32768 2 32767","-1.25 0.5 3.0",local,,,101,1000,2
+102,102,diagnostic,"quoted, ""text""
+second line",,,,local,,,102,1000,3

@@ -75,7 +75,11 @@ fn coverage_bounds(z: u32) -> &'static [(f64, f64, f64, f64)] {
     if z <= BASE_COVERAGE_MAX_ZOOM {
         &[NA_BOUNDS]
     } else {
-        &[BUFFALO_ROCHESTER_BOUNDS, TEXAS_DESERT_BOUNDS, URRG_BOUNDS]
+        // MAP_REGIONS (validated in main) replaces the default detail regions.
+        profile::selected_regions()
+            .ok()
+            .flatten()
+            .unwrap_or(&[BUFFALO_ROCHESTER_BOUNDS, TEXAS_DESERT_BOUNDS, URRG_BOUNDS])
     }
 }
 
@@ -802,6 +806,9 @@ impl BandwidthLimiter {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let profile = Profile::configured()?;
+    if let Some(regions) = profile::selected_regions()? {
+        println!("High-detail regions selected by MAP_REGIONS: {} region(s)", regions.len());
+    }
     let region = env::var("MAP_REGION").unwrap_or_else(|_| profile.default_region().to_string());
     let max_zoom = env::var("MAP_MAX_ZOOM")
         .ok()

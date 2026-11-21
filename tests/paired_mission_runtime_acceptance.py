@@ -2,7 +2,7 @@
 import argparse, base64, hashlib, hmac, json, os, pty, selectors, signal, socket, subprocess, tempfile, threading, time, tty, urllib.request
 from pathlib import Path
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument('--binary', type=Path, required=True, help='Native backend executable built without hitl_mode')
+parser.add_argument('--binary', type=Path, required=True, help='Native backend executable; it runs in GS_STATION_MODE (default testing; never hitl)')
 parser.add_argument('--artifacts-dir', type=Path, help='New directory for disposable state and progress; defaults to a temporary directory')
 args = parser.parse_args()
 SOURCE = Path(__file__).resolve().parents[1]
@@ -129,6 +129,7 @@ def start(name):
     directory = OUT / name
     env = os.environ.copy()
     env.update(
+        GS_STATION_MODE=os.environ.get('GS_STATION_MODE', 'testing'),
         GS_SIM_MODE='0',
         GS_ETHERNET_AUTOCONFIG='off',
         GS_LOG_DIR=str(directory / 'logs'),

@@ -9,7 +9,12 @@ const DEFAULT_TEST_FIRE_LAYOUT_PATH: &str = "layout/layout_test_fire.json";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LayoutConfig {
     #[serde(default)]
+    pub flight_phase_version: u8,
+    #[serde(default)]
     pub test_fire_mode: bool,
+    /// Integrated ground test (served layout only; omitted when false).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub igt_mode: bool,
     pub version: u32,
     #[serde(default)]
     pub branding: BrandingConfig,
@@ -509,6 +514,10 @@ pub struct ActionSpec {
     pub spacer_row_before: bool,
     #[serde(default)]
     pub spacer_row_after: bool,
+    /// Actions-tab section, assigned at load from
+    /// [`crate::sequences::control_section`]; a layout file cannot override it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section: Option<crate::sequences::ControlSection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -695,13 +704,38 @@ pub fn load_layout() -> Result<LayoutConfig, String> {
         .map_err(|e| format!("Failed to read layout file {path:?}: {e}"))?;
     let mut layout: LayoutConfig =
         serde_json::from_str(&raw).map_err(|e| format!("Invalid layout JSON: {e}"))?;
+    normalize_flight_phases(&mut layout)?;
     apply_runtime_layout_overrides(&mut layout);
+    assign_control_sections(&mut layout);
     Ok(layout)
+}
+
+/// Every action carries the section its command belongs to, from the one
+/// backend table beside the per-mode command catalogs.
+fn assign_control_sections(layout: &mut LayoutConfig) {
+    for action in &mut layout.actions_tab.actions {
+        action.section = crate::sequences::control_section(&action.cmd);
+    }
+}
+
+fn normalize_flight_phases(layout: &mut LayoutConfig) -> Result<(), String> {
+    let version = layout.flight_phase_version;
+    if version > crate::types::FLIGHT_PHASE_VERSION {
+        return Err("Unsupported flight phase version".into());
+    }
+    for group in &mut layout.state_tab.states {
+        for phase in &mut group.states {
+            *phase = crate::types::canonical_phase_key(phase, version).to_owned();
+        }
+    }
+    layout.flight_phase_version = crate::types::FLIGHT_PHASE_VERSION;
+    Ok(())
 }
 
 fn apply_runtime_layout_overrides(layout: &mut LayoutConfig) {
     let mode = presentation_mode();
     layout.test_fire_mode = mode == crate::station_mode::Mode::TestFire;
+    layout.igt_mode = mode == crate::station_mode::Mode::IntegratedGroundTest;
     if crate::rrls::is_rrls() {
         layout.branding.app_name = Some("RRLS".into());
         layout.branding.dashboard_title = Some("RRLS".into());
@@ -712,6 +746,7 @@ fn apply_runtime_layout_overrides(layout: &mut LayoutConfig) {
         ("ToggleFlightBuzzer", "Flight Buzzer"),
         ("ResetTClock", "Reset T-clock"),
         ("ResetFlightState", "Reset flight state to Idle"),
+        ("RecoverStation", "Recover station"),
     ] {
         if cmd == "ResetFlightState" && mode != crate::station_mode::Mode::Hitl {
             continue;
@@ -730,6 +765,15 @@ fn apply_runtime_layout_overrides(layout: &mut LayoutConfig) {
                 .expect("valid operator recovery action"),
             );
         }
+    }
+    // HITL lists the Ground test controls too; they are refused (and the
+    // client hides them) unless the HITL replay is on (IgtStatus.igt_active).
+    if matches!(mode, crate::station_mode::Mode::IntegratedGroundTest | crate::station_mode::Mode::Hitl) {
+        ensure_igt_actions(layout);
+    }
+    // Retry FC SD wherever the FC is present (every mode but test fire).
+    if mode != crate::station_mode::Mode::TestFire {
+        ensure_fc_sd_retry_action(layout);
     }
     if mode != crate::station_mode::Mode::Testing {
         return;
@@ -758,15 +802,70 @@ fn apply_runtime_layout_overrides(layout: &mut LayoutConfig) {
             new_row_after: true,
             spacer_row_before: false,
             spacer_row_after: true,
+            section: None,
         },
     );
 }
 
-const GSE_SEQUENCE_ACTIONS: [(&str, &str); 5] = [
+/// The integrated ground test uses the flight layout (AV bay, FC, recovery
+/// and fill content) with the Ground test controls added first.
+fn ensure_igt_actions(layout: &mut LayoutConfig) {
+    for (index, (cmd, label)) in IGT_ACTIONS.into_iter().enumerate() {
+        if layout.actions_tab.actions.iter().any(|action| action.cmd == cmd) {
+            continue;
+        }
+        let (border, bg, fg) = if cmd == "IgtLivePyro" {
+            ("#ef4444", "#450a0a", "#fee2e2")
+        } else {
+            ("#f97316", "#431407", "#ffedd5")
+        };
+        layout.actions_tab.actions.insert(
+            index,
+            serde_json::from_value(serde_json::json!({
+                "cmd": cmd, "label": label, "group": "Ground test",
+                "border": border, "bg": bg, "fg": fg, "illuminated": true
+            }))
+            .expect("valid ground test action"),
+        );
+    }
+}
+
+/// `FcSdRetry` after the last Flight computer action, in its group.
+fn ensure_fc_sd_retry_action(layout: &mut LayoutConfig) {
+    let actions = &mut layout.actions_tab.actions;
+    if actions.iter().any(|action| action.cmd == "FcSdRetry") {
+        return;
+    }
+    let last_fc = actions.iter().rposition(|action| {
+        crate::sequences::control_section(&action.cmd) == Some(crate::sequences::ControlSection::FlightComputer)
+    });
+    let (index, group) = match last_fc {
+        Some(index) => (index + 1, actions[index].group.clone()),
+        None => (actions.len(), "Flight controls".to_string()),
+    };
+    actions.insert(
+        index,
+        serde_json::from_value(serde_json::json!({
+            "cmd": "FcSdRetry", "label": "Retry FC SD", "group": group,
+            "border": "#38bdf8", "bg": "#082f49", "fg": "#e0f2fe"
+        }))
+        .expect("valid FC SD retry action"),
+    );
+}
+
+const IGT_ACTIONS: [(&str, &str); 4] = [
+    ("IgtEnter", "Enter ground test"),
+    ("IgtLivePyro", "LIVE PYRO"),
+    ("IgtDryRun", "Dry-run"),
+    ("IgtExit", "Exit ground test"),
+];
+
+const GSE_SEQUENCE_ACTIONS: [(&str, &str); 6] = [
     ("StartFill", "Start fill"),
     ("PauseFill", "Pause fill"),
     ("CancelFill", "Cancel fill"),
     ("NitrogenTest", "Nitrogen test"),
+    ("Turbocharge", "Turbocharge"),
     ("ValveSelfTest", "Valve self-test"),
 ];
 
@@ -861,6 +960,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_layout_phase_groups_keep_their_wire_meaning() {
+        let mut value: serde_json::Value = serde_json::from_str(include_str!("../layout/layout.json")).unwrap();
+        value.as_object_mut().unwrap().remove("flight_phase_version");
+        value["state_tab"]["states"][0]["states"] = serde_json::json!(["ParachuteDeploy", "Descent"]);
+        let mut layout: LayoutConfig = serde_json::from_value(value).unwrap();
+        let original_data = serde_json::to_value(&layout.data_tab).unwrap();
+        normalize_flight_phases(&mut layout).unwrap();
+        assert_eq!(layout.state_tab.states[0].states, ["Descent", "Reefing"]);
+        assert_eq!(layout.flight_phase_version, 1);
+        assert_eq!(serde_json::to_value(&layout.data_tab).unwrap(), original_data);
+        normalize_flight_phases(&mut layout).unwrap();
+        assert_eq!(layout.state_tab.states[0].states, ["Descent", "Reefing"]);
+    }
+
+    #[test]
     fn gse_commands_are_available_in_all_layouts_and_prelaunch_valve_widgets() {
         for source in [
             include_str!("../layout/layout.json"),
@@ -900,14 +1014,13 @@ mod tests {
                     continue;
                 }
                 for widget in state.sections.iter().flat_map(|s| &s.widgets) {
-                    if let Some(actions) = &widget.actions {
-                        if actions.iter().any(|s| s == "Nitrous") {
+                    if let Some(actions) = &widget.actions
+                        && actions.iter().any(|s| s == "Nitrous") {
                             checked += 1;
                             for (cmd, _) in GSE_SEQUENCE_ACTIONS {
                                 assert!(actions.iter().any(|s| s == cmd));
                             }
                         }
-                    }
                 }
             }
             assert!(checked > 0);
@@ -924,9 +1037,42 @@ mod tests {
         assert!(!layout.state_tab.states.is_empty());
     }
 
-    #[cfg(feature = "testing")]
+    #[test]
+    fn every_control_in_every_mode_has_exactly_one_section() {
+        use crate::sequences::{ControlSection, control_section};
+        use crate::station_mode::Mode;
+        let mut names: Vec<&str> = crate::sequences::every_mode_catalog().concat();
+        for mode in [Mode::Normal, Mode::Hitl, Mode::TestFire, Mode::Testing, Mode::IntegratedGroundTest] {
+            names.extend(crate::types::client_command_names(mode));
+        }
+        names.extend(GSE_SEQUENCE_ACTIONS.iter().map(|(cmd, _)| *cmd));
+        names.extend(["ResetSim", "AutoColdFlow", "ResetFlightState", "ResetTClock", "RecoverStation"]);
+        for name in &names {
+            assert!(control_section(name).is_some(), "{name} has no Actions-tab section");
+        }
+        assert_eq!(control_section("Abort"), Some(ControlSection::Safety));
+        assert_eq!(control_section("NotACommand"), None);
+        // Only Abort is a Safety control.
+        assert_eq!(
+            names.iter().filter(|n| control_section(n) == Some(ControlSection::Safety)).count(),
+            names.iter().filter(|n| **n == "Abort").count()
+        );
+        // The served layout of every mode assigns each action its section.
+        for mode in [Mode::Normal, Mode::Hitl, Mode::TestFire, Mode::Testing, Mode::IntegratedGroundTest] {
+            let _mode = crate::runtime_mode::test_support::thread_mode(mode);
+            let layout = load_layout().expect("layout should parse");
+            for action in &layout.actions_tab.actions {
+                assert_eq!(action.section, control_section(&action.cmd), "{mode:?} {}", action.cmd);
+                assert!(action.section.is_some(), "{mode:?} {} has no section", action.cmd);
+            }
+            let wire = serde_json::to_value(&layout.actions_tab).unwrap();
+            assert!(wire["actions"].as_array().unwrap().iter().all(|a| a["section"].is_string()));
+        }
+    }
+
     #[test]
     fn testing_layout_includes_reset_sim_action() {
+        crate::mode_suite!(Testing);
         let layout = load_layout().expect("layout should parse");
         assert!(
             layout

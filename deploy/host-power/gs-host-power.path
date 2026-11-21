@@ -1,0 +1,9 @@
+[Unit]
+Description=GroundStation power off / reboot requests
+
+[Path]
+PathExists=@GS_DIR@/data/host-power/request
+Unit=gs-host-power.service
+
+[Install]
+WantedBy=multi-user.target

@@ -8,11 +8,8 @@ repository.workspace = true
 
 [features]
 raspberry_pi = ["rppal"]
-testing = []
-hitl_mode = []
 # Explicit MCU simulator clocks without changing operational/HITL policy.
 firmware_sim = []
-test_fire_mode = []
 
 [dependencies]
 gs-browser-assets = { path = "../shared/browser_assets" }
@@ -26,7 +23,7 @@ rcgen = "0.14.10"
 tokio.workspace = true
 serde_json.workspace = true
 rppal = { git = "https://gitlab.rylanswebsite.com/rylan-meilutis/rppal.git", branch = "main", optional = true }
-SEDSnet = { version = "4" }
+SEDSnet = { version = "6.0.0" }
 
 sqlx = { version = "0.9.0", features = ["runtime-tokio", "tls-rustls-ring", "sqlite"] }
 
@@ -48,10 +45,11 @@ flexi_logger = "0.31.10"
 log = "0.4.34"
 time = { version = "0.3.55", features = ["formatting", "macros", "parsing"] }
 opus = "0.4.0"
+codec2 = "0.3.1"
 
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake"] }
 
 [build-dependencies]
-SEDSnet = { version = "4", default-features = false, features = ["std"] }
+SEDSnet = { version = "6.0.0", default-features = false, features = ["std"] }

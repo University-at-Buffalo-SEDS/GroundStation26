@@ -9,7 +9,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::{
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Serialize)]
@@ -17,6 +17,11 @@ pub struct ClockStatus {
     pub utc_ms: u64,
     pub network_utc_ms: Option<i64>,
     pub can_set_system_time: bool,
+    pub set_system_time_permission: bool,
+    pub system_time_unavailable_reason: Option<String>,
+    /// The network time base (epoch, step policy, last step); `None` when
+    /// time sync is not configured.
+    pub network_time_base: Option<crate::types::NetworkTimeBase>,
 }
 #[derive(Deserialize)]
 #[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
@@ -25,14 +30,160 @@ pub enum SyncRequest {
     Network,
 }
 
-fn snapshot(can_set: bool) -> ClockStatus {
+// SEDSnet already anchors a supplied full UTC reading to its monotonic clock
+// and slews corrections. Remember which router has an operator-selected source
+// so the one-second host-clock fallback cannot overwrite that selection.
+static CLIENT_TIME_ROUTERS: std::sync::Mutex<Vec<std::sync::Weak<sedsnet::router::Router>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Recovery replay floors use canonical network UTC, never receipt wall time.
+/// Missing UTC must not produce a recovery request with a different clock domain.
+pub(crate) fn required_control_network_utc_ms(
+    router: &sedsnet::router::Router,
+) -> sedsnet::TelemetryResult<u64> {
+    router
+        .network_time_ms()
+        .filter(|timestamp| *timestamp != 0)
+        .ok_or(sedsnet::TelemetryError::Io("network UTC is not available"))
+}
+
+/// A fresh control stamp: network UTC with the time-base epoch it was read
+/// in, read together, for packets the station builds itself
+/// (`Packet::with_time_epoch`).
+pub(crate) fn required_control_network_stamp(
+    router: &sedsnet::router::Router,
+) -> sedsnet::TelemetryResult<crate::network_stamp::Stamp> {
+    router
+        .network_time_ms_with_epoch()
+        .filter(|(timestamp, _)| *timestamp != 0)
+        .map(|(timestamp, epoch)| crate::network_stamp::Stamp::new(epoch, timestamp as i64))
+        .ok_or(sedsnet::TelemetryError::Io("network UTC is not available"))
+}
+
+/// Ordinary controls share the board's network clock once it is established.
+/// Retain boot-time wall fallback so a manual Stop never needs clock sync.
+/// This does not change receipt timestamps used for UI freshness or recording.
+///
+/// An RRLS follows the station's network time (and its epochs) like a board,
+/// so its controls carry the same time base the boards judge them on.
+pub(crate) fn control_packet_timestamp_ms(router: &sedsnet::router::Router) -> u64 {
+    control_packet_stamp(router).ms.max(0) as u64
+}
+
+/// [`control_packet_timestamp_ms`] with its epoch: the wall-clock fallback is
+/// labelled with the router's current epoch, as the router stamps it.
+pub(crate) fn control_packet_stamp(router: &sedsnet::router::Router) -> crate::network_stamp::Stamp {
+    required_control_network_stamp(router).unwrap_or_else(|_| {
+        if crate::rrls::is_rrls() {
+            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log::warn!("RRLS control stamped with the host wall clock: no network UTC yet");
+            }
+        }
+        crate::network_stamp::Stamp::new(
+            router.network_time_epoch(),
+            crate::telemetry_task::get_current_timestamp_ms() as i64,
+        )
+    })
+}
+
+fn retain_live_client_sources(sources: &mut Vec<std::sync::Weak<sedsnet::router::Router>>) {
+    sources.retain(|source| source.strong_count() != 0);
+}
+
+pub(crate) fn refresh_network_source(router: &sedsnet::router::Router, host_utc_ms: u64) {
+    // The step policy follows the flight state even while an operator-selected
+    // source holds the clock (a later operator set is judged against it).
+    crate::telemetry_task::apply_timesync_step_policy(router);
+    let mut sources = CLIENT_TIME_ROUTERS.lock().unwrap();
+    retain_live_client_sources(&mut sources);
+    if sources
+        .iter()
+        .any(|source| std::ptr::eq(source.as_ptr(), router))
+    {
+        // Keep the SDK's monotonic anchor and normal GPS/remote election.
+        // A wall-clock refresh here would silently undo Use client time.
+        return;
+    }
+    crate::telemetry_task::refresh_station_network_time_from_host_ms(router, host_utc_ms);
+}
+
+#[cfg(test)]
+fn client_source_selected(router: &Arc<sedsnet::router::Router>) -> bool {
+    CLIENT_TIME_ROUTERS
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|source| source.ptr_eq(&Arc::downgrade(router)))
+}
+
+fn select_client_network_source(
+    router: &Arc<sedsnet::router::Router>,
+    utc_ms: i64,
+) -> Result<(), String> {
+    let mut sources = CLIENT_TIME_ROUTERS.lock().unwrap();
+    retain_live_client_sources(&mut sources);
+    // Hold policy selection through SDK admission so a concurrent periodic
+    // host refresh cannot win between the accepted update and source commit.
+    set_network_utc(router, utc_ms)?;
+    if !sources
+        .iter()
+        .any(|source| source.ptr_eq(&Arc::downgrade(router)))
+    {
+        sources.push(Arc::downgrade(router));
+    }
+    Ok(())
+}
+
+/// After the OS clock was set to `utc_ms`, the host clock is the source
+/// again: hand it to the network clock and resume the one-second host refresh
+/// instead of free-running from a one-off client set.
+fn select_host_network_source(
+    router: &Arc<sedsnet::router::Router>,
+    utc_ms: i64,
+) -> Result<(), String> {
+    let mut sources = CLIENT_TIME_ROUTERS.lock().unwrap();
+    retain_live_client_sources(&mut sources);
+    set_network_utc(router, utc_ms)?;
+    // A correction learned against the old host clock no longer applies.
+    crate::telemetry_task::reset_absolute_time_correction();
+    sources.retain(|source| !source.ptr_eq(&Arc::downgrade(router)));
+    Ok(())
+}
+
+fn capability_from_linux_status(status: &str) -> bool {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))
+        .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
+        .is_some_and(|caps| caps & (1u64 << 25) != 0) // CAP_SYS_TIME
+}
+
+fn os_clock_unavailable_reason() -> Option<String> {
+    if crate::flight_sim_runtime::enabled() {
+        return Some("OS clock changes are unavailable in isolated FlightSim; simulated network UTC remains separate.".into());
+    }
+    if !cfg!(target_os = "linux") {
+        return Some("OS clock updates require a Linux GroundStation or RRLS host.".into());
+    }
+    match std::fs::read_to_string("/proc/self/status") {
+        Ok(status) if capability_from_linux_status(&status) => None,
+        _ => Some("The service needs CAP_SYS_TIME. Run the native service as root and include CAP_SYS_TIME if systemd restricts capabilities.".into()),
+    }
+}
+
+fn snapshot(permission: bool) -> ClockStatus {
+    let unavailable = os_clock_unavailable_reason();
     ClockStatus {
         utc_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64,
         network_utc_ms: crate::telemetry_task::recording_network_utc_ms(),
-        can_set_system_time: can_set,
+        can_set_system_time: permission && unavailable.is_none(),
+        set_system_time_permission: permission,
+        system_time_unavailable_reason: unavailable,
+        network_time_base: crate::telemetry_task::network_time_base(),
     }
 }
 fn time_argument(utc: i64) -> Result<String, &'static str> {
@@ -72,10 +223,20 @@ pub async fn sync(
             None => return (StatusCode::CONFLICT, "No complete network UTC is available. Wait for RF GPS time or use your device clock.").into_response(),
         },
     };
-    let argument = match time_argument(utc) {
-        Ok(v) => v,
+    match time_argument(utc) {
+        Ok(_) => {}
         Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+    let Some(router) = state.topology_router.get() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Network router is not ready; the OS clock was not changed.",
+        )
+            .into_response();
     };
+    if let Some(reason) = os_clock_unavailable_reason() {
+        return (StatusCode::SERVICE_UNAVAILABLE, reason).into_response();
+    }
     static UPDATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let Ok(_guard) = UPDATE.try_lock() else {
         return (
@@ -85,7 +246,11 @@ pub async fn sync(
             .into_response();
     };
     let before = snapshot(true).utc_ms;
-    match set_os_time(&argument).await {
+    match update_os_and_network_time(utc, set_os_time, |utc| {
+        select_host_network_source(router, utc)
+    })
+    .await
+    {
         Ok(()) => {
             log::warn!(
                 "System clock changed by {:?}: previous UTC ms={}, requested UTC ms={}",
@@ -116,13 +281,6 @@ pub async fn sync_network(
         Ok(_) => return (StatusCode::UNAUTHORIZED, "Sign in to set network UTC.").into_response(),
         Err(error) => return error,
     };
-    if crate::rrls::is_rrls() {
-        return (
-            StatusCode::CONFLICT,
-            "Network UTC is owned by the primary GroundStation.",
-        )
-            .into_response();
-    }
     let SyncRequest::Client { utc_ms } = request else {
         return (
             StatusCode::BAD_REQUEST,
@@ -130,6 +288,35 @@ pub async fn sync_network(
         )
             .into_response();
     };
+    if crate::rrls::is_rrls() {
+        let token = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "));
+        return crate::command_proxy::submit(
+            &state,
+            &principal,
+            token,
+            crate::command_proxy::Operation::NetworkUtc(utc_ms),
+        )
+        .await;
+    }
+    apply_authorized_network_utc(state, principal, utc_ms).await
+}
+
+/// The primary owns UTC policy for both local and authenticated proxy calls.
+pub(crate) async fn apply_authorized_network_utc(
+    state: Arc<AppState>,
+    principal: crate::auth::AuthPrincipal,
+    utc_ms: i64,
+) -> Response {
+    if crate::rrls::is_rrls() || principal.anonymous || !principal.permissions.set_system_time {
+        return (
+            StatusCode::FORBIDDEN,
+            "Primary network UTC authority required.",
+        )
+            .into_response();
+    }
     let Some(router) = state.topology_router.get() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -137,8 +324,11 @@ pub async fn sync_network(
         )
             .into_response();
     };
-    if let Err(error) = set_network_utc(router, utc_ms) {
+    if let Err(error) = time_argument(utc_ms) {
         return (StatusCode::BAD_REQUEST, error).into_response();
+    }
+    if let Err(error) = select_client_network_source(router, utc_ms) {
+        return (StatusCode::SERVICE_UNAVAILABLE, error).into_response();
     }
     log::info!(
         "Network UTC source set by {:?} to {utc_ms} ms",
@@ -147,35 +337,309 @@ pub async fn sync_network(
     Json(snapshot(true)).into_response()
 }
 
-fn set_network_utc(router: &sedsnet::router::Router, utc_ms: i64) -> Result<(), &'static str> {
-    time_argument(utc_ms)?;
-    router.set_local_network_time(sedsnet::timesync::PartialNetworkTime::from_unix_ms(
-        utc_ms as u64,
-    ));
+/// Hands an operator, client or OS-set UTC to SEDSnet as the station's local
+/// time source. SEDSnet decides: off by more than its step threshold (1 s) it
+/// steps the network clock and starts a new time-base epoch, which followers
+/// adopt within an exchange; otherwise, or while the station's step policy
+/// inhibits steps (Armed through Recovery), it slews at the reference rate
+/// followers track. The policy is refreshed first so the decision uses the
+/// current flight state.
+fn set_network_utc(router: &sedsnet::router::Router, utc_ms: i64) -> Result<(), String> {
+    time_argument(utc_ms).map_err(str::to_string)?;
+    crate::telemetry_task::apply_timesync_step_policy(router);
+    admit_network_utc(router, utc_ms)
+}
+
+/// [`set_network_utc`] under the step policy already applied to `router`.
+fn admit_network_utc(router: &sedsnet::router::Router, utc_ms: i64) -> Result<(), String> {
+    time_argument(utc_ms).map_err(str::to_string)?;
+    let before = router.timesync_status();
+    router
+        .try_set_local_network_time(sedsnet::timesync::PartialNetworkTime::from_unix_ms(
+            utc_ms as u64,
+        ))
+        .map_err(|error| format!("Network UTC source was not admitted: {error}"))?;
+    // Read the clock once so an admitted first UTC anchors at once.
+    let _ = router.network_time();
+    crate::telemetry_task::log_network_time_step(router, before, "operator UTC");
+    if let Some(status) = router.timesync_status()
+        && !status.steps_allowed
+        && status.offset_ns.unsigned_abs() > 1_000_000_000
+    {
+        log::warn!(
+            "Network UTC is {} ms off the operator's time; steps are inhibited in this flight state, so it slews at the reference rate",
+            status.offset_ns / 1_000_000
+        );
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod network_tests {
     #[test]
-    fn utc_corrections_steer_the_existing_network_clock_without_a_hard_jump() {
+    fn controller_headers_follow_client_network_utc_without_changing_receipt_clock() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        };
+        let monotonic = Arc::new(AtomicU64::new(0));
+        let input = monotonic.clone();
+        let router = Arc::new(sedsnet::router::Router::new_with_clock(
+            sedsnet::router::RouterConfig::new([]).with_sender("GS"),
+            Box::new(move || input.load(Ordering::Relaxed)),
+        ));
+        assert!(super::required_control_network_utc_ms(&router).is_err());
+        let receipt_before = crate::telemetry_task::get_current_timestamp_ms();
+        let client = receipt_before + 3_600_000;
+        // This is the same admitted-source operation used by Set Network UTC.
+        super::select_client_network_source(&router, client as i64).unwrap();
+        super::refresh_network_source(&router, receipt_before);
+        monotonic.store(1250, Ordering::Relaxed);
+        let expected = client + 1250;
+        assert_eq!(
+            super::required_control_network_utc_ms(&router).unwrap(),
+            expected
+        );
+        let packet = crate::telemetry_task::controller_packet(
+            &router,
+            crate::telemetry_schema::data_type("VALVE_COMMAND"),
+            &[1],
+        )
+        .unwrap();
+        assert_eq!(packet.timestamp(), expected);
+        let receipt_after = crate::telemetry_task::get_current_timestamp_ms();
+        assert!(receipt_after >= receipt_before);
+        assert!(
+            receipt_after < client,
+            "network UTC must not replace receipt wall time"
+        );
+    }
+
+    #[test]
+    fn unsynchronized_control_fallback_does_not_authorize_recovery() {
+        let router = sedsnet::router::Router::new_with_clock(
+            sedsnet::router::RouterConfig::new([]),
+            Box::new(|| 0),
+        );
+        let before = crate::telemetry_task::get_current_timestamp_ms();
+        let fallback = super::control_packet_timestamp_ms(&router);
+        let after = crate::telemetry_task::get_current_timestamp_ms();
+        assert!((before..=after).contains(&fallback));
+        assert!(super::required_control_network_utc_ms(&router).is_err());
+        assert_eq!(router.network_time_ms(), None);
+    }
+
+    #[test]
+    fn client_source_survives_periodic_host_refresh_and_advances_monotonically() {
         use std::sync::{
             Arc,
             atomic::{AtomicU64, Ordering},
         };
         let clock = Arc::new(AtomicU64::new(0));
         let input = clock.clone();
-        let router = sedsnet::router::Router::new_with_clock(
+        let router = Arc::new(sedsnet::router::Router::new_with_clock(
             sedsnet::router::RouterConfig::new([]),
             Box::new(move || input.load(Ordering::Relaxed)),
-        );
+        ));
+        let client = 1_800_000_000_000;
+        super::select_client_network_source(&router, client).unwrap();
+        for elapsed in 1..=5 {
+            clock.store(elapsed * 1000, Ordering::Relaxed);
+            super::refresh_network_source(&router, (client + 3_600_000) as u64);
+            assert_eq!(
+                router.network_time_ms(),
+                Some(client as u64 + elapsed * 1000)
+            );
+        }
+        // Failed input cannot replace the accepted source or its anchor.
+        assert!(super::select_client_network_source(&router, -1).is_err());
+        assert_eq!(router.network_time_ms(), Some(client as u64 + 5000));
+    }
+
+    #[test]
+    fn host_fallback_remains_available_on_other_routers() {
+        use std::sync::Arc;
+        let selected = Arc::new(sedsnet::router::Router::new(
+            sedsnet::router::RouterConfig::new([]),
+        ));
+        super::select_client_network_source(&selected, 1_800_000_000_000).unwrap();
+        let other = sedsnet::router::Router::new(sedsnet::router::RouterConfig::new([]));
+        super::refresh_network_source(&other, 1_900_000_000_000);
+        let actual = other.network_time_ms().unwrap();
+        assert!((1_900_000_000_000..1_900_000_001_000).contains(&actual));
+    }
+
+    /// A router on a test clock: the station leads (Source, priority 50, as
+    /// in main); a board is a default consumer.
+    fn station_router(
+        clock: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+        sender: &str,
+        station: bool,
+    ) -> sedsnet::router::Router {
+        let input = clock.clone();
+        let cfg = if station {
+            sedsnet::timesync::TimeSyncConfig {
+                role: sedsnet::timesync::TimeSyncRole::Source,
+                priority: 50,
+                ..Default::default()
+            }
+        } else {
+            sedsnet::timesync::TimeSyncConfig::default()
+        };
+        sedsnet::router::Router::new_with_clock(
+            sedsnet::router::RouterConfig::new([])
+                .with_sender(sender)
+                .with_timesync(cfg),
+            Box::new(move || input.load(std::sync::atomic::Ordering::SeqCst)),
+        )
+    }
+
+    type Wire = std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>;
+
+    /// The station and one board (a time sync follower) on a direct link.
+    struct Pair {
+        clock: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        gs: sedsnet::router::Router,
+        board: sedsnet::router::Router,
+        sides: (sedsnet::router::RouterSideId, sedsnet::router::RouterSideId),
+        wires: (Wire, Wire),
+    }
+
+    impl Pair {
+        fn new() -> Self {
+            let clock = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(60_000));
+            // Not "GS": this binary's compile-time DEVICE_IDENTIFIER is "GS",
+            // and SEDSnet's process-wide identity would make the board's time
+            // sync frames look like the station's own.
+            let gs = station_router(&clock, "STATION", true);
+            let board = station_router(&clock, "VB", false);
+            let wires: (Wire, Wire) = Default::default();
+            let tx = wires.0.clone();
+            let gs_side = gs.add_side_packed("board", move |bytes: &[u8]| {
+                tx.lock().unwrap().push(bytes.to_vec());
+                Ok(())
+            });
+            let tx = wires.1.clone();
+            let board_side = board.add_side_packed("gs", move |bytes: &[u8]| {
+                tx.lock().unwrap().push(bytes.to_vec());
+                Ok(())
+            });
+            Self { clock, gs, board, sides: (gs_side, board_side), wires }
+        }
+
+        /// Advances `ms` in 1 ms ticks; a frame arrives on the next tick.
+        fn run(&self, ms: u64) {
+            for _ in 0..ms {
+                self.clock.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let to_board = std::mem::take(&mut *self.wires.0.lock().unwrap());
+                let to_gs = std::mem::take(&mut *self.wires.1.lock().unwrap());
+                for bytes in to_board {
+                    let _ = self.board.rx_packed_from_side(&bytes, self.sides.1);
+                }
+                for bytes in to_gs {
+                    let _ = self.gs.rx_packed_from_side(&bytes, self.sides.0);
+                }
+                for router in [&self.gs, &self.board] {
+                    let _ = router.periodic(0);
+                    let _ = router.drain_queues_with_timeout(0);
+                }
+            }
+        }
+
+        fn utc(&self) -> i64 {
+            self.gs.network_time_ms().unwrap() as i64
+        }
+    }
+
+    /// Corrections within SEDSnet's step threshold slew; nothing steps.
+    #[test]
+    fn small_utc_corrections_slew_the_existing_network_clock() {
+        let clock = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let router = station_router(&clock, "GS", true);
         let base = 1_800_000_000_000;
-        super::set_network_utc(&router, base).unwrap();
-        clock.store(1000, Ordering::Relaxed);
-        super::set_network_utc(&router, base + 11_000).unwrap();
-        assert_eq!(router.network_time_ms(), Some(base as u64 + 1000));
-        clock.store(2000, Ordering::Relaxed);
-        assert_eq!(router.network_time_ms(), Some(base as u64 + 2050));
+        super::admit_network_utc(&router, base).unwrap();
+        clock.store(1000, std::sync::atomic::Ordering::SeqCst);
+        let steps = router.timesync_status().unwrap().steps;
+        super::admit_network_utc(&router, base + 1_000 + 500).unwrap();
+        assert_eq!(router.timesync_status().unwrap().steps, steps);
+        let now = router.network_time_ms().unwrap();
+        assert!((base as u64 + 1000..base as u64 + 1010).contains(&now), "{now}");
+    }
+
+    /// The test-fire fault: the station network clock 3.8 h off (either way).
+    /// An operator UTC set steps it at once (a new epoch); the board adopts
+    /// the epoch within an exchange; commands and reports stamped on either
+    /// side are fresh on the other, and a report stamped before the step is
+    /// judged by its true age.
+    #[test]
+    fn operator_utc_set_hours_off_steps_and_followers_stay_fresh() {
+        for offset in [13_700_000i64, -14_400_000] {
+            let pair = Pair::new();
+            pair.gs.set_timesync_steps_allowed(true);
+            super::admit_network_utc(&pair.gs, 1_800_000_000_000).unwrap();
+            pair.run(5_000);
+            let (board_ms, board_epoch) = pair.board.network_time_ms_with_epoch().unwrap();
+            assert!((board_ms as i64 - pair.utc()).abs() < 50, "board locked first");
+            let target = pair.utc() + offset;
+            let epoch = pair.gs.network_time_epoch();
+            super::admit_network_utc(&pair.gs, target).unwrap();
+            let status = pair.gs.timesync_status().unwrap();
+            assert!(status.epoch > epoch, "{offset}: stepped into a new epoch");
+            assert!((pair.utc() - target).abs() <= 5, "{offset}: read the operator's UTC at once");
+            // The report the board stamped just before the step is 0 s old,
+            // not 3.8 h stale or 4 h ahead.
+            assert!(pair.gs.network_stamp_is_fresh(board_epoch, board_ms, 2_000, 100));
+            pair.run(2_000);
+            let (ms, board_epoch) = pair.board.network_time_ms_with_epoch().unwrap();
+            assert_eq!(board_epoch, status.epoch, "{offset}: board adopted the epoch");
+            assert!((ms as i64 - pair.utc()).abs() < 50, "{offset}: board follows");
+            assert!(pair.gs.network_stamp_is_fresh(board_epoch, ms, 2_000, 100));
+            let (gs_ms, gs_epoch) = pair.gs.network_time_ms_with_epoch().unwrap();
+            assert!(pair.board.network_stamp_is_fresh(gs_epoch, gs_ms, 15_000, 1_000));
+        }
+    }
+
+    /// Armed (steps inhibited): a 3.8 h operator set slews and never steps;
+    /// once the policy allows a step again, the next set steps.
+    #[test]
+    fn operator_utc_set_while_armed_slews_then_steps_when_allowed() {
+        let pair = Pair::new();
+        super::admit_network_utc(&pair.gs, 1_800_000_000_000).unwrap();
+        pair.run(3_000);
+        pair.gs.set_timesync_steps_allowed(crate::absolute_time::may_step(6, true));
+        let steps = pair.gs.timesync_status().unwrap().steps;
+        let before = pair.utc();
+        super::admit_network_utc(&pair.gs, before + 13_700_000).unwrap();
+        pair.run(1_000);
+        let status = pair.gs.timesync_status().unwrap();
+        assert_eq!(status.steps, steps, "no step while Armed");
+        assert!(!status.steps_allowed);
+        assert!((pair.utc() - (before + 1_000)).abs() < 5, "slewed, not stepped");
+        pair.gs.set_timesync_steps_allowed(crate::absolute_time::may_step(1, true));
+        let target = pair.utc() + 13_700_000;
+        super::admit_network_utc(&pair.gs, target).unwrap();
+        assert!(pair.gs.timesync_status().unwrap().steps > steps);
+        assert!((pair.utc() - target).abs() <= 5);
+    }
+
+    /// After an OS clock set the host refresh resumes (it is not left
+    /// free-running from a one-off client source).
+    #[test]
+    fn os_clock_set_resumes_the_host_refresh() {
+        use std::sync::Arc;
+        let router = Arc::new(sedsnet::router::Router::new(
+            sedsnet::router::RouterConfig::new([]),
+        ));
+        super::select_client_network_source(&router, 1_800_000_000_000).unwrap();
+        assert!(super::client_source_selected(&router));
+        super::select_host_network_source(&router, 1_800_000_000_000).unwrap();
+        assert!(!super::client_source_selected(&router), "the host refresh feeds again");
+        // While the step policy allows it (flight state and board locks are
+        // process-wide here), the next host reading steps the clock to it.
+        router.set_timesync_steps_allowed(true);
+        super::admit_network_utc(&router, 1_900_000_000_000).unwrap();
+        let actual = router.network_time_ms().unwrap();
+        assert!((1_900_000_000_000..1_900_000_001_000).contains(&actual), "{actual}");
     }
 
     #[test]
@@ -189,24 +653,51 @@ mod network_tests {
         assert!(super::set_network_utc(&router, i64::MAX).is_err());
     }
 }
-async fn set_os_time(argument: &str) -> Result<(), String> {
-    if !cfg!(target_os = "linux") {
-        return Err("Setting the machine clock is supported on Linux/systemd hosts only.".into());
+/// Separately test the irreversible OS update and the fallible SDK admission.
+/// No clock mutation occurs until validation and the explicit caller authorize it.
+async fn update_os_and_network_time<F, Fut, N>(
+    utc_ms: i64,
+    set_os: F,
+    set_network: N,
+) -> Result<(), String>
+where
+    F: FnOnce(i64) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+    N: FnOnce(i64) -> Result<(), String>,
+{
+    time_argument(utc_ms).map_err(str::to_string)?;
+    set_os(utc_ms).await?;
+    set_network(utc_ms).map_err(|error| format!(
+        "OS clock was updated, but the network UTC source was not accepted: {error}. Network corrections normally apply gradually."
+    ))
+}
+
+#[cfg_attr(all(target_os = "linux", target_pointer_width = "64"), expect(clippy::useless_conversion, reason = "Keep fallible time_t conversion for 32-bit Linux timestamp range rejection"))]
+async fn set_os_time(utc_ms: i64) -> Result<(), String> {
+    time_argument(utc_ms).map_err(str::to_string)?;
+    if let Some(reason) = os_clock_unavailable_reason() {
+        return Err(reason);
     }
-    let mut cmd = tokio::process::Command::new("/usr/bin/timedatectl");
-    cmd.args(["--no-ask-password", "set-time", argument])
-        .kill_on_drop(true);
-    let output = tokio::time::timeout(Duration::from_secs(10), cmd.output())
-        .await
-        .map_err(|_| "Clock update timed out; check systemd-timedated and polkit.".to_string())?
-        .map_err(|e| format!("Could not invoke timedatectl: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "System clock was not set. Check the service user's polkit set-time permission and automatic NTP synchronization. NTP was not disabled automatically. {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+    #[cfg(target_os = "linux")]
+    {
+        let time = libc::timespec {
+            tv_sec: (utc_ms / 1000).try_into().map_err(|_| {
+                "Requested UTC is outside this platform's OS clock range.".to_string()
+            })?,
+            tv_nsec: ((utc_ms % 1000) * 1_000_000) as libc::c_long,
+        };
+        // CLOCK_REALTIME only: CLOCK_MONOTONIC and all process deadlines remain
+        // unchanged. This syscall neither disables NTP nor invokes a shell.
+        if unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &time) } != 0 {
+            return Err(format!(
+                "OS clock was not changed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(())
     }
-    Ok(())
+    #[cfg(not(target_os = "linux"))]
+    Err("OS clock updates require a Linux host.".into())
 }
 #[cfg(test)]
 mod tests {
@@ -366,4 +857,114 @@ mod tests {
         assert!(p.allows(Permission::SetSystemTime));
         assert!(!p.allows(Permission::SendCommands));
     }
+    #[test]
+    fn kernel_capability_is_distinct_from_application_permission() {
+        assert!(capability_from_linux_status(
+            "Name:\tstation\nCapEff:\t0000000002000000\n"
+        ));
+        assert!(!capability_from_linux_status("CapEff:\t0000000000000000\n"));
+        assert!(!capability_from_linux_status("CapEff: not-hex"));
+        assert!(!capability_from_linux_status(""));
+        let denied = snapshot(false);
+        assert!(!denied.can_set_system_time && !denied.set_system_time_permission);
+        #[cfg(not(target_os = "linux"))]
+        assert!(
+            snapshot(true)
+                .system_time_unavailable_reason
+                .unwrap()
+                .contains("Linux")
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_os_update_then_checked_network_source_uses_only_injected_setter() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        let observed = AtomicI64::new(0);
+        let router = Arc::new(sedsnet::router::Router::new(
+            sedsnet::router::RouterConfig::new([]),
+        ));
+        let desired = 1_800_000_000_123;
+        update_os_and_network_time(
+            desired,
+            |utc| {
+                observed.store(utc, Ordering::Relaxed);
+                async { Ok(()) }
+            },
+            |utc| select_client_network_source(&router, utc),
+        )
+        .await
+        .unwrap();
+        assert_eq!(observed.load(Ordering::Relaxed), desired);
+        let reading = router.network_time_ms().unwrap();
+        assert!((desired as u64..desired as u64 + 1000).contains(&reading));
+        refresh_network_source(&router, 1_900_000_000_000);
+        assert!(router.network_time_ms().unwrap() < desired as u64 + 1000);
+    }
+
+    #[tokio::test]
+    async fn clock_update_failures_report_which_side_changed() {
+        use std::cell::Cell;
+        let os_calls = Cell::new(0);
+        let network_calls = Cell::new(0);
+        let invalid = update_os_and_network_time(
+            -1,
+            |_| {
+                os_calls.set(os_calls.get() + 1);
+                async { Ok(()) }
+            },
+            |_| {
+                network_calls.set(network_calls.get() + 1);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(invalid.is_err());
+        assert_eq!((os_calls.get(), network_calls.get()), (0, 0));
+        let failed = update_os_and_network_time(
+            1_800_000_000_000,
+            |_| {
+                os_calls.set(os_calls.get() + 1);
+                async { Err("mock kernel denied clock update".into()) }
+            },
+            |_| {
+                network_calls.set(network_calls.get() + 1);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(failed.contains("kernel denied"));
+        assert_eq!((os_calls.get(), network_calls.get()), (1, 0));
+        let partial = update_os_and_network_time(
+            1_800_000_000_000,
+            |_| {
+                os_calls.set(os_calls.get() + 1);
+                async { Ok(()) }
+            },
+            |_| {
+                network_calls.set(network_calls.get() + 1);
+                Err("mock SDK admission failure".into())
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            partial.contains("OS clock was updated")
+                && partial.contains("network UTC source was not accepted")
+        );
+        assert_eq!((os_calls.get(), network_calls.get()), (2, 1));
+    }
+    #[tokio::test]
+    async fn flight_sim_refuses_actual_os_setter_before_platform_or_privilege_checks() {
+        if crate::flight_sim_runtime::enabled() {
+            let error=super::set_os_time(1_800_000_000_000).await.expect_err("FlightSim must never call clock_settime");
+            assert!(error.contains("isolated FlightSim"),"{error}");
+            return;
+        }
+        let output=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","system_clock::tests::flight_sim_refuses_actual_os_setter_before_platform_or_privilege_checks","--nocapture"])
+            .env("GS_EXECUTION_MODE","flight_sim").output().unwrap();
+        assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+    }
+
 }

@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "name": "rfd-async-64k-drain",
+  "modem": {
+    "serial_baud": 115200,
+    "air_bps": 64000,
+    "max_data_bytes": 3968,
+    "max_retries": 10,
+    "broadcast_retries": 0,
+    "serial_break_ms": 10,
+    "tx_encapsulation": 0,
+    "rx_encapsulation": 0
+  },
+  "transport": {
+    "usable_air_bps": 30000,
+    "frame_overhead_bytes": 16,
+    "packet_burst_ms": 250,
+    "packet_gap_ms": 15,
+    "idle_margin_ms": 5,
+    "rf_share_percent": 100,
+    "host_default_share_percent": 100,
+    "turn_period_ms": 200
+  }
+}

@@ -26,6 +26,12 @@ class WrapperTests(unittest.TestCase):
   self.assertEqual(error.exception.code,2)
  def test_no_bundle_selects_legacy_files_instead_of_a_silent_direct_noop(self):
   args=self.invoke(['--no-bundle']);self.assertEqual(args.kwargs['env']['MAP_BUILD_BUNDLE'],'0');self.assertEqual(args.kwargs['env']['MAP_DIRECT_TO_BUNDLE'],'0')
+ def test_regions_flag_selects_high_detail_regions_without_a_prompt(self):
+  args=self.invoke(['--regions','URRG,midland']);self.assertEqual(args.kwargs['env']['MAP_REGIONS'],'urrg,midland')
+  with self.assertRaises(SystemExit):self.invoke(['--regions','texas'])
+ def test_no_prompt_and_default_regions_off_a_terminal(self):
+  with patch.object(module.sys.stdin,'isatty',return_value=False):args=self.invoke([])
+  self.assertNotIn('MAP_REGIONS',args.kwargs['env'])
  def test_ordinary_download_command_unchanged(self):
   args=self.invoke([]);self.assertEqual(args.args[0],['cargo','run','--release','-p','map_downloader'])
 if __name__=='__main__':unittest.main()
