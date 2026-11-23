@@ -57,13 +57,35 @@ operator approves it.
   are gzip'd or plain XML. All three are read (ZIP local headers with stored/deflate
   entries via `flate2`, which the backend already depends on transitively). From the
   XML the importer takes the nose cone (length, shape, radius), body tubes (length,
-  radius, thickness), trapezoidal fin sets (count, root, tip, span, sweep, thickness),
-  the motor mount inner tube, mass components and mass/CG overrides, and component
-  materials (bulk density). It computes structural masses from geometry and density,
-  the CG along the axis, a Barrowman CP (nose + fins) and so the static margin and
-  CNα, and fills the vehicle parameters (`length`, `diameter`, `nose_length`, fins,
-  `dry_mass` without propellant, `cn_alpha`, `static_margin`). The imported vehicle
-  replaces the hand assumptions until it is cleared; the plan names its vehicle source.
+  radius, thickness), transitions and a boattail (fore/aft radius), trapezoidal fin sets
+  (count, root, tip, span, sweep, thickness), inner tubes, couplers, centering rings and
+  bulkheads (automatic radii: a ring fits between the tube and the inner tube it
+  rings), the motor mount inner tube, mass components, parachutes (canopy and shroud
+  lines, as OpenRocket counts them), and component materials (bulk density). Mass and
+  CG overrides follow OpenRocket: an override replaces the component's own mass, or,
+  with `overridesubcomponentsmass`, the mass of the component and everything inside it
+  (an "override adjustment" entry brings the listed parts to the override, at the
+  override CG when `overridesubcomponentscg` is set); a stage override without that
+  flag is the stage's own mass, added. It computes the CG along the axis, a Barrowman CP
+  (nose + fins + transitions, so a boattail moves it forward) and so the static margin
+  and CNα, and fills the vehicle parameters (`length`, `diameter`, `nose_length`, fins,
+  `boattail_aft_diameter_m`, `dry_mass` without propellant, `cn_alpha`,
+  `static_margin`). The imported vehicle replaces the default until it is cleared; the
+  plan names its vehicle source.
+- **The default vehicle is the team's design.** `tools/flight_profile/vehicle.json` is
+  the import of `tools/flight_profile/vehicle/SWEET_V6.ork` (4.387 m x 156 mm, 3 fins,
+  boattail to 108 mm, 40.84 kg dry: the stage override, measured, including the
+  14.32 kg motor hardware; CG 2.667 m, CP 3.213 m, 3.49 cal); a test imports the file
+  and checks vehicle.json against it. The drag build-up applies base drag over the
+  boattail's aft area, as OpenRocket does.
+- **Cross-check against the stored simulations:** `tools/flight_profile/ork_sims.py`
+  flies the six simulations stored in SWEET_V6.ork (each with its own rail, site, wind
+  and masses, and the design's HRAP thrust curve rebuilt from the stored series,
+  `motors/hrap_design_sweet_v6.csv`) and prints OpenRocket's apogee, peak speed, time to
+  apogee, rail-exit speed and peak acceleration next to ours. Ours is 1-2 % lower in
+  apogee (our +10 % friction and 0.02 Cd allowance for protuberances, which OpenRocket's
+  model of this file does not have; without them ours is 1 % higher), within 0.5 % in
+  peak speed and acceleration, and 1-5 % lower in rail-exit speed.
 - **Cross-check (dev machine only):** `tools/flight_profile/openrocket_crosscheck.py`
   runs OpenRocket itself through `orhelper` (JPype + the OpenRocket JAR) and prints
   OpenRocket's apogee next to the in-repo model's for the same `.ork` and motor. It is
@@ -264,7 +286,9 @@ under the 10.45 kg max fill. With the measured 15.85 L tank that fill leaves abo
 (10.0 L of nitrogen and vapour, against 46 % / 5.5 L for 6.0 kg in the 12 L tank assumed
 before), so the nitrogen pad holds its pressure longer: the volume alone takes the fill
 from 6.0 to 5.95 kg, and the 8.6 kg tank estimate
-(33.2 kg dry instead of 31.6) adds the rest. The
+(33.2 kg dry instead of 31.6) adds the rest. On the SWEET_V6 vehicle (40.84 kg dry,
+measured, with a boattail) the same 10,000 ft plan on a 20 °C day needs 7.15 kg (band
+2345-3775 m); the measured motor as fired (5.65 kg) reaches about 1,515 m. The
 pre-correction 7.05 kN·s curve could not reach 10k ft; the planner handles an
 unreachable target (it reports the reach and disables Apply), and that path is tested.
 
