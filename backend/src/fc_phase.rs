@@ -86,6 +86,9 @@ pub fn observe(state: &crate::state::AppState, value: u8, source: Source, event_
     if let (Some(previous), Some(current)) = (previous, state.fc_phase.snapshot()) {
         crate::recovery_events::observe_fc_state(state, previous, current.phase, event_ms);
     }
+    if let Some(current) = state.fc_phase.snapshot() {
+        crate::sd_download::fc::observe_phase(state, current.phase);
+    }
     if before != state.fc_phase.snapshot().map(|seen| seen.phase) {
         let _ = state.state_tx.send(crate::web::FlightStateMsg { state: state.local_flight_state_snapshot() });
     }

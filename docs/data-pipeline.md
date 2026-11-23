@@ -322,7 +322,15 @@ Defaults come from `EventKind::default_policy` (`recording_store.rs:127-149`):
 
 **Matching.** `matching_capture` picks the `launch`, `hitl` or `ground_test` capture whose window ±5 s (`MATCH_SLACK_MS`) best overlaps the file's network-UTC span. Launch and HITL rank above ground test.
 
-**Storage.** `offer_file` copies the file unchanged to `<capture>/board_sd/<BOARD>/<name>`. It adds a `board_sd` manifest entry (bytes, SHA-256, first/last UTC, rows, `matched_by: utc_window`, source) and deduplicates by SHA-256.
+**Storage.** `offer_file` (or `offer_file_with`, which adds the link and relay provenance) copies the file unchanged to `<capture>/board_sd/<BOARD>/<name>`. It adds a `board_sd` manifest entry and deduplicates by SHA-256. The entry holds:
+
+- bytes, SHA-256, first/last UTC, rows, `matched_by: utc_window`;
+- `source` (`network_download` or `sd_import`);
+- `link` (`radio` or `wired`, network downloads only);
+- `sd_format`: the parsed `# seds-sd` line (format, version, board, firmware, tick_hz, schema). Headerless files have none.
+- `relay`: present for files forwarded by the RRLS (§3.4a). It records `via`, the relay id, and per hop (`FC->RRLS`, `RRLS->GS`) the check, SHA-256, CRC re-requests and time.
+
+Every attachment, FC or DAQ, queues `burn_report::request_recompute`. The burn report reads only DAQ entries today, so FC data has no consumer yet beyond the attachment and the SD import.
 
 **Sources.**
 
@@ -331,7 +339,8 @@ Defaults come from `EventKind::default_policy` (`recording_store.rs:127-149`):
   - Lists `/LAUNCH` over SEDSnet port 4511 (`SD_FILE_STREAM_PORT`).
   - Downloads in 512-byte blocks (`BLOCK_BYTES`) at most 16 KiB/s (`GS_SD_DOWNLOAD_MAX_BYTES_PER_SEC`), to `data/sd-downloads/DAQ/LAUNCH/`.
   - A finished file is offered, and `rescan_downloads` re-offers earlier downloads when a capture is saved.
-- **Any board by import.** `recording_sd::upload` offers an imported CSV to `offer_file`. The FC does not serve its card over the network.
+- **FC by network.** The FC is collected automatically after landing (§3.4a), into `data/sd-downloads/FC/ROOT/`. `rescan_downloads` also re-offers FC launch files found there when a capture is saved.
+- **Any board by import.** `recording_sd::upload` offers an imported CSV to `offer_file`.
 
 ### 3.4 DAQ lead-up fetch (`sd_download/leadup.rs`)
 
@@ -368,6 +377,135 @@ sequenceDiagram
   DL->>DAQ: binary search, then window blocks, at most 8 KiB/s
   DL->>GS: cut_lead_up: file.leadup.csv, manifest updated
 ```
+
+**Shared with the FC.** `leadup.rs` takes the board from the job (`board`, default `DAQ`). It keeps one jobs file per board (`sd-downloads/<board>/leadup/jobs.json`) and uses `step_with` with per-board `Params`: the rate, the whole-file limit, and the row rate used for the progress estimate. FC jobs never download a whole file. They check the tails of at most the 6 newest ordinary `irec-*` files, newest by UTC name first. The DAQ lead-up worker yields to an owed FC launch file (`fc::launch_file_owed`).
+
+### 3.4a FC SD collection after landing (`sd_download/fc.rs`, `sd_download/relay.rs`)
+
+**Trigger, with no operator action.** `fc_phase::observe` passes every FC state report to `fc::observe_phase`. A job is queued in `data/sd-downloads/FC/jobs.json` in two cases:
+
+- the FC's Landed report holds for 5 s (`LANDED_CONFIRM_MS`). Network FLIGHT_STATE 13 from sender FC is Landed for both local Landed and local Recovery, republished every 2 s. A Landed that reverts within 5 s does not count.
+- the FC reports Recovery (its BOARD_STATE_STATUS readback).
+
+`capture_task` evaluates the trigger once a second (`fc::tick`). The trigger fires once per flight: a latch persisted in `jobs.json` is re-armed when the FC reports Armed or an in-flight phase. The administrator setting `fc_sd_auto_collect` (Recordings settings, default on) disables it; turning it off also pauses a running job. A second setting, `fc_sd_leadup` (default on), adds the lead-up. The trigger works in flight, HITL and IGT; captures of kind `launch`, `hitl` and `ground_test` all match.
+
+**Steps.** One worker per station, `fc::run`:
+
+1. LIST the FC card root (P2P 4511, dir 0, `irec*.csv`).
+2. `choose_launch_file`: the newest `irec_LAUNCH*` whose UTC name lies between 15 min before the flight capture began and 1 min after the trigger; otherwise the newest dated launch file; otherwise the last one listed. A file still open is waited for, up to 2 min (`sd_conclude` closes it about 5 s after Landed).
+3. Download it to `sd-downloads/FC/ROOT/<name>.part`. Each READ answer's CRC-32 is checked; a mismatch is requested again and counted (`crc_errors`).
+4. Attach it with `offer_file_with`, notify the operator (persistent notification), and queue the burn-report recompute. Without a capture it waits for one; it gives up after 2 min if no flight capture is pending. A later save attaches it through `rescan_downloads`.
+5. Optionally cut the 60 s lead-up from the same boot's ordinary file (window reads only, §3.4).
+
+**Persistence.** Job stage, offsets (`.part` size, lead-up `fetched`/`start_offset`), CRC counts and the operator stop all live on disk. A link drop, an FC reboot or a station restart resumes from the kept offset. Failures back off 5 s, doubling up to 60 s. There is no deadline: the job retries until it completes.
+
+**Ground-test image.** The FC's `--ground-test` (IGT) image has no SD read service (flash budget). In IGT mode a listing that is refused or silent for 30 s ends the job as `unavailable`, with one notice: "FC SD service not available in the ground-test image". Import that card by hand. Flight and HITL use the flight image. Firmware-sim: the same path works if the native FC serves port 4511. The native FC currently reports its SD card as not mounted, so the listing comes back empty, and after three listings the job ends `unavailable`.
+
+**Priority: lowest; it never competes.**
+
+- One 512-byte READ in flight.
+- Rate:
+  - radio: `GS_FC_SD_RADIO_MAX_BYTES_PER_SEC`, default 512 B/s of payload;
+  - wired: `GS_FC_SD_WIRED_MAX_BYTES_PER_SEC`, default 16 KiB/s.
+- Adaptive radio rate (`AdaptiveRate`): while the FC is Landed or in Recovery, no command was sent for 30 s, GPS is fresh and the GS radio queue is nearly empty, the rate rises by 64 B/s every 5 s up to `GS_FC_SD_RADIO_CEILING_BYTES_PER_SEC` (default 640). Any yield trigger returns it to the base at once.
+- Link detection (`fc::link`):
+  - `GS_FC_SD_LINK=radio|wired` overrides;
+  - otherwise the link is radio whenever the AV-bay link is an RFD modem (raw-UART serial or a configured RFD profile), unless the FC has been heard only on the umbilical side;
+  - without an RFD modem it is wired.
+- Operator FC downloads from the SD download panel use the same rate.
+
+**Pause rules.** The worker checks them before each block, and the transfer gate polls them every 100 ms. A pause aborts the block in flight; whole blocks are kept.
+
+- an operator stop (`POST /api/sd_download/fc/stop`; persisted until `/resume`);
+- the setting turned off;
+- the station gate (Idle, Landed or Recovery; no fill/launch sequence);
+- the DAQ launch-file fetch owed or running; another SD transfer;
+- a command sent in the last 10 s (`QUIET_AFTER_COMMAND`);
+- recovery GPS degraded: 3 `GPS_DATA` fixes arrived within 30 s, then more than 3 s of silence. A GPS silent for over 60 s no longer holds the link.
+- radio only:
+  - a poor link: at least 10 CRC rejects in the last minute, making up at least 20 % of frames (`link_quality`);
+  - congestion: 1.5 KB queued for the radio or 4 parked frames (radio TX budget).
+
+The RF board's own queue (BOARD_HEALTH RFT1 words) is not used. The GS paces its requests instead.
+
+**Ordering with the DAQ.**
+
+1. Operator downloads and the DAQ launch-file fetch (fill link, minutes).
+2. The FC launch file.
+3. The DAQ lead-up.
+4. The FC lead-up.
+
+`MANAGER` runs one transfer at a time.
+
+**Safety test** (`on_a_shared_radio_budget_gps_and_commands_keep_rate_and_latency`). The test models a turn-based link: 691 B per 200 ms each way, FIFO, carrying real SEDSnet routers. With the fetch running at 512 B/s it injects 1 Hz GPS and a command every 3 s. Results:
+
+- every GPS fix and every command arrived within 2 turns (worst seen: GPS 464 ms, command 78 ms);
+- the partial file stayed frozen during each command quiet time;
+- fetch payload stayed at or below 512 B/s, and its down-link wire bytes below 35 % of the budget.
+
+**Status and control.**
+
+| Method | Path | Permission |
+| --- | --- | --- |
+| GET | `/api/sd_download/fc` | view data |
+| POST | `/api/sd_download/fc/stop`, `/api/sd_download/fc/resume` | command (`SdDownload`), as the other SD download routes |
+
+The status (`fc::Status`) is also returned in `/api/sd_download` (`fc_collect`) and `/api/recordings/store` (`fc_sd_collect`, shown in the Recordings panel). It contains:
+
+- `active`: state, file, bytes done/total, rate, paused reason, ETA, link and CRC errors;
+- recent jobs;
+- `power_off`;
+- RRLS forward progress and the RRLS outbox.
+
+**Power-off readiness** (`relay::power_off_ready`). The AV bay can be powered off once the GS or the RRLS holds the launch file complete and verified, with the lead-up settled when it is wanted:
+
+- every block CRC-checked;
+- the file's SHA-256 computed.
+
+Complete at the RRLS counts even before its forward to the GS finishes. The station notifies once: "FC SD fully received by GS|RRLS, checksums verified: AV bay can be powered off".
+
+**RRLS store-and-forward (bounded).**
+
+- **The RF board, not the receiver, caps FC egress.** Every AV-bay byte leaves through the RF board's radio turn: 691 UART bytes per 200 ms, about 3.4 KB/s, shared with about 1.5 KB/s of AV-bay telemetry (RFBoard26 docs §4.3). A closer RRLS can't fetch much faster. It gains only a cleaner link (fewer CRC rejects and retransmissions) and the same adaptive ceiling. A faster post-landing path needs an RF-board firmware change, which is a follow-up not made here: a larger turn burst share after Landed that still leaves uplink time for recovery commands.
+- **A standby RRLS's radio stays silent.** Its router side has egress disabled so it never collides with the primary. It fetches from the FC (with the same client, CRC checks and pause rules) only while it owns the AV bay in takeover, and only when `relay::choose_path` says the RRLS path wins. That function is pure and decides on the direct link (lost for more than 3 s, or poor), whether the RRLS is in range, whether it hears the AV bay, how clean the RRLS's link is, and whether the RRLS may transmit.
+- **The RRLS outbox.** The RRLS copies each verified file, plus its lead-up, into the protected outbox `data/sd-downloads/FC/outbox/` with its SHA-256 (`outbox.json`). Nothing there is deleted automatically. The RRLS serves the outbox on P2P port 4512 (`RELAY_STREAM_PORT`, peer `GS` only) with the same LIST/READ/CRC wire, a virtual `<name>.sha256` metadata sidecar per file, and `CONFIRM` (`0x24`: SHA-256 + name).
+- **The GS pull** (`relay::pull`, every 10–60 s while the RRLS is in the address book):
+  1. read the sidecars;
+  2. download each file resumably to `sd-downloads/FC/RRLS/`, CRC-checked per block;
+  3. verify the SHA-256 end to end. A mismatch deletes the copy and fetches it again; three mismatches refuse it with a notice.
+  4. send CONFIRM;
+  5. attach the file with `via=RRLS` provenance.
+
+  A forwarded launch file completes the GS's direct job, and the direct job pauses while the RRLS outbox holds the launch file. The pull uses the direct path's pause rules and adaptive rate.
+- **Known limit.** If the GS and an RRLS in takeover both reach the FC, each new stream replaces the other's (the FC serves one session). Each side resumes from its own offset after backoff.
+
+**Transfer time for a typical FC launch file.**
+
+The file size is derived from FC docs §7.5 and §3. The launch file runs from Launch acceptance, about 10 s before T0, to Recovery, about 5 s after Landed. The estimate assumes a flight of about 2.4 min:
+
+| Phase | Duration | FC SD rate | Bytes |
+| --- | --- | --- | --- |
+| Countdown on the pad | 10 s | ≈65 KB/s (225 raw rows/s plus summaries) | 650 KB |
+| Ascent (Launch to Apogee) | 25 s | ≈25 KB/s | 625 KB |
+| Descent (Apogee to Landed) | 120 s | ≈12 KB/s: baro raw 25 Hz × 245 B, BARO 20 Hz × ~110 B, DKF 25 Hz × ~150 B; accel and gyro are off | 1,440 KB |
+| Landed to Recovery | 5 s | sensors off | ≈0 |
+| **Total** | | | **≈2.7 MB** |
+
+Wire cost per 512-byte block was measured on real SEDSnet routers (`wire_bytes_per_block_on_an_instant_link`):
+
+- down: 1094 B in 7 packets (6 DATA frames, each ≤100 B of data + 11 B header, the CRC, SEDSnet headers, plus one stream ACK), including the 4-byte radio frame header;
+- up: 414 B (the READ and 6 ACKs).
+
+On the turn-based simulation with 100 ms retransmission, down was about 1.5 KB per block.
+
+| Path | Payload rate | 2.7 MB launch file | 60 s lead-up (≈3.9 MB) | FC docs' 10 MB example |
+| --- | --- | --- | --- | --- |
+| Direct radio, default | 512 B/s; down ≈1.09 KB/s (32 % of the 3.4 KB/s turn) | 2.7e6 / 512 = 5,273 s ≈ **88 min** | 7,617 s ≈ 2.1 h | 5.4 h |
+| Direct radio, adaptive ceiling | 640 B/s; down ≈1.37 KB/s, with telemetry ≈83 % of the turn | 4,219 s ≈ **70 min** | 1.7 h | 4.3 h |
+| Via RRLS (takeover) | the same RF turn cap: ≤640 B/s; gains only from fewer retransmissions | ≈ **70 min** at best; the forward to the GS follows at the RRLS's airtime share (≈1.4–2 KB/s of wire ≈ 650–930 B/s of payload, ≈50–70 min). The AV bay may be off by then. | 1.7 h | 4.3 h |
+| **Bench (wired)** | 16 KiB/s (the FC paces at ≤ ~50 KB/s) | 2.7e6 / 16,384 = 165 s ≈ **2.8 min** | 238 s ≈ 4 min | 10.2 min |
+
+**The bench path is the fast way to power down early.** Reconnect the recovered rocket by umbilical, USB or CAN (no RFD radio in the path). The same service and collection run without operator action, at 16 KiB/s. If the station cannot tell the FC is wired (for example the AV-bay link is still an RFD modem), set `GS_FC_SD_LINK=wired`. The radio path suits a vehicle that stays powered until recovery. To power off sooner, use the bench.
 
 ### 3.5 SD import into a recording (`recording_sd.rs`, `recording_sd_import.py`, `recording_sd_resolve.py`)
 
@@ -574,7 +712,12 @@ These are described, not fixed.
    - The CSV is computed with the calibration loaded when the export runs, not the recording's `calibration_history` (`recording_store.rs:1048`, `telemetry_task.rs:2314`).
    - `Weight` is always `0.0` and `Thrust` repeats `1000kg Calibrated` in kg (`test_fire_csv.rs:115`, `:260`).
 8. **SD resolver firmware pins (fixed for files with a format block).** Files with a SEDS-SD format block are selected by format and version, whatever their firmware revision (§3.5). Headerless files still need a pinned `mapping_profile` + `firmware_head`, so a headerless file from an unpinned DAQ revision is refused. `kg50_kg` maps only `kg50_v`, whose `calibrated_value` is kg; `kg50_p6_v` carries input volts, so a P6 run has no SD weight. The legacy `fc-20261101` profile still labels accelerations `g`; the FC writes m/s², and `fc` v2 labels them `m/s2`.
-9. **The DAQ launch-file fetch is fragile.** The request is an in-memory flag (`sd_download.rs:939-946`), lost on a restart. It is set only for `launch` captures, not `hitl` or `ground_test` (`recording_store.rs:1059`). It gives up after 1 h of unavailable downloads (`sd_download.rs:953`). The lead-up jobs, by contrast, persist.
+9. **The DAQ launch-file fetch is fragile.**
+   - The request is an in-memory flag (`sd_download.rs` `LAUNCH_FETCH`), lost on a restart.
+   - It gives up after 1 h of unavailable downloads (`fetch_launch_files`).
+   - It is scheduled for `launch`, `hitl` and `ground_test` captures alike (`recording_store.rs` `run_due`).
+
+   The DAQ lead-up jobs persist. So does the FC collection (§3.4a): it has a persisted job, `.part` offsets and no deadline, and covers all three capture kinds. The DAQ launch fetch is unchanged.
 10. **Thermal correction depends on a fresh temperature.** If a thermal entry with a nonzero slope is configured, `temperature_corrected_raw` returns `None` without a `DAQ_ADC_TEMPERATURE` from the last 2 s (`loadcell.rs` `recent_adc_temperature`, `temperature_corrected_raw`). The weight then becomes unavailable.
 11. **Documentation mismatch.** [backend/rolling-recording.md](backend/rolling-recording.md) gives the HITL capture 10 min / 5 min. The code default is 300 s / 120 s (`recording_store.rs:131`).
 12. **No burn report on `dev`.** No impulse, thrust or merge code exists on `dev` (§3.6). Until it lands, the merged DAQ SD data is reachable only through the SD import (§3.5) and the attached raw files.

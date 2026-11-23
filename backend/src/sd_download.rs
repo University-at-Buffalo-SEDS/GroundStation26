@@ -8,6 +8,12 @@
 //! continue) in Idle, Landed or Recovery with no fill/launch sequence active.
 //! Completed files are handed to `recording_sd::upload` unchanged, so the
 //! existing import, provenance and "SD rows win" merge rules apply.
+//!
+//! The DAQ serves `/LAUNCH`, `/UTC` and `/NO_UTC` (directories 0..2); the
+//! Flight Computer serves only its card root (directory 0, `ROOT` here,
+//! listing `irec*.csv`) and closes every READ answer with a CRC-32 of the
+//! block (`FLAG_CRC`). The FC is collected automatically after landing by
+//! [`fc`].
 use crate::{
     auth::Permission,
     state::AppState,
@@ -33,6 +39,8 @@ pub const SD_FILE_STREAM_PORT: u16 = 4511;
 const OP_LIST: u8 = 0x21;
 const OP_READ: u8 = 0x22;
 const OP_CANCEL: u8 = 0x23;
+/// RRLS relay outbox only: the GS confirms a forwarded file by its SHA-256.
+const OP_CONFIRM: u8 = 0x24;
 const RESPONSE_FLAG: u8 = 0x80;
 const STATUS_OK: u8 = 0;
 const STATUS_BAD_STATE: u8 = 2;
@@ -42,10 +50,15 @@ const STATUS_END: u8 = 6;
 const DATA_HEADER: usize = 11;
 const LIST_HEADER: usize = 12;
 const FLAG_LAST: u8 = 0x01;
+/// The frame ends a READ answer and carries 4 trailing bytes: the zlib CRC-32
+/// (little-endian) of every data byte of that answer (FC firmware).
+const FLAG_CRC: u8 = 0x02;
 const ENTRY_OPEN: u8 = 0x01;
 const NAME_MAX: usize = 63;
 pub const BLOCK_BYTES: u64 = 512;
 pub const DIRECTORIES: [&str; 3] = ["LAUNCH", "UTC", "NO_UTC"];
+/// The FC serves its card root only (directory 0).
+pub const FC_DIRECTORIES: [&str; 1] = ["ROOT"];
 const MAX_ENTRIES_PER_DIR: u16 = 4096;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -59,7 +72,15 @@ static MANAGER: LazyLock<Manager> = LazyLock::new(Manager::default);
 
 /// Boards whose current firmware serves the SD download stream.
 pub fn supports_sd_download(board: Board) -> bool {
-    matches!(board, Board::DaqBoard)
+    matches!(board, Board::DaqBoard | Board::FlightComputer)
+}
+
+/// The directory table a board serves, by wire index.
+pub fn directories(board: Board) -> &'static [&'static str] {
+    match board {
+        Board::FlightComputer => &FC_DIRECTORIES,
+        _ => &DIRECTORIES,
+    }
 }
 
 /// Downloads run only while nothing is being filled, armed or flown.
@@ -83,7 +104,7 @@ fn station_gate(state: &AppState) -> Option<String> {
     None
 }
 
-type Gate = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+pub(crate) type Gate = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
 fn max_bytes_per_second() -> u64 {
     std::env::var("GS_SD_DOWNLOAD_MAX_BYTES_PER_SEC")
@@ -91,6 +112,15 @@ fn max_bytes_per_second() -> u64 {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| (512..=262_144).contains(value))
         .unwrap_or(16 * 1024)
+}
+
+/// Operator downloads: the FC is usually reached over the AV-bay radio, so
+/// its rate follows the FC collection's link rule (radio 512 B/s).
+fn max_bytes_per_second_for(state: &AppState, board: Board) -> u64 {
+    match board {
+        Board::FlightComputer => fc::rate(fc::link(state)),
+        _ => max_bytes_per_second(),
+    }
 }
 
 // ---------------------------------------------------------------- wire codec
@@ -134,6 +164,7 @@ enum Frame {
     List(ListFrame),
     Data(DataFrame),
     Cancel(u8),
+    Confirm(u8),
 }
 
 fn u32_at(p: &[u8], at: usize) -> u32 {
@@ -173,6 +204,7 @@ fn decode_frame(p: &[u8]) -> Option<Frame> {
             }))
         }
         b if b == OP_CANCEL | RESPONSE_FLAG && p.len() == 2 => Some(Frame::Cancel(p[1])),
+        b if b == OP_CONFIRM | RESPONSE_FLAG && p.len() == 2 => Some(Frame::Confirm(p[1])),
         _ => None,
     }
 }
@@ -187,8 +219,8 @@ pub fn valid_name(name: &str) -> bool {
         && name.bytes().any(|b| b != b'.')
 }
 
-fn dir_index(dir: &str) -> Option<u8> {
-    DIRECTORIES
+fn dir_index(board: Board, dir: &str) -> Option<u8> {
+    directories(board)
         .iter()
         .position(|d| d.eq_ignore_ascii_case(dir))
         .map(|i| i as u8)
@@ -198,7 +230,7 @@ fn status_text(status: u8) -> &'static str {
     match status {
         0 => "ok",
         1 => "bad message",
-        2 => "board refused: not in Idle/Landed/Recovery or launch logging active",
+        2 => "board refused: not in an SD download state (DAQ: Idle/Landed/Recovery without launch logging; FC: Landed/Recovery)",
         3 => "board busy",
         4 => "file not found on SD card",
         5 => "SD read error",
@@ -246,6 +278,9 @@ pub struct JobStatus {
     pub message: String,
     pub started_at_ms: u64,
     pub updated_at_ms: u64,
+    /// READ answers whose CRC-32 did not match and were requested again.
+    #[serde(default)]
+    pub crc_errors: u64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -269,7 +304,7 @@ struct JobEntry {
 }
 
 #[derive(Default)]
-struct Manager {
+pub(crate) struct Manager {
     jobs: Mutex<HashMap<u64, JobEntry>>,
     listings: Mutex<HashMap<String, Listing>>,
     listing_busy: AtomicBool,
@@ -319,6 +354,7 @@ impl Manager {
                     message: "queued".into(),
                     started_at_ms: now,
                     updated_at_ms: now,
+                    crc_errors: 0,
                 },
                 cancel: cancel.clone(),
             },
@@ -392,7 +428,7 @@ fn now_ms() -> u64 {
 
 // ----------------------------------------------------------- board stream
 
-struct OwnedEvent {
+pub(crate) struct OwnedEvent {
     kind: P2pStreamEventKind,
     stream_id: P2pStreamId,
     peer: String,
@@ -400,7 +436,7 @@ struct OwnedEvent {
 }
 
 #[derive(Debug)]
-enum StreamError {
+pub(crate) enum StreamError {
     Gate(String),
     Cancelled,
     Other(String),
@@ -412,7 +448,7 @@ impl From<String> for StreamError {
     }
 }
 
-struct BoardStream {
+pub(crate) struct BoardStream {
     router: Arc<Router>,
     board: &'static str,
     port: u16,
@@ -429,7 +465,19 @@ impl BoardStream {
         gate: &Gate,
         cancel: &AtomicBool,
     ) -> Result<Self, StreamError> {
-        let host = board.sender_id();
+        Self::open_peer(manager, router, board.sender_id(), SD_FILE_STREAM_PORT, gate, cancel).await
+    }
+
+    /// A stream to any SD file service (a board on 4511, the RRLS relay
+    /// outbox on `relay::RELAY_STREAM_PORT`).
+    async fn open_peer(
+        manager: &Manager,
+        router: Arc<Router>,
+        host: &'static str,
+        service_port: u16,
+        gate: &Gate,
+        cancel: &AtomicBool,
+    ) -> Result<Self, StreamError> {
         if router.resolve_hostname(host).is_none() {
             return Err(StreamError::Other(format!(
                 "{host} is not present in the SEDSnet address book"
@@ -459,7 +507,7 @@ impl BoardStream {
         if port == 0 {
             return Err(StreamError::Other("no free SD download source port".into()));
         }
-        let stream = match router.open_p2p_stream_to_hostname(host, SD_FILE_STREAM_PORT, port) {
+        let stream = match router.open_p2p_stream_to_hostname(host, service_port, port) {
             Ok(stream) => stream,
             Err(err) => {
                 router.clear_p2p_stream_port(port);
@@ -585,11 +633,22 @@ impl Drop for BoardStream {
 
 async fn list_on_stream(
     stream: &mut BoardStream,
+    board: Board,
+    gate: &Gate,
+    cancel: &AtomicBool,
+) -> Result<Vec<RemoteFile>, StreamError> {
+    list_dirs(stream, directories(board), board == Board::FlightComputer, gate, cancel).await
+}
+
+async fn list_dirs(
+    stream: &mut BoardStream,
+    dirs: &[&str],
+    fc_names_only: bool,
     gate: &Gate,
     cancel: &AtomicBool,
 ) -> Result<Vec<RemoteFile>, StreamError> {
     let mut files = Vec::new();
-    for (dir, dir_name) in DIRECTORIES.iter().enumerate() {
+    for (dir, dir_name) in dirs.iter().enumerate() {
         let mut index = 0_u16;
         let mut attempts = 0_u32;
         while index < MAX_ENTRIES_PER_DIR {
@@ -620,7 +679,11 @@ async fn list_on_stream(
             };
             match frame.status {
                 STATUS_OK => {
-                    if valid_name(&frame.name) {
+                    // The FC lists only `irec*.csv`; anything else is ignored.
+                    let wanted = !fc_names_only
+                        || crate::recording_store::board_sd::classify_name(&frame.name)
+                            .is_some_and(|(b, _)| b == "FC");
+                    if wanted && valid_name(&frame.name) {
                         files.push(RemoteFile {
                             dir: (*dir_name).into(),
                             name: frame.name,
@@ -663,7 +726,7 @@ fn local_paths(root: &FsPath, board: Board, dir: &str, name: &str) -> (PathBuf, 
 /// A completed local copy; `None` if missing, partial or unsafe.
 pub(crate) fn completed_file(root: &FsPath, board: &str, dir: &str, name: &str) -> Option<PathBuf> {
     let board = Board::from_sender_id(board).filter(|b| supports_sd_download(*b))?;
-    let dir = DIRECTORIES[dir_index(dir)? as usize];
+    let dir = directories(board)[dir_index(board, dir)? as usize];
     if !valid_name(name) {
         return None;
     }
@@ -688,7 +751,7 @@ fn local_files(root: &FsPath) -> Vec<LocalFile> {
         .copied()
         .filter(|b| supports_sd_download(*b))
     {
-        for dir in DIRECTORIES {
+        for dir in directories(board) {
             let Ok(entries) = std::fs::read_dir(root.join(board.sender_id()).join(dir)) else {
                 continue;
             };
@@ -705,7 +768,7 @@ fn local_files(root: &FsPath) -> Vec<LocalFile> {
                 if valid_name(&name) {
                     out.push(LocalFile {
                         board: board.sender_id().into(),
-                        dir: dir.into(),
+                        dir: (*dir).into(),
                         name,
                         bytes: meta.len(),
                         complete,
@@ -729,13 +792,56 @@ fn disk_ok(path: &FsPath, needed: u64) -> Result<(), String> {
 
 // --------------------------------------------------------------- transfer
 
-struct TransferRequest {
+pub(crate) struct TransferRequest {
     id: u64,
     board: Board,
     dir: u8,
     name: String,
     root: PathBuf,
     max_bps: u64,
+    /// Offer the finished file to the launch captures (operator and DAQ
+    /// launch downloads). The FC collection attaches it itself.
+    attach: bool,
+    /// READ answers re-requested after a CRC-32 mismatch.
+    crc_errors: AtomicU64,
+    /// Another SD file service than the board itself (host, P2P port).
+    peer: Option<(&'static str, u16)>,
+    /// Local folder under `<root>/<board>/` instead of the wire directory.
+    local_dir: Option<&'static str>,
+    /// A rate that may change during the transfer (FC adaptive rate); read
+    /// before every block. `max_bps` otherwise.
+    rate_fn: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
+}
+
+impl TransferRequest {
+    fn current_rate(&self) -> u64 {
+        self.rate_fn.as_ref().map_or(self.max_bps, |f| f()).max(1)
+    }
+}
+
+impl TransferRequest {
+    fn new(id: u64, board: Board, dir: u8, name: &str, root: PathBuf, max_bps: u64) -> Self {
+        Self {
+            id,
+            board,
+            dir,
+            name: name.into(),
+            root,
+            max_bps: max_bps.max(1),
+            attach: true,
+            crc_errors: AtomicU64::new(0),
+            peer: None,
+            local_dir: None,
+            rate_fn: None,
+        }
+    }
+}
+
+/// zlib CRC-32 (IEEE, reflected, init/xorout 0xFFFFFFFF), as the FC computes it.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(bytes);
+    hasher.finalize()
 }
 
 /// Reads one block answer starting at `offset`. Returns (bytes, file_size, end).
@@ -772,6 +878,34 @@ async fn read_block(
                     // from an earlier retried request are ignored.
                     if u64::from(frame.offset) != offset + data.len() as u64 {
                         continue;
+                    }
+                    if frame.flags & FLAG_CRC != 0 {
+                        // FC: the last frame of the answer carries the CRC-32
+                        // of the whole answered block after its data.
+                        let Some(split) = frame.data.len().checked_sub(4) else {
+                            attempts += 1;
+                            if attempts > MAX_RETRIES {
+                                return Err(StreamError::Other("malformed CRC frame".into()));
+                            }
+                            continue 'retry;
+                        };
+                        data.extend_from_slice(&frame.data[..split]);
+                        let sent = u32::from_le_bytes(frame.data[split..].try_into().expect("four bytes"));
+                        if crc32(&data) != sent {
+                            req.crc_errors.fetch_add(1, Ordering::Relaxed);
+                            attempts += 1;
+                            log::warn!(
+                                "{} SD block {} of {} failed its CRC-32; requesting it again",
+                                req.board.sender_id(),
+                                offset,
+                                req.name
+                            );
+                            if attempts > MAX_RETRIES {
+                                return Err(StreamError::Other("SD block failed its CRC-32 repeatedly".into()));
+                            }
+                            continue 'retry;
+                        }
+                        return Ok((data, u64::from(frame.file_size), false));
                     }
                     data.extend_from_slice(&frame.data);
                     if frame.flags & FLAG_LAST != 0 || data.len() as u64 >= BLOCK_BYTES {
@@ -812,7 +946,13 @@ async fn transfer(
     gate: &Gate,
     cancel: &AtomicBool,
 ) -> Result<(), StreamError> {
-    let dir_name = DIRECTORIES[req.dir as usize];
+    let dir_name = match req.local_dir {
+        Some(dir) => dir,
+        None => directories(req.board)
+            .get(req.dir as usize)
+            .copied()
+            .ok_or_else(|| "unknown SD folder".to_string())?,
+    };
     let (final_path, part_path) = local_paths(&req.root, req.board, dir_name, &req.name);
     tokio::fs::create_dir_all(part_path.parent().expect("download folder"))
         .await
@@ -830,9 +970,10 @@ async fn transfer(
     };
     manager.update(req.id, |s| {
         s.phase = Phase::Connecting;
-        s.message = format!("connecting to {}", req.board.sender_id());
+        s.message = format!("connecting to {}", req.peer.map_or(req.board.sender_id(), |p| p.0));
     });
-    let mut stream = BoardStream::open(manager, router, req.board, gate, cancel).await?;
+    let (host, service_port) = req.peer.unwrap_or((req.board.sender_id(), SD_FILE_STREAM_PORT));
+    let mut stream = BoardStream::open_peer(manager, router, host, service_port, gate, cancel).await?;
 
     // Resume check: the block holding our last byte must still match, else
     // the card was replaced or rewritten and we restart from zero.
@@ -880,13 +1021,17 @@ async fn transfer(
     let mut sent_this_run = 0_u64;
     let mut last_disk_check = 0_u64;
     let mut offset = have;
+    // Bandwidth bound: the next request waits until the bytes already asked
+    // for fit the (possibly changing) rate; no catch-up burst after a stall.
+    let mut due = Instant::now();
     loop {
-        // Bandwidth bound: never ask for more than max_bps on average.
-        let due = started + Duration::from_secs_f64(sent_this_run as f64 / req.max_bps as f64);
         if let Some(wait) = due.checked_duration_since(Instant::now()) {
             tokio::time::sleep(wait).await;
         }
         let (data, file_size, end) = read_block(&mut stream, req, offset, gate, cancel).await?;
+        let now = Instant::now();
+        due = due.max(now.checked_sub(Duration::from_millis(250)).unwrap_or(now))
+            + Duration::from_secs_f64(data.len() as f64 / req.current_rate() as f64);
         if !data.is_empty() {
             file.write_all(&data)
                 .await
@@ -895,10 +1040,12 @@ async fn transfer(
             sent_this_run += data.len() as u64;
         }
         let elapsed = started.elapsed().as_secs_f64().max(0.001);
+        let crc_errors = req.crc_errors.load(Ordering::Relaxed);
         manager.update(req.id, |s| {
             s.bytes_done = offset;
             s.total_bytes = file_size.max(offset);
             s.bytes_per_second = (sent_this_run as f64 / elapsed) as u64;
+            s.crc_errors = crc_errors;
         });
         if offset - last_disk_check >= 4 * 1024 * 1024 {
             last_disk_check = offset;
@@ -924,7 +1071,9 @@ async fn transfer(
     });
     // A board launch file follows its GS launch capture; an ordinary file can
     // supply the lead-up of one already attached.
-    if let Some(data_root) = req.root.parent().map(FsPath::to_path_buf) {
+    if req.attach
+        && let Some(data_root) = req.root.parent().map(FsPath::to_path_buf)
+    {
         let name = req.name.clone();
         let _ = tokio::task::spawn_blocking(move || {
             if let Err(error) = crate::recording_store::board_sd::offer_file(&data_root, &final_path, &name, "network_download") {
@@ -1048,25 +1197,32 @@ fn start_job(
     root: PathBuf,
     gate: Gate,
 ) -> Result<JobStatus, String> {
+    start_job_at(manager, router, board, dir, name, root, gate, max_bytes_per_second())
+}
+
+#[expect(clippy::too_many_arguments, reason = "one job's owned transfer context")]
+fn start_job_at(
+    manager: &'static Manager,
+    router: Arc<Router>,
+    board: Board,
+    dir: &str,
+    name: &str,
+    root: PathBuf,
+    gate: Gate,
+    max_bps: u64,
+) -> Result<JobStatus, String> {
     if !supports_sd_download(board) {
         return Err(format!("{} does not serve SD downloads", board.as_str()));
     }
-    let dir_i = dir_index(dir).ok_or("unknown SD folder")?;
+    let dir_i = dir_index(board, dir).ok_or("unknown SD folder")?;
     if !valid_name(name) {
         return Err("invalid SD file name".into());
     }
     if let Some(reason) = gate() {
         return Err(reason);
     }
-    let (id, cancel) = manager.create_job(board, DIRECTORIES[dir_i as usize], name)?;
-    let req = TransferRequest {
-        id,
-        board,
-        dir: dir_i,
-        name: name.into(),
-        root,
-        max_bps: max_bytes_per_second(),
-    };
+    let (id, cancel) = manager.create_job(board, directories(board)[dir_i as usize], name)?;
+    let req = TransferRequest::new(id, board, dir_i, name, root, max_bps);
     tokio::spawn(run_job(manager, router, req, gate, cancel));
     Ok(manager.get(id).expect("new SD download job"))
 }
@@ -1103,7 +1259,7 @@ async fn refresh_listing(
     let never = AtomicBool::new(false);
     let result = async {
         let mut stream = BoardStream::open(manager, router, board, &gate, &never).await?;
-        let files = list_on_stream(&mut stream, &gate, &never).await;
+        let files = list_on_stream(&mut stream, board, &gate, &never).await;
         stream.finish(files.is_err());
         files
     }
@@ -1194,6 +1350,7 @@ pub async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
         "listings": listings,
         "jobs": MANAGER.list(),
         "local": local_files(&root),
+        "fc_collect": fc::status(&state),
     }))
     .into_response()
 }
@@ -1247,7 +1404,7 @@ pub async fn start(
     {
         return (StatusCode::INSUFFICIENT_STORAGE, e).into_response();
     }
-    match start_job(
+    match start_job_at(
         &MANAGER,
         router,
         board,
@@ -1255,6 +1412,7 @@ pub async fn start(
         &body.name,
         root,
         app_gate(&state),
+        max_bytes_per_second_for(&state, board),
     ) {
         Ok(job) => (StatusCode::ACCEPTED, Json(job)).into_response(),
         Err(e) if e.contains("already active") => (StatusCode::CONFLICT, e).into_response(),
@@ -1334,6 +1492,9 @@ pub fn routes() -> axum::Router<Arc<AppState>> {
         .route("/api/sd_download/{board}/list", post(list))
         .route("/api/sd_download/{board}/start", post(start))
         .route("/api/sd_download/jobs/{id}/cancel", post(cancel))
+        .route("/api/sd_download/fc", get(fc::status_route))
+        .route("/api/sd_download/fc/stop", post(fc::stop_route))
+        .route("/api/sd_download/fc/resume", post(fc::resume_route))
         .route(
             "/api/recordings/{id}/sd/imports/{token}/download",
             post(import_downloaded),
@@ -1342,6 +1503,12 @@ pub fn routes() -> axum::Router<Arc<AppState>> {
 
 #[path = "sd_download/leadup.rs"]
 pub(crate) mod leadup;
+
+#[path = "sd_download/fc.rs"]
+pub(crate) mod fc;
+
+#[path = "sd_download/relay.rs"]
+pub(crate) mod relay;
 
 #[cfg(test)]
 mod tests;

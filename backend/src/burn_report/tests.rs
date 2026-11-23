@@ -452,6 +452,9 @@ fn add_daq_file(folder: &Path, m: &mut Manifest, stand: &Stand, profile: impl Fn
             lead_up_file: None,
             lead_up_from_ms: None,
             lead_up_rows: 0,
+            link: None,
+            sd_format: None,
+            relay: None,
         });
 }
 

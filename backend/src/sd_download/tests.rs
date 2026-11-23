@@ -179,7 +179,7 @@ fn serve(daq: &Arc<Router>, board: Arc<MockBoard>) {
     .unwrap();
 }
 
-fn pump(gs: Arc<Router>, daq: Arc<Router>) -> (Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
+pub(super) fn pump(gs: Arc<Router>, daq: Arc<Router>) -> (Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
     let running = Arc::new(AtomicBool::new(true));
     let flag = running.clone();
     let task = tokio::spawn(async move {
@@ -192,7 +192,7 @@ fn pump(gs: Arc<Router>, daq: Arc<Router>) -> (Arc<AtomicBool>, tokio::task::Joi
     (running, task)
 }
 
-fn pattern(len: usize, seed: u8) -> Vec<u8> {
+pub(super) fn pattern(len: usize, seed: u8) -> Vec<u8> {
     (0..len)
         .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
         .collect()
@@ -203,14 +203,7 @@ fn open_gate() -> Gate {
 }
 
 fn request(id: u64, root: &FsPath, name: &str) -> TransferRequest {
-    TransferRequest {
-        id,
-        board: Board::DaqBoard,
-        dir: 0,
-        name: name.into(),
-        root: root.into(),
-        max_bps: 10_000_000,
-    }
+    TransferRequest::new(id, Board::DaqBoard, 0, name, root.into(), 10_000_000)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -429,6 +422,7 @@ async fn leaving_idle_pauses_the_transfer_and_refuses_new_work() {
         .unwrap_err(),
         "now Armed"
     );
+    // The FC has only its card root (and is blocked here anyway).
     assert!(
         start_job(
             manager,
@@ -441,6 +435,7 @@ async fn leaving_idle_pauses_the_transfer_and_refuses_new_work() {
         )
         .is_err()
     );
+    assert!(start_job(manager, gs.clone(), Board::RFBoard, "ROOT", "F.CSV", root.0.clone(), open_gate()).is_err());
     running.store(false, Ordering::Relaxed);
     task.await.unwrap();
 }

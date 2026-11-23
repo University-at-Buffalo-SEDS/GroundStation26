@@ -67,6 +67,8 @@ struct StoreResponse {
     is_admin: bool,
     /// Background DAQ lead-up fetches (progress for the Recordings panel).
     board_sd_fetch: Vec<crate::sd_download::leadup::Job>,
+    /// The automatic FC SD collection after landing.
+    fc_sd_collect: crate::sd_download::fc::Status,
 }
 
 async fn store(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -118,6 +120,7 @@ async fn store(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
             settings: state.recording_store.settings(),
             is_admin: principal.is_admin(),
             board_sd_fetch: crate::sd_download::leadup::load(&root),
+            fc_sd_collect: crate::sd_download::fc::status(&state),
         })
         .into_response(),
     )

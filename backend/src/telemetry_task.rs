@@ -3430,6 +3430,7 @@ async fn handle_packet_inner(
                 values: row_values,
             };
             if row.data_type == "GPS_DATA" {
+                crate::sd_download::fc::note_gps();
                 crate::antenna::observe_source_gps(&row, crate::network_stamp::Stamp::of(&pkt));
             }
             out.push(row);

@@ -428,6 +428,10 @@ impl Tracker {
         (r.healthy && elapsed(now, r.last) <= r.timeout_ms())
             .then(|| now.saturating_duration_since(r.connected_since))
     }
+    /// Which station sides a board was heard on: (AV-bay radio, umbilical).
+    pub(crate) fn sides(&self, sender: &str) -> Option<(bool, bool)> {
+        self.boards.get(canonical_sender_id(sender.trim())).map(|r| (r.rocket, r.fill))
+    }
     pub fn membership(&mut self, sender: &str, side: &str) {
         if let Some(r) = self.boards.get_mut(canonical_sender_id(sender)) {
             r.rocket |= side == "rocket_comms";

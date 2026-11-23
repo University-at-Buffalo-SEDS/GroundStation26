@@ -1,8 +1,8 @@
 //! Board SD launch files follow the GS launch capture automatically.
 //!
 //! FC (`irec_LAUNCH-*.csv`) and DAQ (`DAQ_LAUNCH_*.CSV`) launch files reach
-//! the station by network download (DAQ, `sd_download`) or manual SD import
-//! (`recording_sd`). Either way the file is matched to the GS launch capture
+//! the station by network download (`sd_download`; the FC's automatically
+//! after landing, `sd_download::fc`) or manual SD import (`recording_sd`). Either way the file is matched to the GS launch capture
 //! whose window overlaps its network-UTC rows, copied unchanged into
 //! `<capture>/board_sd/<BOARD>/`, and listed in the capture's manifest.
 //!
@@ -44,6 +44,103 @@ pub struct BoardSdEntry {
     pub lead_up_from_ms: Option<i64>,
     #[serde(default)]
     pub lead_up_rows: u64,
+    /// Network downloads: `radio` (AV-bay RFD link) or `wired` (bench,
+    /// umbilical, USB or CAN). Absent for imports and older entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
+    /// The file's `# seds-sd` format line, when it has one (older and
+    /// headerless files have none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sd_format: Option<SdFormat>,
+    /// Store-and-forward through the RRLS: who carried it and each hop's check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<RelayProvenance>,
+}
+
+/// How a relayed board file reached the station.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayProvenance {
+    /// `RRLS`.
+    pub via: String,
+    /// The relay station's SEDSnet hostname.
+    pub relay_id: String,
+    pub hops: Vec<RelayHop>,
+}
+
+/// One hop: `FC->RRLS` (CRC-32 per 512-byte READ answer) or `RRLS->GS`
+/// (CRC-32 per block and the SHA-256 of the whole file).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayHop {
+    pub hop: String,
+    pub check: String,
+    pub sha256: String,
+    #[serde(default)]
+    pub crc_errors: u64,
+    pub completed_at_ms: u64,
+}
+
+/// The `# seds-sd,format=..,version=..,board=..,firmware=..,tick_hz=..,schema=..`
+/// line of a board SD file (line 2 in current firmware). Informational here:
+/// acceptance is the SD resolver's job.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SdFormat {
+    pub format: String,
+    pub version: u32,
+    #[serde(default)]
+    pub board: String,
+    #[serde(default)]
+    pub firmware: String,
+    #[serde(default)]
+    pub tick_hz: Option<u64>,
+    #[serde(default)]
+    pub schema: String,
+}
+
+/// Parses one `# seds-sd,...` line (None for any other line).
+pub(crate) fn parse_sd_format_line(line: &str) -> Option<SdFormat> {
+    let rest = line.trim_end_matches(['\r', '\n']).strip_prefix("# seds-sd,")?;
+    let mut out = SdFormat::default();
+    let mut version = None;
+    for pair in rest.split(',') {
+        let Some((key, value)) = pair.split_once('=') else { continue };
+        match key.trim() {
+            "format" => out.format = value.trim().into(),
+            "version" => version = value.trim().parse().ok(),
+            "board" => out.board = value.trim().into(),
+            "firmware" => out.firmware = value.trim().into(),
+            "tick_hz" => out.tick_hz = value.trim().parse().ok(),
+            "schema" => out.schema = value.trim().into(),
+            _ => {}
+        }
+    }
+    out.version = version?;
+    (!out.format.is_empty()).then_some(out)
+}
+
+/// The format line among the first lines of a board SD file.
+pub(crate) fn read_sd_format(path: &Path) -> Option<SdFormat> {
+    let reader = BufReader::new(std::fs::File::open(path).ok()?);
+    reader
+        .lines()
+        .take(8)
+        .map_while(Result::ok)
+        .find_map(|line| parse_sd_format_line(&line))
+}
+
+/// How a file reached the station (manifest provenance).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Provenance {
+    /// `network_download` or `sd_import`.
+    pub source: String,
+    /// `radio` or `wired` for network downloads.
+    pub link: Option<String>,
+    pub relay: Option<RelayProvenance>,
+}
+
+impl Provenance {
+    pub(crate) fn new(source: &str) -> Self {
+        Self { source: source.into(), link: None, relay: None }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -150,7 +247,7 @@ pub(crate) fn scan(path: &Path, name: &str) -> Option<BoardFile> {
     span
 }
 
-fn sha256_hex(path: &Path) -> std::io::Result<String> {
+pub(crate) fn sha256_hex(path: &Path) -> std::io::Result<String> {
     use std::io::Read;
     let mut context = ring::digest::Context::new(&ring::digest::SHA256);
     let mut file = std::fs::File::open(path)?;
@@ -249,6 +346,12 @@ pub(crate) enum Outcome {
 /// Matches one board SD file (launch or ordinary) to the launch captures.
 /// Blocking file work: call from `spawn_blocking`.
 pub(crate) fn offer_file(root: &Path, path: &Path, name: &str, source: &str) -> std::io::Result<Vec<Outcome>> {
+    offer_file_with(root, path, name, &Provenance::new(source))
+}
+
+/// [`offer_file`] with full provenance (the FC collection records its link).
+pub(crate) fn offer_file_with(root: &Path, path: &Path, name: &str, provenance: &Provenance) -> std::io::Result<Vec<Outcome>> {
+    let source = provenance.source.as_str();
     if !safe_name(name) {
         return Ok(vec![Outcome::Ignored]);
     }
@@ -274,6 +377,17 @@ pub(crate) fn offer_file(root: &Path, path: &Path, name: &str, source: &str) -> 
     let sha = sha256_hex(path)?;
     let target = board_dir.join(name);
     let already = read_manifest(&folder).is_some_and(|m| m.board_sd.iter().any(|e| e.sha256 == sha));
+    if already && provenance.link.is_some() {
+        // Attached earlier by a rescan without the link: complete it.
+        update_manifest(&folder, |m| {
+            let Some(e) = m.board_sd.iter_mut().find(|e| e.sha256 == sha && e.link.is_none()) else { return false };
+            e.link = provenance.link.clone();
+            if e.relay.is_none() {
+                e.relay = provenance.relay.clone();
+            }
+            true
+        })?;
+    }
     if !already {
         let tmp = board_dir.join(format!(".{name}.partial"));
         std::fs::copy(path, &tmp)?;
@@ -292,6 +406,9 @@ pub(crate) fn offer_file(root: &Path, path: &Path, name: &str, source: &str) -> 
             lead_up_file: None,
             lead_up_from_ms: None,
             lead_up_rows: 0,
+            link: provenance.link.clone(),
+            sd_format: read_sd_format(&target),
+            relay: provenance.relay.clone(),
         };
         update_manifest(&folder, |m| {
             if m.board_sd.iter().any(|e| e.sha256 == sha) {
@@ -311,11 +428,19 @@ pub(crate) fn offer_file(root: &Path, path: &Path, name: &str, source: &str) -> 
     if file.board == "DAQ" && !has_lead_up {
         crate::sd_download::leadup::enqueue(root, &folder, name, file.first_utc);
     }
-    if file.board == "DAQ" {
-        // The burn report becomes final with the DAQ's full-rate load cells.
-        crate::burn_report::request_recompute(&folder);
-    }
+    // The burn report becomes final with the DAQ's full-rate load cells; an
+    // FC file triggers the same recompute so every consumer of the capture's
+    // board SD files sees it.
+    crate::burn_report::request_recompute(&folder);
     Ok(vec![Outcome::Attached(folder)])
+}
+
+/// Capture folders holding `board`'s attached `file`.
+pub(crate) fn folders_with(root: &Path, board: &str, file: &str) -> Vec<PathBuf> {
+    launch_folders(root)
+        .into_iter()
+        .filter(|f| read_manifest(f).is_some_and(|m| m.board_sd.iter().any(|e| e.board == board && e.file == file)))
+        .collect()
 }
 
 fn launch_folders(root: &Path) -> Vec<PathBuf> {
@@ -330,7 +455,7 @@ fn launch_folders(root: &Path) -> Vec<PathBuf> {
 /// Ordinary board files already on the station (network downloads).
 fn local_ordinary_files(root: &Path, board: &str) -> Vec<(PathBuf, String)> {
     let mut out = Vec::new();
-    for dir in ["UTC", "NO_UTC"] {
+    for dir in ["UTC", "NO_UTC", "ROOT"] {
         for entry in std::fs::read_dir(root.join("sd-downloads").join(board).join(dir)).into_iter().flatten().flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             if classify_name(&name).is_some_and(|(b, launch)| b == board && !launch) {
@@ -408,9 +533,13 @@ pub(crate) fn cut_lead_up(folder: &Path, board: &str, launch_file: &str, source:
 /// After a launch capture is saved: attach board launch files already on the
 /// station (earlier network downloads) that fall in its window.
 pub(crate) fn rescan_downloads(root: &Path) {
-    for board in ["DAQ", "FC"] {
-        for entry in std::fs::read_dir(root.join("sd-downloads").join(board).join("LAUNCH")).into_iter().flatten().flatten() {
+    // The DAQ keeps launch files in /LAUNCH; the FC has one card root.
+    for (board, dir) in [("DAQ", "LAUNCH"), ("FC", "LAUNCH"), ("FC", "ROOT")] {
+        for entry in std::fs::read_dir(root.join("sd-downloads").join(board).join(dir)).into_iter().flatten().flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
+            if !classify_name(&name).is_some_and(|(_, launch)| launch) {
+                continue;
+            }
             if let Err(error) = offer_file(root, &entry.path(), &name, "network_download") {
                 log::warn!("board SD {name}: {error}");
             }

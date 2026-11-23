@@ -185,6 +185,11 @@ pub struct Settings {
     /// attachments and the OS: it stops growing (oldest segments go) here.
     pub reserve_free_mb: u64,
     pub events: BTreeMap<EventKind, EventPolicy>,
+    /// Collect the Flight Computer's SD launch file automatically after it
+    /// lands (`sd_download::fc`). Missing in older files: on.
+    pub fc_sd_auto_collect: bool,
+    /// Also fetch the FC's 60 s lead-up window from its ordinary file.
+    pub fc_sd_leadup: bool,
 }
 
 impl Default for Settings {
@@ -200,6 +205,8 @@ impl Default for Settings {
                 .into_iter()
                 .map(|kind| (kind, kind.default_policy()))
                 .collect(),
+            fc_sd_auto_collect: true,
+            fc_sd_leadup: true,
         }
     }
 }
@@ -1035,6 +1042,8 @@ pub(crate) async fn capture_task(
         }
         // Burn reports: the live provisional one and queued capture recomputes.
         crate::burn_report::tick(&state, &root);
+        // FC SD collection after landing (trigger, and the worker after a restart).
+        crate::sd_download::fc::tick(&state, &root);
         // Pending DAQ lead-up fetches (also after a restart) run in the background.
         ticks = ticks.wrapping_add(1);
         if ticks % 15 == 0 && crate::sd_download::leadup::pending(&root) {

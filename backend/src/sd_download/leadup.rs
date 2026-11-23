@@ -1,4 +1,9 @@
-//! Low-priority fetch of the DAQ lead-up window after a launch.
+//! Low-priority fetch of a board's lead-up window after a launch.
+//!
+//! Written for the DAQ and shared with the Flight Computer collection
+//! ([`super::fc`]): a job's `board` picks the card layout and its own jobs
+//! file (`sd-downloads/<board>/leadup/jobs.json`); the FC worker drives its
+//! jobs with [`step_with`] at the FC link rate and only ever reads a window.
 //!
 //! A DAQ launch file attached to a launch capture gets the minute before its
 //! first row from the DAQ's regular session file of the same boot. Only that
@@ -30,6 +35,7 @@ static JOBS_LOCK: Mutex<()> = Mutex::new(());
 /// Called whenever command packets are flushed to the network.
 pub(crate) fn note_command_traffic() {
     LAST_COMMAND_MS.store(now_ms(), Ordering::Release);
+    super::fc::SIGNALS.note_command(now_ms());
 }
 
 #[cfg(test)]
@@ -59,6 +65,9 @@ fn rate() -> u64 {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Job {
+    /// `DAQ` (default, older job files) or `FC`.
+    #[serde(default = "daq_board")]
+    pub board: String,
     /// Capture folder relative to the data directory.
     pub capture: String,
     pub launch_file: String,
@@ -83,44 +92,63 @@ pub struct Job {
     pub done: bool,
 }
 
-fn dir(root: &FsPath) -> PathBuf {
-    root.join("sd-downloads").join("DAQ").join("leadup")
+fn daq_board() -> String {
+    "DAQ".into()
 }
 
+fn board_of(name: &str) -> Board {
+    if name == "FC" { Board::FlightComputer } else { Board::DaqBoard }
+}
+
+fn dir(root: &FsPath, board: &str) -> PathBuf {
+    root.join("sd-downloads").join(board).join("leadup")
+}
+
+/// The DAQ lead-up jobs (Recordings panel, DAQ worker).
 pub(crate) fn load(root: &FsPath) -> Vec<Job> {
-    std::fs::read(dir(root).join(JOBS_FILE))
+    load_board(root, "DAQ")
+}
+
+pub(crate) fn load_board(root: &FsPath, board: &str) -> Vec<Job> {
+    std::fs::read(dir(root, board).join(JOBS_FILE))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default()
 }
 
-fn save(root: &FsPath, jobs: &[Job]) {
-    let path = dir(root).join(JOBS_FILE);
-    let _ = std::fs::create_dir_all(dir(root));
+fn save(root: &FsPath, board: &str, jobs: &[Job]) {
+    let path = dir(root, board).join(JOBS_FILE);
+    let _ = std::fs::create_dir_all(dir(root, board));
     let tmp = path.with_extension("tmp");
     if std::fs::write(&tmp, serde_json::to_vec_pretty(jobs).unwrap_or_default()).is_ok() {
         let _ = std::fs::rename(tmp, path);
     }
 }
 
-fn update(root: &FsPath, launch_file: &str, apply: impl FnOnce(&mut Job)) {
+fn update(root: &FsPath, board: &str, launch_file: &str, apply: impl FnOnce(&mut Job)) {
     let _guard = JOBS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut jobs = load(root);
+    let mut jobs = load_board(root, board);
     if let Some(job) = jobs.iter_mut().find(|j| j.launch_file == launch_file) {
         apply(job);
     }
-    save(root, &jobs);
+    save(root, board, &jobs);
 }
 
 /// Queue the lead-up fetch for a DAQ launch file attached to `folder`.
 pub(crate) fn enqueue(root: &FsPath, folder: &FsPath, launch_file: &str, first_row_ms: i64) {
+    enqueue_board(root, "DAQ", folder, launch_file, first_row_ms);
+}
+
+/// Queue the lead-up fetch for `board`'s launch file attached to `folder`.
+pub(crate) fn enqueue_board(root: &FsPath, board: &str, folder: &FsPath, launch_file: &str, first_row_ms: i64) {
     let Ok(capture) = folder.strip_prefix(root) else { return };
     let _guard = JOBS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut jobs = load(root);
+    let mut jobs = load_board(root, board);
     if jobs.iter().any(|j| j.launch_file == launch_file) {
         return;
     }
     jobs.push(Job {
+        board: board.into(),
         capture: capture.to_string_lossy().into_owned(),
         launch_file: launch_file.into(),
         from_ms: first_row_ms - board_sd::LEAD_UP_MS,
@@ -129,11 +157,17 @@ pub(crate) fn enqueue(root: &FsPath, folder: &FsPath, launch_file: &str, first_r
         message: "waiting until SD downloads are allowed".into(),
         ..Job::default()
     });
-    save(root, &jobs);
+    save(root, board, &jobs);
 }
 
 pub(crate) fn pending(root: &FsPath) -> bool {
     load(root).iter().any(|j| !j.done)
+}
+
+/// A DAQ lead-up job is reading the card right now (not merely waiting).
+pub(crate) fn transferring(root: &FsPath) -> bool {
+    RUNNING.load(Ordering::Acquire)
+        && load(root).iter().any(|j| !j.done && matches!(j.phase.as_str(), "searching" | "fetching" | "downloading"))
 }
 
 /// Some reason while command traffic was seen within [`QUIET_AFTER_COMMAND`].
@@ -146,6 +180,7 @@ pub(crate) fn command_quiet() -> Option<String> {
 /// Why the lead-up fetch must not use the link right now.
 fn quiet_gate(state: &Arc<AppState>) -> Gate {
     let app = app_gate(state);
+    let weak = Arc::downgrade(state);
     Arc::new(move || {
         if let Some(reason) = app() {
             return Some(reason);
@@ -155,6 +190,11 @@ fn quiet_gate(state: &Arc<AppState>) -> Gate {
         }
         if super::launch_fetch_owed() {
             return Some("the DAQ launch file fetch goes first".into());
+        }
+        if let Some(state) = weak.upgrade()
+            && super::fc::launch_file_owed(&crate::recording_export::directory(&state))
+        {
+            return Some("the FC launch file collection goes first".into());
         }
         command_quiet()
     })
@@ -197,15 +237,25 @@ impl Source<'_> {
     }
 }
 
-fn request(root: &FsPath, dir_name: &str, name: &str) -> Option<TransferRequest> {
-    Some(TransferRequest {
-        id: 0,
-        board: Board::DaqBoard,
-        dir: dir_index(dir_name)?,
-        name: name.into(),
-        root: root.join("sd-downloads"),
-        max_bps: rate(),
-    })
+fn request(root: &FsPath, board: Board, dir_name: &str, name: &str, max_bps: u64) -> Option<TransferRequest> {
+    Some(TransferRequest::new(0, board, dir_index(board, dir_name)?, name, root.join("sd-downloads"), max_bps))
+}
+
+/// Per-board fetch parameters.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Params {
+    /// Window reads are paced to this many payload bytes per second.
+    pub rate: u64,
+    /// A whole ordinary file at or below this size is downloaded instead.
+    pub whole_file_bytes: u64,
+    /// Row bytes per millisecond at full rate (progress estimate only).
+    pub bytes_per_ms: u64,
+}
+
+impl Params {
+    fn daq() -> Self {
+        Self { rate: rate(), whole_file_bytes: small_file_bytes(), bytes_per_ms: 110 }
+    }
 }
 
 /// Runs every pending job once the link is quiet. One worker at a time.
@@ -226,7 +276,7 @@ pub(crate) async fn run(state: Arc<AppState>) {
     while Instant::now() < deadline {
         let Some(job) = load(&root).into_iter().find(|j| !j.done) else { return };
         if let Some(reason) = gate() {
-            update(&root, &job.launch_file, |j| {
+            update(&root, "DAQ", &job.launch_file, |j| {
                 j.phase = "paused".into();
                 j.message = format!("paused: {reason}");
             });
@@ -237,7 +287,7 @@ pub(crate) async fn run(state: Arc<AppState>) {
         match step(&MANAGER, &root, router, &job, &gate).await {
             Ok(()) => {}
             Err(StreamError::Gate(reason)) => {
-                update(&root, &job.launch_file, |j| {
+                update(&root, "DAQ", &job.launch_file, |j| {
                     j.phase = "paused".into();
                     j.message = format!("paused: {reason}; resumes when allowed");
                 });
@@ -248,7 +298,7 @@ pub(crate) async fn run(state: Arc<AppState>) {
                     StreamError::Other(e) => e,
                     _ => "cancelled".into(),
                 };
-                update(&root, &job.launch_file, |j| {
+                update(&root, "DAQ", &job.launch_file, |j| {
                     j.phase = "retrying".into();
                     j.message = format!("{text}; retrying");
                 });
@@ -258,7 +308,7 @@ pub(crate) async fn run(state: Arc<AppState>) {
     }
 }
 
-/// One attempt at a job: find the source, then fetch (resuming) and finish.
+/// One attempt at a DAQ job: find the source, then fetch (resuming) and finish.
 pub(crate) async fn step(
     manager: &'static Manager,
     root: &FsPath,
@@ -266,9 +316,47 @@ pub(crate) async fn step(
     job: &Job,
     gate: &Gate,
 ) -> Result<(), StreamError> {
+    step_with(manager, root, router, job, gate, Params::daq()).await
+}
+
+/// The ordinary files of the same card that may hold the lead-up, in the
+/// order their tails are checked. The FC names its files by network UTC
+/// seconds (`irec-<s>-<nnn>.csv`, uptime ms before UTC is known) and has one
+/// per boot, so only the newest few candidates are read over the radio.
+fn lead_up_candidates(board: Board, files: &[RemoteFile], to_ms: i64) -> Vec<RemoteFile> {
+    use crate::recording_store::board_sd::classify_name;
+    if board != Board::FlightComputer {
+        return files.iter().filter(|f| f.dir != "LAUNCH" && f.size > 0).cloned().collect();
+    }
+    let mut out: Vec<(i64, usize, RemoteFile)> = files
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.size > 0 && classify_name(&f.name) == Some(("FC", false)))
+        .map(|(i, f)| {
+            let utc_s = super::fc::name_utc_seconds(&f.name).filter(|s| *s * 1000 <= to_ms + 5_000);
+            (utc_s.unwrap_or(-1), i, f.clone())
+        })
+        .collect();
+    // Dated names newest first, then undated ones in reverse card order.
+    out.sort_by_key(|e| std::cmp::Reverse((e.0, e.1)));
+    out.into_iter().take(6).map(|(_, _, f)| f).collect()
+}
+
+/// One attempt at a job of any board.
+pub(crate) async fn step_with(
+    manager: &'static Manager,
+    root: &FsPath,
+    router: Arc<Router>,
+    job: &Job,
+    gate: &Gate,
+    params: Params,
+) -> Result<(), StreamError> {
+    let board_name = job.board.clone();
+    let board = board_of(&board_name);
+    let label = board.sender_id();
     let folder = root.join(&job.capture);
     if !folder.join(crate::recording_store::MANIFEST_FILE).exists() {
-        update(root, &job.launch_file, |j| {
+        update(root, &board_name, &job.launch_file, |j| {
             j.done = true;
             j.phase = "dropped".into();
             j.message = "the capture was deleted".into();
@@ -277,17 +365,17 @@ pub(crate) async fn step(
     }
     let mut job = job.clone();
     if job.source.is_none() {
-        update(root, &job.launch_file, |j| {
+        update(root, &board_name, &job.launch_file, |j| {
             j.phase = "searching".into();
-            j.message = "finding the DAQ session file that ended at the launch".into();
+            j.message = format!("finding the {label} session file that ended at the launch");
         });
-        let listing = refresh_listing(manager, router.clone(), Board::DaqBoard, gate.clone())
+        let listing = refresh_listing(manager, router.clone(), board, gate.clone())
             .await
             .map_err(StreamError::Other)?;
-        let mut stream = BoardStream::open(manager, router.clone(), Board::DaqBoard, gate, &AtomicBool::new(false)).await?;
+        let mut stream = BoardStream::open(manager, router.clone(), board, gate, &AtomicBool::new(false)).await?;
         let mut best: Option<(i64, RemoteFile)> = None;
-        for file in listing.files.iter().filter(|f| f.dir != "LAUNCH" && f.size > 0) {
-            let Some(req) = request(root, &file.dir, &file.name) else { continue };
+        for file in lead_up_candidates(board, &listing.files, job.to_ms).iter() {
+            let Some(req) = request(root, board, &file.dir, &file.name, params.rate) else { continue };
             let mut source = Source { stream: &mut stream, req };
             // The last two whole blocks (block reads stop at 512-byte boundaries).
             let tail = (file.size.saturating_sub(1) / BLOCK_BYTES).saturating_sub(1) * BLOCK_BYTES;
@@ -312,14 +400,14 @@ pub(crate) async fn step(
         }
         stream.finish(false);
         let Some((_, file)) = best else {
-            update(root, &job.launch_file, |j| {
+            update(root, &board_name, &job.launch_file, |j| {
                 j.done = true;
                 j.phase = "unavailable".into();
-                j.message = "no DAQ session file on the card covers the minute before launch".into();
+                j.message = format!("no {label} session file on the card covers the minute before launch");
             });
             return Ok(());
         };
-        update(root, &job.launch_file, |j| {
+        update(root, &board_name, &job.launch_file, |j| {
             j.source = Some(file.name.clone());
             j.source_dir = Some(file.dir.clone());
             j.source_size = file.size;
@@ -329,31 +417,31 @@ pub(crate) async fn step(
         job.source_size = file.size;
     }
     let (Some(name), Some(dir_name)) = (job.source.clone(), job.source_dir.clone()) else { return Ok(()) };
-    if job.source_size <= small_file_bytes() {
+    if job.source_size <= params.whole_file_bytes {
         // Small: the whole file, kept; the normal download path attaches it
         // (and its lead-up) to the capture when complete.
-        update(root, &job.launch_file, |j| {
+        update(root, &board_name, &job.launch_file, |j| {
             j.phase = "downloading".into();
             j.message = format!("downloading the whole {} ({} bytes)", name, j.source_size);
         });
         let downloads = root.join("sd-downloads");
-        let started = start_job(manager, router, Board::DaqBoard, &dir_name, &name, downloads.clone(), gate.clone())
+        let started = start_job_at(manager, router, board, &dir_name, &name, downloads.clone(), gate.clone(), params.rate)
             .map_err(StreamError::Gate)?;
         while manager.get(started.id).is_some_and(|s| s.phase.is_active()) {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        let complete = completed_file(&downloads, "DAQ", &dir_name, &name);
+        let complete = completed_file(&downloads, label, &dir_name, &name);
         if complete.is_none() {
             return Err(StreamError::Gate("the whole-file download did not finish".into()));
         }
         finish(root, &job, &folder, complete.as_deref(), None)
     } else {
-        fetch_window(manager, root, router, &job, &folder, &name, &dir_name, gate).await
+        fetch_window(manager, root, router, &job, &folder, &name, &dir_name, gate, params).await
     }
 }
 
-fn part_paths(root: &FsPath, launch_file: &str) -> (PathBuf, PathBuf) {
-    let base = dir(root).join(launch_file);
+fn part_paths(root: &FsPath, board: &str, launch_file: &str) -> (PathBuf, PathBuf) {
+    let base = dir(root, board).join(launch_file);
     (base.with_extension("header"), base.with_extension("window.part"))
 }
 
@@ -367,12 +455,15 @@ async fn fetch_window(
     name: &str,
     dir_name: &str,
     gate: &Gate,
+    params: Params,
 ) -> Result<(), StreamError> {
-    let mut stream = BoardStream::open(manager, router, Board::DaqBoard, gate, &AtomicBool::new(false)).await?;
-    let req = request(root, dir_name, name).ok_or_else(|| StreamError::Other("bad SD folder".into()))?;
+    let board_name = job.board.as_str();
+    let board = board_of(board_name);
+    let mut stream = BoardStream::open(manager, router, board, gate, &AtomicBool::new(false)).await?;
+    let req = request(root, board, dir_name, name, params.rate).ok_or_else(|| StreamError::Other("bad SD folder".into()))?;
     let mut source = Source { stream: &mut stream, req };
-    let (header_path, part_path) = part_paths(root, &job.launch_file);
-    std::fs::create_dir_all(dir(root)).map_err(|e| e.to_string())?;
+    let (header_path, part_path) = part_paths(root, board_name, &job.launch_file);
+    std::fs::create_dir_all(dir(root, board_name)).map_err(|e| e.to_string())?;
     // The CSV header and calibration lines that precede the first row.
     if !header_path.exists() {
         let mut header = String::new();
@@ -400,7 +491,7 @@ async fn fetch_window(
     let start = match job.start_offset {
         Some(start) => start,
         None => {
-            update(root, &job.launch_file, |j| {
+            update(root, board_name, &job.launch_file, |j| {
                 j.phase = "searching".into();
                 j.message = format!("locating the lead-up window in {name}");
             });
@@ -416,7 +507,7 @@ async fn fetch_window(
                     None => hi = mid,
                 }
             }
-            update(root, &job.launch_file, |j| j.start_offset = Some(lo));
+            update(root, board_name, &job.launch_file, |j| j.start_offset = Some(lo));
             lo
         }
     };
@@ -435,9 +526,10 @@ async fn fetch_window(
         .map_err(|e| e.to_string())?;
     let started = Instant::now();
     let mut sent = 0u64;
-    let estimate = (job.to_ms - job.from_ms).max(1) as u64 * 110; // ~110 B/ms of DAQ rows at full rate
+    let estimate = (job.to_ms - job.from_ms).max(1) as u64 * params.bytes_per_ms;
+    let rate = params.rate.max(1);
     loop {
-        let due = started + Duration::from_secs_f64(sent as f64 / rate() as f64);
+        let due = started + Duration::from_secs_f64(sent as f64 / rate as f64);
         if let Some(wait) = due.checked_duration_since(Instant::now()) {
             tokio::time::sleep(wait).await;
         }
@@ -452,7 +544,7 @@ async fn fetch_window(
         sent += bytes.len() as u64;
         let (_, last) = block_times(&bytes, false);
         let covered = last.is_some_and(|ts| ts >= job.to_ms);
-        update(root, &job.launch_file, |j| {
+        update(root, board_name, &job.launch_file, |j| {
             j.fetched = have;
             j.phase = "fetching".into();
             j.message = format!("{have} of about {estimate} bytes of the lead-up window");
@@ -466,7 +558,7 @@ async fn fetch_window(
     drop(out);
     stream.finish(false);
     // Header + window bytes form a CSV the lead-up cut reads like any file.
-    let assembled = dir(root).join(format!("{}.window.csv", job.launch_file));
+    let assembled = dir(root, board_name).join(format!("{}.window.csv", job.launch_file));
     {
         let mut file = std::fs::File::create(&assembled).map_err(|e| e.to_string())?;
         use std::io::Write;
@@ -490,7 +582,7 @@ fn finish(
     scratch: Option<(&FsPath, &FsPath)>,
 ) -> Result<(), StreamError> {
     let rows = match source {
-        Some(path) => board_sd::cut_lead_up(folder, "DAQ", &job.launch_file, path, job.from_ms, job.to_ms)
+        Some(path) => board_sd::cut_lead_up(folder, &job.board, &job.launch_file, path, job.from_ms, job.to_ms)
             .map_err(|e| StreamError::Other(e.to_string()))?,
         None => 0,
     };
@@ -498,7 +590,7 @@ fn finish(
         let _ = std::fs::remove_file(header);
         let _ = std::fs::remove_file(part);
     }
-    update(root, &job.launch_file, |j| {
+    update(root, &job.board, &job.launch_file, |j| {
         j.done = true;
         j.phase = if rows > 0 { "complete" } else { "unavailable" }.into();
         j.message = if rows > 0 {
