@@ -142,15 +142,16 @@ pub(crate) fn decode_diagnostics(w: &[u32]) -> Option<BoardDiagnostics> {
                 stale_drops: w[21],
             }
         }),
-        // GB: the same words, tagged "LTC1", when no SD/ADC block owns them.
+        // GB/PB: the same words, tagged "LTC1", when no SD/ADC block owns
+        // them. PB stops at word 19 (see observe_diagnostics).
         power_monitors: (w[1] & (16 | 32 | 128) == 0 && w[16] == POWER_MONITOR_TAG).then(|| {
             PowerMonitorHealth {
                 voltage_present: w[17] & 1 != 0,
                 current_present: w[17] & 2 != 0,
                 retry_delay_ms: w[18],
                 retries: w[19],
-                bus_clears: w[20],
-                failed_bus_clears: w[21],
+                bus_clears: Some(w[20]),
+                failed_bus_clears: Some(w[21]),
             }
         }),
         // AB: words 19..20, tagged "CSN1" (words 16..18 carry its last refusal).
@@ -315,6 +316,13 @@ impl Tracker {
             return false;
         }
         let mut report = report;
+        if sender == "PB"
+            && let Some(power) = report.power_monitors.as_mut()
+        {
+            // PB's LTC1 block is words 16..19; it has no bus-clear counters.
+            power.bus_clears = None;
+            power.failed_bus_clears = None;
+        }
         report.time_sync = decode_time_sync(sender, words);
         if report.time_sync.is_some_and(|t| t.synced) {
             BOARD_TIME_LOCKED_UNTIL_MS.store(monotonic_ms() + 15_000, std::sync::atomic::Ordering::Relaxed);
@@ -728,8 +736,8 @@ mod tests {
                 current_present: false,
                 retry_delay_ms: 4000,
                 retries: 9,
-                bus_clears: 2,
-                failed_bus_clears: 1,
+                bus_clears: Some(2),
+                failed_bus_clears: Some(1),
             })
         );
         assert_eq!(decoded.rf_tx_timing, None);
@@ -740,6 +748,31 @@ mod tests {
         }
         let json = serde_json::to_value(decode_diagnostics(&[1, 0, 0, 0, 1000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap()).unwrap();
         assert!(json.get("power_monitors").is_none() && json.get("current_sense").is_none());
+    }
+    #[test]
+    fn pb_power_monitor_block_has_no_bus_clear_counters() {
+        let mut words = [0_u32; 24];
+        words[0] = 1;
+        words[4] = 1000;
+        words[1] = 1;
+        words[16..20].copy_from_slice(&[0x3143_544C, 2, 8000, 5]);
+        let mut tracker = Tracker::default();
+        let now = Instant::now();
+        assert!(tracker.observe_diagnostics("PB", &words, now, 1));
+        assert!(tracker.observe_diagnostics("GB", &words, now, 1));
+        let power = |sender: &str| tracker.boards[sender].diagnostics.as_ref().unwrap().0.power_monitors.clone().unwrap();
+        assert_eq!(
+            power("PB"),
+            PowerMonitorHealth {
+                voltage_present: false,
+                current_present: true,
+                retry_delay_ms: 8000,
+                retries: 5,
+                bus_clears: None,
+                failed_bus_clears: None,
+            }
+        );
+        assert_eq!(power("GB").bus_clears, Some(0));
     }
     #[test]
     fn ab_current_sense_status_names_channels_and_flags() {

@@ -628,8 +628,8 @@ pub struct BoardDiagnostics {
     /// RF radio TX queue timing block. Missing on older RF firmware/other boards.
     #[serde(default)]
     pub rf_tx_timing: Option<RfTxTiming>,
-    /// GB LTC2990 power monitors (words 16..21, tag "LTC1"). Missing on
-    /// older GB firmware and other boards.
+    /// GB/PB LTC2990 power monitors (word 16 tag "LTC1"). Missing on older
+    /// GB/PB firmware and other boards.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub power_monitors: Option<PowerMonitorHealth>,
     /// AB Hall current-sense trust (words 19..20, tag "CSN1"). Missing on
@@ -719,19 +719,22 @@ pub struct BoardTimeSync {
     pub stratum: Option<u8>,
 }
 
-/// GB BOARD_HEALTH words 16..21 ("LTC1" tag): which LTC2990 power monitors
-/// answer and the I2C retry backoff. Counters are cumulative since boot.
+/// GB (words 16..21) and PB (words 16..19) BOARD_HEALTH "LTC1" block: which
+/// LTC2990 power monitors answer and the I2C retry backoff. Counters are
+/// cumulative since boot. PB has no bus-clear counters (`None`).
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default, Hash)]
 pub struct PowerMonitorHealth {
     /// The voltage LTC2990 answers (absent readings are not trusted).
     pub voltage_present: bool,
     /// The current LTC2990 answers.
     pub current_present: bool,
-    /// Current retry delay, ms; 0 when both answer.
+    /// Current (PB: longest) retry delay, ms; 0 when both answer.
     pub retry_delay_ms: u32,
     pub retries: u32,
-    pub bus_clears: u32,
-    pub failed_bus_clears: u32,
+    #[serde(default)]
+    pub bus_clears: Option<u32>,
+    #[serde(default)]
+    pub failed_bus_clears: Option<u32>,
 }
 
 /// AB BOARD_HEALTH words 19..20 ("CSN1" tag): Hall current-sense trust.
