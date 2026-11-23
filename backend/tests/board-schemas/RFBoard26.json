@@ -242,9 +242,9 @@
       "priority": 200
     },
     {
-      "rust": "ActuatorFuelTankPressure",
-      "name": "FUEL_TANK_PRESSURE",
-      "doc": "Fuel Tank Pressure: 1 \u00d7 float32 element.",
+      "rust": "ActuatorOxTankPressure",
+      "name": "OX_TANK_PRESSURE",
+      "doc": "Ox Tank Pressure: 1 \u00d7 float32 element (psi).",
       "class": "Data",
       "element": {
         "kind": "Static",
