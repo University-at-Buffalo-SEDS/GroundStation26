@@ -7,7 +7,7 @@
   "stale_ms": 5000,
   "sources": [
     "FirmwareSimulator src/bay/native_plant.rs (Supply::paths: supply reaches the tank only with the AB valve open, the QD connected and the bottle open)",
-    "GroundStation26 docs/firmware-sim.md (bottles, regulator 1000 psi, 12 L tank, vent vapour, dump liquid)",
+    "GroundStation26 docs/firmware-sim.md (bottles, regulator 1000 psi, 15.85 L tank, vent vapour, dump liquid)",
     "GroundStation26 backend/src/telemetry_task.rs valve_state_values (VALVE_STATE order)",
     "GroundStation26 backend/src/gse/overpressure.rs (850 psi relief, 950 psi abort, defaults)",
     "ActuatorBoard26 main.h N2_SIG PB13, N20_SIG PB14, IGNITER_SIG PB12; ValveBoard26 main.h Solenoid PB11, servo_driver.h vent/dump servos",
@@ -29,7 +29,7 @@
     { "id": "n2o_bottle", "kind": "bottle", "label": "N2O bottle", "sublabel": "≈745 psi (20 °C)", "x": 40, "y": 360, "w": 80, "h": 170, "fluid": "n2o_liquid",
       "pressure": { "constant": 745, "assumed": true } },
     { "id": "manifold", "kind": "junction", "label": "Fill manifold", "x": 440, "y": 300, "w": 16, "h": 16 },
-    { "id": "tank", "kind": "tank", "label": "Run tank", "sublabel": "12 L", "x": 680, "y": 160, "w": 130, "h": 300,
+    { "id": "tank", "kind": "tank", "label": "Run tank", "sublabel": "15.85 L", "x": 680, "y": 160, "w": 130, "h": 300,
       "pressure": { "telemetry": "PRESSURE_TRANSDUCER_CALIBRATED", "sender": "VB" },
       "level": { "telemetry": "LOADCELL_FILL_PERCENT", "sender": "DAQ" } },
     { "id": "atm_vent", "kind": "atmosphere", "label": "Atmosphere", "sublabel": "vent", "x": 1000, "y": 70, "w": 110, "h": 44,

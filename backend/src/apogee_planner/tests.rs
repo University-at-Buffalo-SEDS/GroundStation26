@@ -39,6 +39,17 @@ fn model_copies_match_tools_flight_profile() {
     assert!((reference.impulse - motor::REF_IMPULSE_NS).abs() < 1.0, "REF_IMPULSE_NS follows the curve: {}", reference.impulse);
 }
 
+#[test]
+fn the_default_tank_volume_is_the_measured_one_in_vehicle_json() {
+    let cfg: Value = serde_json::from_str(flight::VEHICLE_JSON).unwrap();
+    assert_eq!(cfg["vehicle"]["run_tank_volume_l"].as_f64(), Some(DEFAULT_TANK_VOLUME_L), "vehicle.json run_tank_volume_l");
+    assert!((DEFAULT_TANK_VOLUME_L - 967.45 * 0.016387064).abs() < 1e-4, "967.45 in³");
+    assert_eq!(Settings::default().tank_volume_l, DEFAULT_TANK_VOLUME_L);
+    // 15 % ullage at 20 °C: about 11.0 kg (10.6 kg liquid + 0.4 kg vapour)
+    let max = n2o::max_fill_kg(DEFAULT_TANK_VOLUME_L, 0.15, 20.0);
+    assert!((max - 10.97).abs() < 0.02, "{max}");
+}
+
 // ------------------------------------------------------------ flight model vs tools/flight_profile
 
 fn set_path(cfg: &mut Value, dotted: &str, value: &Value) {
@@ -293,7 +304,7 @@ fn solver_input(target_m: f64) -> solver::Input {
         fit: motor::MotorFit::fit(&[motor::FitPoint::reference()]),
         target_m,
         tank_c: 15.0,
-        tank_volume_l: 12.0,
+        tank_volume_l: DEFAULT_TANK_VOLUME_L,
         min_ullage: 0.15,
         min_fill_kg: 3.0,
         max_supercharge_psi: 800.0,
@@ -531,6 +542,58 @@ async fn settings_vehicle_and_calibration_persist() {
     assert_eq!(inner.calibration.points.len(), 1);
     assert_eq!(inner.applied.as_ref().unwrap().plan.id, plan.id);
     assert!(!inner.fit_history.is_empty());
+}
+
+async fn load_settings_file(body: &Value) -> (Settings, Value) {
+    let dir = temp_dir("migrate");
+    std::fs::create_dir_all(dir.join(DIR)).unwrap();
+    std::fs::write(dir.join(DIR).join(SETTINGS_FILE), serde_json::to_vec(body).unwrap()).unwrap();
+    let state = crate::state::tests::test_app_state().await;
+    load(&state, dir.clone());
+    let settings = rt(&state).inner.lock().unwrap().settings.clone();
+    let stored: Value = serde_json::from_slice(&std::fs::read(dir.join(DIR).join(SETTINGS_FILE)).unwrap()).unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+    (settings, stored)
+}
+
+#[tokio::test]
+async fn stored_settings_with_the_assumed_12_l_default_move_to_the_measured_tank() {
+    // A station's settings from before the version field, still on the old default.
+    let mut old = serde_json::to_value(Settings { target_apogee_m: 2500.0, ..Default::default() }).unwrap();
+    old["tank_volume_l"] = json!(12.0);
+    old.as_object_mut().unwrap().remove("version");
+    let (s, stored) = load_settings_file(&old).await;
+    assert_eq!(s.tank_volume_l, DEFAULT_TANK_VOLUME_L);
+    assert_eq!(s.version, SETTINGS_VERSION);
+    assert!((s.target_apogee_m - 2500.0).abs() < 1e-9, "the rest is kept");
+    assert_eq!(stored["tank_volume_l"].as_f64(), Some(DEFAULT_TANK_VOLUME_L), "written back");
+    assert_eq!(stored["version"].as_u64(), Some(SETTINGS_VERSION as u64));
+
+    // An administrator's own volume is kept.
+    old["tank_volume_l"] = json!(14.0);
+    let (s, _) = load_settings_file(&old).await;
+    assert_eq!(s.tank_volume_l, 14.0);
+
+    // Once current, 12 L is an administrator's choice and stays.
+    old["tank_volume_l"] = json!(12.0);
+    old["version"] = json!(SETTINGS_VERSION);
+    let (s, _) = load_settings_file(&old).await;
+    assert_eq!(s.tank_volume_l, 12.0);
+}
+
+#[tokio::test]
+async fn an_administrator_setting_12_l_is_kept_across_a_restart() {
+    let r = rig(Mode::Normal).await;
+    let dir = rt(&r.state).inner.lock().unwrap().data_dir.clone().unwrap();
+    // A client that does not send the version.
+    let mut body = serde_json::to_value(Settings { target_apogee_m: 2000.0, tank_volume_l: 12.0, ..Default::default() }).unwrap();
+    body.as_object_mut().unwrap().remove("version");
+    let settings: Settings = serde_json::from_value(body).unwrap();
+    assert_eq!(settings.version, 0);
+    update_settings(&r.state, &principal(true, true), settings).unwrap();
+    let again = crate::state::tests::test_app_state().await;
+    load(&again, dir);
+    assert_eq!(rt(&again).inner.lock().unwrap().settings.tank_volume_l, 12.0);
 }
 
 /// `cargo test -p groundstation_backend print_reference_plans -- --ignored --nocapture`

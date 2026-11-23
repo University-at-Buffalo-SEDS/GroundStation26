@@ -123,22 +123,25 @@ mod tests {
     }
 
     #[test]
-    fn twelve_litre_tank_at_fifteen_percent_ullage_holds_the_default_8_kg() {
-        let m = max_fill_kg(12.0, 0.15, 20.0);
-        assert!((m - 8.3).abs() < 0.3, "{m}");
-        assert!(max_fill_kg(12.0, 0.15, 30.0) < m, "warmer liquid is less dense");
-        assert!((ullage(12.0, m, 20.0) - 0.15).abs() < 1e-6);
+    fn the_measured_tank_at_fifteen_percent_ullage_holds_about_11_kg() {
+        // 967.45 in³ = 15.8537 L: 10.6 kg liquid + 0.4 kg vapour at 20 °C
+        let v = crate::apogee_planner::DEFAULT_TANK_VOLUME_L;
+        let m = max_fill_kg(v, 0.15, 20.0);
+        assert!((m - 10.97).abs() < 0.05, "{m}");
+        assert!(max_fill_kg(v, 0.15, 30.0) < m, "warmer liquid is less dense");
+        assert!((ullage(v, m, 20.0) - 0.15).abs() < 1e-6);
     }
 
     #[test]
     fn supercharge_raises_the_mean_pressure_only_above_vapour_pressure() {
+        let v = crate::apogee_planner::DEFAULT_TANK_VOLUME_L;
         let pv = vapour_pressure_psig(10.0);
-        let self_p = mean_liquid_phase_pressure_pa(12.0, 6.0, 10.0, pv - 50.0);
+        let self_p = mean_liquid_phase_pressure_pa(v, 6.0, 10.0, pv - 50.0);
         assert!((self_p - SELF_PRESSURISED_FACTOR * vapour_pressure_pa(10.0)).abs() < 1.0);
-        let sc = mean_liquid_phase_pressure_pa(12.0, 6.0, 10.0, 750.0);
+        let sc = mean_liquid_phase_pressure_pa(v, 6.0, 10.0, 750.0);
         assert!(sc > self_p);
         // A fuller tank (less ullage) loses its nitrogen pad pressure faster.
-        let full = mean_liquid_phase_pressure_pa(12.0, 8.0, 10.0, 750.0);
+        let full = mean_liquid_phase_pressure_pa(v, 10.0, 10.0, 750.0);
         assert!(full < sc);
     }
 }

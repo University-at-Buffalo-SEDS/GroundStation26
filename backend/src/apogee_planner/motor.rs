@@ -30,15 +30,16 @@ pub fn reference_mean_pressure_pa() -> f64 {
 
 /// Mean liquid-phase pressure (Pa abs) of a fire from what the archive knows:
 /// its tank pressure at ignition (taken as the start of the liquid phase), or,
-/// failing that, the vapour pressure at the ambient temperature.
+/// failing that, the vapour pressure at the ambient temperature. The fires were
+/// on the run tank, so its measured volume sets a supercharged fire's ullage.
 pub fn mean_pressure_for_fire(tank_psig: Option<f64>, supercharge_psig: Option<f64>, ambient_c: Option<f64>, fill_kg: f64) -> f64 {
     match (tank_psig, ambient_c) {
         (Some(p), _) => {
             let t = n2o::saturation_temperature_c((p + n2o::ATM_PSI) * n2o::PA_PER_PSI);
             let sc = supercharge_psig.unwrap_or(p).max(p);
-            n2o::mean_liquid_phase_pressure_pa(12.0, fill_kg, t, sc)
+            n2o::mean_liquid_phase_pressure_pa(crate::apogee_planner::DEFAULT_TANK_VOLUME_L, fill_kg, t, sc)
         }
-        (None, Some(t)) => n2o::mean_liquid_phase_pressure_pa(12.0, fill_kg, t, supercharge_psig.unwrap_or(0.0)),
+        (None, Some(t)) => n2o::mean_liquid_phase_pressure_pa(crate::apogee_planner::DEFAULT_TANK_VOLUME_L, fill_kg, t, supercharge_psig.unwrap_or(0.0)),
         _ => reference_mean_pressure_pa(),
     }
 }
@@ -227,14 +228,14 @@ mod tests {
         let cfg = Config::reference();
         let fit = MotorFit::fit(&[FitPoint::reference()]);
         let t = n2o::saturation_temperature_c((REF_TANK_PSIG + n2o::ATM_PSI) * n2o::PA_PER_PSI);
-        let m = motor_for_fill(&cfg, &fit, REF_FILL_KG, t, 0.0, 12.0, 1.0);
+        let m = motor_for_fill(&cfg, &fit, REF_FILL_KG, t, 0.0, crate::apogee_planner::DEFAULT_TANK_VOLUME_L, 1.0);
         assert!((m.motor.impulse - REF_IMPULSE_NS).abs() < 1.0, "{}", m.motor.impulse);
         let base = Motor::from_config(&cfg.motor, THRUST_CSV);
         assert!((m.motor.burn_s() - base.burn_s()).abs() < 1e-3, "same pressure, same curve: {} vs {} (pbar {} ref {})", m.motor.burn_s(), base.burn_s(), m.mean_pressure_pa, fit.p_ref_pa);
         // More fill burns longer at the same pressure; a supercharge burns harder.
-        let big = motor_for_fill(&cfg, &fit, 7.5, t, 0.0, 12.0, 1.0);
+        let big = motor_for_fill(&cfg, &fit, 7.5, t, 0.0, crate::apogee_planner::DEFAULT_TANK_VOLUME_L, 1.0);
         assert!(big.motor.burn_s() > base.burn_s());
-        let hard = motor_for_fill(&cfg, &fit, REF_FILL_KG, t, 750.0, 12.0, 1.0);
+        let hard = motor_for_fill(&cfg, &fit, REF_FILL_KG, t, 750.0, crate::apogee_planner::DEFAULT_TANK_VOLUME_L, 1.0);
         assert!(hard.motor.impulse > m.motor.impulse);
         assert!(hard.motor.f.iter().cloned().fold(0.0, f64::max) > base.f.iter().cloned().fold(0.0, f64::max));
     }

@@ -128,7 +128,7 @@ Both are tested on the same topology, by Rust unit tests and
 - Supply rule: FirmwareSimulator `src/bay/native_plant.rs` `Supply::paths`. Nitrous or nitrogen reaches the tank only with the AB valve open, the QD connected and the bottle open.
 - Bottles and regulator: `docs/firmware-sim.md`.
   - The regulator is set at 1000 psi; the N2O vapour pressure is about 745 psi at 20 °C. Both are drawn as assumed values.
-  - The tank is 12 L. The vent passes vapour; the dump passes liquid from the bottom.
+  - The tank is 15.85 L (measured 967.45 in³). The vent passes vapour; the dump passes liquid from the bottom.
 - Valve order: `VALVE_STATE` [pilot, normally-open (vent), dump, igniter, nitrogen, nitrous, retracted] (`telemetry_task.rs` `valve_state_values`).
 - Pins:
   - AB `N2_SIG` PB13, `N20_SIG` PB14, `IGNITER_SIG` PB12.

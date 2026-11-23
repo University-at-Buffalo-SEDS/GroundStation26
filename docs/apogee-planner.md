@@ -109,10 +109,13 @@ shorter. The propellant mass for the trajectory is `m_fill · (1 + 1/OF)` with O
 4 % residual, as in `vehicle.json`.
 
 **Achievable fill.** Max fill is the liquid that leaves the minimum ullage (default
-15 %) in the run tank (default 12 L, `vehicle.json`) at the warmest expected tank
+15 %) in the run tank (default 15.85 L, measured 967.45 in³, `vehicle.json`
+`run_tank_volume_l`) at the warmest expected tank
 temperature (forecast + 5 °C), plus the vapour: `m_max = ρ_l·V(1−u) + ρ_v·V·u`
 (N2O saturated densities and vapour pressure from the ESDU 91022 correlations, as used
-in the hybrid literature). 15 % at 20 °C gives 8.3 kg (8.0 kg liquid + 0.3 kg vapour), about the station's default 8 kg target.
+in the hybrid literature). 15 % at 20 °C gives 11.0 kg (10.6 kg liquid + 0.4 kg vapour) and leaves 2.38 L of headspace for the
+nitrogen; the planner's cap on a 20 °C day uses 25 °C and is 10.45 kg. (The 12 L assumed before the tank
+was measured gave 8.3 kg at 20 °C and 1.8 L.)
 The supercharge target must be at or above `P_vap(T)` (lower means no nitrogen is
 added) and below the hardware limits in section 4.
 
@@ -224,6 +227,10 @@ and every warning.
 - Settings → Mission → Apogee planner. An administrator sets the target apogee (ft or
   m AGL), the weather source, online weather opt-in, manual weather, tank and limit
   parameters, and imports a `.ork`. Anyone who may send commands can press **Compute**.
+  The settings live in `<data>/apogee_planner/settings.json` with a `version`. Settings
+  from before version 1 that still hold the assumed 12 L tank volume (the old default;
+  no measured volume existed then) are moved to the measured 15.85 L at startup and
+  written back; any other stored volume is the administrator's and is kept.
 - The plan shows fill mass, supercharge pressure, the apogee band, warnings, the weather
   used and its age, the vehicle and motor-fit sources.
 - **Apply to fill targets** opens a confirm dialog listing the old and new targets and
@@ -251,8 +258,13 @@ and every warning.
 
 **What the numbers say today.** With the corrected 9.19 kN·s fire and the pressure
 exponent prior (n = 0.3), a 20 °C day with the nominal 750 psi supercharge reaches
-10,000 ft with about 6.0 kg (band ±600 m, from the single fire's 10 % impulse
-uncertainty, extrapolation to a warmer, harder-pressurised tank, and the weather). The
+10,000 ft with about 6.2 kg (band ±630 m, from the single fire's 10 % impulse
+uncertainty, extrapolation to a warmer, harder-pressurised tank, and the weather), well
+under the 10.45 kg max fill. With the measured 15.85 L tank that fill leaves about 63 % ullage
+(10.0 L of nitrogen and vapour, against 46 % / 5.5 L for 6.0 kg in the 12 L tank assumed
+before), so the nitrogen pad holds its pressure longer: the volume alone takes the fill
+from 6.0 to 5.95 kg, and the 8.6 kg tank estimate
+(33.2 kg dry instead of 31.6) adds the rest. The
 pre-correction 7.05 kN·s curve could not reach 10k ft; the planner handles an
 unreachable target (it reports the reach and disables Apply), and that path is tested.
 

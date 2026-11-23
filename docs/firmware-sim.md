@@ -156,7 +156,7 @@ their internal state:
 
 Fill system:
 
-* **Nitrous**: saturated liquid/vapour in a 12 L tank with ESDU 91022 property correlations (vapour pressure,
+* **Nitrous**: saturated liquid/vapour in the 15.85 L run tank (measured 967.45 in³, `vehicle.json` `run_tank_volume_l`) with ESDU 91022 property correlations (vapour pressure,
   liquid/vapour density, latent heat, liquid heat capacity; checked against NIST at -20/0/20 C), equilibrium
   liquid/vapour split and ullage, a lumped liquid+wall temperature with heat from ambient. Liquid flows in from a
   22.7 kg bottle at ambient (orifice flow, 15 psi head) only while the AB valve is open, the QD connected and the
@@ -191,7 +191,7 @@ Liftoff and flight: the motor lights once the igniter has fired (not required in
 fires no igniter) and the pilot opens with at least 0.5 kg of liquid; the main valve is assumed to stay open to
 burnout once lit (HITL opens the pilot for 1.5 s). On the test stand (test fire mode) the rocket stays put. In
 flight: the umbilical separates (the VB leaves the fill CAN bus, the continuity loop opens, the QD disconnects);
-1-D vertical dynamics with the vehicle of `tools/flight_profile/vehicle.json` (31.6 kg dry, 1.1 kg fuel, 6 in, Cd
+1-D vertical dynamics with the vehicle of `tools/flight_profile/vehicle.json` (33.2 kg dry, 1.1 kg fuel, 6 in, Cd
 0.5), drag with ISA density shifted by the ambient temperature, horizontal wind drift with gusts (no weathercocking);
 descent 25 m/s under the drogue and 5.8 m/s under the main after the FC fires each output, ballistic without them.
 The FC barometer reads true ISA pressure at the geometric altitude above the 890 m pad (FlightComputer26 baro_agl,
@@ -245,7 +245,7 @@ Additions since the MVP:
 The FC runs its real estimator and recovery logic. The coordinator's flight model drives the FC's BMP390/BMI088
 models through the native shim (`sim_flight_sensors.c`, "flightsens" device, from the first plant step): the pad
 before liftoff, then the flight. Pyro outputs are observed and change the descent model. The vehicle parameters
-mirror `tools/flight_profile/vehicle.json` (15 ft x 6 in, 31.6 kg dry) and the 11-16 motor; with the measured
+mirror `tools/flight_profile/vehicle.json` (15 ft x 6 in, 33.2 kg dry) and the 11-16 motor; with the measured
 motor the vehicle reaches about 1.4 km, `motor.impulse_scale` about 1.8 gives the 10 kft profile.
 
 ## 5. Raspberry Pi 5, bundles and the remote build

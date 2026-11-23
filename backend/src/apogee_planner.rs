@@ -46,6 +46,13 @@ const FIT_HISTORY_FILE: &str = "fit_history.json";
 pub(crate) const PLAN_MAX_AGE_MS: i64 = 30 * 60 * 1000;
 const MAX_ORK_BYTES: usize = 32 * 1024 * 1024;
 const FT: f64 = 0.3048;
+/// The run tank's measured volume: 967.45 in³ (Rylan, 2026-11-23), as
+/// `run_tank_volume_l` in tools/flight_profile/vehicle.json (a test checks they agree).
+pub const DEFAULT_TANK_VOLUME_L: f64 = 15.8537;
+/// The volume assumed before the tank was measured, the default of settings version 0.
+const ASSUMED_TANK_VOLUME_L: f64 = 12.0;
+/// 1: the default tank volume is the measured one (`Settings::migrate`).
+const SETTINGS_VERSION: u32 = 1;
 
 // ------------------------------------------------------------ settings
 
@@ -64,6 +71,9 @@ pub struct Settings {
     pub min_fill_kg: f64,
     pub meop_psi: f64,
     pub nominal_supercharge_psi: Option<f64>,
+    /// Settings written before the version existed read as 0 (not the current default).
+    #[serde(default)]
+    pub version: u32,
 }
 
 impl Default for Settings {
@@ -76,16 +86,37 @@ impl Default for Settings {
             launch_time_ms: None,
             manual_weather: Default::default(),
             tank_temp_c: None,
-            tank_volume_l: 12.0,
+            tank_volume_l: DEFAULT_TANK_VOLUME_L,
             min_ullage_frac: 0.15,
             min_fill_kg: 3.0,
             meop_psi: 750.0,
             nominal_supercharge_psi: None,
+            version: SETTINGS_VERSION,
         }
     }
 }
 
 impl Settings {
+    /// Brings settings stored by an older station up to date; returns what changed.
+    ///
+    /// Version 0 stored the assumed 12 L default for the tank volume. Nobody had a
+    /// measured volume then, so a stored 12 L is that untouched default (an
+    /// administrator could not have entered it as a measurement) and becomes the
+    /// measured volume. Any other stored volume was set by an administrator and is kept.
+    fn migrate(&mut self) -> Option<String> {
+        if self.version >= SETTINGS_VERSION {
+            return None;
+        }
+        self.version = SETTINGS_VERSION;
+        if self.tank_volume_l == ASSUMED_TANK_VOLUME_L {
+            self.tank_volume_l = DEFAULT_TANK_VOLUME_L;
+            return Some(format!(
+                "Apogee planner: the run tank volume setting was the old assumed {ASSUMED_TANK_VOLUME_L} L default; it is now the measured {DEFAULT_TANK_VOLUME_L} L (967.45 in³)."
+            ));
+        }
+        Some(format!("Apogee planner: kept the administrator's run tank volume setting of {} L.", self.tank_volume_l))
+    }
+
     fn validate(&self) -> Result<(), String> {
         if !(30.0..=30_000.0).contains(&self.target_apogee_m) {
             return Err("Target apogee must be within 30..30000 m AGL.".into());
@@ -263,6 +294,12 @@ fn append_log(dir: &Path, value: &Value) -> std::io::Result<()> {
 pub(crate) fn load(state: &AppState, dir: PathBuf) {
     let mut inner = rt(state).inner.lock().unwrap();
     inner.settings = read_json::<Settings>(&dir, SETTINGS_FILE).filter(|s| s.validate().is_ok()).unwrap_or_default();
+    if let Some(note) = inner.settings.migrate() {
+        log::info!("{note}");
+        if let Err(e) = write_json(&dir, SETTINGS_FILE, &inner.settings) {
+            log::warn!("Apogee planner: the migrated settings were not saved ({e}); they are migrated again at the next start.");
+        }
+    }
     inner.weather_cache = read_json(&dir, WEATHER_FILE);
     inner.vehicle = read_json(&dir, VEHICLE_FILE);
     inner.calibration = read_json(&dir, CALIBRATION_FILE).unwrap_or_default();
@@ -760,7 +797,9 @@ pub(crate) fn view(state: &AppState) -> Value {
     })
 }
 
-pub(crate) fn update_settings(state: &AppState, principal: &AuthPrincipal, settings: Settings) -> Result<Value, (StatusCode, String)> {
+pub(crate) fn update_settings(state: &AppState, principal: &AuthPrincipal, mut settings: Settings) -> Result<Value, (StatusCode, String)> {
+    // An administrator's settings are current whatever version the client sent.
+    settings.version = SETTINGS_VERSION;
     if principal.anonymous || !principal.is_admin() {
         return Err((StatusCode::FORBIDDEN, "Only an administrator may change the apogee planner settings.".into()));
     }
