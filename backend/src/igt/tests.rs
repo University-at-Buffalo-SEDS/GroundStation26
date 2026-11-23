@@ -467,7 +467,8 @@ async fn recording_start_rows_name_the_station_mode() {
     assert_eq!(kinds[0].0, "GS_STATION_MODE");
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&kinds[0].1).unwrap(),
-        json!({"mode": "integrated_ground_test", "igt_active": true, "mock_wet_dress": false, "hitl_replay": false})
+        json!({"mode": "integrated_ground_test", "igt_active": true, "mock_wet_dress": false, "hitl_replay": false,
+               "provenance": "hardware", "firmware_sim": false})
     );
     assert_eq!(kinds[0].2, "GS");
     assert_eq!(kinds[1].0, "GS_IGT");

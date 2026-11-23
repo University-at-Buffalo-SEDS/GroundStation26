@@ -7,11 +7,12 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
-use sqlx::{
-    Row, SqlitePool,
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
-};
+use sqlx::{Row, SqlitePool};
 use std::sync::Arc;
+pub(crate) mod context;
+pub(crate) mod sources;
+#[cfg(test)]
+mod replay_modes_tests;
 const PAGE: i64 = 512;
 const MAX_WINDOW_MS: i64 = 30_000;
 
@@ -69,6 +70,9 @@ pub struct Sample {
     pub diagnostic: Option<serde_json::Value>,
     #[serde(default,skip_serializing_if="Option::is_none")]
     pub valid_until_ms: Option<i64>,
+    /// Version-aware decoding of a packed status row (DAQ_INPUT_HEALTH v1/v2).
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    pub decoded: Option<serde_json::Value>,
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Page {
@@ -81,19 +85,33 @@ pub struct Page {
     pub diagnostic_streams: Option<serde_json::Value>,
 }
 async fn open(state: &AppState, id: &str) -> Result<SqlitePool, StatusCode> {
-    let path = recording_export::recording_path(&recording_export::directory(state), id).await?;
-    let db = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(
-            SqliteConnectOptions::new()
-                .filename(path)
-                .read_only(true)
-                .create_if_missing(false),
-        )
-        .await
-        .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
-    crate::recording_sd::activate_resolved(&db).await.map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
-    Ok(db)
+    sources::open(state, id).await
+}
+/// The u32 words of a packet payload saved as a JSON byte array.
+pub(crate) fn payload_words(payload: &str) -> Option<Vec<u32>> {
+    let bytes: Vec<u8> = serde_json::from_str(payload).ok()?;
+    (bytes.len() % 4 == 0 && !bytes.is_empty())
+        .then(|| bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+}
+/// DAQ_INPUT_HEALTH decoded with the station's decoder, which reads both the
+/// version-1 (10 word) and version-2 (18 word) layouts.
+fn decode_input_health(payload: &str) -> Option<serde_json::Value> {
+    let words = payload_words(payload)?;
+    let report = crate::daq_input_health::Report::decode(&words)?;
+    let mut value = serde_json::json!({
+        "version": words[0] & 0xFF,
+        "active": report.active, "latched": report.latched, "episodes": report.episodes,
+        "vmain_mv": report.vmain_mv, "vmain_min_mv": report.vmain_min_mv,
+        "chamber_mv": report.chamber_mv, "chamber_min_mv": report.chamber_min_mv,
+        "faults": crate::daq_input_health::FAULTS.iter().filter(|f| report.active & f.bit() != 0).map(|f| f.label()).collect::<Vec<_>>(),
+    });
+    if let Some(v2) = &report.v2 {
+        value["noise"] = serde_json::to_value(v2.noise).unwrap_or_default();
+        value["excitation_mv"] = serde_json::to_value(v2.excitation_mv).unwrap_or_default();
+        value["frames_skipped"] = v2.frames_skipped.into();
+        value["scans_restarted"] = v2.scans_restarted.into();
+    }
+    Some(value)
 }
 async fn snapshot_from(db: &SqlitePool) -> anyhow::Result<Snapshot> {
     let row=sqlx::query("SELECT COALESCE(MAX(id),0) AS upper_id, MIN(timestamp_ms) AS start_ms, MAX(timestamp_ms) AS end_ms FROM telemetry").fetch_one(db).await?;
@@ -112,7 +130,7 @@ async fn page_from(db: &SqlitePool, window: &Window) -> anyhow::Result<Page> {
     let types = window.types()?;
     let volts_from_id = crate::telemetry_db::loadcell_volts_from_id(db).await;
     let diagnostic_payload = diagnostic_payload_expression(db).await?;
-    let rows=sqlx::query(if diagnostic_payload { "SELECT id,timestamp_ms,source_timestamp_ms,substr(COALESCE(sender_id,''),1,257) AS sender_id,data_type,substr(COALESCE(values_json,'[]'),1,32769) AS values_json, CASE WHEN substr(data_type,1,4)='REC_' OR data_type IN ('BOARD_HEALTH','DAQ_SD_HEALTH','DAQ_LAUNCH_LOG_STATUS') THEN substr(payload_json,1,16385) ELSE NULL END AS recorded_diagnostic_payload, CASE WHEN data_type='KG50' THEN substr(payload_json,1,256) END AS loadcell_payload FROM telemetry WHERE id > ? AND id <= ? AND timestamp_ms >= ? AND timestamp_ms <= ? AND data_type IN (SELECT value FROM json_each(?)) ORDER BY id LIMIT ?" } else { "SELECT id,timestamp_ms,source_timestamp_ms,substr(COALESCE(sender_id,''),1,257) AS sender_id,data_type,substr(COALESCE(values_json,'[]'),1,32769) AS values_json, NULL AS recorded_diagnostic_payload, NULL AS loadcell_payload FROM telemetry WHERE id > ? AND id <= ? AND timestamp_ms >= ? AND timestamp_ms <= ? AND data_type IN (SELECT value FROM json_each(?)) ORDER BY id LIMIT ?" })
+    let rows=sqlx::query(if diagnostic_payload { "SELECT id,timestamp_ms,source_timestamp_ms,substr(COALESCE(sender_id,''),1,257) AS sender_id,data_type,substr(COALESCE(values_json,'[]'),1,32769) AS values_json, CASE WHEN substr(data_type,1,4)='REC_' OR data_type IN ('BOARD_HEALTH','DAQ_SD_HEALTH','DAQ_LAUNCH_LOG_STATUS') THEN substr(payload_json,1,16385) ELSE NULL END AS recorded_diagnostic_payload, CASE WHEN data_type IN ('KG50','DAQ_INPUT_HEALTH') THEN substr(payload_json,1,512) END AS loadcell_payload FROM telemetry WHERE id > ? AND id <= ? AND timestamp_ms >= ? AND timestamp_ms <= ? AND data_type IN (SELECT value FROM json_each(?)) ORDER BY id LIMIT ?" } else { "SELECT id,timestamp_ms,source_timestamp_ms,substr(COALESCE(sender_id,''),1,257) AS sender_id,data_type,substr(COALESCE(values_json,'[]'),1,32769) AS values_json, NULL AS recorded_diagnostic_payload, NULL AS loadcell_payload FROM telemetry WHERE id > ? AND id <= ? AND timestamp_ms >= ? AND timestamp_ms <= ? AND data_type IN (SELECT value FROM json_each(?)) ORDER BY id LIMIT ?" })
         .bind(window.after_id).bind(window.upper_id).bind(window.start_ms).bind(window.end_ms).bind(serde_json::to_string(&types)?).bind(PAGE+1).fetch_all(db).await?;
     let has_more = rows.len() > PAGE as usize;
     let mut samples = Vec::new();
@@ -124,7 +142,7 @@ async fn page_from(db: &SqlitePool, window: &Window) -> anyhow::Result<Page> {
     }
     let mut seeds = Vec::new();
     if window.after_id == 0 {
-        let rows = sqlx::query(if diagnostic_payload { "SELECT id,timestamp_ms,source_timestamp_ms,substr(COALESCE(sender_id,''),1,257) AS sender_id,data_type,substr(COALESCE(values_json,'[]'),1,32769) AS values_json, CASE WHEN substr(data_type,1,4)='REC_' OR data_type IN ('BOARD_HEALTH','DAQ_SD_HEALTH','DAQ_LAUNCH_LOG_STATUS') THEN substr(payload_json,1,16385) ELSE NULL END AS recorded_diagnostic_payload, CASE WHEN data_type='KG50' THEN substr(payload_json,1,256) END AS loadcell_payload FROM (SELECT *,ROW_NUMBER() OVER(PARTITION BY data_type,sender_id ORDER BY timestamp_ms DESC,id DESC) AS rank FROM telemetry WHERE id <= ? AND timestamp_ms < ? AND data_type IN (SELECT value FROM json_each(?))) WHERE rank=1 LIMIT 257" } else { "SELECT id,timestamp_ms,source_timestamp_ms,substr(COALESCE(sender_id,''),1,257) AS sender_id,data_type,substr(COALESCE(values_json,'[]'),1,32769) AS values_json, NULL AS recorded_diagnostic_payload, NULL AS loadcell_payload FROM (SELECT *,ROW_NUMBER() OVER(PARTITION BY data_type,sender_id ORDER BY timestamp_ms DESC,id DESC) AS rank FROM telemetry WHERE id <= ? AND timestamp_ms < ? AND data_type IN (SELECT value FROM json_each(?))) WHERE rank=1 LIMIT 257" })
+        let rows = sqlx::query(if diagnostic_payload { "SELECT id,timestamp_ms,source_timestamp_ms,substr(COALESCE(sender_id,''),1,257) AS sender_id,data_type,substr(COALESCE(values_json,'[]'),1,32769) AS values_json, CASE WHEN substr(data_type,1,4)='REC_' OR data_type IN ('BOARD_HEALTH','DAQ_SD_HEALTH','DAQ_LAUNCH_LOG_STATUS') THEN substr(payload_json,1,16385) ELSE NULL END AS recorded_diagnostic_payload, CASE WHEN data_type IN ('KG50','DAQ_INPUT_HEALTH') THEN substr(payload_json,1,512) END AS loadcell_payload FROM (SELECT *,ROW_NUMBER() OVER(PARTITION BY data_type,sender_id ORDER BY timestamp_ms DESC,id DESC) AS rank FROM telemetry WHERE id <= ? AND timestamp_ms < ? AND data_type IN (SELECT value FROM json_each(?))) WHERE rank=1 LIMIT 257" } else { "SELECT id,timestamp_ms,source_timestamp_ms,substr(COALESCE(sender_id,''),1,257) AS sender_id,data_type,substr(COALESCE(values_json,'[]'),1,32769) AS values_json, NULL AS recorded_diagnostic_payload, NULL AS loadcell_payload FROM (SELECT *,ROW_NUMBER() OVER(PARTITION BY data_type,sender_id ORDER BY timestamp_ms DESC,id DESC) AS rank FROM telemetry WHERE id <= ? AND timestamp_ms < ? AND data_type IN (SELECT value FROM json_each(?))) WHERE rank=1 LIMIT 257" })
             .bind(window.upper_id).bind(window.start_ms).bind(serde_json::to_string(&types)?).fetch_all(db).await?;
         anyhow::ensure!(rows.len() <= 256, "too many replay source series");
         for row in rows {
@@ -160,10 +178,11 @@ fn decode(row: sqlx::sqlite::SqliteRow, volts_from_id: i64) -> anyhow::Result<Sa
     );
     let mut values: Vec<Option<f32>> = serde_json::from_str(&raw)?;
     let id: i64 = row.try_get("id")?;
+    let payload: Option<String> = row.try_get("loadcell_payload").unwrap_or(None);
     if id < volts_from_id {
-        let payload: Option<String> = row.try_get("loadcell_payload").unwrap_or(None);
         crate::loadcell::legacy_loadcell_row_to_volts(&data_type, payload.as_deref(), &mut values);
     }
+    let decoded = (data_type == "DAQ_INPUT_HEALTH").then(|| payload.as_deref().and_then(decode_input_health)).flatten();
     anyhow::ensure!(
         values.len() <= 1024 && values.iter().flatten().all(|v| v.is_finite()),
         "invalid recorded replay values"
@@ -195,6 +214,7 @@ fn decode(row: sqlx::sqlite::SqliteRow, volts_from_id: i64) -> anyhow::Result<Sa
         phase,
         diagnostic,
         valid_until_ms:None,
+        decoded,
     })
 }
 
@@ -230,7 +250,7 @@ async fn export_from(db: &SqlitePool) -> anyhow::Result<serde_json::Value> {
     let mut bytes = 0usize;
     let mut after = 0i64;
     loop {
-        let rows = sqlx::query(if diagnostic_payload { "SELECT id,timestamp_ms,source_timestamp_ms,substr(COALESCE(sender_id,''),1,257) AS sender_id,data_type,substr(COALESCE(values_json,'[]'),1,32769) AS values_json, CASE WHEN substr(data_type,1,4)='REC_' OR data_type IN ('BOARD_HEALTH','DAQ_SD_HEALTH','DAQ_LAUNCH_LOG_STATUS') THEN substr(payload_json,1,16385) ELSE NULL END AS recorded_diagnostic_payload, CASE WHEN data_type='KG50' THEN substr(payload_json,1,256) END AS loadcell_payload FROM telemetry WHERE id>? AND id<=? ORDER BY id LIMIT 512" } else { "SELECT id,timestamp_ms,source_timestamp_ms,substr(COALESCE(sender_id,''),1,257) AS sender_id,data_type,substr(COALESCE(values_json,'[]'),1,32769) AS values_json, NULL AS recorded_diagnostic_payload, NULL AS loadcell_payload FROM telemetry WHERE id>? AND id<=? ORDER BY id LIMIT 512" })
+        let rows = sqlx::query(if diagnostic_payload { "SELECT id,timestamp_ms,source_timestamp_ms,substr(COALESCE(sender_id,''),1,257) AS sender_id,data_type,substr(COALESCE(values_json,'[]'),1,32769) AS values_json, CASE WHEN substr(data_type,1,4)='REC_' OR data_type IN ('BOARD_HEALTH','DAQ_SD_HEALTH','DAQ_LAUNCH_LOG_STATUS') THEN substr(payload_json,1,16385) ELSE NULL END AS recorded_diagnostic_payload, CASE WHEN data_type IN ('KG50','DAQ_INPUT_HEALTH') THEN substr(payload_json,1,512) END AS loadcell_payload FROM telemetry WHERE id>? AND id<=? ORDER BY id LIMIT 512" } else { "SELECT id,timestamp_ms,source_timestamp_ms,substr(COALESCE(sender_id,''),1,257) AS sender_id,data_type,substr(COALESCE(values_json,'[]'),1,32769) AS values_json, NULL AS recorded_diagnostic_payload, NULL AS loadcell_payload FROM telemetry WHERE id>? AND id<=? ORDER BY id LIMIT 512" })
             .bind(after).bind(snapshot.upper_id).fetch_all(db).await?;
         if rows.is_empty() { break; }
         for row in rows {
@@ -248,6 +268,8 @@ async fn export_from(db: &SqlitePool) -> anyhow::Result<serde_json::Value> {
         "samples":samples,"recording_diagnostics_schema":crate::telemetry_task::recording_diagnostics::descriptors(),"schema":serde_json::from_str::<serde_json::Value>(include_str!("../config/telemetry_config.json"))?});
     if let Some(config)=value["sd_provenance"]["imports"][0]["manifest"]["config"].as_object().cloned(){
         for field in ["schema","view_config","layout","valve_mappings"]{if let Some(saved)=config.get(field){value[field]=saved.clone();}}
+        // A layout saved before the barometer label fix names the values in the old order.
+        if crate::layout::relabel_legacy_barometer(&mut value["layout"]) { value["layout_relabelled"] = true.into(); }
         value["configuration_provenance"]="Imported capture configuration; all source-specific snapshots retained in sd_provenance.imports".into();
     }
     Ok(value)
@@ -257,7 +279,13 @@ pub async fn export(State(state): State<Arc<AppState>>, headers: HeaderMap, Path
     if let Err(response) = crate::web::authorize_headers(&state, &headers, Permission::ViewData).await { return response; }
     let db = match open(&state, &id).await { Ok(db) => db, Err(code) => return code.into_response() };
     match export_from(&db).await {
-        Ok(mut value) => { value["recording"] = id.into(); if serde_json::to_vec(&value).map_or(true,|bytes|bytes.len()>64*1024*1024){return (StatusCode::UNPROCESSABLE_ENTITY,"Replay including SD provenance exceeds 64 MiB; select a smaller recording").into_response();} json(value) },
+        Ok(mut value) => {
+            if let Some(source) = sources::Source::parse(&id)
+                && let Ok(ctx) = context::context_from(&crate::recording_export::directory(&state), &id, &source, &db).await
+            {
+                value["replay_context"] = serde_json::to_value(ctx).unwrap_or_default();
+            }
+            value["recording"] = id.into(); if serde_json::to_vec(&value).map_or(true,|bytes|bytes.len()>64*1024*1024){return (StatusCode::UNPROCESSABLE_ENTITY,"Replay including SD provenance exceeds 64 MiB; select a smaller recording").into_response();} json(value) },
         Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
     }
 }
@@ -1217,7 +1245,7 @@ mod loadcell_volts_replay_tests {
 
     #[tokio::test]
     async fn an_activated_sd_resolved_view_uses_its_own_mark() {
-        let db = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        let db = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
         sqlx::query("CREATE TABLE telemetry (id INTEGER PRIMARY KEY, timestamp_ms INTEGER NOT NULL, source_timestamp_ms INTEGER, sender_id TEXT, data_type TEXT NOT NULL, values_json TEXT, payload_json TEXT)")
             .execute(&db).await.unwrap();
         crate::telemetry_db::mark_loadcell_volts(&db).await.unwrap();

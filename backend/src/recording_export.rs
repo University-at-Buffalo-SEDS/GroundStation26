@@ -92,6 +92,10 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/api/recordings/{id}/replay/window",
             get(crate::recording_replay::window),
         )
+        .route("/api/recordings/{id}/replay/context", get(crate::recording_replay::context::context))
+        .route("/api/recordings/{id}/replay/layout", get(crate::recording_replay::context::layout))
+        .route("/api/recordings/{id}/replay/overlays", get(crate::recording_replay::context::overlays))
+        .route("/api/recordings/{id}/replay/alerts", get(crate::recording_replay::context::alerts))
         .route(
             "/api/recordings/{id}/replay/trajectory",
             get(crate::recording_replay::trajectory),

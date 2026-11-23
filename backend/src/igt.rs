@@ -616,6 +616,11 @@ pub(crate) fn recording_start_rows(state: &AppState) -> Vec<crate::telemetry_db:
             "igt_active": active,
             "mock_wet_dress": settings.mock_wet_dress,
             "hitl_replay": settings.hitl_replay,
+            // Where the data comes from, so a replay of any recording (not
+            // only a capture with a manifest) shows the simulated-firmware
+            // or flight-sim banner it was recorded under.
+            "provenance": crate::firmware_sim_mode::provenance(),
+            "firmware_sim": crate::firmware_sim_mode::enabled(),
         })
         .to_string(),
     }];

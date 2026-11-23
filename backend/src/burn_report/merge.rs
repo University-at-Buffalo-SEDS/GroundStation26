@@ -136,7 +136,7 @@ pub(crate) fn parse_daq_line(line: &str) -> Option<(Channel, Sample)> {
     ))
 }
 
-fn csv_fields(line: &str) -> Vec<String> {
+pub(crate) fn csv_fields(line: &str) -> Vec<String> {
     let mut fields = Vec::new();
     let mut current = String::new();
     let mut quoted = false;

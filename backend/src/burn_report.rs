@@ -545,7 +545,7 @@ fn live_tick(state: &Arc<AppState>, now: i64) {
     }
 }
 
-fn read_report(folder: &Path) -> Option<BurnReport> {
+pub(crate) fn read_report(folder: &Path) -> Option<BurnReport> {
     serde_json::from_slice(&std::fs::read(folder.join(REPORT_FILE)).ok()?).ok()
 }
 

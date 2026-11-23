@@ -995,6 +995,11 @@ fn apply_switch(state: &Arc<AppState>, from: Mode, token: crate::runtime_mode::M
         crate::gse::mode_switch::reset_phase_control(state);
     }
     LAYOUT_REVISION.fetch_add(1, Ordering::AcqRel);
+    // The recording keeps going across an in-process switch: mark the new mode
+    // in it, so a replay of this segment presents each part in its own mode.
+    for row in crate::igt::recording_start_rows(state) {
+        let _ = state.db_queue_tx.try_send(crate::telemetry_db::DbQueueItem::Write(row));
+    }
     // The policy the UI shows and the server enforces, for the new mode.
     crate::sequences::refresh_action_policy_projection(state);
 }

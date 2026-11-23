@@ -699,15 +699,101 @@ mod observer_mode_layout_tests {
 }
 
 pub fn load_layout() -> Result<LayoutConfig, String> {
-    let path = layout_path();
-    let raw = std::fs::read_to_string(&path)
+    load_layout_file(&layout_path(), presentation_mode())
+}
+
+/// The layout a station in `mode` presents, for a saved-data replay of a
+/// recording made in that mode. The station's own (possibly custom) layout is
+/// used when `mode` is the mode it presents now; otherwise the shipped
+/// default for `mode`. Never changes the station mode or its live layout.
+pub(crate) fn load_layout_for_mode(mode: crate::station_mode::Mode) -> Result<LayoutConfig, String> {
+    if mode == presentation_mode() {
+        return load_layout();
+    }
+    load_layout_file(&default_layout_path(mode), mode)
+}
+
+fn load_layout_file(path: &std::path::Path, mode: crate::station_mode::Mode) -> Result<LayoutConfig, String> {
+    let raw = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read layout file {path:?}: {e}"))?;
     let mut layout: LayoutConfig =
         serde_json::from_str(&raw).map_err(|e| format!("Invalid layout JSON: {e}"))?;
     normalize_flight_phases(&mut layout)?;
-    apply_runtime_layout_overrides(&mut layout);
+    apply_runtime_layout_overrides(&mut layout, mode);
     assign_control_sections(&mut layout);
     Ok(layout)
+}
+
+/// BAROMETER_DATA is (altitude, pressure, temperature) in every recording:
+/// the FC always sent that order, and only the station's labels were wrong
+/// before the fix. A layout saved before it (inside an SD import manifest or
+/// a portable replay) labels the channels (pressure, temperature, altitude);
+/// this puts every BAROMETER_DATA label back on the value it names. Returns
+/// whether anything changed.
+pub(crate) fn relabel_legacy_barometer(layout: &mut serde_json::Value) -> bool {
+    fn index_for(label: &str) -> Option<u64> {
+        let l = label.to_ascii_lowercase();
+        if l.contains("alt") || l == "barometer" {
+            Some(0)
+        } else if l.contains("press") || l.contains("prs") {
+            Some(1)
+        } else if l.contains("temp") || l.contains("tmp") {
+            Some(2)
+        } else {
+            None
+        }
+    }
+    fn walk(v: &mut serde_json::Value, changed: &mut bool) {
+        match v {
+            serde_json::Value::Object(map) => {
+                let baro = |map: &serde_json::Map<String, serde_json::Value>, key: &str| {
+                    map.get(key).and_then(|v| v.as_str()) == Some("BAROMETER_DATA")
+                };
+                if baro(map, "id")
+                    && let Some(channels) = map.get_mut("channels").and_then(|c| c.as_array_mut())
+                    && channels.len() == 3
+                {
+                    let labels: Vec<String> = channels.iter().filter_map(|c| c.as_str().map(str::to_owned)).collect();
+                    let mut ordered: Vec<Option<String>> = vec![None, None, None];
+                    for label in &labels {
+                        if let Some(i) = index_for(label) {
+                            ordered[i as usize] = Some(label.clone());
+                        }
+                    }
+                    if ordered.iter().all(Option::is_some) && ordered.iter().flatten().ne(labels.iter()) {
+                        *channels = ordered.into_iter().flatten().map(serde_json::Value::from).collect();
+                        *changed = true;
+                    }
+                }
+                if baro(map, "data_type") {
+                    if let Some(items) = map.get_mut("items").and_then(|c| c.as_array_mut()) {
+                        for item in items {
+                            let want = item["label"].as_str().and_then(index_for);
+                            if let Some(want) = want
+                                && item["index"].as_u64() != Some(want)
+                            {
+                                item["index"] = want.into();
+                                *changed = true;
+                            }
+                        }
+                    }
+                    let want = map.get("label").and_then(|l| l.as_str()).and_then(index_for);
+                    if let Some(want) = want
+                        && map.get("index").and_then(|i| i.as_u64()).is_some_and(|i| i != want)
+                    {
+                        map.insert("index".into(), want.into());
+                        *changed = true;
+                    }
+                }
+                map.values_mut().for_each(|v| walk(v, changed));
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(|v| walk(v, changed)),
+            _ => {}
+        }
+    }
+    let mut changed = false;
+    walk(layout, &mut changed);
+    changed
 }
 
 /// Every action carries the section its command belongs to, from the one
@@ -732,8 +818,7 @@ fn normalize_flight_phases(layout: &mut LayoutConfig) -> Result<(), String> {
     Ok(())
 }
 
-fn apply_runtime_layout_overrides(layout: &mut LayoutConfig) {
-    let mode = presentation_mode();
+fn apply_runtime_layout_overrides(layout: &mut LayoutConfig, mode: crate::station_mode::Mode) {
     layout.test_fire_mode = mode == crate::station_mode::Mode::TestFire;
     layout.igt_mode = mode == crate::station_mode::Mode::IntegratedGroundTest;
     if crate::rrls::is_rrls() {

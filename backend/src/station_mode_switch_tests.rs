@@ -857,3 +857,28 @@ fn firmware_target_ids_roundtrip() {
         assert_eq!(Target::parse(&target.id()), Some(target));
     }
 }
+
+/// The recording keeps running across an in-process switch; the new mode is
+/// written into it (with its provenance) so a replay of that segment shows
+/// each part in the mode it was recorded in.
+#[tokio::test]
+async fn in_process_switch_marks_the_new_mode_in_the_recording() {
+    let _mode = thread_mode(Mode::Normal);
+    let mut f = fixture().await;
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    Arc::get_mut(&mut f.state).unwrap().db_queue_tx = tx;
+    switch_in_process(&f, "operator", "test_fire").await;
+    assert_eq!(crate::runtime_mode::current(), Mode::TestFire);
+    let mut marked = None;
+    while let Ok(item) = rx.try_recv() {
+        if let crate::telemetry_db::DbQueueItem::Write(crate::telemetry_db::DbWrite::Telemetry { data_type, payload_json, .. }) = item
+            && data_type == "GS_STATION_MODE"
+        {
+            marked = Some(serde_json::from_str::<Value>(&payload_json).unwrap());
+        }
+    }
+    let marked = marked.expect("GS_STATION_MODE row written at the switch");
+    assert_eq!(marked["mode"], "test_fire");
+    assert_eq!(marked["provenance"], "hardware");
+    assert_eq!(marked["firmware_sim"], false);
+}
