@@ -354,6 +354,14 @@ pub(crate) fn refresh_station_network_time_from_host_ms(router: &Router, host_ut
 }
 
 fn refresh_station_network_time_at(router: &Router, host_ns: i64) {
+    refresh_station_network_time_sampled(router, host_ns, router.clock_now_ns());
+}
+
+/// `host_ns` read when the router's clock read `sampled_mono_ns`: whatever
+/// this refresh waits for below (the absolute-time lock) is added back, so
+/// the reading is applied for the instant it describes and a wait never
+/// looks like a host clock step.
+fn refresh_station_network_time_sampled(router: &Router, host_ns: i64, sampled_mono_ns: u64) {
     let mut reports: Vec<(i64, u64)> = router
         .take_utc_reference_reports()
         .into_iter()
@@ -385,8 +393,10 @@ fn refresh_station_network_time_at(router: &Router, host_ns: i64) {
         may_step,
     });
     let status = abs.status();
-    let utc_ns = host_ns.saturating_add(abs.correction_ns());
+    let correction_ns = abs.correction_ns();
     drop(abs);
+    let waited_ns = i64::try_from(router.clock_now_ns().saturating_sub(sampled_mono_ns)).unwrap_or(i64::MAX);
+    let utc_ns = host_ns.saturating_add(correction_ns).saturating_add(waited_ns);
     // Never feed 1970 or a stale RTC-less boot time as UTC.
     if status.source == crate::absolute_time::AbsoluteSource::Unsynced
         && !(1_577_836_800_000_000_000..4_354_819_200_000_000_000).contains(&utc_ns)
@@ -3623,6 +3633,44 @@ pub fn timesync_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The router worker read the host clock, then waited 1.5 s (a lock, a
+    /// busy radio write, a stalled host) before applying it: the reading is
+    /// applied for the instant it was taken. Applied as "now" it was 1.5 s
+    /// behind the network clock and, steps being allowed before Armed,
+    /// stepped it back (a new epoch) and forward again on the next refresh.
+    #[test]
+    fn a_refresh_that_waited_never_steps_the_station_network_clock() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let clock = Arc::new(AtomicU64::new(1_000_000));
+        let input = clock.clone();
+        let router = Router::new_with_clock(
+            sedsnet::router::RouterConfig::new([]).with_sender("STATION").with_timesync(
+                sedsnet::timesync::TimeSyncConfig {
+                    role: sedsnet::timesync::TimeSyncRole::Source,
+                    priority: 50,
+                    ..Default::default()
+                },
+            ),
+            Box::new(move || input.load(Ordering::SeqCst)),
+        );
+        let host_ns = 1_800_000_000_000i64 * 1_000_000;
+        refresh_station_network_time_sampled(&router, host_ns, router.clock_now_ns());
+        let steps = router.timesync_status().unwrap().steps;
+        let epoch = router.network_time_epoch();
+        for wait_ms in [1_500u64, 7_600, 250] {
+            clock.fetch_add(1_000, Ordering::SeqCst);
+            let sampled = router.clock_now_ns();
+            let host = host_ns + (clock.load(Ordering::SeqCst) as i64 - 1_000_000) * 1_000_000;
+            clock.fetch_add(wait_ms, Ordering::SeqCst);
+            refresh_station_network_time_sampled(&router, host, sampled);
+            let now = router.network_time_ms().unwrap() as i64;
+            let expected = (host + wait_ms as i64 * 1_000_000) / 1_000_000;
+            assert!((now - expected).abs() <= 2, "{wait_ms} ms wait: {now} vs {expected}");
+        }
+        assert_eq!(router.timesync_status().unwrap().steps, steps, "no step");
+        assert_eq!(router.network_time_epoch(), epoch);
+    }
     use crate::auth::AuthManager;
     use crate::fill_targets;
     use crate::gpio::GpioPins;

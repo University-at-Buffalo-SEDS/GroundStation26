@@ -92,6 +92,28 @@ fn retain_live_client_sources(sources: &mut Vec<std::sync::Weak<sedsnet::router:
 }
 
 pub(crate) fn refresh_network_source(router: &sedsnet::router::Router, host_utc_ms: u64) {
+    if client_source_holds(router) {
+        return;
+    }
+    crate::telemetry_task::refresh_station_network_time_from_host_ms(router, host_utc_ms);
+}
+
+/// The periodic refresh: the station's host clock is read when it is
+/// applied, after the step policy and the client-source check, so a refresh
+/// that waited (a busy router worker, a lock, a stalled host) never feeds
+/// the network clock an old reading. A reading taken before such a wait was
+/// stale by the wait and, beyond the 1 s threshold, stepped the network
+/// clock back and then forward again a second later (two new epochs).
+pub(crate) fn refresh_network_source_now(router: &sedsnet::router::Router) {
+    if client_source_holds(router) {
+        return;
+    }
+    crate::telemetry_task::refresh_station_network_time(router);
+}
+
+/// Applies the step policy and reports whether an operator-selected client
+/// source holds the clock (no host refresh then).
+fn client_source_holds(router: &sedsnet::router::Router) -> bool {
     // The step policy follows the flight state even while an operator-selected
     // source holds the clock (a later operator set is judged against it).
     crate::telemetry_task::apply_timesync_step_policy(router);
@@ -103,9 +125,9 @@ pub(crate) fn refresh_network_source(router: &sedsnet::router::Router, host_utc_
     {
         // Keep the SDK's monotonic anchor and normal GPS/remote election.
         // A wall-clock refresh here would silently undo Use client time.
-        return;
+        return true;
     }
-    crate::telemetry_task::refresh_station_network_time_from_host_ms(router, host_utc_ms);
+    false
 }
 
 #[cfg(test)]

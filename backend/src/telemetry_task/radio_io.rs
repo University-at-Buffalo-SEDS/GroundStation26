@@ -5630,10 +5630,7 @@ pub(super) fn spawn_router_worker_thread(
                     if last_clock_refresh.elapsed() >= Duration::from_secs(1) {
                         // The station's host clock (the simulator clock under
                         // simulation), not the UI wall clock.
-                        crate::system_clock::refresh_network_source(
-                            &router,
-                            crate::telemetry_task::station_host_utc_ms(),
-                        );
+                        crate::system_clock::refresh_network_source_now(&router);
                         last_clock_refresh = std::time::Instant::now();
                     }
                     if let Ok(queued) = router.poll_timesync() {
