@@ -51,8 +51,12 @@ const BATTERY_VOLTAGE_GROUND_STATION_MIN_THRESHOLD: f32 = 12.3; // V
 const BATTERY_VOLTAGE_GROUND_STATION_MAX_THRESHOLD: f32 = 16.5; // V
 const BATTERY_LOW_VOLTAGE_ALWAYS_WARN_THRESHOLD: f32 = 13.0; // V
 
-// Battery current thresholds (A)
-const BATTERY_CURRENT_MIN_THRESHOLD: f32 = 0.0; // A
+// Battery current thresholds (A). BATTERY_CURRENT is one float32 (amps) from
+// the LTC2990 boards. Recorded idle draw (Nov 2026, 7,463 samples): GB
+// 0.41-1.54 A, PB 4.05-4.37 A, VB -0.14-0.55 A. The VB sense reads a few tens
+// of mA either side of zero at rest, so the floor allows offset noise and only
+// a real reverse current or a swapped sense trips it.
+const BATTERY_CURRENT_MIN_THRESHOLD: f32 = -1.0; // A
 const BATTERY_CURRENT_MAX_THRESHOLD: f32 = 50.0; // A
 
 // Fuel Tank Pressure thresholds (psi)
@@ -218,6 +222,19 @@ fn battery_voltage_out_of_range(sender_id: &str, voltage: f32) -> bool {
         .is_some_and(|(min_v, max_v)| voltage < min_v || voltage > max_v);
 
     outside_configured_range || battery_low_voltage_always_warns(sender_id, voltage)
+}
+
+const BATTERY_CURRENT_WARNING: &str = "Critical: Battery current out of range!";
+
+/// BATTERY_CURRENT carries a single float32 (schema count 1): the current is
+/// element 0. Undecodable payloads warn nothing rather than a fake 0 A.
+fn check_battery_current(values: &[f32], warnings: &mut HashSet<&'static str>) {
+    if let Some(current) = values.first()
+        && current.is_finite()
+        && !(BATTERY_CURRENT_MIN_THRESHOLD..=BATTERY_CURRENT_MAX_THRESHOLD).contains(current)
+    {
+        warnings.insert(BATTERY_CURRENT_WARNING);
+    }
 }
 
 fn check_accel_thresholds(values: &[f32], warnings: &mut HashSet<&'static str>) {
@@ -654,15 +671,8 @@ async fn safety_loop(
                 }
 
                 ty if ty == crate::telemetry_schema::data_type("BATTERY_CURRENT") => {
-                    let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 2]);
-
-                    // Current
-                    if let Some(current) = values.get(1)
-                        && ((BATTERY_CURRENT_MIN_THRESHOLD > *current)
-                            || (*current > BATTERY_CURRENT_MAX_THRESHOLD))
-                    {
-                        cycle_warnings.insert("Critical: Battery current out of range!");
-                    }
+                    let values = pkt.data_as_f32().unwrap_or_default();
+                    check_battery_current(&values, &mut cycle_warnings);
                 }
 
                 ty if ty == crate::telemetry_schema::data_type("BATTERY_VOLTAGE") => {
@@ -1149,6 +1159,59 @@ mod tests {
                 expected
             );
         }
+    }
+
+    fn battery_current_packet(sender: &str, amps: f32) -> sedsnet::packet::Packet {
+        sedsnet::packet::Packet::new(
+            crate::telemetry_schema::data_type("BATTERY_CURRENT"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+            sender,
+            1,
+            Arc::<[u8]>::from(amps.to_le_bytes().to_vec()),
+        )
+        .unwrap()
+    }
+
+    fn battery_current_warns(sender: &str, amps: f32) -> bool {
+        let packet = battery_current_packet(sender, amps);
+        let values = packet.data_as_f32().unwrap();
+        // The wire schema has exactly one element; the old check read [1].
+        assert_eq!(values.len(), 1);
+        let mut warnings = HashSet::new();
+        check_battery_current(&values, &mut warnings);
+        warnings.contains(BATTERY_CURRENT_WARNING)
+    }
+
+    #[test]
+    fn battery_current_alarm_trips_on_the_single_schema_element() {
+        crate::mode_suite!(Normal, Testing);
+        assert!(battery_current_warns("PB", 60.0));
+        assert!(battery_current_warns("GB", 50.5));
+        assert!(battery_current_warns("VB", -5.0));
+        assert!(battery_current_warns("VB", -1.01));
+    }
+
+    #[test]
+    fn battery_current_alarm_ignores_recorded_idle_draw() {
+        crate::mode_suite!(Normal, Testing);
+        // Extremes from the Nov 2026 Pi recordings, per sender.
+        for (sender, amps) in [
+            ("GB", 0.4115),
+            ("GB", 1.5352),
+            ("PB", 4.0518),
+            ("PB", 4.3683),
+            ("VB", -0.1359),
+            ("VB", 0.5485),
+            ("VB", 0.0),
+        ] {
+            assert!(!battery_current_warns(sender, amps), "{sender} {amps} A");
+        }
+        assert!(!battery_current_warns("PB", 50.0));
+        assert!(!battery_current_warns("PB", -1.0));
+        let mut warnings = HashSet::new();
+        check_battery_current(&[], &mut warnings);
+        check_battery_current(&[f32::NAN], &mut warnings);
+        assert!(warnings.is_empty());
     }
 
     #[test]
