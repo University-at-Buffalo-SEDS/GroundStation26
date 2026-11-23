@@ -628,6 +628,14 @@ pub struct BoardDiagnostics {
     /// RF radio TX queue timing block. Missing on older RF firmware/other boards.
     #[serde(default)]
     pub rf_tx_timing: Option<RfTxTiming>,
+    /// GB LTC2990 power monitors (words 16..21, tag "LTC1"). Missing on
+    /// older GB firmware and other boards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power_monitors: Option<PowerMonitorHealth>,
+    /// AB Hall current-sense trust (words 19..20, tag "CSN1"). Missing on
+    /// older AB firmware and other boards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_sense: Option<CurrentSenseStatus>,
     /// Board's own network-time quality (SEDSnet 4.4). Missing on older firmware.
     #[serde(default)]
     pub time_sync: Option<BoardTimeSync>,
@@ -709,6 +717,34 @@ pub struct BoardTimeSync {
     /// re-serving the GS over CAN; `None` when the board does not report it.
     #[serde(default)]
     pub stratum: Option<u8>,
+}
+
+/// GB BOARD_HEALTH words 16..21 ("LTC1" tag): which LTC2990 power monitors
+/// answer and the I2C retry backoff. Counters are cumulative since boot.
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default, Hash)]
+pub struct PowerMonitorHealth {
+    /// The voltage LTC2990 answers (absent readings are not trusted).
+    pub voltage_present: bool,
+    /// The current LTC2990 answers.
+    pub current_present: bool,
+    /// Current retry delay, ms; 0 when both answer.
+    pub retry_delay_ms: u32,
+    pub retries: u32,
+    pub bus_clears: u32,
+    pub failed_bus_clears: u32,
+}
+
+/// AB BOARD_HEALTH words 19..20 ("CSN1" tag): Hall current-sense trust.
+/// Channel names are "N2O", "N2", "Igniter" and "H-bridge".
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default, Hash)]
+pub struct CurrentSenseStatus {
+    /// Channels whose readings are not trusted (never acted on).
+    pub untrusted: Vec<String>,
+    /// The Hall mismatch abort is compiled into this firmware.
+    pub mismatch_abort_enabled: bool,
+    /// Channels that showed a current mismatch since boot (diagnostic only
+    /// while untrusted).
+    pub mismatch_latched: Vec<String>,
 }
 
 /// RF BOARD_HEALTH words 16..21 ("RFT1" tag). Timing and high-water cover the

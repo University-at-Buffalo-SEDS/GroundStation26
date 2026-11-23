@@ -1,5 +1,8 @@
 //! Diagnostic liveness history. Silence is not evidence of a reboot or a CPU fault.
-use crate::types::{BoardDiagnostics, NetworkBoardHealthEntry, RfTxTiming, canonical_sender_id};
+use crate::types::{
+    BoardDiagnostics, CurrentSenseStatus, NetworkBoardHealthEntry, PowerMonitorHealth, RfTxTiming,
+    canonical_sender_id,
+};
 use std::{collections::HashMap, time::Instant};
 pub const TIMEOUT_MS: u64 = 12_000;
 /// Silence that marks a board offline, by its link. Umbilical (CAN) boards report at 1-250 Hz (frame age
@@ -139,8 +142,47 @@ pub(crate) fn decode_diagnostics(w: &[u32]) -> Option<BoardDiagnostics> {
                 stale_drops: w[21],
             }
         }),
+        // GB: the same words, tagged "LTC1", when no SD/ADC block owns them.
+        power_monitors: (w[1] & (16 | 32 | 128) == 0 && w[16] == POWER_MONITOR_TAG).then(|| {
+            PowerMonitorHealth {
+                voltage_present: w[17] & 1 != 0,
+                current_present: w[17] & 2 != 0,
+                retry_delay_ms: w[18],
+                retries: w[19],
+                bus_clears: w[20],
+                failed_bus_clears: w[21],
+            }
+        }),
+        // AB: words 19..20, tagged "CSN1" (words 16..18 carry its last refusal).
+        current_sense: (w[1] & (16 | 128) == 0 && w[19] == CURRENT_SENSE_TAG)
+            .then(|| decode_current_sense(w[20])),
         ..Default::default()
     })
+}
+
+/// "LTC1" little-endian in BOARD_HEALTH word 16 (GB power monitors).
+const POWER_MONITOR_TAG: u32 = 0x3143_544C;
+/// "CSN1" little-endian in BOARD_HEALTH word 19 (AB current sense).
+const CURRENT_SENSE_TAG: u32 = 0x314E_5343;
+
+/// AB current-sense status word: bits 0..3 untrusted (N2O, N2, igniter,
+/// H-bridge), bit 8 mismatch abort compiled in, bits 16..18 mismatch latched
+/// since boot (N2O, N2, igniter). ActuatorBoard26 `current_sense_trust.h`.
+fn decode_current_sense(word: u32) -> CurrentSenseStatus {
+    const CHANNELS: [&str; 4] = ["N2O", "N2", "Igniter", "H-bridge"];
+    let named = |mask: u32, count: usize| {
+        CHANNELS[..count]
+            .iter()
+            .enumerate()
+            .filter(|(bit, _)| mask & (1 << bit) != 0)
+            .map(|(_, name)| name.to_string())
+            .collect()
+    };
+    CurrentSenseStatus {
+        untrusted: named(word & 0xF, 4),
+        mismatch_abort_enabled: word & (1 << 8) != 0,
+        mismatch_latched: named((word >> 16) & 7, 3),
+    }
 }
 /// Optional router services that failed to start on RF/PB firmware
 /// (telemetry.c TELEMETRY_SERVICE_*). The board keeps routing and retries
@@ -669,6 +711,56 @@ mod tests {
         words[1] = 1;
         words[16] = 0x3154_4653;
         assert_eq!(decode_diagnostics(&words).unwrap().rf_tx_timing, None);
+    }
+    #[test]
+    fn gb_power_monitor_block_is_tagged_and_never_shadows_sd_words() {
+        let mut words = [0_u32; 24];
+        words[0] = 1;
+        words[4] = 1000;
+        words[1] = 1 | 4 | 8 | 64;
+        assert_eq!(decode_diagnostics(&words).unwrap().power_monitors, None); // older GB
+        words[16..22].copy_from_slice(&[0x3143_544C, 1, 4000, 9, 2, 1]);
+        let decoded = decode_diagnostics(&words).unwrap();
+        assert_eq!(
+            decoded.power_monitors,
+            Some(PowerMonitorHealth {
+                voltage_present: true,
+                current_present: false,
+                retry_delay_ms: 4000,
+                retries: 9,
+                bus_clears: 2,
+                failed_bus_clears: 1,
+            })
+        );
+        assert_eq!(decoded.rf_tx_timing, None);
+        assert_eq!(decoded.current_sense, None);
+        for flag in [16, 32, 128] {
+            words[1] = 1 | flag;
+            assert_eq!(decode_diagnostics(&words).unwrap().power_monitors, None);
+        }
+        let json = serde_json::to_value(decode_diagnostics(&[1, 0, 0, 0, 1000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap()).unwrap();
+        assert!(json.get("power_monitors").is_none() && json.get("current_sense").is_none());
+    }
+    #[test]
+    fn ab_current_sense_status_names_channels_and_flags() {
+        let mut words = [0_u32; 24];
+        words[0] = 1;
+        words[4] = 1000;
+        words[1] = 1 | 4 | 64;
+        words[16] = 0x3146_4552; // AB refusal block in 16..18 is not ours
+        assert_eq!(decode_diagnostics(&words).unwrap().current_sense, None); // older AB
+        words[19] = 0x314E_5343;
+        words[20] = 0xF | (1 << 8) | (0b101 << 16);
+        let status = decode_diagnostics(&words).unwrap().current_sense.unwrap();
+        assert_eq!(status.untrusted, ["N2O", "N2", "Igniter", "H-bridge"]);
+        assert!(status.mismatch_abort_enabled);
+        assert_eq!(status.mismatch_latched, ["N2O", "Igniter"]);
+        words[20] = 0b0100;
+        let status = decode_diagnostics(&words).unwrap().current_sense.unwrap();
+        assert_eq!(status.untrusted, ["Igniter"]);
+        assert!(!status.mismatch_abort_enabled && status.mismatch_latched.is_empty());
+        words[1] = 1 | 16; // SD counters own word 19 on other boards
+        assert_eq!(decode_diagnostics(&words).unwrap().current_sense, None);
     }
     #[test]
     fn service_faults_share_word_six_without_changing_the_watchdog_mask() {
