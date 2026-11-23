@@ -18,7 +18,9 @@ from pathlib import Path
 MAX_ROWS = 200_000
 MAX_SERIES = 128
 RAW_TYPES = {"LOADCELL_WEIGHT_KG": "KG1000", "LOADCELL_50_WEIGHT_KG": "KG50",
-             "PRESSURE_TRANSDUCER_CALIBRATED": "FUEL_TANK_PRESSURE"}
+             "PRESSURE_TRANSDUCER_CALIBRATED": "OX_TANK_PRESSURE"}
+# Recordings made before the ox tank PT rename name it FUEL_TANK_PRESSURE.
+LEGACY_TYPE_NAMES = {"FUEL_TANK_PRESSURE": "OX_TANK_PRESSURE"}
 
 
 def read_rows(request):
@@ -78,6 +80,8 @@ def read_rows(request):
                         raise ValueError("Resolved recording has invalid source provenance; no export was produced.")
                     provenance[(name,row[0])]=info
                     row=row[:-1]
+                if row[4] in LEGACY_TYPE_NAMES:
+                    row = row[:4] + (LEGACY_TYPE_NAMES[row[4]],) + row[5:]
                 result.append((name,) + row)
                 if len(result) > MAX_ROWS:
                     raise ValueError("Selection exceeds 200,000 recorded rows. Choose a recording or narrower time window; no rows were silently dropped.")
@@ -106,7 +110,7 @@ def channels(rows):
 def regression(key, samples, streams, history=None):
     sender, kind, index = json.loads(key)
     sensor = {**RAW_TYPES, "LOADCELL_FILL_PERCENT": "KG50"}.get(kind)
-    if sensor == "FUEL_TANK_PRESSURE":
+    if sensor == "OX_TANK_PRESSURE":
         sensor = "IADC"
     if sensor and history:
         import bisect

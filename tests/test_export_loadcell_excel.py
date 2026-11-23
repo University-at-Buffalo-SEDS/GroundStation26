@@ -59,14 +59,16 @@ class RecordingExportTests(unittest.TestCase):
                     (1, 2000, 10, "DAQ", "KG1000", "[1.5]"),
                     (2, 1000, 9, "DAQ", "KG1000", "[null]"),
                     (3, 2000, 11, "DAQ", "KG1000", "[2.5]"),
-                    (4, 2000, 44, "VB", "FUEL_TANK_PRESSURE", "[3.5]"),
+                    (4, 2000, 44, "VB", "FUEL_TANK_PRESSURE", "[3.5]"),  # pre-rename name
+                    (6, 2000, 45, "VB", "OX_TANK_PRESSURE", "[3.75]"),
                     (5, 2000, 11, "DAQ", "KG50", "[99]"),
                 ])
             streams = read_recording(path)
             self.assertEqual([row.value for row in streams["KG1000"]], [None, 1.5, 2.5])
             self.assertEqual(len(select_window(streams, 2000, 2000)["KG1000"]), 2)
             self.assertNotIn("KG50", streams)
-            self.assertEqual(streams["FUEL_TANK_PRESSURE"][0].source_ms, 44)
+            self.assertNotIn("FUEL_TANK_PRESSURE", streams)
+            self.assertEqual([row.source_ms for row in streams["OX_TANK_PRESSURE"]], [44, 45])
             with self.assertRaises(ValueError):
                 select_window(streams, 3000, 4000)
             with self.assertRaises(ValueError):
@@ -77,7 +79,7 @@ class RecordingExportTests(unittest.TestCase):
         streams = {
             "KG1000": [Sample(timestamp, 17744228, "=literal", "3", 0.015170760452747345)],
             "LOADCELL_WEIGHT_KG": [Sample(timestamp, 17744228, "DAQ", "4", 4.047607421875)],
-            "FUEL_TANK_PRESSURE": [Sample(timestamp + 50, 17744480, "VB", "16", 466.6)],
+            "OX_TANK_PRESSURE": [Sample(timestamp + 50, 17744480, "VB", "16", 466.6)],
             "PRESSURE_TRANSDUCER_CALIBRATED": [Sample(timestamp + 50, 17744480, "VB", "17", None)],
         }
         with tempfile.TemporaryDirectory() as directory:

@@ -8,6 +8,9 @@ Usage: extract.py RECORDING.csv[.gz] OUT.npz
 import csv, gzip, json, sys, collections
 import numpy as np
 
+# Exports made before the ox tank PT rename name it FUEL_TANK_PRESSURE.
+LEGACY_TYPE_NAMES = {'FUEL_TANK_PRESSURE': 'OX_TANK_PRESSURE'}
+
 def main(src, out):
     op = gzip.open if src.endswith('.gz') else open
     t = collections.defaultdict(list); s = collections.defaultdict(list); v = collections.defaultdict(list)
@@ -16,7 +19,7 @@ def main(src, out):
     with op(src, 'rt', newline='') as f:
         r = csv.reader(f); next(r)
         for row in r:
-            key = f"{row[3]}|{row[4]}"
+            key = f"{row[3]}|{LEGACY_TYPE_NAMES.get(row[4], row[4])}"
             try:
                 vals = json.loads(row[5]) if row[5] else []
             except ValueError:

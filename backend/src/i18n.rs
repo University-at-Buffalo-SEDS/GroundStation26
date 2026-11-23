@@ -127,14 +127,14 @@ const KNOWN_TRANSLATIONS: &[(&str, &str, &str)] = &[
     ("Startup", "Inicio", "Démarrage"),
     ("Abort", "Abortar", "Abandon"),
     (
-        "Fuel Tank Pressure",
-        "Presión del tanque de combustible",
-        "Pression du réservoir carburant",
+        "Ox Tank Pressure",
+        "Presión del tanque de oxidante",
+        "Pression du réservoir d'oxydant",
     ),
     (
-        "FUEL TANK PRESSURE",
-        "PRESIÓN DEL TANQUE DE COMBUSTIBLE",
-        "PRESSION DU RÉSERVOIR CARBURANT",
+        "OX TANK PRESSURE",
+        "PRESIÓN DEL TANQUE DE OXIDANTE",
+        "PRESSION DU RÉSERVOIR D'OXYDANT",
     ),
     (
         "Tank Pressure",

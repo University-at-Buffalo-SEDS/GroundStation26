@@ -272,13 +272,13 @@ mod display_history_tests {
         input.push(TelemetryRow {
             timestamp_ms: 1,
             sender_id: "VB".into(),
-            data_type: "FUEL_TANK_PRESSURE".into(),
+            data_type: "OX_TANK_PRESSURE".into(),
             values: vec![Some(12.0)],
         });
         input.push(TelemetryRow {
             timestamp_ms: 874_998,
             sender_id: "VB".into(),
-            data_type: "FUEL_TANK_PRESSURE".into(),
+            data_type: "OX_TANK_PRESSURE".into(),
             values: vec![Some(42.0)],
         });
         input.sort_by_key(|row| row.timestamp_ms);
@@ -316,7 +316,7 @@ mod display_history_tests {
         assert_eq!(
             sampled
                 .iter()
-                .filter(|row| row.data_type == "FUEL_TANK_PRESSURE")
+                .filter(|row| row.data_type == "OX_TANK_PRESSURE")
                 .count(),
             2
         );
@@ -1785,7 +1785,10 @@ async fn stream_recent_rows_response(state: Arc<AppState>) -> Response {
             while let Ok(Some(row)) = rows.try_next().await {
                 let telemetry_row = TelemetryRow {
                     timestamp_ms: row.get::<i64, _>("timestamp_ms"),
-                    data_type: row.get::<String, _>("data_type"),
+                    data_type: crate::telemetry_schema::canonical_type_name(
+                        &row.get::<String, _>("data_type"),
+                    )
+                    .to_string(),
                     sender_id: row.get::<String, _>("sender_id"),
                     values: recorded_values_from_row(&row, volts_from_id),
                 };
@@ -1877,7 +1880,10 @@ async fn load_recent_rows_from_db(
     for row in rows_db {
         let telemetry_row = TelemetryRow {
             timestamp_ms: row.get::<i64, _>("timestamp_ms"),
-            data_type: row.get::<String, _>("data_type"),
+            data_type: crate::telemetry_schema::canonical_type_name(
+                        &row.get::<String, _>("data_type"),
+                    )
+                    .to_string(),
             sender_id: row.get::<String, _>("sender_id"),
             values: recorded_values_from_row(&row, volts_from_id),
         };

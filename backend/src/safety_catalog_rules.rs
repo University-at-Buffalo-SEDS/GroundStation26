@@ -44,7 +44,7 @@ const TANK: &[Spec] = &[
         summary: "A threshold trips only when fresh valve-board readings stay at or above it continuously for {station.overpressure_sustain_ms} ms, measured on capture timestamps (about 13 samples at 50 Hz). Brief spikes, repeated captures and samples older than {station.pressure_fresh_ms} ms never trip.",
         details: &[
             "Real tank pressure rises over seconds; a floating transducer input or a solenoid switching glitch lasts tens of milliseconds. A gap longer than the sustained time between readings restarts it.",
-            "Only the valve-board FUEL_TANK_PRESSURE lane is used; the station's calibrated IADC never substitutes.",
+            "Only the valve-board OX_TANK_PRESSURE lane (legacy name FUEL_TANK_PRESSURE) is used; the station's calibrated IADC never substitutes.",
             "Invalid threshold settings fall back to 850/950 psi and 3 s: protection is never disabled.",
         ],
         modes: ALL,

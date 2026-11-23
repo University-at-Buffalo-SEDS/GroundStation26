@@ -3002,7 +3002,7 @@ async fn sequence_loop(
             crate::normal_publication_probe::point(state, crate::normal_publication_probe::Site::CountedTick, flight_state as u8).await;
         }
         let valves = ValveSnapshot::read(state);
-        let pressure_psi = *state.latest_fuel_tank_pressure.lock().unwrap();
+        let pressure_psi = *state.latest_ox_tank_pressure.lock().unwrap();
         let current_mass_kg = *state.latest_fill_mass_kg.lock().unwrap();
         let now = Instant::now();
         let now_ms = crate::telemetry_task::get_current_timestamp_ms();

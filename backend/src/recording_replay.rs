@@ -53,7 +53,8 @@ impl Window {
                 && types.iter().all(|v| !v.is_empty() && v.len() <= 128),
             "invalid replay type filter"
         );
-        Ok(types)
+        // Recordings made before the ox tank PT rename carry its legacy name.
+        Ok(crate::telemetry_schema::expand_type_filter(&types))
     }
 }
 #[derive(Debug, Serialize, Deserialize)]
@@ -172,6 +173,7 @@ fn decode(row: sqlx::sqlite::SqliteRow, volts_from_id: i64) -> anyhow::Result<Sa
     let raw: String = row.try_get("values_json")?;
     let sender: String = row.try_get("sender_id")?;
     let data_type: String = row.try_get("data_type")?;
+    let data_type = crate::telemetry_schema::canonical_type_name(&data_type).to_string();
     anyhow::ensure!(
         raw.len() <= 32768 && sender.len() <= 256,
         "oversized recorded replay sample"
@@ -270,6 +272,8 @@ async fn export_from(db: &SqlitePool) -> anyhow::Result<serde_json::Value> {
         for field in ["schema","view_config","layout","valve_mappings"]{if let Some(saved)=config.get(field){value[field]=saved.clone();}}
         // A layout saved before the barometer label fix names the values in the old order.
         if crate::layout::relabel_legacy_barometer(&mut value["layout"]) { value["layout_relabelled"] = true.into(); }
+        // A layout or view saved before the ox tank PT rename names its legacy type.
+        for field in ["layout","view_config"]{crate::layout::canonicalize_legacy_type_names(&mut value[field]);}
         value["configuration_provenance"]="Imported capture configuration; all source-specific snapshots retained in sd_provenance.imports".into();
     }
     Ok(value)
@@ -881,6 +885,38 @@ mod tests {
         assert!(first.rows[0].timestamp_ms > last.rows[0].timestamp_ms);
         assert_eq!(last.rows[0].values[1], None);
     }
+    /// A recording made before the ox tank PT rename keys its rows by
+    /// FUEL_TANK_PRESSURE; replay serves them (rows, seeds and the full
+    /// export) as OX_TANK_PRESSURE, also for a client that asks by either name.
+    #[tokio::test]
+    async fn legacy_fuel_tank_pressure_rows_replay_as_ox_tank_pressure() {
+        let db = db().await;
+        insert(&db, 500, "FUEL_TANK_PRESSURE", "[300.5]").await;
+        insert(&db, 1000, "FUEL_TANK_PRESSURE", "[310.5]").await;
+        insert(&db, 1500, "OX_TANK_PRESSURE", "[320.5]").await;
+        let saved = snapshot_from(&db).await.unwrap();
+        for requested in ["OX_TANK_PRESSURE", "FUEL_TANK_PRESSURE"] {
+            let window = Window {
+                start_ms: 800,
+                types: format!("[\"{requested}\"]"),
+                ..query(saved.upper_id)
+            };
+            let page = page_from(&db, &window).await.unwrap();
+            assert_eq!(
+                page.rows.iter().map(|r| (r.data_type.as_str(), r.values[0])).collect::<Vec<_>>(),
+                vec![("OX_TANK_PRESSURE", Some(310.5)), ("OX_TANK_PRESSURE", Some(320.5))],
+                "{requested}"
+            );
+            assert_eq!(page.seeds.len(), 1, "{requested}");
+            assert_eq!(page.seeds[0].data_type, "OX_TANK_PRESSURE");
+            assert_eq!(page.seeds[0].values[0], Some(300.5));
+        }
+        let exported = export_from(&db).await.unwrap();
+        let types: Vec<&str> = exported["samples"].as_array().unwrap().iter()
+            .map(|s| s["data_type"].as_str().unwrap()).collect();
+        assert_eq!(types, ["OX_TANK_PRESSURE"; 3]);
+    }
+
     #[test]
     fn invalid_or_unbounded_requests_are_rejected() {
         for q in [

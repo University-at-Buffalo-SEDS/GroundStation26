@@ -9,7 +9,7 @@ fn nitrogen_topup_cannot_erase_already_loaded_nitrous_mass() {
     let nitrogen_target = sim_nitrogen_target_mass_kg();
     let loaded_mass = nitrogen_target + 8.0;
     model.loadcell_mass_kg = loaded_mass;
-    model.fuel_tank_pressure_psi = 745.0;
+    model.ox_tank_pressure_psi = 745.0;
     model.last_physics_ms = 1000;
     model
         .valves
@@ -66,7 +66,7 @@ fn equal_clock_multisensor_polls_cannot_advance_tank_physics() {
     crate::telemetry_schema::initialize().unwrap();
     let mut model = FlightSimState::new();
     model.loadcell_mass_kg = 0.25;
-    model.fuel_tank_pressure_psi = 0.0;
+    model.ox_tank_pressure_psi = 0.0;
     model.last_physics_ms = 1000;
     model
         .valves
@@ -80,12 +80,12 @@ fn equal_clock_multisensor_polls_cannot_advance_tank_physics() {
     model
         .valves
         .insert(ActuatorBoardCommands::NitrousOpen as u8, false);
-    let before = (model.loadcell_mass_kg, model.fuel_tank_pressure_psi);
+    let before = (model.loadcell_mass_kg, model.ox_tank_pressure_psi);
     for _ in 0..20 {
         model.update_physics(1000);
     }
     assert_eq!(
-        (model.loadcell_mass_kg, model.fuel_tank_pressure_psi),
+        (model.loadcell_mass_kg, model.ox_tank_pressure_psi),
         before,
         "zero elapsed clock still changed physics due to sensor polling"
     );
@@ -111,11 +111,11 @@ fn a_delayed_command_cannot_backfill_flow_before_model_receipt() {
         2000,
     );
     assert_eq!(m.loadcell_mass_kg, 0.0);
-    assert!(m.fuel_tank_pressure_psi < 0.001);
+    assert!(m.ox_tank_pressure_psi < 0.001);
     m.update_ground_plant(2500);
-    let pressure = m.fuel_tank_pressure_psi;
+    let pressure = m.ox_tank_pressure_psi;
     assert!(pressure > 9.9 && pressure < 10.1);
     m.stop_modeled_outputs_at(Board::ActuatorBoard, 2500, 2500);
     m.update_ground_plant(3000);
-    assert!((m.fuel_tank_pressure_psi - pressure).abs() < 0.001);
+    assert!((m.ox_tank_pressure_psi - pressure).abs() < 0.001);
 }

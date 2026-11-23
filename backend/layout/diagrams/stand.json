@@ -43,7 +43,7 @@
     { "id": "fill_phase", "label": "Fill phase", "x": 24, "y": 6, "value": { "status": "fill_phase" }, "format": "text" },
     { "id": "flight_state", "label": "Flight state", "x": 260, "y": 6, "value": { "status": "flight_state" }, "format": "text" },
     { "id": "provenance", "label": "Data", "x": 520, "y": 6, "value": { "status": "provenance" }, "format": "text" },
-    { "id": "tank_pt", "label": "Tank PT (VB)", "x": 250, "y": 120, "value": { "telemetry": "PRESSURE_TRANSDUCER_CALIBRATED", "sender": "VB" },
+    { "id": "tank_pt", "label": "Ox tank PT (VB)", "x": 250, "y": 120, "value": { "telemetry": "PRESSURE_TRANSDUCER_CALIBRATED", "sender": "VB" },
       "unit": "psi", "precision": 0, "warn_above": 850 },
     { "id": "fill_mass", "label": "Fill mass (KG50)", "x": 250, "y": 166, "value": { "telemetry": "LOADCELL_50_WEIGHT_KG", "sender": "DAQ" },
       "unit": "kg", "precision": 2 },

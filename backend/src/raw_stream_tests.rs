@@ -129,14 +129,14 @@ async fn stream_token_reads_only_the_feed_and_never_commands() {
     let (_root, state, app) = fixture().await;
     let grant = issue(
         &app,
-        serde_json::json!({"label":"OBS overlay","types":["FUEL_TANK_PRESSURE"]}),
+        serde_json::json!({"label":"OBS overlay","types":["OX_TANK_PRESSURE"]}),
     )
     .await;
     let token = grant["token"].as_str().unwrap().to_string();
     assert!(token.starts_with("gss1."));
     assert_eq!(grant["label"], "OBS overlay");
     assert_eq!(grant["issuer"], "administrator");
-    assert_eq!(grant["types"], serde_json::json!(["FUEL_TANK_PRESSURE"]));
+    assert_eq!(grant["types"], serde_json::json!(["OX_TANK_PRESSURE"]));
     // Only the digest is stored.
     let stored: Vec<String> = sqlx::query_scalar("SELECT token FROM auth_sessions")
         .fetch_all(&state.auth_db)
@@ -386,7 +386,7 @@ async fn open_ndjson_stream_delivers_rows_then_ends_with_bye_on_revocation() {
     let (_root, state, app) = fixture().await;
     let grant = issue(
         &app,
-        serde_json::json!({"label":"curl","types":["FUEL_TANK_PRESSURE"]}),
+        serde_json::json!({"label":"curl (pre-rename token)","types":["FUEL_TANK_PRESSURE"]}),
     )
     .await;
     let token = grant["token"].as_str().unwrap().to_string();
@@ -434,12 +434,12 @@ async fn open_ndjson_stream_delivers_rows_then_ends_with_bye_on_revocation() {
         .send(telemetry("KG1000", "DAQ", 10, vec![Some(0.3)]));
     let _ = state
         .ws_tx
-        .send(telemetry("FUEL_TANK_PRESSURE", "VB", 11, vec![Some(512.0)]));
+        .send(telemetry("OX_TANK_PRESSURE", "VB", 11, vec![Some(512.0)]));
     while !lines.iter().any(|l| l["ty"] == "row") {
         assert!(next_lines(&mut lines).await, "no row arrived");
     }
     let row = lines.iter().find(|l| l["ty"] == "row").unwrap();
-    assert_eq!(row["data_type"], "FUEL_TANK_PRESSURE");
+    assert_eq!(row["data_type"], "OX_TANK_PRESSURE");
     assert_eq!(row["units"], serde_json::json!(["psi"]));
     assert!(!lines.iter().any(|l| l["data_type"] == "KG1000"));
     // Revoke while open: the stream says bye and ends.
@@ -551,7 +551,7 @@ async fn websocket_feed_hello_rows_status_and_bye() {
 fn filters_match_exact_prefix_and_sender_and_intersect_the_scope() {
     let scope = StreamScope {
         label: "x".into(),
-        types: vec!["LOADCELL_*".into(), "FUEL_TANK_PRESSURE".into()],
+        types: vec!["LOADCELL_*".into(), "OX_TANK_PRESSURE".into()],
         senders: vec!["DAQ".into(), "VB".into()],
         max_hz: Some(10.0),
     };
@@ -573,8 +573,12 @@ fn filters_match_exact_prefix_and_sender_and_intersect_the_scope() {
         "sender outside the scope"
     );
     let open = Filter::from_query(&query(&[("senders", "vb")]), None).unwrap();
-    assert!(open.admits("FUEL_TANK_PRESSURE", "VB"));
-    assert!(!open.admits("FUEL_TANK_PRESSURE", "AB"));
+    assert!(open.admits("OX_TANK_PRESSURE", "VB"));
+    assert!(!open.admits("OX_TANK_PRESSURE", "AB"));
+    // A filter saved before the ox tank PT rename still admits its rows.
+    let legacy = Filter::from_query(&query(&[("types", "fuel_tank_pressure")]), None).unwrap();
+    assert!(legacy.admits("OX_TANK_PRESSURE", "VB"));
+    assert!(!legacy.admits("PRESSURE_TRANSDUCER_CALIBRATED", "VB"));
     assert_eq!(open.max_hz, DEFAULT_MAX_HZ);
     assert_eq!(open.max_rows_per_s, DEFAULT_MAX_ROWS_PER_S);
     // Privacy denylist applies to every filter.
@@ -697,7 +701,7 @@ fn catalog_tracks_rows_rates_latest_values_and_scope() {
         );
     }
     catalog.observe(
-        &out("FUEL_TANK_PRESSURE", "VB", 99),
+        &out("OX_TANK_PRESSURE", "VB", 99),
         t0 + Duration::from_millis(4_900),
     );
     let all = catalog.snapshot(&Filter::default(), t0 + Duration::from_millis(5_000));
@@ -713,7 +717,7 @@ fn catalog_tracks_rows_rates_latest_values_and_scope() {
     };
     let only = catalog.snapshot(&scoped, t0 + Duration::from_millis(5_000));
     assert_eq!(only.len(), 1);
-    assert_eq!(only[0].data_type, "FUEL_TANK_PRESSURE");
+    assert_eq!(only[0].data_type, "OX_TANK_PRESSURE");
     // Quiet for five seconds: rate falls to zero, history stays.
     let later = catalog.snapshot(&Filter::default(), t0 + Duration::from_secs(12));
     assert!(later.iter().all(|e| e.rate_hz == 0.0));
@@ -803,7 +807,7 @@ fn every_documented_stream_has_fields_and_units_of_equal_length() {
         "DAQ_SAR_VOLTAGES",
         "DAQ_CURRENT_SENSE",
         "DAQ_POWER_MONITOR",
-        "FUEL_TANK_PRESSURE",
+        "OX_TANK_PRESSURE",
         "PRESSURE_TRANSDUCER_CALIBRATED",
         "VALVE_STATE",
         "IGNITER_SENSE_SIGNAL",

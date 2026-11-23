@@ -620,8 +620,8 @@ pub(super) fn prepare_derived_loadcell_rows(
     state: &Arc<AppState>,
     sample: &DerivedLoadcellSample<'_>,
 ) -> Option<PreparedLoadcellRows> {
-    let calibration_sensor_id = if sample.sensor_id
-        == &*crate::telemetry_schema::data_type("FUEL_TANK_PRESSURE").as_str()
+    let calibration_sensor_id = if crate::telemetry_schema::canonical_type_name(sample.sensor_id)
+        == crate::telemetry_schema::OX_TANK_PRESSURE
     {
         loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE
     } else {
@@ -715,7 +715,7 @@ pub(super) fn prepare_derived_loadcell_rows(
             }
             loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE => {
                 state.gse.lock().unwrap().observe_pressure(None);
-                let mut pressure = state.latest_fuel_tank_pressure.lock().unwrap();
+                let mut pressure = state.latest_ox_tank_pressure.lock().unwrap();
                 *pressure = None;
             }
             _ => {}
@@ -738,7 +738,7 @@ pub(super) fn prepare_derived_loadcell_rows(
                 sample.receipt,
             );
             {
-                let mut pressure = state.latest_fuel_tank_pressure.lock().unwrap();
+                let mut pressure = state.latest_ox_tank_pressure.lock().unwrap();
                 *pressure = Some(calibrated_value);
             }
             vec![(
@@ -1308,7 +1308,12 @@ pub(super) fn telemetry_rows_from_packet_values(
                     values,
                 )]
             }),
-        _ => vec![(pkt.data_type().as_str().to_string(), values)],
+        // A legacy wire name (e.g. FUEL_TANK_PRESSURE from older valve-board
+        // firmware) becomes its canonical row name here, at ingress.
+        ty => vec![(
+            crate::telemetry_schema::canonical_type_name(&ty.as_str()).to_string(),
+            values,
+        )],
     }
 }
 

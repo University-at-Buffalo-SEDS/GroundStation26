@@ -36,8 +36,8 @@ def fire_ignition(d, out):
     ax[1].plot(sel(t5)[m], k5[m] * 1000, color=ORANGE); ax[1].set_ylabel('KG50 (P6)\ninput mV')
     tp, vm = s(z, 'DAQ|DAQ_POWER_MONITOR', 2); m = sel(tp) < 25
     ax[2].plot(sel(tp)[m], vm[m], color=AQUA, marker='.', ms=2, lw=0.8); ax[2].set_ylabel('DAQ VMAIN V')
-    tf, fp = s(z, 'VB|FUEL_TANK_PRESSURE'); m = sel(tf) < 25
-    ax[3].plot(sel(tf)[m], fp[m], color=YELLOW); ax[3].set_ylabel('Tank psi'); ax[3].set_xlabel('seconds from recording start')
+    tf, fp = s(z, 'VB|OX_TANK_PRESSURE'); m = sel(tf) < 25
+    ax[3].plot(sel(tf)[m], fp[m], color=YELLOW); ax[3].set_ylabel('Ox tank psi'); ax[3].set_xlabel('seconds from recording start')
     for a in ax: a.axvline(9.2, color=MUTED, lw=0.8, ls=':')
     ax[3].text(9.4, 300, 'supply restored /\nburn starts', fontsize=8, color=MUTED)
     fig.tight_layout(); fig.savefig(os.path.join(out, 'fire-20261116-ignition.png'), dpi=110); plt.close(fig)

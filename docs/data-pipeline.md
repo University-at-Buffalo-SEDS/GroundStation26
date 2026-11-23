@@ -79,7 +79,7 @@ flowchart LR
 On the fill side:
 
 - The gateway bridges its CAN side to Pico-Fi over a 1,000,000-baud UART (gateway-board26 `CMakeLists.txt:77`).
-- Under receive pressure, the gateway ring drops best-effort KG1000, KG50 and FUEL_TANK_PRESSURE frames first (gateway-board26 `Core/Inc/can_rx_admission.h`).
+- Under receive pressure, the gateway ring drops best-effort KG1000, KG50 and OX_TANK_PRESSURE (formerly FUEL_TANK_PRESSURE) frames first (gateway-board26 `Core/Inc/can_rx_admission.h`).
 
 On the avionics side, the RF board has two router sides, `can` and `radio` (RFBoard26 `Core/Src/telemetry.c`).
 
@@ -175,11 +175,21 @@ The steps run in this order:
 
 | Type | Payload | Rate (VB source) | GS handling | Derived | Units |
 | --- | --- | --- | --- | --- | --- |
-| `FUEL_TANK_PRESSURE` | f32[1] | 50 Hz, latest of a 500 Hz ADC (`VALVE_PRESSURE_REPORT_HZ 50`, `Core/Inc/telemetry_rates.h:6`) | generic; `gse::observe_valve_pressure_ingress`; `gse::overpressure::evaluate` | `PRESSURE_TRANSDUCER_CALIBRATED` through the `iadc` calibration | psi |
+| `OX_TANK_PRESSURE` (oxidiser tank PT) | f32[1] | 50 Hz, latest of a 500 Hz ADC (`VALVE_PRESSURE_REPORT_HZ 50`, `Core/Inc/telemetry_rates.h:6`) | generic; `gse::observe_valve_pressure_ingress`; `gse::overpressure::evaluate` | `PRESSURE_TRANSDUCER_CALIBRATED` through the `iadc` calibration | psi |
 | `VALVE_PRESSURE_SD_V1` | u8[44] | about 62.5 batches/s, to the DAQ only | not received by the GS; logged on the DAQ SD as `valve_pressure_psi` | | |
 | `UMBILICAL_STATUS` | u8[2] | every 500 ms plus on change (`UMBILICAL_STATUS_PERIOD_TICKS`, `Core/Src/main_thread.c:30`) | `validate_umbilical_status`, `persist_umbilical_status` | valve state | |
 | `BATTERY_VOLTAGE` / `BATTERY_CURRENT` | f32[1] | 1 s | generic; `emit_derived_battery_rows` | battery %, drop rate, remaining time | V, A |
 | `WARNING` | string | event | `gse::auto_vent::board_warning`, `gse::overpressure::board_warning` | | |
+
+`OX_TANK_PRESSURE` was named `FUEL_TANK_PRESSURE` before 2026-11 (it was always the
+oxidiser tank PT). The station schema keeps the legacy type (its own name-derived wire
+id) so older firmware, SD cards and recordings still decode, and maps the name to
+`OX_TANK_PRESSURE` wherever it enters: live ingress (`telemetry_rows_from_packet_values`,
+`handle_packet_inner`), safety checks (`telemetry_schema::is_ox_tank_pressure`), saved-data
+replay rows and type filters (`recording_replay::decode`, `expand_type_filter`), CSV exports,
+the recording report, layouts, diagrams and replay view configs
+(`layout::canonicalize_legacy_type_names`), the calibration tab config and raw-stream type
+filters. Nothing rewrites a recording file.
 
 ### 2.4 Actuator board (fill CAN)
 
@@ -644,7 +654,7 @@ The two rate columns cover different things:
 | SAR / current / aux analog | `analog_in_1..8_v`, `isense*`, `vmon_v`, `imon_v`, `analog_out_*`: every 100 ms | `DAQ_SAR_VOLTAGES`, `DAQ_CURRENT_SENSE`, `DAQ_POWER_MONITOR` at 4/s each |
 | MCP CH2–7 | `mcp3564r_ch2_v`..`ch7_v`: aux pass every 100 ms | `DAQ_SDADC_VOLTAGES` at 4/s |
 | ADC die temperature | `adc_temperature_c` on every raw row; `mcp3564r_temp_c` every 100 ms | `DAQ_ADC_TEMPERATURE` at 4/s |
-| VB tank PT | `valve_pressure_psi` on the DAQ SD: 250 Hz, VB 12-bit code + psi | `FUEL_TANK_PRESSURE` at 50 Hz from the VB, then `PRESSURE_TRANSDUCER_CALIBRATED` |
+| VB ox tank PT | `valve_pressure_psi` on the DAQ SD: 250 Hz, VB 12-bit code + psi | `OX_TANK_PRESSURE` at 50 Hz from the VB, then `PRESSURE_TRANSDUCER_CALIBRATED` |
 | FC IMU | `gyroscope_sample`, `accelerometer_sample` per acquisition (100 Hz ODR); `IMU` summary every 50 ms (`LOG_RATE_SD`) | `IMU_DATA` at 5 Hz, then `ACCEL_DATA` and `GYRO_DATA` |
 | FC baro | `barometer_sample` (25 Hz ODR); `BARO` every 50 ms | `BAROMETER_DATA` at 5 Hz |
 | FC Kalman | `EKF` / `DKF` per filter output | `ASCENT_STATE` / `DESCENT_STATE` at 5 Hz |

@@ -61,6 +61,7 @@ pub async fn export_recording_csv(
             'COMBUSTION_CHAMBER_PRESSURE',
             'COMBUSTION_CHAMBER_VOLTAGE',
             'DAQ_ADC_TEMPERATURE',
+            'OX_TANK_PRESSURE',
             'FUEL_TANK_PRESSURE',
             'IADC',
             'BATTERY_VOLTAGE',
@@ -156,7 +157,8 @@ pub async fn export_recording_csv(
                     values,
                 });
             }
-            "FUEL_TANK_PRESSURE" | "IADC" => {
+            // FUEL_TANK_PRESSURE: the ox tank PT's name in older recordings.
+            "OX_TANK_PRESSURE" | "FUEL_TANK_PRESSURE" | "IADC" => {
                 state.pressure_raw = first_value;
             }
             "BATTERY_VOLTAGE" => {

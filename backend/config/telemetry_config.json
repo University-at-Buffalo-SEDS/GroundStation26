@@ -251,8 +251,24 @@
       "priority": 200
     },
     {
+      "name": "OX_TANK_PRESSURE",
+      "doc": "Ox Tank Pressure: 1 \u00d7 float32 element (psi). The valve board's oxidiser tank PT.",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 1
+      },
+      "endpoints": [
+        "GROUND_STATION",
+        "SD_CARD"
+      ],
+      "reliable": "Off",
+      "priority": 0
+    },
+    {
       "name": "FUEL_TANK_PRESSURE",
-      "doc": "Fuel Tank Pressure: 1 \u00d7 float32 element.",
+      "doc": "Legacy name of OX_TANK_PRESSURE (the same oxidiser tank PT). Kept so older valve-board firmware, SD cards and recordings still decode; the station records and displays it as OX_TANK_PRESSURE.",
       "class": "Data",
       "element": {
         "kind": "Static",

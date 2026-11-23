@@ -295,7 +295,7 @@ async fn csv_page(
             next=row.try_get("id")?;let provenance_json:String=row.try_get("provenance_json")?;
             let parsed:serde_json::Value=serde_json::from_str(&provenance_json).unwrap_or_default();
             let sender=row.try_get::<Option<String>,_>("sender_id")?.unwrap_or_default();
-            let ty=row.try_get::<String,_>("data_type")?;
+            let ty=crate::telemetry_schema::canonical_type_name(&row.try_get::<String,_>("data_type")?).to_string();
             let payload=row.try_get::<Option<String>,_>("payload_json")?.unwrap_or_default();
             let mut cells=vec![next.to_string(),parsed["received_timestamp_ms"].as_i64().map(|v|v.to_string()).unwrap_or_default(),
                 row.try_get::<Option<i64>,_>("source_timestamp_ms")?.map(|v|v.to_string()).unwrap_or_default(),
@@ -319,6 +319,8 @@ async fn csv_page(
         let source: Option<i64> = row.try_get("source_timestamp_ms")?;
         let sender: Option<String> = row.try_get("sender_id")?;
         let ty: String = row.try_get("data_type")?;
+        // Pre-rename recordings export under the canonical type name.
+        let ty = crate::telemetry_schema::canonical_type_name(&ty).to_string();
         let values: Option<String> = row.try_get("values_json")?;
         let payload: Option<String> = row.try_get("payload_json")?;
         chunk.push_str(&format!(

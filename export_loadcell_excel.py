@@ -28,12 +28,14 @@ from pathlib import Path
 CHANNELS = {
     "KG1000": ("Loadcell raw", "Raw"),
     "LOADCELL_WEIGHT_KG": ("Loadcell kg", "kg"),
-    "FUEL_TANK_PRESSURE": ("PT raw", "Raw"),
+    "OX_TANK_PRESSURE": ("Ox tank PT raw", "Raw"),
     "IADC": ("PT raw IADC", "Raw"),
     "PRESSURE_TRANSDUCER_CALIBRATED": ("PT calibrated", "psi"),
     "RECALCULATED_KG": ("Loadcell recalculated kg", "kg"),
     "ABSOLUTE_KG": ("Loadcell absolute kg", "kg"),
 }
+# Recordings exported before the ox tank PT rename name it FUEL_TANK_PRESSURE.
+LEGACY_TYPE_NAMES = {"FUEL_TANK_PRESSURE": "OX_TANK_PRESSURE"}
 
 
 @dataclass(frozen=True)
@@ -59,7 +61,7 @@ def read_recording(path):
         if missing:
             raise ValueError(f"CSV missing columns: {', '.join(sorted(missing))}")
         for line, row in enumerate(reader, 2):
-            kind = row["data_type"]
+            kind = LEGACY_TYPE_NAMES.get(row["data_type"], row["data_type"])
             if kind not in streams:
                 continue
             try:
@@ -497,7 +499,7 @@ def main():
     for kind in ("KG1000", "LOADCELL_WEIGHT_KG", "PRESSURE_TRANSDUCER_CALIBRATED"):
         if kind not in streams:
             print(f"Warning: {kind} is absent from the recording.", file=sys.stderr)
-    if not any(kind in streams for kind in ("FUEL_TANK_PRESSURE", "IADC")):
+    if not any(kind in streams for kind in ("OX_TANK_PRESSURE", "IADC")):
         print("Warning: no raw PT channel in the recording.", file=sys.stderr)
     if args.all or args.start is not None:
         start = min(rows[0].received_ms for rows in streams.values()) if args.all else args.start

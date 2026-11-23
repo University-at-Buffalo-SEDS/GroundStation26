@@ -32,6 +32,9 @@ when both are present.
 | `max_hz` | Rate cap per stream (one `data_type` + `sender` pair) | 50 | 0.1–1000; never above the token's `max_hz` |
 | `max_rows_per_s` | Cap on all rows of the connection | 5000 | 1–20000 |
 
+The ox tank PT streams as `OX_TANK_PRESSURE`. A `types` entry or token scope that
+still names its old `FUEL_TANK_PRESSURE` matches it.
+
 An invalid value is a `400` with a message. Unknown parameters are ignored
 (cache-busting parameters in overlay URLs are harmless).
 
@@ -107,7 +110,7 @@ response ends.
 {"schema":"gs26.raw-stream.v1","server_time_ms":1767225600000,"network_time_ms":1767225600002,
  "provenance":{"station":"live","igt_replay":false,"mode":"Normal"},
  "viewer":{"kind":"session"},
- "streams":[{"data_type":"FUEL_TANK_PRESSURE","sender":"VB","rows":15020,"rate_hz":50.0,
+ "streams":[{"data_type":"OX_TANK_PRESSURE","sender":"VB","rows":15020,"rate_hz":50.0,
    "last_received_ms":1767225599990,"last_source_ms":1767225599975,"values":[512.3],
    "fields":["tank_pressure_raw"],"units":["psi"],"provenance":"live"}]}
 ```
@@ -253,7 +256,7 @@ import json, requests
 
 URL = "https://groundstation.local/api/stream/raw"
 TOKEN = "gss1.REPLACE_ME"
-params = {"types": "FUEL_TANK_PRESSURE,VALVE_STATE", "max_hz": "20"}
+params = {"types": "OX_TANK_PRESSURE,VALVE_STATE", "max_hz": "20"}
 with requests.get(URL, params=params, stream=True, verify=False, timeout=30,
                   headers={"Authorization": f"Bearer {TOKEN}"}) as response:
     response.raise_for_status()

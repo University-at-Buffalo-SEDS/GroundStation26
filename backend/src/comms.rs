@@ -10527,7 +10527,7 @@ mod raw_uart_tests {
     #[test]
     fn tap_non_groundstation_gps_skips_groundstation_addressed_fill_telemetry() {
         let pkt = Packet::new(
-            crate::telemetry_schema::data_type("FUEL_TANK_PRESSURE"),
+            crate::telemetry_schema::data_type("OX_TANK_PRESSURE"),
             &[
                 crate::telemetry_schema::endpoint("GROUND_STATION"),
                 crate::telemetry_schema::endpoint("SD_CARD"),

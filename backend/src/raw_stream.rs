@@ -395,6 +395,19 @@ fn list_matches(list: &[String], value: &str) -> bool {
     list.is_empty() || list.iter().any(|p| pattern_matches(p, value))
 }
 
+/// Type filters saved before the ox tank PT rename (stream tokens, OBS
+/// overlays, scripts) name FUEL_TANK_PRESSURE; rows carry OX_TANK_PRESSURE.
+fn type_list_matches(list: &[String], data_type: &str) -> bool {
+    list.is_empty()
+        || list.iter().any(|p| {
+            pattern_matches(p, data_type)
+                || pattern_matches(
+                    crate::telemetry_schema::canonical_type_name(&p.to_ascii_uppercase()),
+                    data_type,
+                )
+        })
+}
+
 fn parse_list(raw: Option<&String>, name: &str, upper: bool) -> Result<Vec<String>, String> {
     let Some(raw) = raw else {
         return Ok(Vec::new());
@@ -469,8 +482,8 @@ impl Filter {
 
     pub(crate) fn admits(&self, data_type: &str, sender: &str) -> bool {
         !denied(data_type)
-            && list_matches(&self.scope_types, data_type)
-            && list_matches(&self.types, data_type)
+            && type_list_matches(&self.scope_types, data_type)
+            && type_list_matches(&self.types, data_type)
             && list_matches(&self.scope_senders, sender)
             && list_matches(&self.senders, sender)
     }
@@ -1162,7 +1175,7 @@ pub(crate) fn schema(data_type: &str) -> (&'static [&'static str], &'static [&'s
             &["V", "V", "V", "A"],
         ),
         // Valve board, actuator board, gateway
-        "FUEL_TANK_PRESSURE" => (&["tank_pressure_raw"], &["psi"]),
+        "OX_TANK_PRESSURE" | "FUEL_TANK_PRESSURE" => (&["tank_pressure_raw"], &["psi"]),
         "PRESSURE_TRANSDUCER_CALIBRATED" => (&["tank_pressure"], &["psi"]),
         "VALVE_STATE" => (
             &[

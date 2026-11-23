@@ -152,7 +152,7 @@ const FILL_SYSTEM_SENSOR_SEQUENCE: &[SimSensorSpec] = &[
         sender: Board::DaqBoard,
     },
     SimSensorSpec {
-        dtype: crate::telemetry_schema::types::FUEL_TANK_PRESSURE,
+        dtype: crate::telemetry_schema::types::OX_TANK_PRESSURE,
         sender: Board::ValveBoard,
     },
     SimSensorSpec {
@@ -306,7 +306,7 @@ struct FlightSimState {
     last_housekeeping_emit_ms: u64,
     next_av_bay_sensor_idx: usize,
     next_fill_system_sensor_idx: usize,
-    fuel_tank_pressure_psi: f32,
+    ox_tank_pressure_psi: f32,
     fuel_flow_lpm: f32,
     battery_v: f32,
     battery_a: f32,
@@ -375,7 +375,7 @@ impl FlightSimState {
             last_housekeeping_emit_ms: 0,
             next_av_bay_sensor_idx: 0,
             next_fill_system_sensor_idx: 0,
-            fuel_tank_pressure_psi: 5.0,
+            ox_tank_pressure_psi: 5.0,
             fuel_flow_lpm: 0.0,
             battery_v: AV_BAY_BATTERY_MAX_V,
             battery_a: 1.2,
@@ -1044,43 +1044,43 @@ impl FlightSimState {
 
         if n2_open && !dump_open {
             let target_psi = nitrogen_pressure_target_psi(self.loadcell_mass_kg);
-            let delta = target_psi - self.fuel_tank_pressure_psi;
+            let delta = target_psi - self.ox_tank_pressure_psi;
             let max_step = NITROGEN_PRESSURE_RESPONSE_PER_S * dt_s.max(0.02) * 20.0;
-            self.fuel_tank_pressure_psi += delta.clamp(-max_step, max_step);
+            self.ox_tank_pressure_psi += delta.clamp(-max_step, max_step);
         } else if n2o_open && !dump_open {
             // Nitrous is self-pressurizing: pressure trends toward equilibrium
             // while the actual quantity is determined by the loadcell mass.
             let target_psi = nitrous_equilibrium_pressure_psi(self.loadcell_mass_kg);
-            let delta = target_psi - self.fuel_tank_pressure_psi;
+            let delta = target_psi - self.ox_tank_pressure_psi;
             let max_step = NITROUS_PRESSURE_RESPONSE_PER_S * dt_s.max(0.02) * 20.0;
-            self.fuel_tank_pressure_psi += delta.clamp(-max_step, max_step);
+            self.ox_tank_pressure_psi += delta.clamp(-max_step, max_step);
         } else {
             // Once nitrous is loaded, tank pressure should remain near vapor equilibrium
             // even after the valve closes; otherwise hold the existing pressure.
             if nitrous_loaded && self.loadcell_mass_kg > 0.05 {
                 let target_psi = nitrous_equilibrium_pressure_psi(self.loadcell_mass_kg);
-                let delta = target_psi - self.fuel_tank_pressure_psi;
+                let delta = target_psi - self.ox_tank_pressure_psi;
                 let max_step = (NITROUS_PRESSURE_RESPONSE_PER_S * 0.35) * dt_s.max(0.02) * 20.0;
-                self.fuel_tank_pressure_psi += delta.clamp(-max_step, max_step);
+                self.ox_tank_pressure_psi += delta.clamp(-max_step, max_step);
             }
-            self.fuel_tank_pressure_psi = self.fuel_tank_pressure_psi.max(0.0);
+            self.ox_tank_pressure_psi = self.ox_tank_pressure_psi.max(0.0);
         }
 
         if dump_open {
             let target_psi = vented_pressure_target_psi(self.loadcell_mass_kg, nitrous_loaded);
-            let delta = target_psi - self.fuel_tank_pressure_psi;
-            self.fuel_tank_pressure_psi += delta.clamp(
+            let delta = target_psi - self.ox_tank_pressure_psi;
+            self.ox_tank_pressure_psi += delta.clamp(
                 -DUMP_PRESSURE_BLEED_PSI_PER_S * dt_s,
                 DUMP_PRESSURE_BLEED_PSI_PER_S * dt_s,
             );
         } else if no_open {
-            let delta = -self.fuel_tank_pressure_psi;
-            self.fuel_tank_pressure_psi += delta.clamp(
+            let delta = -self.ox_tank_pressure_psi;
+            self.ox_tank_pressure_psi += delta.clamp(
                 -NORMALLY_OPEN_PRESSURE_BLEED_PSI_PER_S * dt_s,
                 NORMALLY_OPEN_PRESSURE_BLEED_PSI_PER_S * dt_s,
             );
         }
-        self.fuel_tank_pressure_psi = self.fuel_tank_pressure_psi.max(0.0);
+        self.ox_tank_pressure_psi = self.ox_tank_pressure_psi.max(0.0);
 
 
         }
@@ -1210,7 +1210,7 @@ impl FlightSimState {
         now_ms: u64,
     ) -> TelemetryResult<Option<Packet>> {
         self.update_physics(now_ms);
-        if crate::runtime_mode::is_testing() && !self.plant_observation_valid && matches!(spec.dtype,ty if ty==crate::telemetry_schema::data_type("FUEL_TANK_PRESSURE")||ty==crate::telemetry_schema::data_type("KG1000")) {return Ok(None);}
+        if crate::runtime_mode::is_testing() && !self.plant_observation_valid && matches!(spec.dtype,ty if ty==crate::telemetry_schema::data_type("OX_TANK_PRESSURE")||ty==crate::telemetry_schema::data_type("KG1000")) {return Ok(None);}
         let mut rng = rand::rng();
         if spec.sender == Board::ValveBoard && valve_board_disconnected_for_state(self.flight_state)
         {
@@ -1270,8 +1270,8 @@ impl FlightSimState {
                     .flat_map(|v| v.to_le_bytes())
                     .collect()
             }
-            ty if ty == crate::telemetry_schema::data_type("FUEL_TANK_PRESSURE") => {
-                vec![self.fuel_tank_pressure_psi]
+            ty if ty == crate::telemetry_schema::data_type("OX_TANK_PRESSURE") => {
+                vec![self.ox_tank_pressure_psi]
                     .into_iter()
                     .flat_map(|v| v.to_le_bytes())
                     .collect()
@@ -1410,7 +1410,7 @@ fn next_scheduled_pressure_transducer_packet(
 ) -> TelemetryResult<Option<Packet>> {
     state.next_sensor_packet(
         SimSensorSpec {
-            dtype: crate::telemetry_schema::data_type("FUEL_TANK_PRESSURE"),
+            dtype: crate::telemetry_schema::data_type("OX_TANK_PRESSURE"),
             sender: Board::ValveBoard,
         },
         now_ms,
@@ -1591,7 +1591,7 @@ impl FlightSimState {
         let mut plant=self.expanded_plant.take().unwrap_or_else(||{
             let mut plant=ground_plant::Plant::empty();
             plant.liquid_kg=f64::from(self.loadcell_mass_kg.max(0.0));
-            plant.vapor_partial_psi=f64::from(self.fuel_tank_pressure_psi.max(0.0));
+            plant.vapor_partial_psi=f64::from(self.ox_tank_pressure_psi.max(0.0));
             plant
         });
         let valves=ground_plant::Valves{nitrogen:self.valve_on(9),nitrous:self.valve_on(10),vent:self.valve_on(1),dump:self.valve_on(2),pilot:self.valve_on(0)};
@@ -1600,7 +1600,7 @@ impl FlightSimState {
         if matches!(result,Err(ground_plant::StepError::ClockGap)) {log::warn!("SIMULATED plant clock discontinuity: missing interval not integrated; current sensor observation suppressed");}
         if self.plant_observation_valid {
             self.loadcell_mass_kg=plant.mass_kg(parameters) as f32;
-            self.fuel_tank_pressure_psi=plant.pressure_psi() as f32;
+            self.ox_tank_pressure_psi=plant.pressure_psi() as f32;
         }
         self.expanded_plant=Some(plant);
     }
@@ -1945,7 +1945,7 @@ mod tests {
         let mut sim = super::FlightSimState::new();
         let valves = sim.valves.clone();
         let flight_state = sim.flight_state;
-        let pressure = sim.fuel_tank_pressure_psi;
+        let pressure = sim.ox_tank_pressure_psi;
         let mass = sim.loadcell_mass_kg;
         assert!(sim.queued.is_empty());
         for command in [
@@ -1959,7 +1959,7 @@ mod tests {
             assert!(!sim.apply_command(&command, 1000));
             assert_eq!(sim.valves, valves);
             assert_eq!(sim.flight_state, flight_state);
-            assert_eq!(sim.fuel_tank_pressure_psi, pressure);
+            assert_eq!(sim.ox_tank_pressure_psi, pressure);
             assert_eq!(sim.loadcell_mass_kg, mass);
             assert!(sim.queued.is_empty());
             assert!(sim.launch_sequence_started_ms.is_none());
@@ -2212,7 +2212,7 @@ mod tests {
             )
         }));
         assert!(fill.iter().any(|spec| spec.dtype
-            == crate::telemetry_schema::data_type("FUEL_TANK_PRESSURE")
+            == crate::telemetry_schema::data_type("OX_TANK_PRESSURE")
             && spec.sender == crate::types::Board::ValveBoard));
         assert!(
             av_bay

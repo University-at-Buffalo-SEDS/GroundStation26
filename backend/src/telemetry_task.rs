@@ -3144,7 +3144,9 @@ async fn handle_packet_inner(
         return Vec::new();
     }
 
-    let data_type_str = pkt.data_type().as_str().to_string();
+    // Legacy wire names are recorded and published under their canonical name.
+    let data_type_str =
+        crate::telemetry_schema::canonical_type_name(&pkt.data_type().as_str()).to_string();
     let ts_ms = get_current_timestamp_ms() as i64;
 
     let payload_json = payload_json_from_pkt(&pkt);
@@ -3328,7 +3330,9 @@ async fn handle_packet_inner(
             live_receipt,
         );
         if sender_id == Board::ValveBoard.sender_id()
-            && rows.iter().any(|(kind, _)| kind == "FUEL_TANK_PRESSURE")
+            && rows
+                .iter()
+                .any(|(kind, _)| kind == crate::telemetry_schema::OX_TANK_PRESSURE)
         {
             crate::gse::overpressure::evaluate(state);
         }
@@ -3342,7 +3346,7 @@ async fn handle_packet_inner(
                     loadcell::RAW_LOADCELL_DATA_TYPE_1000KG
                         | loadcell::RAW_LOADCELL_DATA_TYPE_50KG
                         | loadcell::RAW_PRESSURE_TRANSDUCER_DATA_TYPE
-                        | "FUEL_TANK_PRESSURE"
+                        | crate::telemetry_schema::OX_TANK_PRESSURE
                 ) {
                     return None;
                 }
@@ -6448,7 +6452,7 @@ mod tests {
             last_packet_rx_ms: Arc::new(AtomicU64::new(0)),
             umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
             pending_umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
-            latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),
+            latest_ox_tank_pressure: Arc::new(Mutex::new(None)),
             gse: Arc::new(Mutex::new(crate::gse::Runtime::default())),
         phase_control_selected: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         phase_control_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -7484,9 +7488,8 @@ mod tests {
         assert_eq!(serde_json::to_value(&*state.loadcell_calibration.lock().unwrap()).unwrap(), original);
     }
 
-    #[tokio::test]
-    async fn fuel_tank_pressure_updates_latest_with_calibrated_value() {
-        let (db_tx, _db_rx) = mpsc::channel(32);
+    async fn ox_tank_pressure_updates_latest_with_calibrated_value(wire_name: &str) {
+        let (db_tx, mut db_rx) = mpsc::channel(32);
         let state = test_app_state(db_tx.clone()).await;
         let db_overflow = test_db_overflow();
         let mut ws_rx = state.ws_tx.subscribe();
@@ -7499,30 +7502,38 @@ mod tests {
         }
 
         let pkt = Packet::new(
-            crate::telemetry_schema::data_type("FUEL_TANK_PRESSURE"),
+            crate::telemetry_schema::data_type(wire_name),
             &[crate::telemetry_schema::endpoint("GROUND_STATION")],
             Board::DaqBoard.sender_id(),
             567_890,
             f32_payload(&[370.0]),
         )
-        .expect("failed to build fuel tank pressure packet");
+        .expect("failed to build ox tank pressure packet");
 
         let row = handle_packet(&state, &db_tx, &db_overflow, pkt)
             .await
             .into_iter()
             .next()
-            .expect("fuel tank pressure packet should produce raw telemetry row");
+            .expect("ox tank pressure packet should produce raw telemetry row");
 
-        assert_eq!(
-            row.data_type,
-            crate::telemetry_schema::data_type("FUEL_TANK_PRESSURE")
-                .as_str()
-                .to_string()
-        );
+        // Either wire name is published and recorded under the canonical name.
+        assert_eq!(row.data_type, crate::telemetry_schema::OX_TANK_PRESSURE);
         assert_eq!(row.values, vec![Some(370.0)]);
         assert!(
             row.timestamp_ms > 567_890,
             "raw pressure row should use ground-station ingest time, not stale board timestamp"
+        );
+        let mut recorded = Vec::new();
+        while let Ok(item) = db_rx.try_recv() {
+            recorded.push(format!("{item:?}"));
+        }
+        assert!(
+            recorded.iter().any(|item| item.contains("\"OX_TANK_PRESSURE\"")),
+            "raw row must be recorded under the canonical name: {recorded:?}"
+        );
+        assert!(
+            recorded.iter().all(|item| !item.contains("FUEL_TANK_PRESSURE")),
+            "legacy name must not be recorded: {recorded:?}"
         );
 
         let derived = ws_rx
@@ -7536,9 +7547,19 @@ mod tests {
         assert_eq!(derived.values, vec![Some(745.0)]);
         assert_eq!(derived.timestamp_ms, row.timestamp_ms);
         assert_eq!(
-            *state.latest_fuel_tank_pressure.lock().unwrap(),
+            *state.latest_ox_tank_pressure.lock().unwrap(),
             Some(745.0)
         );
+    }
+
+    #[tokio::test]
+    async fn ox_tank_pressure_packet_updates_latest_with_calibrated_value() {
+        ox_tank_pressure_updates_latest_with_calibrated_value("OX_TANK_PRESSURE").await;
+    }
+
+    #[tokio::test]
+    async fn legacy_fuel_tank_pressure_packet_is_canonicalized_to_ox_tank_pressure() {
+        ox_tank_pressure_updates_latest_with_calibrated_value("FUEL_TANK_PRESSURE").await;
     }
 
     #[tokio::test]

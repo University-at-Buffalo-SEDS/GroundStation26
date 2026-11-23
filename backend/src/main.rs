@@ -1675,7 +1675,7 @@ async fn main() -> anyhow::Result<()> {
         last_packet_rx_ms: Arc::new(AtomicU64::new(0)),
         umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
         pending_umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
-        latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),
+        latest_ox_tank_pressure: Arc::new(Mutex::new(None)),
         gse: Arc::new(Mutex::new(crate::gse::Runtime::default())),
         phase_control_selected: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         phase_control_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1928,7 +1928,7 @@ async fn main() -> anyhow::Result<()> {
                         Some(2)
                     } else if ty == telemetry_schema::data_type("BATTERY_CURRENT") {
                         Some(3)
-                    } else if ty == telemetry_schema::data_type("FUEL_TANK_PRESSURE") {
+                    } else if telemetry_schema::is_ox_tank_pressure(ty) {
                         Some(4)
                     } else {
                         None

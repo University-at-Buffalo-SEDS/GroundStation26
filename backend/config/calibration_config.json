@@ -60,8 +60,8 @@
     },
     {
       "id": "IADC",
-      "label": "Tank Pressure",
-      "data_type": "FUEL_TANK_PRESSURE",
+      "label": "Ox Tank Pressure",
+      "data_type": "OX_TANK_PRESSURE",
       "channel": "iadc",
       "fit_color": "#a78bfa",
       "raw_label": "Raw",

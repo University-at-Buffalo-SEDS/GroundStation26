@@ -35,6 +35,7 @@ fn main() {
                 "GPS_DATA",
                 "BAROMETER_DATA",
                 "FUEL_FLOW",
+                "OX_TANK_PRESSURE",
                 "FUEL_TANK_PRESSURE",
                 "BATTERY_VOLTAGE",
                 "BATTERY_CURRENT",

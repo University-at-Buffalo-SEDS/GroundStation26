@@ -59,9 +59,9 @@ const BATTERY_LOW_VOLTAGE_ALWAYS_WARN_THRESHOLD: f32 = 13.0; // V
 const BATTERY_CURRENT_MIN_THRESHOLD: f32 = -1.0; // A
 const BATTERY_CURRENT_MAX_THRESHOLD: f32 = 50.0; // A
 
-// Fuel Tank Pressure thresholds (psi)
-const FUEL_TANK_PRESSURE_MIN_THRESHOLD: f32 = 0.0; // psi
-const FUEL_TANK_PRESSURE_MAX_THRESHOLD: f32 = 3000.0; // psi
+// Ox Tank Pressure thresholds (psi)
+const OX_TANK_PRESSURE_MIN_THRESHOLD: f32 = 0.0; // psi
+const OX_TANK_PRESSURE_MAX_THRESHOLD: f32 = 3000.0; // psi
 
 // Kalman Filter thresholds
 const KALMAN_STATE_MIN_THRESHOLD: f32 = -5000.0; // arbitrary units
@@ -234,6 +234,17 @@ fn check_battery_current(values: &[f32], warnings: &mut HashSet<&'static str>) {
         && !(BATTERY_CURRENT_MIN_THRESHOLD..=BATTERY_CURRENT_MAX_THRESHOLD).contains(current)
     {
         warnings.insert(BATTERY_CURRENT_WARNING);
+    }
+}
+
+/// Ox tank PT range check; the packet may carry the current or legacy wire id.
+fn check_ox_tank_pressure(pkt: &sedsnet::packet::Packet, warnings: &mut HashSet<&'static str>) {
+    let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 1]);
+    if let Some(pressure) = values.first()
+        && ((OX_TANK_PRESSURE_MIN_THRESHOLD > *pressure)
+            || (*pressure > OX_TANK_PRESSURE_MAX_THRESHOLD))
+    {
+        warnings.insert("Critical: Ox tank pressure out of range!");
     }
 }
 
@@ -687,16 +698,9 @@ async fn safety_loop(
                     }
                 }
 
-                // Fuel tank pressure: [pressure_psi, ...]
-                ty if ty == crate::telemetry_schema::data_type("FUEL_TANK_PRESSURE") => {
-                    let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 1]);
-
-                    if let Some(pressure) = values.first()
-                        && ((FUEL_TANK_PRESSURE_MIN_THRESHOLD > *pressure)
-                            || (*pressure > FUEL_TANK_PRESSURE_MAX_THRESHOLD))
-                    {
-                        cycle_warnings.insert("Critical: Fuel tank pressure out of range!");
-                    }
+                // Ox tank pressure: [pressure_psi, ...] (current or legacy wire id)
+                ty if crate::telemetry_schema::is_ox_tank_pressure(ty) => {
+                    check_ox_tank_pressure(&pkt, &mut cycle_warnings);
                 }
 
                 // Ascent/descent Kalman filter state packets.
@@ -1235,5 +1239,39 @@ mod tests {
         crate::mode_suite!(Normal, Testing);
         assert!(battery_voltage_out_of_range("GB", 13.0));
         assert!(battery_voltage_out_of_range("GW", 13.0));
+    }
+}
+
+#[cfg(test)]
+mod ox_tank_pressure_tests {
+    use super::*;
+
+    fn packet(name: &str, psi: f32) -> sedsnet::packet::Packet {
+        sedsnet::packet::Packet::new(
+            crate::telemetry_schema::data_type(name),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+            "VB",
+            1,
+            Arc::from(psi.to_le_bytes().to_vec().into_boxed_slice()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ox_tank_pressure_rule_fires_on_current_and_legacy_wire_ids() {
+        for name in ["OX_TANK_PRESSURE", "FUEL_TANK_PRESSURE"] {
+            let high = packet(name, OX_TANK_PRESSURE_MAX_THRESHOLD + 1.0);
+            assert!(crate::telemetry_schema::is_ox_tank_pressure(high.data_type()), "{name}");
+            let mut warnings = HashSet::new();
+            check_ox_tank_pressure(&high, &mut warnings);
+            assert!(warnings.contains("Critical: Ox tank pressure out of range!"), "{name}");
+
+            let mut warnings = HashSet::new();
+            check_ox_tank_pressure(&packet(name, 500.0), &mut warnings);
+            assert!(warnings.is_empty(), "{name}");
+        }
+        assert!(!crate::telemetry_schema::is_ox_tank_pressure(
+            crate::telemetry_schema::data_type("BATTERY_VOLTAGE")
+        ));
     }
 }

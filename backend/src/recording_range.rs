@@ -98,6 +98,7 @@ async fn page(
         let source: Option<i64> = row.try_get("source_timestamp_ms")?;
         let sender: Option<String> = row.try_get("sender_id")?;
         let ty: String = row.try_get("data_type")?;
+        let ty = crate::telemetry_schema::canonical_type_name(&ty).to_string();
         let values: Option<String> = row.try_get("values_json")?;
         let payload: Option<String> = row.try_get("payload_json")?;
         csv.push_str(&format!(

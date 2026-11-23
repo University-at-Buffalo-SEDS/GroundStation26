@@ -237,7 +237,7 @@ pub struct AppState {
     pub pending_umbilical_valve_states: Arc<Mutex<HashMap<u8, PendingUmbilicalValveState>>>,
 
     /// Latest fuel tank pressure (psi)
-    pub latest_fuel_tank_pressure: Arc<Mutex<Option<f32>>>,
+    pub latest_ox_tank_pressure: Arc<Mutex<Option<f32>>>,
     pub gse: Arc<Mutex<crate::gse::Runtime>>,
     /// Committed operator selection for presentation; mutation still validates Runtime revision.
     pub phase_control_selected: Arc<AtomicBool>,
@@ -2771,7 +2771,7 @@ impl AppState {
             status.ema_gap_ms = None;
             status.warned = false;
         }
-        *self.latest_fuel_tank_pressure.lock().unwrap() = None;
+        *self.latest_ox_tank_pressure.lock().unwrap() = None;
         crate::gse::progress::replace_runtime_for_sim_reset(self);
         *self.latest_fill_mass_kg.lock().unwrap() = None;
         self.last_command_ms.lock().unwrap().clear();
@@ -4547,7 +4547,7 @@ pub(crate) mod tests {
             last_packet_rx_ms: Arc::new(AtomicU64::new(0)),
             umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
             pending_umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
-            latest_fuel_tank_pressure: Arc::new(Mutex::new(None)),
+            latest_ox_tank_pressure: Arc::new(Mutex::new(None)),
             gse: Arc::new(Mutex::new(crate::gse::Runtime::default())),
             phase_control_selected: Arc::new(AtomicBool::new(true)),
             phase_control_revision: Arc::new(AtomicU64::new(0)),

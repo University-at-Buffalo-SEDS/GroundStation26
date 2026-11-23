@@ -24,6 +24,7 @@ pub fn initialize() -> anyhow::Result<()> {
                 ("GPS_DATA", types::GPS_DATA),
                 ("BAROMETER_DATA", types::BAROMETER_DATA),
                 ("FUEL_FLOW", types::FUEL_FLOW),
+                ("OX_TANK_PRESSURE", types::OX_TANK_PRESSURE),
                 ("FUEL_TANK_PRESSURE", types::FUEL_TANK_PRESSURE),
                 ("BATTERY_VOLTAGE", types::BATTERY_VOLTAGE),
                 ("BATTERY_CURRENT", types::BATTERY_CURRENT),
@@ -68,6 +69,50 @@ pub fn data_type(name: &str) -> DataType {
     DataType::named(name)
 }
 
+/// The valve board's oxidiser tank pressure transducer (psi, f32 x 1).
+pub const OX_TANK_PRESSURE: &str = "OX_TANK_PRESSURE";
+/// The same PT's former, inaccurate name. Older valve-board firmware, board SD
+/// cards, recordings, layouts and saved dashboards still carry it; the
+/// schema keeps the type so those decode, and the station maps it to
+/// [`OX_TANK_PRESSURE`] wherever a type name enters (live ingress, replay,
+/// SD import, layout load, API filters).
+pub const LEGACY_FUEL_TANK_PRESSURE: &str = "FUEL_TANK_PRESSURE";
+
+/// Maps a legacy telemetry type name to its canonical name; every other name
+/// is returned unchanged.
+pub fn canonical_type_name(name: &str) -> &str {
+    if name == LEGACY_FUEL_TANK_PRESSURE {
+        OX_TANK_PRESSURE
+    } else {
+        name
+    }
+}
+
+/// Type names a recorded-data filter must match for the requested canonical
+/// names: each canonical name also matches its legacy rows (and a legacy name
+/// in an old saved filter also matches canonical rows).
+pub fn expand_type_filter(types: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = types.to_vec();
+    for name in types {
+        let alias = if name == OX_TANK_PRESSURE {
+            LEGACY_FUEL_TANK_PRESSURE
+        } else if name == LEGACY_FUEL_TANK_PRESSURE {
+            OX_TANK_PRESSURE
+        } else {
+            continue;
+        };
+        if !out.iter().any(|t| t == alias) {
+            out.push(alias.to_string());
+        }
+    }
+    out
+}
+
+/// True for the ox tank PT under either its current or its legacy wire id.
+pub fn is_ox_tank_pressure(ty: DataType) -> bool {
+    ty == types::OX_TANK_PRESSURE || ty == types::FUEL_TANK_PRESSURE
+}
+
 /// BAROMETER_DATA element order on the wire: the FC sends its
 /// `baro { alt, prs, tmp }` struct whole (schema: "alt, prs, tmp").
 pub mod baro {
@@ -82,6 +127,40 @@ pub mod baro {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// OX_TANK_PRESSURE is the ox tank PT's canonical type; FUEL_TANK_PRESSURE
+    /// stays decodable as its legacy alias. Both are name-hash wire ids (no
+    /// explicit "id"), so a board schema naming OX_TANK_PRESSURE gets the
+    /// same id as the station without coordination.
+    #[test]
+    fn ox_tank_pressure_and_its_legacy_alias_share_one_shape() {
+        initialize().unwrap();
+        let config: serde_json::Value = serde_json::from_slice(SCHEMA_JSON).unwrap();
+        let entry = |name: &str| {
+            let mut ty = config["types"].as_array().unwrap().iter()
+                .find(|ty| ty["name"] == name).unwrap().clone();
+            assert!(ty.get("id").is_none(), "{name} must keep its name-derived id");
+            ty.as_object_mut().unwrap().remove("name");
+            ty.as_object_mut().unwrap().remove("doc");
+            ty
+        };
+        assert_eq!(entry("OX_TANK_PRESSURE"), entry("FUEL_TANK_PRESSURE"));
+        assert_ne!(types::OX_TANK_PRESSURE, types::FUEL_TANK_PRESSURE);
+        assert_eq!(data_type("OX_TANK_PRESSURE"), types::OX_TANK_PRESSURE);
+        assert!(is_ox_tank_pressure(types::OX_TANK_PRESSURE));
+        assert!(is_ox_tank_pressure(types::FUEL_TANK_PRESSURE));
+        assert_eq!(canonical_type_name("FUEL_TANK_PRESSURE"), "OX_TANK_PRESSURE");
+        assert_eq!(canonical_type_name("OX_TANK_PRESSURE"), "OX_TANK_PRESSURE");
+        assert_eq!(
+            expand_type_filter(&["OX_TANK_PRESSURE".into(), "KG50".into()]),
+            ["OX_TANK_PRESSURE", "KG50", "FUEL_TANK_PRESSURE"]
+        );
+        println!(
+            "OX_TANK_PRESSURE id {} (legacy FUEL_TANK_PRESSURE id {})",
+            types::OX_TANK_PRESSURE.0,
+            types::FUEL_TANK_PRESSURE.0
+        );
+    }
 
     #[test]
     fn daq_storage_types_keep_distinct_canonical_ids_and_shapes() {

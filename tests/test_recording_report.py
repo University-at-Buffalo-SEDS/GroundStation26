@@ -43,6 +43,20 @@ class Reports(unittest.TestCase):
         self.assertEqual([float(r["value"]) for r in rows],[1,3,5,7])
         self.assertTrue(all(r["regression_json"] for r in rows))
 
+    def test_legacy_fuel_tank_pressure_rows_report_as_ox_tank_pressure(self):
+        with closing(sqlite3.connect(self.path)) as db, db:
+            for i in range(10):
+                for kind, value in [("FUEL_TANK_PRESSURE", i), ("PRESSURE_TRANSDUCER_CALIBRATED", 4*i+1)]:
+                    db.execute("INSERT INTO telemetry VALUES(NULL,?,?,?,?,?,?)",(5000+i*100,i,"VB",kind,json.dumps([value]),"[]"))
+        preview=json.loads(report.run(self.request))
+        keys=[c["key"] for c in preview["channels"]]
+        self.assertIn('["VB","OX_TANK_PRESSURE",0]', keys)
+        self.assertFalse(any("FUEL_TANK_PRESSURE" in k for k in keys))
+        cal=next(c for c in preview["channels"] if "PRESSURE_TRANSDUCER_CALIBRATED" in c["key"])
+        self.assertEqual(cal["regression"]["raw_type"],"OX_TANK_PRESSURE")
+        self.assertEqual(cal["regression"]["slope"],4)
+        self.assertEqual(cal["regression"]["intercept"],1)
+
     def test_named_valve_updates_keep_numeric_values_and_unknowns(self):
         with closing(sqlite3.connect(self.path)) as db, db:
             for t, values in [(3000,[1,None,0]),(4000,[0,1,1])]:

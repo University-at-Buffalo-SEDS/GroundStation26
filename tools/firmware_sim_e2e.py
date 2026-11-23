@@ -210,7 +210,7 @@ def main() -> int:
 
 
 def vb_psi(st: Station):
-    r = st.latest("FUEL_TANK_PRESSURE", "VB")
+    r = st.latest("OX_TANK_PRESSURE", "VB")
     return r["values"][0] if r else None
 
 

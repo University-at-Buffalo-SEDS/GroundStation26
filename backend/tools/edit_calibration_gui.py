@@ -31,7 +31,7 @@ CHANNEL_SPECS = {
         "color": "#22d3ee",
     },
     "iadc": {
-        "label": "Tank Pressure",
+        "label": "Ox Tank Pressure",
         "points_key": "points_iadc",
         "raw_key": "iadc_raw",
         "linear_key": "iadc",

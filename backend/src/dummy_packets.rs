@@ -29,7 +29,7 @@ fn random_packet() -> TelemetryResult<Packet> {
         crate::telemetry_schema::data_type("BATTERY_CURRENT"),
         crate::telemetry_schema::data_type("BAROMETER_DATA"),
         crate::telemetry_schema::data_type("FUEL_FLOW"),
-        crate::telemetry_schema::data_type("FUEL_TANK_PRESSURE"),
+        crate::telemetry_schema::data_type("OX_TANK_PRESSURE"),
     ];
 
     let dtype = choices[rng.random_range(0..choices.len())];
@@ -98,7 +98,7 @@ fn random_packet() -> TelemetryResult<Packet> {
         ty if ty == crate::telemetry_schema::data_type("FUEL_FLOW") => {
             vec![rng.random_range(0.0..20.0)]
         }
-        ty if ty == crate::telemetry_schema::data_type("FUEL_TANK_PRESSURE") => {
+        ty if ty == crate::telemetry_schema::data_type("OX_TANK_PRESSURE") => {
             vec![rng.random_range(0.0..120.0)]
         }
         _ => vec![0.0],

@@ -206,10 +206,10 @@
     ],
     "tabs": [
       {
-        "id": "FUEL_TANK_PRESSURE",
-        "label": "Fuel Tank Pressure",
+        "id": "OX_TANK_PRESSURE",
+        "label": "Ox Tank Pressure",
         "channels": [
-          "Tank Pressure"
+          "Ox Tank Pressure"
         ],
         "chart": {
           "enabled": true
@@ -773,14 +773,14 @@
           {
             "id": "loadcell_pressure_transducer",
             "label": "Pressure Transducer",
-            "data_type": "FUEL_TANK_PRESSURE",
+            "data_type": "OX_TANK_PRESSURE",
             "channels": [
               "Pressure Transducer"
             ],
             "chart_groups": [
               {
                 "title": "Raw",
-                "data_type": "FUEL_TANK_PRESSURE",
+                "data_type": "OX_TANK_PRESSURE",
                 "labels": [
                   "Raw"
                 ],
@@ -807,7 +807,7 @@
             "summary_items": [
               {
                 "label": "Raw",
-                "data_type": "FUEL_TANK_PRESSURE",
+                "data_type": "OX_TANK_PRESSURE",
                 "index": 0,
                 "formatter": {
                   "kind": "number",
@@ -1904,10 +1904,10 @@
             "widgets": [
               {
                 "kind": "summary",
-                "data_type": "FUEL_TANK_PRESSURE",
+                "data_type": "OX_TANK_PRESSURE",
                 "items": [
                   {
-                    "label": "Tank Pressure",
+                    "label": "Ox Tank Pressure",
                     "index": 0,
                     "fill_target_fluid": "nitrous",
                     "fill_target_kind": "pressure_psi",
@@ -1951,9 +1951,9 @@
                 "chart_title": "Pressure and Loadcell",
                 "chart_series": [
                   {
-                    "data_type": "FUEL_TANK_PRESSURE",
+                    "data_type": "OX_TANK_PRESSURE",
                     "index": 0,
-                    "label": "Tank Pressure",
+                    "label": "Ox Tank Pressure",
                     "display_filter": {
                       "enabled": true,
                       "kind": "low_pass",
@@ -2177,10 +2177,10 @@
             "widgets": [
               {
                 "kind": "summary",
-                "data_type": "FUEL_TANK_PRESSURE",
+                "data_type": "OX_TANK_PRESSURE",
                 "items": [
                   {
-                    "label": "Tank Pressure",
+                    "label": "Ox Tank Pressure",
                     "index": 0
                   }
                 ]
@@ -2210,9 +2210,9 @@
                 "chart_title": "Pressure and Loadcell",
                 "chart_series": [
                   {
-                    "data_type": "FUEL_TANK_PRESSURE",
+                    "data_type": "OX_TANK_PRESSURE",
                     "index": 0,
-                    "label": "Tank Pressure",
+                    "label": "Ox Tank Pressure",
                     "display_filter": {
                       "enabled": true,
                       "kind": "low_pass",
@@ -2251,18 +2251,18 @@
             "widgets": [
               {
                 "kind": "summary",
-                "data_type": "FUEL_TANK_PRESSURE",
+                "data_type": "OX_TANK_PRESSURE",
                 "items": [
                   {
-                    "label": "Tank Pressure",
+                    "label": "Ox Tank Pressure",
                     "index": 0
                   }
                 ]
               },
               {
                 "kind": "chart",
-                "data_type": "FUEL_TANK_PRESSURE",
-                "chart_title": "Fuel Tank Pressure",
+                "data_type": "OX_TANK_PRESSURE",
+                "chart_title": "Ox Tank Pressure",
                 "width": 1200.0,
                 "height": 260.0
               }
@@ -2351,10 +2351,10 @@
             "widgets": [
               {
                 "kind": "actions",
-                "data_type": "FUEL_TANK_PRESSURE",
+                "data_type": "OX_TANK_PRESSURE",
                 "items": [
                   {
-                    "label": "Tank Pressure",
+                    "label": "Ox Tank Pressure",
                     "index": 0
                   }
                 ],
@@ -2468,10 +2468,10 @@
             "widgets": [
               {
                 "kind": "summary",
-                "data_type": "FUEL_TANK_PRESSURE",
+                "data_type": "OX_TANK_PRESSURE",
                 "items": [
                   {
-                    "label": "Tank Pressure",
+                    "label": "Ox Tank Pressure",
                     "index": 0
                   }
                 ]
@@ -2501,9 +2501,9 @@
                 "chart_title": "Pressure and Loadcell",
                 "chart_series": [
                   {
-                    "data_type": "FUEL_TANK_PRESSURE",
+                    "data_type": "OX_TANK_PRESSURE",
                     "index": 0,
-                    "label": "Tank Pressure",
+                    "label": "Ox Tank Pressure",
                     "display_filter": {
                       "enabled": true,
                       "kind": "low_pass",
@@ -2645,14 +2645,14 @@
         ],
         "sections": [
           {
-            "title": "FUEL TANK PRESSURE",
+            "title": "OX TANK PRESSURE",
             "widgets": [
               {
                 "kind": "summary",
-                "data_type": "FUEL_TANK_PRESSURE",
+                "data_type": "OX_TANK_PRESSURE",
                 "items": [
                   {
-                    "label": "Tank Pressure",
+                    "label": "Ox Tank Pressure",
                     "index": 0
                   }
                 ]

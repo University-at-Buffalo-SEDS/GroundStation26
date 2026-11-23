@@ -116,7 +116,7 @@ def analyze(path):
     _, w1 = series(z, 'DAQ|LOADCELL_WEIGHT_KG')
     _, w5 = series(z, 'DAQ|LOADCELL_50_WEIGHT_KG')
     tp, pm = series(z, 'DAQ|DAQ_POWER_MONITOR')
-    tf, fp = series(z, 'VB|FUEL_TANK_PRESSURE')
+    tf, fp = series(z, 'VB|OX_TANK_PRESSURE')
     r = {'recording': name, 'minutes': float((t1[-1] - t1[0]) / 60000.0),
          'rate_hz': float(len(t1) / max(1, (t1[-1] - t1[0]) / 1000.0))}
     r['vmain_min'] = float(np.nanmin(pm[:, 2])) if tp is not None else None

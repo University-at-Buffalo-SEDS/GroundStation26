@@ -175,10 +175,19 @@ pub(crate) async fn context_from(
         .bind(MAX_TYPES as i64)
         .fetch_all(db)
         .await?;
-    let mut series = Vec::new();
+    let mut series: Vec<Series> = Vec::new();
     for row in series_rows {
-        series.push(Series { data_type: row.try_get("data_type")?, sender_id: row.try_get("sender_id")?, rows: row.try_get("n")? });
+        // Legacy type names (pre-rename recordings) list under their canonical name.
+        let data_type: String = row.try_get("data_type")?;
+        let data_type = crate::telemetry_schema::canonical_type_name(&data_type).to_string();
+        let sender_id: String = row.try_get("sender_id")?;
+        let rows: i64 = row.try_get("n")?;
+        match series.iter_mut().find(|s| s.data_type == data_type && s.sender_id == sender_id) {
+            Some(existing) => existing.rows += rows,
+            None => series.push(Series { data_type, sender_id, rows }),
+        }
     }
+    series.sort_by(|a, b| (&a.data_type, &a.sender_id).cmp(&(&b.data_type, &b.sender_id)));
     let count = |ty: &str| series.iter().filter(|s| s.data_type == ty).map(|s| s.rows).sum::<i64>();
     let sim_sample_rows = count("SIM_SAMPLE");
 

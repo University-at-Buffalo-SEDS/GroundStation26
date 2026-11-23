@@ -429,8 +429,8 @@ pub fn calibration_tab_layout() -> CalibrationTabLayout {
             },
             CalibrationSensorSpec {
                 id: "IADC".to_string(),
-                label: "Tank Pressure".to_string(),
-                data_type: "FUEL_TANK_PRESSURE".to_string(),
+                label: "Ox Tank Pressure".to_string(),
+                data_type: "OX_TANK_PRESSURE".to_string(),
                 channel: "iadc".to_string(),
                 fit_color: "#a78bfa".to_string(),
                 raw_label: "Raw".to_string(),
@@ -459,7 +459,12 @@ fn calibration_config_path() -> PathBuf {
 fn load_calibration_tab_layout_from_file() -> Option<CalibrationTabLayout> {
     let path = calibration_config_path();
     let raw = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str::<CalibrationTabLayout>(&raw).ok()
+    let mut layout = serde_json::from_str::<CalibrationTabLayout>(&raw).ok()?;
+    // A config written before the ox tank PT rename names its legacy type.
+    for sensor in &mut layout.sensors {
+        sensor.data_type = crate::telemetry_schema::canonical_type_name(&sensor.data_type).to_string();
+    }
+    Some(layout)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2512,7 +2517,7 @@ impl HistoryCalibration {
         let sensor = match row.data_type.as_str() {
             "KG1000" => "KG1000",
             "KG50" => "KG50",
-            "IADC" | "FUEL_TANK_PRESSURE" => "IADC",
+            "IADC" | crate::telemetry_schema::OX_TANK_PRESSURE | crate::telemetry_schema::LEGACY_FUEL_TANK_PRESSURE => "IADC",
             _ => return vec![row],
         };
         let kind = match sensor {

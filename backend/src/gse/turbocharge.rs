@@ -15,7 +15,7 @@ pub(crate) fn observe_valve_pressure_ingress(
     {
         return;
     }
-    let Some((_, values)) = rows.iter().find(|(kind, _)| kind == "FUEL_TANK_PRESSURE") else {
+    let Some((_, values)) = rows.iter().find(|(kind, _)| kind == crate::telemetry_schema::OX_TANK_PRESSURE) else {
         return;
     };
     let value = values
@@ -147,7 +147,7 @@ fn capture_binding(
     );
     let signature = mass_calibration_signature(&calibration);
     let binding = serde_json::json!({"config":config_for_binding(&rt.engine.config),"targets":targets,"calibration":calibration,
-        "pressure_source":"VB/FUEL_TANK_PRESSURE/firmware_psi","pressure_capture_epoch":rt.valve_pressure_epoch,"mass_capture_epoch":rt.mass_source_epoch,"routes":route_binding(state)});
+        "pressure_source":"VB/OX_TANK_PRESSURE/firmware_psi","pressure_capture_epoch":rt.valve_pressure_epoch,"mass_capture_epoch":rt.mass_source_epoch,"routes":route_binding(state)});
     (binding, signature, targets)
 }
 #[cfg(test)]
@@ -760,7 +760,7 @@ pub(super) fn decorate_status(state: &AppState, response: &mut serde_json::Value
             rt.engine.status.phase,
             Phase::Turbocharge | Phase::PauseSetup | Phase::Paused
         ) {
-        "VB/FUEL_TANK_PRESSURE/firmware_psi"
+        "VB/OX_TANK_PRESSURE/firmware_psi"
     } else {
         "GS calibrated IADC"
     });
@@ -768,7 +768,7 @@ pub(super) fn decorate_status(state: &AppState, response: &mut serde_json::Value
         rt.fresh_mass(now)
             .is_some_and(|mass| accepts_mass(state, &rt, mass))
     );
-    response["valve_pressure"]=rt.valve_pressure.map_or(serde_json::Value::Null,|p|serde_json::json!({"psi":p.value,"source":"VB/FUEL_TANK_PRESSURE","source_timestamp_ms":rt.last_valve_pressure_source_ms.map(|s|s.ms),"age_ms":now.checked_sub(p.at_ms)}));
+    response["valve_pressure"]=rt.valve_pressure.map_or(serde_json::Value::Null,|p|serde_json::json!({"psi":p.value,"source":"VB/OX_TANK_PRESSURE","source_timestamp_ms":rt.last_valve_pressure_source_ms.map(|s|s.ms),"age_ms":now.checked_sub(p.at_ms)}));
     response["turbocharge"] = serde_json::json!({"active":rt.turbocharge.is_some(),"pending_inventory_qualification":rt.turbo_inventory_pending,"phase":rt.turbocharge.as_ref().map(Controller::phase),"evidence":rt.turbo_evidence,"max_added_nitrogen_mass_kg":rt.engine.config.turbocharge_max_added_mass_kg,"disabled_reason":configuration_reason(&rt)});
 }
 
@@ -890,7 +890,7 @@ mod tests {
     #[tokio::test]
     async fn firmware_psi_lane_never_uses_chamber_iadc_or_other_sender_and_does_not_renew_replay() {
         let state = crate::state::tests::test_app_state().await;
-        let raw = vec![("FUEL_TANK_PRESSURE".into(), vec![Some(370.0)])];
+        let raw = vec![("OX_TANK_PRESSURE".into(), vec![Some(370.0)])];
         observe_valve_pressure_ingress(&state, "DAQ", &raw, 100, 100);
         observe_valve_pressure_ingress(
             &state,
@@ -910,7 +910,7 @@ mod tests {
         observe_valve_pressure_ingress(
             &state,
             "VB",
-            &[("FUEL_TANK_PRESSURE".into(), vec![Some(999.0)])],
+            &[("OX_TANK_PRESSURE".into(), vec![Some(999.0)])],
             100,
             101,
         );
@@ -931,7 +931,7 @@ mod tests {
         let state = crate::state::tests::test_app_state().await;
         state.gse.lock().unwrap().clock = Instant::now() - std::time::Duration::from_secs(10);
         let now = crate::telemetry_task::get_current_timestamp_ms() as i64;
-        let rows = vec![("FUEL_TANK_PRESSURE".into(), vec![Some(370.0)])];
+        let rows = vec![("OX_TANK_PRESSURE".into(), vec![Some(370.0)])];
         observe_valve_pressure_ingress(&state, "VB", &rows, now - 1500, now);
         let rt = state.gse.lock().unwrap();
         let pressure = rt.valve_pressure.unwrap();

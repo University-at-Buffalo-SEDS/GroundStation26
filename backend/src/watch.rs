@@ -501,9 +501,9 @@ const ITEMS: &[ItemDef] = &[
     },
     ItemDef {
         id: "tank_pressure",
-        label: "Tank pressure",
+        label: "Ox tank pressure",
         source: Source::Telemetry {
-            channels: &[("FUEL_TANK_PRESSURE", None, 0)],
+            channels: &[("OX_TANK_PRESSURE", None, 0)],
             quantity: Quantity::Pressure("psi"),
             precision: 0,
             stale_after_ms: FAST,
@@ -1144,7 +1144,7 @@ mod tests {
         let telemetry = |dt: &str, _: Option<&str>, index: usize| match (dt, index) {
             ("DESCENT_STATE", 2) => Some((1234.4, 99_800)),
             ("DESCENT_STATE", 3) => Some((-6.15, 99_800)),
-            ("FUEL_TANK_PRESSURE", 0) => Some((812.0, 50_000)),
+            ("OX_TANK_PRESSURE", 0) => Some((812.0, 50_000)),
             _ => None,
         };
         let mut input = base_input(&telemetry);
@@ -1257,15 +1257,15 @@ mod tests {
             values,
         };
         let rows: std::collections::VecDeque<_> = vec![
-            row(1, "FUEL_TANK_PRESSURE", "VB", vec![Some(10.0)]),
+            row(1, "OX_TANK_PRESSURE", "VB", vec![Some(10.0)]),
             row(2, "BATTERY_VOLTAGE", "XX", vec![Some(9.0)]),
-            row(3, "FUEL_TANK_PRESSURE", "VB", vec![Some(20.0)]),
+            row(3, "OX_TANK_PRESSURE", "VB", vec![Some(20.0)]),
             row(4, "BATTERY_VOLTAGE", "PB", vec![Some(15.5)]),
             row(5, "DESCENT_STATE", "FC", vec![None, None, Some(100.0), None]),
         ]
         .into();
         let found = latest_values(&rows);
-        assert_eq!(found[&("FUEL_TANK_PRESSURE".into(), None, 0)], (20.0, 3));
+        assert_eq!(found[&("OX_TANK_PRESSURE".into(), None, 0)], (20.0, 3));
         assert_eq!(found[&("BATTERY_VOLTAGE".into(), Some("PB".into()), 0)], (15.5, 4));
         assert_eq!(found[&("DESCENT_STATE".into(), None, 2)], (100.0, 5));
         assert!(!found.contains_key(&("DESCENT_STATE".into(), None, 3)));

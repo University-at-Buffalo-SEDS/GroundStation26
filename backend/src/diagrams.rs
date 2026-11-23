@@ -117,6 +117,10 @@ pub fn load(dir: &Path) -> Reply {
             .and_then(|m| if m.len() > MAX_FILE_BYTES { Err("file too large".into()) } else { Ok(()) })
             .and_then(|()| std::fs::read(&path).map_err(|e| e.to_string()))
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).map_err(|e| e.to_string()))
+            .map(|mut value| {
+                crate::layout::canonicalize_legacy_type_names(&mut value);
+                value
+            })
             .and_then(|value| check(&stem, &value).map(|()| value));
         match parsed {
             Ok(value) => reply.diagrams.push(value),

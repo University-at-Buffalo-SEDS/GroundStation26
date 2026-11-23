@@ -716,12 +716,59 @@ pub(crate) fn load_layout_for_mode(mode: crate::station_mode::Mode) -> Result<La
 fn load_layout_file(path: &std::path::Path, mode: crate::station_mode::Mode) -> Result<LayoutConfig, String> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read layout file {path:?}: {e}"))?;
-    let mut layout: LayoutConfig =
+    let mut value: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("Invalid layout JSON: {e}"))?;
+    canonicalize_legacy_type_names(&mut value);
+    let mut layout: LayoutConfig =
+        serde_json::from_value(value).map_err(|e| format!("Invalid layout JSON: {e}"))?;
     normalize_flight_phases(&mut layout)?;
     apply_runtime_layout_overrides(&mut layout, mode);
     assign_control_sections(&mut layout);
     Ok(layout)
+}
+
+/// Renames legacy telemetry type names (and the matching human label) in a
+/// layout, diagram or saved view: a custom layout, SD import manifest or
+/// portable replay saved before the ox tank PT rename names
+/// FUEL_TANK_PRESSURE, which the station now publishes as OX_TANK_PRESSURE.
+/// Only whole strings are replaced. Returns whether anything changed.
+pub(crate) fn canonicalize_legacy_type_names(value: &mut serde_json::Value) -> bool {
+    fn renamed(text: &str) -> Option<&'static str> {
+        match text {
+            crate::telemetry_schema::LEGACY_FUEL_TANK_PRESSURE => Some(crate::telemetry_schema::OX_TANK_PRESSURE),
+            "Fuel Tank Pressure" => Some("Ox Tank Pressure"),
+            "Fuel tank pressure" => Some("Ox tank pressure"),
+            "FUEL TANK PRESSURE" => Some("OX TANK PRESSURE"),
+            _ => None,
+        }
+    }
+    fn walk(v: &mut serde_json::Value, changed: &mut bool) {
+        match v {
+            serde_json::Value::String(text) => {
+                if let Some(new) = renamed(text) {
+                    *text = new.to_string();
+                    *changed = true;
+                }
+            }
+            serde_json::Value::Object(map) => {
+                // Keys too: maps keyed by data type (e.g. per-type settings).
+                let legacy: Vec<String> = map.keys().filter(|k| renamed(k).is_some()).cloned().collect();
+                for key in legacy {
+                    let new = renamed(&key).unwrap().to_string();
+                    if let Some(item) = map.remove(&key) {
+                        map.entry(new).or_insert(item);
+                        *changed = true;
+                    }
+                }
+                map.values_mut().for_each(|v| walk(v, changed));
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(|v| walk(v, changed)),
+            _ => {}
+        }
+    }
+    let mut changed = false;
+    walk(value, &mut changed);
+    changed
 }
 
 /// BAROMETER_DATA is (altitude, pressure, temperature) in every recording:
@@ -1043,6 +1090,48 @@ fn ensure_gse_sequence_actions(layout: &mut LayoutConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A custom layout saved before the ox tank PT rename names
+    /// FUEL_TANK_PRESSURE; it loads with OX_TANK_PRESSURE and the new label,
+    /// and the shipped layouts no longer name the legacy type.
+    #[test]
+    fn legacy_fuel_tank_pressure_layout_loads_as_ox_tank_pressure() {
+        let shipped = [
+            include_str!("../layout/layout.json"),
+            include_str!("../layout/layout_hitl.json"),
+            include_str!("../layout/layout_test_fire.json"),
+        ];
+        for source in shipped {
+            assert!(!source.contains("FUEL_TANK_PRESSURE") && !source.contains("Fuel Tank"));
+            assert!(source.contains("\"OX_TANK_PRESSURE\""));
+        }
+        let legacy = shipped[0]
+            .replace("OX_TANK_PRESSURE", "FUEL_TANK_PRESSURE")
+            .replace("\"Ox Tank Pressure\"", "\"Fuel Tank Pressure\"");
+        let path = std::env::temp_dir().join(format!("gs-legacy-ox-layout-{}.json", std::process::id()));
+        std::fs::write(&path, &legacy).unwrap();
+        let loaded = load_layout_file(&path, crate::station_mode::Mode::Normal);
+        let _ = std::fs::remove_file(&path);
+        let loaded = loaded.unwrap();
+        let expected = load_layout_file(
+            &default_layout_path(crate::station_mode::Mode::Normal),
+            crate::station_mode::Mode::Normal,
+        )
+        .unwrap();
+        assert_eq!(serde_json::to_value(&loaded).unwrap(), serde_json::to_value(&expected).unwrap());
+        let tab = loaded.data_tab.tabs.iter().find(|t| t.id == "OX_TANK_PRESSURE").unwrap();
+        assert_eq!(tab.label, "Ox Tank Pressure");
+
+        let mut view = serde_json::json!({"FUEL_TANK_PRESSURE": {"index": 0},
+            "items": [{"data_type": "FUEL_TANK_PRESSURE", "label": "Fuel tank pressure"}],
+            "note": "FUEL_TANK_PRESSURE is not renamed inside longer text"});
+        assert!(canonicalize_legacy_type_names(&mut view));
+        assert_eq!(view["OX_TANK_PRESSURE"]["index"], 0);
+        assert_eq!(view["items"][0]["data_type"], "OX_TANK_PRESSURE");
+        assert_eq!(view["items"][0]["label"], "Ox tank pressure");
+        assert_eq!(view["note"], "FUEL_TANK_PRESSURE is not renamed inside longer text");
+        assert!(!canonicalize_legacy_type_names(&mut view));
+    }
 
     #[test]
     fn legacy_layout_phase_groups_keep_their_wire_meaning() {
