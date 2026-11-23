@@ -1,5 +1,11 @@
 # FC host replay of the IGT datasets
 
+> **Stale since 2026-11-22.** The datasets were regenerated after the motor curve gained the
+> KG50 unloading term (`tools/flight_profile/extract_thrust.py`, 9.19 kN s instead of 7.05).
+> `nominal_10k` and its variants are re-tuned to 3048 m and `measured_motor` now reaches about
+> 2137 m, so the numbers below describe the previous files. The FC host replay
+> (`tools/igt_replay_host.py`, not in this repo) has not been re-run on the new files.
+
 Each set was replayed through FlightComputer26 (fix/baro-agl-altitude 659440e, on origin/dev d286b5e)
 with `tools/igt_replay_host.py`. That tool runs the real `ground_test.c` CSV validation and
 interpolation, `kalman.c` and `evaluation.c` on the host, on the board's 10 ms baro schedule. The

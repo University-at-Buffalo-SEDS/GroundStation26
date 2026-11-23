@@ -496,7 +496,7 @@ README gives each one's apogee, Mach, accelerations and event times:
 | Folder | Use |
 | --- | --- |
 | `nominal_10k` | the default: a nominal flight to 10,000 ft AGL |
-| `measured_motor` | the 2026-11-16 motor as measured (7 kN s, about 4,500 ft) |
+| `measured_motor` | the 2026-11-16 motor as measured (9.2 kN s with the fill-cell unloading, about 7,000 ft) |
 | `high_wind` | 9 m/s wind with gusts: weathercocking and drift |
 | `early_apogee_noise` | Kalman stress: baro noise, outliers, Mach error and a false-descent step before apogee |
 | `off_nominal` | FC logic: a late main, an IMU saturation glitch, a frozen baro and a GPS dropout |
@@ -520,7 +520,7 @@ To load one:
    python3 tools/igt_csv.py check /media/$USER/SDCARD --fc-site 31.758,-102.046,890.016
    ```
 4. Eject the card, put it back in the FC, and follow section 12. Enter ground
-   test should report `IGT CSV ok: IMU 10446 247s, BARO 12367 247s, GPS 2378`
+   test should report `IGT CSV ok: IMU 10322 243s, BARO 12173 243s, GPS 2326`
    for `nominal_10k`. Validation reads about 1 MB, so it takes a few seconds.
 
 Each set starts with 10 s at rest on a 5° rail, because the motor lights

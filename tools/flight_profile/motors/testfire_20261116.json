@@ -1,18 +1,18 @@
 {
   "summary": {
     "motor": "UB SEDS N2O hybrid, static test fire 2026-11-16 (local evening; GS recording timestamped 2026-11-17 00:59:46 UTC)",
-    "total_impulse_ns": 7050,
+    "total_impulse_ns": 9192,
     "total_impulse_range_ns": [
-      5400,
-      8300
+      7600,
+      10100
     ],
     "impulse_class": "K (5120-10240 N*s)",
-    "burn_time_s": 4.6,
-    "burn_time_definition": "time thrust >= 5% of peak (144 N), t=0.01 s to 4.6 s on the CSV timebase; thrust reaches 0 at 5.35 s. Liquid phase (tank-pressure knee) ends about 2.7 s; after that comes a vapor-phase tail decaying from about 1.7 kN to 0",
-    "peak_thrust_n": 2880,
-    "peak_thrust_note": "startup peak at t~0.7 s (measured 260-340 kgf samples). The 0.2-0.55 s hold at 2734 N is interpolated, not measured; if that segment was higher the peak could be ~3.1 kN",
+    "burn_time_s": 5.65,
+    "burn_time_definition": "time thrust >= 5% of peak (165 N); thrust reaches 0 at 7.5 s. KG1000 carries load from lift-off (0.19 s) to 5.45 s; after that the rocket is back on KG50 and the vapour tail is seen only as the KG50 returning to its post-burn value (5.45-7.5 s). Liquid phase (tank-pressure knee) ends about 2.7 s",
+    "peak_thrust_n": 3295,
+    "peak_thrust_note": "startup peak at t~0.8 s. The 0.2-0.65 s KG1000 level is interpolated, not measured",
     "liquid_phase_plateau_n": "about 2.0 kN decaying to 1.7 kN (t 0.9-2.7 s)",
-    "average_thrust_n": 1530,
+    "average_thrust_n": 1627,
     "average_thrust_definition": "total impulse / 5%-of-peak burn time",
     "propellant_mass_kg": 6.7,
     "propellant_mass_range_kg": [
@@ -25,9 +25,51 @@
       "fuel_kg": 1.1,
       "fuel_how": "NOT measured; no fuel grain mass found in repos. Assumed O/F 5 (range 3.5-7), i.e. 0.8-1.6 kg"
     },
-    "delivered_isp_s": "about 107 s (7050 N*s / (6.7 kg * 9.807)); range ~85-135 s. Low compared with an ideal hybrid (180-220 s), which is typical of a small test motor with a long vapor tail. It is also possible that KG50 overstates the ox or KG1000 understates thrust",
+    "delivered_isp_s": "about 140 s on 6.7 kg (5.6 kg N2O by the GS fill reading + about 1.1 kg fuel assumed). The KG50 pre/post difference says 12.2 kg left the stand with the recorded KG50 slope (22 799 kg/V, Isp 77 s) or 6.9 kg with the earlier 12 915 kg/V fit (Isp 136 s); the KG50 calibration is unverified (docs/loadcell-investigation-2026-11.md 2.2), so the propellant mass, not the impulse, is the weakest number. The apogee planner calibrates impulse per kg of GS fill reading (9.19 kN s / 5.65 kg = 1627 N s/kg), the quantity it sets",
     "t0_definition": "CSV t=0 is the valve-open time + 0.1 s (VB VALVE_STATE valve[0]=1 received at recording t=9.188 s; mapped to the DAQ clock with the median DAQ receive-source offset of 19 ms). The 0.1 s ignition delay matches the 2026-10-31 fire, where chamber pressure rose 0.16 s after valve open",
-    "flight_use_note": "About 7 kN*s is probably well short of 10k ft for a 6 in x ~4.6 m rocket (that usually needs ~10-20 kN*s depending on mass). If the mock flight must reach 10k ft, scale the curve's thrust axis (or burn time) and state that it is scaled."
+    "flight_use_note": "About 9.2 kN s is still short of the ~12.6 kN s that reaches 10k ft on the assumed 31.6 kg airframe; scale the curve (and say so) for 10k ft mock flights.",
+    "total_impulse_kg1000_only_ns": 7106,
+    "kg50_unloading": {
+      "formula": "thrust(t) = g*(F_KG1000(t) + (R_pre - R_KG50(t)) - burned(t)); burned(t) = (R_pre - R_post) * impulse fraction(t), iterated",
+      "why": "The rocket hangs from the 50 kg fill cell; thrust unloads KG50 first and only presses KG1000 after lifting the rocket off (gap closed). While lifted KG50 reads its zero-load value and KG1000 reads thrust minus the current weight, so the hanging weight must be added back. Only KG50 differences enter (its tare convention does not matter; its slope does).",
+      "kg50_pre_burn_kg": 5.65,
+      "kg50_lifted_plateau_kg": -38.23,
+      "kg50_post_burn_kg": -6.56,
+      "hanging_mass_at_ignition_kg": 43.88,
+      "mass_lost_in_burn_kg": 12.21,
+      "kg50_term_ns": 2086.4,
+      "gap_closing_transient": "KG50 reaches its zero-load plateau at 0.19 s; KG1000 is unusable until 0.65 s (open lead), so the gap closing is inside the assumed startup fill",
+      "drop_back": "the rocket settles back onto KG50 from 5.45 s (KG1000 at baseline) over about 2 s as the vapour tail decays; no impact spike is visible in the 40 Hz KG50",
+      "caveats": [
+        "KG50 pre-burn value was taken during the 11 V supply sag (up to ~2 kg offset elsewhere that night)",
+        "11 KG50 spike samples during the burn match the supply-dip signature (docs/loadcell-investigation-2026-11.md 2.3) and are removed by the rolling median",
+        "KG50 slope unverified: the earlier 12 915 kg/V fit scales the KG50 term by 0.57 (8.27 kN s total)"
+      ],
+      "variants_ns": {
+        "nominal": 9192.0,
+        "low_startup": 8142.1,
+        "high_startup": 9660.6,
+        "kg50_alternate_slope": 8267.4,
+        "kg1000_only": 7105.6
+      },
+      "quality_flags": {
+        "kg50_spikes_during_burn": 11,
+        "kg50_spike_note": "supply-dip/ground signature (docs/loadcell-investigation-2026-11.md 2.3); removed by the rolling median",
+        "kg1000_rail_or_open_lead_samples": 62,
+        "kg1000_startup_gap_s": [
+          0.0,
+          0.65
+        ],
+        "lift_off_kg50_s": 0.187,
+        "gap_closing_transient_s": [
+          0.187,
+          0.65
+        ],
+        "drop_back_onto_kg50_s": 5.487,
+        "kg50_slope_unverified": true,
+        "kg50_pre_burn_during_supply_sag": true
+      }
+    }
   },
   "thrust_curve_csv": "testfire_20261116.csv",
   "sources": [
@@ -53,7 +95,7 @@
   ],
   "methods": {
     "method_1_loadcell_integration": {
-      "status": "USED (fire 2026-11-16)",
+      "status": "USED (fire 2026-11-16), with the KG50 unloading term added 2026-11-22 (tools/flight_profile/extract_thrust.py)",
       "steps": [
         "Take DAQ LOADCELL_WEIGHT_KG samples (40 Hz) on DAQ source timestamps. Receive-time batching gaps (e.g. 10.14-10.49 s) are not real gaps; the source clock is continuous",
         "Reject rails and open-lead artifacts (values >= 600 or <= -50 kg; the channel rails at 1726 kg and -96 kg)",
@@ -61,16 +103,19 @@
         "Apply a 5-sample rolling median, 0.05 s bin means, then two 3-point moving averages",
         "The 2.59-2.83 s (valve-relative) cluster at liquid runout (values 2-449 kg alternating) is replaced by linear interpolation; its block mean (~212 kg) was close to its neighbours, so the impulse effect is about 60 N*s",
         "Valve-relative 0-0.65 s has no trustworthy data (open-lead rail/garbage mix). Filled with an assumed ramp 0 -> 2734 N over 0.1-0.3 s and a hold to the first good sample. The ox tank pressure starts dropping immediately at valve open, and the 10-31 fire lit within 0.16 s, so prompt ignition is the nominal assumption",
-        "Trapezoid-integrate; burn ends when thrust drops below 0.5 kgf"
+        "Trapezoid-integrate; burn ends when thrust drops below 0.5 kgf",
+        "Add the KG50 unloading: thrust = g*(KG1000 + (KG50_pre - KG50(t)) - burned(t)), KG50 rolling-median filtered, 0.05 s bins, clipped to [lifted plateau, pre-burn]; burned(t) scales with the impulse fraction (iterated). Curve ends when thrust stays below 1% of peak"
       ],
       "impulse_measured_only_portion_ns": 5821,
       "impulse_assumed_startup_fill_ns": 1230,
       "variants_ns": {
-        "nominal_prompt_ignition": 7051,
-        "low_thrust_zero_until_0.55s": 5957,
-        "high_startup_at_1.15x_first_good_level": 7539
+        "nominal": 9192.0,
+        "low_startup": 8142.1,
+        "high_startup": 9660.6,
+        "kg50_alternate_slope": 8267.4,
+        "kg1000_only": 7105.6
       },
-      "uncertainty_budget": "startup gap -1.1/+0.5 kN*s; KG1000 gain unverified and an open lead / DAQ supply intermittent were present, so add +/-10% for calibration; combined range 5.4-8.3 kN*s"
+      "uncertainty_budget": "startup gap -1.05/+0.47 kN s; KG1000 gain +-10% (0.71 kN s); KG50 slope 22 799 vs 12 915 kg/V -0.92 kN s; combined 7.6-10.1 kN s"
     },
     "method_2_chamber_pressure_x_Cf_x_At": {
       "status": "NOT USABLE for thrust",
@@ -86,7 +131,7 @@
   "unusable_or_rejected_data": [
     "2026-11-16 fire KG1000: railed at 1726 kg (raw 0.194 V saturation) before valve open and intermittently for the first ~0.65 s after (open lead), then mostly clean. Isolated glitches at ~2.6-2.8 s",
     "2026-11-16 fire chamber PT: deliberately disconnected",
-    "2026-11-16 fire KG50: steps -44 kg exactly while the burn runs and stays flat while thrust decays, so it is not thrust and not ox mass during the burn (electrical/ground offset, consistent with the DAQ supply/ground intermittent). Post-fire value drifts from -6.2 to -3.9 kg over 25 min, so the post-fire ox residual is not measurable",
+    "2026-11-16 fire KG50: CORRECTED 2026-11-22: the -44 kg step during the burn is the rocket lifting off the fill cell (zero-load plateau), not an electrical offset; it is now part of the thrust (kg50_unloading). Post-fire value drifts from -6.2 to -3.9 kg over 25 min, so the post-fire ox residual is not measurable",
     "2026-10-31 fire KG1000: no thrust response at all (only isolated spikes), so it cannot give a thrust curve",
     "2026-10-31 fire KG50: also steps about -21 kg during the burn (same artifact); only the pre/post values are used",
     "groundstation_recording_2026-10-30_23-23-48_776.db: valve dump at t=771.8 s; tank 437 psi blew down in ~2 s with no liquid phase, Pc only 17 psig spike, KG1000 flat. A cold-flow/vent, not a fire",
@@ -97,5 +142,6 @@
     "Local .workspace-progress/chamber-testfire-csv-20261030 holds only code/test logs for the CSV exporter (no fire data). postfire-20261116 gs/ and decode/ hold simulator/cohort outputs, not real fire recordings",
     "FlightComputer26 MOTOR_BURN_TIME = 3500 ms (fcconfig.h) and the sim value 4500 ms are design/test constants, not measurements. FirmwareSimulator flight_profile.py uses a synthetic constant-thrust model"
   ],
-  "scripts": "scripts/ (summ.py, peaks.py, bins.py, thrust.py, curve.py; fireB.json is the extracted intermediate)"
+  "scripts": "scripts/ (summ.py, peaks.py, bins.py, thrust.py, curve.py; fireB.json is the extracted intermediate)",
+  "raw_window_csv": "raw/fire_20261116_window.csv (KG50, KG1000 and tank PT, -10..30 s from valve open, values as recorded)"
 }
