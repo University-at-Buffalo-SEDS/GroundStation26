@@ -580,7 +580,7 @@ const BOARDS: &[Spec] = &[
     Spec {
         id: "board-igniter-safing",
         title: "Igniter and launch-sequence timing",
-        summary: "AB turns the igniter on 4.25 s after an accepted Launch and off automatically after 10 s, then holds it off for 1.5 s; VB opens PILOT 10 s after acceptance for 1.5 s. A Launch timestamp more than 5 s old or 1 s in the future is refused, and any Abort or Stop drives the igniter low.",
+        summary: "AB turns the igniter on 5 s after the accepted Launch timestamp (T−5 s) and off automatically after 10 s, then holds it off for 1.5 s; VB opens PILOT 10 s after acceptance for 1.5 s. A Launch timestamp more than 5 s old or 1 s in the future is refused, and any Abort or Stop drives the igniter low.",
         details: &[],
         modes: ALL,
         enforced_in: &["ActuatorBoard26/Core/Src/main_task.c:300", "ValveBoard26/Core/Src/main_thread.c:214"],

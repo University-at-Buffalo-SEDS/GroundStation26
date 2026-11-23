@@ -153,7 +153,7 @@ All files go in the `IGT` directory at the root of the FC's SD card (FAT,
 - Recommended rates: IMU 100 Hz, baro 50 Hz, GPS 10 Hz. Higher rates work, but
   they take longer to validate.
 - Ignition on the stand comes about 10 s after Launch (VB pilot at
-  Launch + 10 s, AB igniter at + 4.25 s). Put the replayed liftoff at about
+  Launch + 10 s, AB igniter at + 5 s, i.e. T−5 s). Put the replayed liftoff at about
   `t_ms = 10000`, with the vehicle at rest before it.
 
 ### 4.3 Replay
@@ -435,7 +435,7 @@ This mirrors the DAQ's SD health and `DaqSdRetry`.
 | VB launch sequence | Pilot at Launch + 10 s for 1.5 s, exactly as in test fire. VB does not check FC state. | none |
 | VB post-Launch auto-vent | Starts only on GS heartbeat loss (5 s) or a broken continuity wire. Vents at max(trigger + 150 s, Launch + 60 s). It does not depend on FC flight state, so the simulated InFlight/Landed has no effect. **Keep the GS link and the continuity wire intact**, or VB vents mid-test, which is safe but ends the test. | none |
 | VB/AB FLIGHT_STATE | They accept InFlight and Landed forward-only after Launch. The effects are the same as in flight: automatic and heartbeat aborts are already off after Launch, and Landed allows OTA reset. | none |
-| AB igniter | Fires at Launch + 4.25 s for 10 s, exactly as in test fire. It does not depend on the FC. | none |
+| AB igniter | Fires at Launch + 5 s (T−5 s) for 10 s, exactly as in test fire. It does not depend on the FC. | none |
 | FC pyro gate | Section 5. Watchdog deployment records are skipped for dry-run pulses. | FC |
 | RRLS takeover | Needs 6 s without primary HEALTH. With the GS alive it never takes over, whatever the FC reports. If it does take over, it can only send Abort. | none |
 | RF | Time-sync steps are blocked from Armed through Landed, as in flight. It relays `SIM_SAMPLE` from the runtime schema. | none |

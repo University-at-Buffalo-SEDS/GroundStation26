@@ -31,7 +31,7 @@ fn nitrogen_topup_cannot_erase_already_loaded_nitrous_mass() {
     );
 }
 #[test]
-fn actual_admitted_raw_igniter_sequence_models_original_compensated_timeline() {
+fn actual_admitted_raw_igniter_sequence_models_original_t_minus_5_timeline() {
     crate::mode_suite!(Testing);
     crate::telemetry_schema::initialize().unwrap();
     let mut model = FlightSimState::new();
@@ -43,18 +43,18 @@ fn actual_admitted_raw_igniter_sequence_models_original_compensated_timeline() {
         14,
         10_000,
     );
-    model.update_physics(14_249);
+    model.update_physics(14_999);
     assert!(!model.valve_on(ActuatorBoardCommands::IgniterOn as u8));
-    model.update_physics(14_250);
+    model.update_physics(15_000);
     assert!(
         model.valve_on(ActuatorBoardCommands::IgniterOn as u8),
-        "accepted raw14 has no model effect at originalUTC+4250"
+        "accepted raw14 has no model effect at originalUTC+5000"
     );
-    model.update_physics(24_249);
+    model.update_physics(24_999);
     assert!(model.valve_on(ActuatorBoardCommands::IgniterOn as u8));
-    model.update_physics(24_250);
+    model.update_physics(25_000);
     assert!(!model.valve_on(ActuatorBoardCommands::IgniterOn as u8));
-    model.update_physics(14250);
+    model.update_physics(15000);
     assert!(
         !model.valve_on(ActuatorBoardCommands::IgniterOn as u8),
         "completed pulse cannot restart after modelclock rollback"
