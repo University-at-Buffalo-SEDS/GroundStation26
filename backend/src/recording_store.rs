@@ -1033,6 +1033,8 @@ pub(crate) async fn capture_task(
         if crate::sd_download::take_launch_fetch() {
             tokio::spawn(crate::sd_download::fetch_launch_files(state.clone()));
         }
+        // Burn reports: the live provisional one and queued capture recomputes.
+        crate::burn_report::tick(&state, &root);
         // Pending DAQ lead-up fetches (also after a restart) run in the background.
         ticks = ticks.wrapping_add(1);
         if ticks % 15 == 0 && crate::sd_download::leadup::pending(&root) {
@@ -1064,9 +1066,10 @@ pub(crate) async fn run_due(state: &AppState, root: &Path) -> Vec<Result<Capture
                     // already downloaded, then fetch the DAQ's over the network.
                     let root_owned = root.to_path_buf();
                     let _ = tokio::task::spawn_blocking(move || board_sd::rescan_downloads(&root_owned)).await;
-                    if capture.kind == EventKind::Launch {
-                        crate::sd_download::schedule_launch_fetch();
-                    }
+                    // In every mode (HITL, integrated ground test and test fire
+                    // too): the burn report's final version needs the DAQ file.
+                    crate::sd_download::schedule_launch_fetch();
+                    crate::burn_report::capture_saved(&capture, &saved.folder);
                 }
                 let message = format!(
                     "Saved {} capture \"{}\" ({} telemetry rows) to {}",

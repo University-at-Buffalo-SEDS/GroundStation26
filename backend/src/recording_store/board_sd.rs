@@ -311,6 +311,10 @@ pub(crate) fn offer_file(root: &Path, path: &Path, name: &str, source: &str) -> 
     if file.board == "DAQ" && !has_lead_up {
         crate::sd_download::leadup::enqueue(root, &folder, name, file.first_utc);
     }
+    if file.board == "DAQ" {
+        // The burn report becomes final with the DAQ's full-rate load cells.
+        crate::burn_report::request_recompute(&folder);
+    }
     Ok(vec![Outcome::Attached(folder)])
 }
 

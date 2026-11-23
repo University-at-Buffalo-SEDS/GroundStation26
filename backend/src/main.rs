@@ -52,12 +52,14 @@ mod ethernet_autoconfig;
 mod fill_delivery_probe;
 mod fill_recording;
 mod fill_targets;
+mod fire_archive;
 mod firmware_update;
 mod flight_setup;
 mod flight_sim;
 mod firmware_sim_mode;
 mod flight_sim_runtime;
 mod flight_maxima;
+mod burn_report;
 mod gpio;
 mod gpio_panel;
 mod gse;
@@ -1759,6 +1761,7 @@ async fn main() -> anyhow::Result<()> {
     state.set_recording_status(state.recording_status_snapshot());
     // Integrated ground test settings, the Launch latch and the FC launch site.
     crate::igt::load_persisted(&state);
+    crate::fire_archive::load_persisted(&state);
     // The RFD modem check may enter command mode only outside flight and
     // with no launch or sequence running. Seed it from the restored state
     // before the radio opens, then keep it current.

@@ -531,6 +531,8 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .merge(crate::igt::routes())
         .merge(crate::launch_site::routes())
         .merge(crate::apogee_planner::routes())
+        .merge(crate::burn_report::routes())
+        .merge(crate::fire_archive::routes())
         .merge(crate::proximity_lock::routes())
         .merge(crate::station_pairing::manage::routes())
         .merge(crate::launch_history::api::routes())

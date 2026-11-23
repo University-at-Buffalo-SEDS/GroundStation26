@@ -937,9 +937,16 @@ async fn transfer(
 }
 
 static LAUNCH_FETCH: AtomicBool = AtomicBool::new(false);
+/// The launch fetch is running (waiting for a safe state or transferring).
+static LAUNCH_FETCH_RUNNING: AtomicBool = AtomicBool::new(false);
 /// A launch capture was saved: fetch the DAQ's launch files once allowed.
 pub(crate) fn schedule_launch_fetch() {
     LAUNCH_FETCH.store(true, Ordering::Release);
+}
+/// A DAQ launch-file fetch is scheduled or running: the low-priority lead-up
+/// fetch yields the link to it.
+pub(crate) fn launch_fetch_owed() -> bool {
+    LAUNCH_FETCH.load(Ordering::Acquire) || LAUNCH_FETCH_RUNNING.load(Ordering::Acquire)
 }
 pub(crate) fn take_launch_fetch() -> bool {
     LAUNCH_FETCH.swap(false, Ordering::AcqRel)
@@ -950,6 +957,14 @@ pub(crate) fn take_launch_fetch() -> bool {
 /// sequence, no other transfer). Each completed file attaches itself to its
 /// launch capture (see `transfer`). Gives up after an hour of waiting.
 pub(crate) async fn fetch_launch_files(state: Arc<AppState>) {
+    struct Running;
+    impl Drop for Running {
+        fn drop(&mut self) {
+            LAUNCH_FETCH_RUNNING.store(false, Ordering::Release);
+        }
+    }
+    LAUNCH_FETCH_RUNNING.store(true, Ordering::Release);
+    let _running = Running;
     let deadline = Instant::now() + Duration::from_secs(3600);
     loop {
         if station_gate(&state).is_none() && !MANAGER.active() {
@@ -959,7 +974,8 @@ pub(crate) async fn fetch_launch_files(state: Arc<AppState>) {
             log::warn!("DAQ launch files were not fetched: downloads stayed unavailable for an hour");
             return;
         }
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        // Start as soon as the station is safe (the burn report waits on it).
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
     let Some(router) = state.topology_router.get().cloned() else { return };
     let listing = match refresh_listing(&MANAGER, router.clone(), Board::DaqBoard, app_gate(&state)).await {

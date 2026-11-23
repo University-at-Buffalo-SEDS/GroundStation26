@@ -153,6 +153,9 @@ fn quiet_gate(state: &Arc<AppState>) -> Gate {
         if MANAGER.active() || MANAGER.listing_busy.load(Ordering::Acquire) {
             return Some("another SD transfer is running".into());
         }
+        if super::launch_fetch_owed() {
+            return Some("the DAQ launch file fetch goes first".into());
+        }
         command_quiet()
     })
 }

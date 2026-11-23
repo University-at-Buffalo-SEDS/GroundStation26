@@ -1,0 +1,39 @@
+{
+  "id": "2026-11-16_static_fire",
+  "label": "Static fire 2026-11-16 (GS recording 2026-11-17 00:59:46 UTC)",
+  "date": "2026-11-17",
+  "source": "seed",
+  "burn_report_id": null,
+  "capture_id": "groundstation_recording_2026-11-17_00-59-46_065.db",
+  "fill_kg": 5.65,
+  "fill_before_kg": null,
+  "fill_after_kg": -6.56,
+  "tank_psi_at_ignition": 404.1,
+  "tank_temp_c": null,
+  "supercharge_psi": null,
+  "ambient_c": null,
+  "weather": null,
+  "impulse_ns": 9192.0,
+  "impulse_sigma_ns": 900.0,
+  "burn_time_s": 5.65,
+  "peak_thrust_n": 3294.8,
+  "chamber_valid": false,
+  "result": "Static fire on the stand; chamber PT deliberately disconnected",
+  "applied_plan": null,
+  "quality_flags": [
+    {"code": "kg1000_clamp", "severity": "bad", "message": "KG1000 railed before ignition and swung between floor and clamp for the first 0.65 s (open lead) and in the 2.6-2.8 s cluster; 62 rail samples in the burn window"},
+    {"code": "kg1000_startup_gap", "severity": "warn", "message": "KG1000 unreadable until 0.65 s; bridged with an assumed ramp to the first good level (startup variants 8.14-9.66 kN s)"},
+    {"code": "kg50_supply_dip_spikes", "severity": "warn", "message": "11 KG50 spike samples during the burn (supply-dip/ground signature, docs/loadcell-investigation-2026-11.md 2.3); removed by the rolling median. Pre-burn KG50 read during the 11 V supply sag"},
+    {"code": "gap_closing_transient", "severity": "info", "message": "KG50 reached its zero-load plateau at 0.19 s, inside the KG1000 startup gap"},
+    {"code": "drop_back", "severity": "info", "message": "rocket back on KG50 from 5.45 s; the vapour tail to 7.5 s is seen only by KG50"},
+    {"code": "kg50_slope", "severity": "warn", "message": "KG50 slope 22 799 kg/V unverified (12 915 kg/V fit gives 8.27 kN s); the fill reading 5.65 kg is a GS reading, not a verified mass"}
+  ],
+  "simulated": false,
+  "review": {
+    "status": "accepted",
+    "exclude_from_fit": false,
+    "notes": "Seeded from tools/flight_profile/motors/testfire_20261116.json (extract_thrust.py, KG50 unloading included): 9.19 kN s, range 7.6-10.1.",
+    "reviewed_by": "seed",
+    "reviewed_ms": null
+  }
+}

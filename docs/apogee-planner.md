@@ -314,6 +314,40 @@ ignition, `R_post` its settled value after the burn and `F(t)` the KG1000 readin
    pending record.
 5. HITL and simulated data are marked `simulated` and excluded from the fit by default.
 
+**Implementation notes** (`backend/src/burn_report.rs`, `burn_report/thrust.rs`,
+`burn_report/merge.rs`):
+
+- The live provisional report is computed 40 s after a Launch/HITL capture starts (or
+  when it ends, if sooner) from the station's recent telemetry cache; the saved
+  provisional report is recomputed from the capture's `recording.db` when it is
+  materialized; the final report when a DAQ launch file is attached
+  (`recording_store::board_sd::offer_file` queues the folder). A final report is
+  never replaced by a provisional one; an unchanged recompute raises no second
+  notification. After a restart, captures with a DAQ file but no final report are
+  recomputed.
+- The ignition reference is the first VB `VALVE_STATE` main-valve open with load-cell
+  data around it, else the first clear KG50 unloading (3 kg below its 3 s median) or
+  KG1000 load, minus 0.15 s.
+- DAQ SD rows used: `kg1000_network`, `kg50_network`, `chamber_pressure_raw_volts_psi`
+  (preferred over telemetry) and `valve_pressure_psi` (the VB tank PT relayed; the
+  station's own VB telemetry is preferred), network-time rows only, `value` else
+  `calibrated_value`. Station rows use `source_timestamp_ms` when present. The
+  preferred source covers a stretch when its neighbouring samples are within 250 ms;
+  the other source fills the rest.
+- KG1000 samples at a rail (outside −50..600 kg), within 60 ms of one, or more than
+  max(40 kg, 35 %) from their 7-sample median are dropped. If the first trusted sample
+  comes after 0.15 s, the start is bridged with a ramp (0.10-0.30 s) to that level and
+  flagged. The KG50 floor is the mode of the readings below both the pre- and
+  post-burn levels when it is held within ±1 kg for 0.5 s; the rocket counts as lifted
+  only if KG1000 also took load (a flat floor without KG1000 load is flagged
+  `kg1000_no_load`, a lower bound). KG50 samples more than 5 kg outside
+  [floor, pre-burn] are dropped as supply-dip spikes.
+- σ = √((0.10·I_KG1000,measured)² + (0.6·I_startup bridge)² + (0.25·I_KG50 term)²).
+- On the committed 11-16 window the Rust extraction gives 9.11 kN·s (Python 9.19).
+- The DAQ launch-file fetch is scheduled after every Launch, HITL and ground-test
+  capture in every mode, polls the safe-state gate every second, and the lead-up fetch
+  yields to it while it is scheduled or running.
+
 ## 9. Fire archive
 
 `<data>/fire_archive/<YYYY-MM-DD>_<label>/` holds `fire.json` and `thrust.csv` per fire,
@@ -325,6 +359,17 @@ pressure if valid, the result, the applied plan and its predictions, the data-qu
 flags and the review state (`pending` / `accepted` / `rejected`, `exclude_from_fit`,
 notes). The archive is seeded with 2026-11-16 (accepted) and 2026-10-31 (lower bound,
 excluded). An operator reviews each new record before it enters the fit.
+
+Record ids are `<YYYY-MM-DD>_<HHMMSS>_<kind>` (UTC of the ignition reference) for burn
+reports and `<date>_<label>` for imports; a recomputed report updates the same record
+(numbers and flags) and keeps its review. The seeds are compiled in from
+`backend/config/fire_archive_seed/` and written only when missing, so a review of a
+seed survives restarts. The 2026-10-31 seed is `rejected` and excluded (lower bound
+only). The motor fit reads `fire_archive::fit_inputs(state)`: accepted, not excluded,
+not simulated records with a fill and an impulse (σ defaults to 10 % when missing).
+The supercharge recorded for a burn is the station's nitrous pressure target when the
+report was saved; ambient temperature and weather come from the launch capture's
+`details.apogee_plan` (`plan.weather`) when present.
 
 ## 10. API
 

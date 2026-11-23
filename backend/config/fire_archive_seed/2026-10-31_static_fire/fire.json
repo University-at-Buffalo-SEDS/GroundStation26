@@ -1,0 +1,36 @@
+{
+  "id": "2026-10-31_static_fire",
+  "label": "Static fire 2026-10-31 (GS recording 2026-10-31 18:57:24 UTC)",
+  "date": "2026-10-31",
+  "source": "seed",
+  "burn_report_id": null,
+  "capture_id": "groundstation_recording_2026-10-31_18-57-24_119.db",
+  "fill_kg": 3.98,
+  "fill_before_kg": null,
+  "fill_after_kg": 0.66,
+  "tank_psi_at_ignition": 341.6,
+  "tank_temp_c": null,
+  "supercharge_psi": null,
+  "ambient_c": null,
+  "weather": null,
+  "impulse_ns": null,
+  "impulse_sigma_ns": null,
+  "burn_time_s": 6.0,
+  "peak_thrust_n": null,
+  "chamber_valid": true,
+  "result": "Static fire on the stand; KG1000 did not read",
+  "applied_plan": null,
+  "quality_flags": [
+    {"code": "kg1000_no_load", "severity": "bad", "message": "KG50 sat on a flat -17.5 kg zero-load plateau (rocket lifted, 21.5 kg hanging) from 1 to 4.5 s, but KG1000 never responded: thrust above the hanging weight is unknown. Lower bound only: about 21.5 kg x g over the lifted time plus the KG50-only start and tail, roughly 1 kN s"},
+    {"code": "chamber_pt", "severity": "info", "message": "chamber PT 43 psig startup peak, 38 decaying to 19 psig; liquid phase about 5.3 s"},
+    {"code": "kg50_supply_dip_spikes", "severity": "warn", "message": "KG50 spikes to -31 kg during the burn (supply-dip signature)"}
+  ],
+  "simulated": false,
+  "review": {
+    "status": "rejected",
+    "exclude_from_fit": true,
+    "notes": "Lower bound only (KG1000 did not take load); kept for the record and the burn timing. Different injector/plumbing configuration from 11-16 (about 0.7 vs 2 kg/s ox flow).",
+    "reviewed_by": "seed",
+    "reviewed_ms": null
+  }
+}
