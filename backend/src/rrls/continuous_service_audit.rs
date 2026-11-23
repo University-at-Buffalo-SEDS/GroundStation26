@@ -176,7 +176,7 @@ fn continuous_three_lane_large_report_and_metadata_baseline() {
         .iter()
         .filter(|e| e["canonical"].as_bool() == Some(true))
         .find_map(|e| {
-            let bytes = STANDARD.decode(e["payload"].as_str().unwrap()).unwrap();
+            let bytes = from_rr_v1_for_test(&STANDARD.decode(e["payload"].as_str().unwrap()).unwrap());
             let body = decode(&bytes).map_or(bytes.as_slice(), |(_, b)| b);
             serialize::unpack_packet(body)
                 .ok()

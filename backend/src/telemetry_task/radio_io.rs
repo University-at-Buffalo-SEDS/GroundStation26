@@ -6414,7 +6414,7 @@ mod rfd_worker_tests {
             .windows(expected_wire.len())
             .position(|w| w == expected_wire)
             .expect("exact production Mesh envelope and CRC inside raw UART frame");
-        assert_eq!(mode, frame_start + 8);
+        assert_eq!(mode, frame_start + 5);
         assert_eq!(&captured[frame_start..frame_start + 2], &[0xA6, 0x5B]);
         let framed_length = 4 + usize::from(u16::from_le_bytes(
             captured[frame_start + 2..frame_start + 4]
@@ -6423,10 +6423,10 @@ mod rfd_worker_tests {
         ));
         assert_eq!(
             framed_length,
-            reply.len() + 12,
-            "charged wire includes raw4+Mesh8 overhead"
+            reply.len() + 9,
+            "charged wire includes raw4+Mesh5 overhead"
         );
-        assert_eq!(framed_length, 37);
+        assert_eq!(framed_length, 34);
         assert!(
             captured.len() >= frame_start + framed_length,
             "full owned frame including MeshCRC accepted"

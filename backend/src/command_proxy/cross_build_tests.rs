@@ -15,10 +15,9 @@ async fn get(root:&Path,name:&str)->Vec<u8>{
     }).await.unwrap_or_else(|_|panic!("missing cross-compiled fixture message {name}"))
 }
 fn health(mesh:&crate::rrls::Shared,view:Transport){
-    let mut bytes=b"RR\x01\x00".to_vec();bytes.extend(view.session.to_le_bytes());
+    let mut bytes=view.session.to_le_bytes().to_vec();
     bytes.extend(view.sequence.to_le_bytes());bytes.push(1);
-    let mut crc=u32::MAX;for byte in &bytes {crc^=u32::from(*byte);for _ in 0..8{crc=(crc>>1)^(0xedb88320&0u32.wrapping_sub(crc&1));}}
-    bytes.extend((!crc).to_le_bytes());let mut mesh=mesh.lock().unwrap();let now=mesh.now();mesh.incoming(true,&bytes,now);
+    let bytes=crate::rrls::encode(0,&bytes);let mut mesh=mesh.lock().unwrap();let now=mesh.now();mesh.incoming(true,&bytes,now);
 }
 #[tokio::test(flavor="multi_thread",worker_threads=2)]
 async fn cross_compiled_interlock_exchange_or_local_enum_contract(){

@@ -126,11 +126,7 @@ fn physical_frames(raw: &[u8], require_complete: bool) -> Vec<Vec<u8>> {
             break;
         }
         let body = raw[cursor + 4..end].to_vec();
-        assert!(body.starts_with(b"RR\x01"));
-        assert_eq!(
-            crc32fast::hash(&body[..body.len() - 4]),
-            u32::from_le_bytes(body[body.len() - 4..].try_into().unwrap())
-        );
+        assert!(crate::rrls::decode(&body).is_some(), "a valid RR envelope");
         frames.push(body);
         cursor = end;
     }
@@ -448,21 +444,22 @@ async fn root_profile_clock_and_catalog_share_ordinary_service() {
             drain_peer(&mut peer, &mut primary_bytes);
             let frames = physical_frames(&primary_bytes, false);
             for body in frames.iter().skip(pi) {
-                if body.get(3) == Some(&2) && body[4..].starts_with(b"SDT\x03") {
-                    physical.push(serde_json::json!({"at_ms":tick,"index":u16::from_le_bytes(body[12..14].try_into().unwrap()),"inner_hex":body[4..body.len()-4].iter().map(|b|format!("{b:02x}")).collect::<String>()}));
+                let (kind, inner) = crate::rrls::decode(body).unwrap();
+                if kind == 2 && inner.starts_with(b"SDT\x03") {
+                    physical.push(serde_json::json!({"at_ms":tick,"index":u16::from_le_bytes(inner[8..10].try_into().unwrap()),"inner_hex":inner.iter().map(|b|format!("{b:02x}")).collect::<String>()}));
                 }
                 if with_clock
                     && clock_offer_at.is_none()
-                    && body.get(3) == Some(&2)
-                    && body[4..].starts_with(b"SDT\x03")
-                    && u16::from_le_bytes(body[12..14].try_into().unwrap()) == 0
+                    && kind == 2
+                    && inner.starts_with(b"SDT\x03")
+                    && u16::from_le_bytes(inner[8..10].try_into().unwrap()) == 0
                 {
                     clock_offer_at = Some(tick + 1);
                 }
                 if offer_release_at.is_none()
-                    && body.get(3) == Some(&15)
-                    && body.get(4) == Some(&0x10)
-                    && u16::from_le_bytes(body[30..32].try_into().unwrap()) as usize
+                    && kind == 15
+                    && inner.first() == Some(&0x10)
+                    && u16::from_le_bytes(inner[26..28].try_into().unwrap()) as usize
                         == clock_fixture.as_ref().unwrap().original_reply.len()
                 {
                     let entries = events.lock().unwrap();
@@ -520,10 +517,10 @@ async fn root_profile_clock_and_catalog_share_ordinary_service() {
             }
             let replies = physical_frames(&relay_bytes, false);
             for body in replies.iter().skip(ri) {
-                let delayed = body.get(3) == Some(&15)
-                    && body.get(4) == Some(&0x11)
-                    && body.len() >= 49
-                    && u16::from_le_bytes(body[47..49].try_into().unwrap()) as usize
+                let inner = crate::rrls::decode(body).map_or(&[][..], |(kind, inner)| if kind == 15 { inner } else { &[] });
+                let delayed = inner.first() == Some(&0x11)
+                    && inner.len() >= 45
+                    && u16::from_le_bytes(inner[43..45].try_into().unwrap()) as usize
                         == clock_fixture.as_ref().unwrap().original_reply.len();
                 if delayed && offer_release_at.is_some_and(|at| tick < at) {
                     assert!(delayed_offers.len() < 2);
@@ -561,8 +558,9 @@ async fn root_profile_clock_and_catalog_share_ordinary_service() {
     let legacy = frames
         .iter()
         .filter(|b| {
-            b.get(3) == Some(&10)
-                && b[4..b.len() - 4] == clock_fixture.as_ref().unwrap().original_reply
+            crate::rrls::decode(b).is_some_and(|(kind, inner)| {
+                kind == 10 && inner == clock_fixture.as_ref().unwrap().original_reply
+            })
         })
         .count();
     event(

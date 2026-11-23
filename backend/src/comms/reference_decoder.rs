@@ -94,10 +94,7 @@ mod tests {
         assert_eq!(decoder.rejected, 1);
     }
     fn rr(kind: u8, payload: &[u8]) -> Vec<u8> {
-        let mut body = vec![b'R', b'R', 1, kind];
-        body.extend_from_slice(payload);
-        body.extend_from_slice(&crc32fast::hash(&body).to_le_bytes());
-        body
+        crate::rrls::encode(kind, payload)
     }
     fn nested_revoke() -> Vec<u8> {
         use crate::rrls::budget_negotiation::{Context, Message, Nonce, encode};

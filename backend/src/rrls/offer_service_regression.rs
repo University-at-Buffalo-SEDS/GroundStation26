@@ -1,10 +1,13 @@
 use super::*;
 use std::time::{Duration, Instant};
+/// Fixture hex; captured RR v1 envelopes come back re-encoded as RR v2.
 fn unhex(s: &str) -> Vec<u8> {
-    s.as_bytes()
+    let bytes: Vec<u8> = s
+        .as_bytes()
         .as_chunks::<2>().0.iter()
         .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap())
-        .collect()
+        .collect();
+    from_rr_v1_for_test(&bytes)
 }
 #[test]
 fn accepted_offer_must_reach_paid_service_before_original_probe_deadline() {
@@ -461,12 +464,12 @@ fn byte_refusal_never_creates_stuck_pending_or_extra_reservation() {
             assert_eq!(free, 410);
             break;
         }
-        let frame = (free - 410).min(MAX_PAYLOAD + 8);
-        assert!(frame >= 8);
+        let frame = (free - 410).min(MAX_PAYLOAD + RR_CRC_OVERHEAD);
+        assert!(frame >= RR_CRC_OVERHEAD);
         mesh.enqueue(
             Outgoing {
                 command: true,
-                bytes: encode(DOWN_DATA, &vec![9; frame - 8]),
+                bytes: encode(DOWN_DATA, &vec![9; frame - RR_CRC_OVERHEAD]),
             },
             254,
             10060,

@@ -409,10 +409,10 @@ impl Queued {
         self.flags |= Self::BUDGET_EVER_RESERVED;
     }
     fn closes_packet_batch(&self) -> bool {
-        if self.frame.bytes.get(3) == Some(&HOST_CONTROL) {
+        if kind_of(&self.frame.bytes) == Some(HOST_CONTROL) {
             return true;
         }
-        if self.frame.bytes.get(3) == Some(&STATION_STATE) {
+        if kind_of(&self.frame.bytes) == Some(STATION_STATE) {
             return false;
         }
         !self.independent_discovery()
@@ -421,11 +421,11 @@ impl Queued {
             })
     }
     fn boundary_contract(&self) -> Option<(u64, bool)> {
-        if self.frame.bytes.get(3) == Some(&HOST_CONTROL) {
+        if kind_of(&self.frame.bytes) == Some(HOST_CONTROL) {
             let (_, body) = decode(&self.frame.bytes)?;
             return crate::command_proxy::wire_boundary(body).map(|id| (id, false));
         }
-        if self.independent_discovery() || self.frame.bytes.get(3) == Some(&STATION_STATE) {
+        if self.independent_discovery() || kind_of(&self.frame.bytes) == Some(STATION_STATE) {
             return None;
         }
         decode(&self.frame.bytes)
@@ -468,7 +468,7 @@ impl Transmission {
         if queued.priority < 254 || queued.independent_discovery() {
             return None;
         }
-        if queued.frame.bytes.get(3) == Some(&HOST_CONTROL) {
+        if kind_of(&queued.frame.bytes) == Some(HOST_CONTROL) {
             return queued.boundary_contract();
         }
         let (_, body) = decode(&queued.frame.bytes)?;
@@ -482,7 +482,7 @@ impl Transmission {
         }
         if self.queued.priority >= 254
             || self.queued.settings_origin == SettingsOrigin::FramingOffer
-            || (self.queued.frame.bytes.get(3) == Some(&SETTINGS)
+            || (kind_of(&self.queued.frame.bytes) == Some(SETTINGS)
                 && self.queued.settings_origin == SettingsOrigin::None)
             || (self.settings_action.is_none()
                 && self.queued.settings_origin == SettingsOrigin::None
@@ -502,12 +502,12 @@ impl Transmission {
         {
             return 0;
         }
-        let kind = self.frame().bytes.get(3);
+        let kind = kind_of(&self.frame().bytes);
         // A timed-out negotiation still sends the original whole legacy owner.
         // Probe/fragment actions and their physical kind15 envelopes never fund it.
         if self.settings_action.is_some()
             && !(self.settings_action == Some(settings_framing::Action::Legacy)
-                && kind == Some(&SETTINGS)
+                && kind == Some(SETTINGS)
                 && matches!(
                     self.queued.settings_origin,
                     SettingsOrigin::Settings | SettingsOrigin::Reply
@@ -515,8 +515,8 @@ impl Transmission {
         {
             return 0;
         }
-        if matches!(kind, Some(&DOWN_DATA) | Some(&UP_DATA) | Some(&AV_BAY_DATA))
-            || (kind == Some(&SETTINGS)
+        if matches!(kind, Some(DOWN_DATA) | Some(UP_DATA) | Some(AV_BAY_DATA))
+            || (kind == Some(SETTINGS)
                 && matches!(
                     self.queued.settings_origin,
                     SettingsOrigin::Settings | SettingsOrigin::Reply
@@ -532,8 +532,8 @@ impl Transmission {
             && !self.queued.closes_packet_batch()
             && !self.queued.independent_discovery()
             && matches!(
-                self.queued.frame.bytes.get(3),
-                Some(&DOWN_DATA) | Some(&AV_BAY_DATA)
+                kind_of(&self.queued.frame.bytes),
+                Some(DOWN_DATA) | Some(AV_BAY_DATA)
             )
         {
             self.queued.frame.bytes.len() + 4
@@ -1025,7 +1025,7 @@ impl Mesh {
         if let Some(i) = self
             .queue
             .iter()
-            .position(|q| q.frame.bytes.get(3) == Some(&STATION_STATE))
+            .position(|q| kind_of(&q.frame.bytes) == Some(STATION_STATE))
         {
             let old = self.queue.remove(i).unwrap();
             self.bytes -= old.frame.bytes.len();
@@ -1121,8 +1121,8 @@ impl Mesh {
     }
     fn budget_kind(bytes: &[u8]) -> bool {
         matches!(
-            bytes.get(3),
-            Some(&BUDGET_CONTROL) | Some(&RF_PROFILE_CONTROL)
+            kind_of(bytes),
+            Some(BUDGET_CONTROL) | Some(RF_PROFILE_CONTROL)
         )
     }
     fn poll_budget(&mut self, now: u64) {
@@ -1237,7 +1237,7 @@ impl Mesh {
         }
     }
     fn settings_parent(&self, queued: &Queued) -> bool {
-        queued.frame.bytes.get(3) == Some(&SETTINGS)
+        kind_of(&queued.frame.bytes) == Some(SETTINGS)
             && self
                 .settings_framing
                 .as_ref()
@@ -1249,7 +1249,7 @@ impl Mesh {
                 && let Some(state) = self.settings_framing.as_mut() {
                     state.offer_pending(body, false);
                 }
-        if queued.frame.bytes.get(3) == Some(&SETTINGS)
+        if kind_of(&queued.frame.bytes) == Some(SETTINGS)
             && let Some(state) = self.settings_framing.as_mut() {
                 state.retire(settings_framing::OwnerId::of(&queued.frame.bytes));
             }
@@ -1331,13 +1331,13 @@ impl Mesh {
         let framing = &mut self.settings_framing;
         self.queue.retain(|q| {
             let keep = matches!(
-                q.frame.bytes.get(3),
-                Some(&POSITION)
-                    | Some(&VOICE)
-                    | Some(&SETTINGS)
-                    | Some(&HOST_CONTROL)
-                    | Some(&BUDGET_CONTROL)
-                    | Some(&RF_PROFILE_CONTROL)
+                kind_of(&q.frame.bytes),
+                Some(POSITION)
+                    | Some(VOICE)
+                    | Some(SETTINGS)
+                    | Some(HOST_CONTROL)
+                    | Some(BUDGET_CONTROL)
+                    | Some(RF_PROFILE_CONTROL)
             );
             if !keep {
                 removed_bytes += q.frame.bytes.len();
@@ -1355,10 +1355,10 @@ impl Mesh {
         self.bytes -= removed_bytes;
     }
     fn independent_discovery(frame: &Outgoing) -> bool {
-        if !matches!(frame.bytes.get(3), Some(&DOWN_DATA) | Some(&AV_BAY_DATA)) {
+        if !matches!(kind_of(&frame.bytes), Some(DOWN_DATA) | Some(AV_BAY_DATA)) {
             return false;
         }
-        let Some(body) = frame.bytes.get(4..frame.bytes.len().saturating_sub(4)) else {
+        let Some(body) = payload_unchecked(&frame.bytes) else {
             return false;
         };
         // Canonical snapshots have no SDT dictionary/chunk dependency. Never
@@ -1370,10 +1370,10 @@ impl Mesh {
     }
 
     fn sdt_dependency(frame: &Outgoing) -> (u8, u32) {
-        if !matches!(frame.bytes.get(3), Some(&DOWN_DATA) | Some(&AV_BAY_DATA)) {
+        if !matches!(kind_of(&frame.bytes), Some(DOWN_DATA) | Some(AV_BAY_DATA)) {
             return (0, 0);
         }
-        let Some(bytes) = frame.bytes.get(4..frame.bytes.len().saturating_sub(4)) else {
+        let Some(bytes) = payload_unchecked(&frame.bytes) else {
             return (0, 0);
         };
         if !bytes.starts_with(b"SDT") {
@@ -1439,17 +1439,17 @@ impl Mesh {
         now.saturating_sub(q.at)
             > if q.settings_origin == SettingsOrigin::Reply {
                 5_000
-            } else if q.frame.bytes.get(3) == Some(&VOICE) {
+            } else if kind_of(&q.frame.bytes) == Some(VOICE) {
                 VOICE_EXPIRY_MS
-            } else if q.frame.bytes.get(3) == Some(&STATION_STATE) {
+            } else if kind_of(&q.frame.bytes) == Some(STATION_STATE) {
                 crate::station_state::TTL_MS
             } else if q.independent_discovery() {
                 3_000
-            } else if q.frame.bytes.get(3) == Some(&HOST_CONTROL) {
+            } else if kind_of(&q.frame.bytes) == Some(HOST_CONTROL) {
                 // Sent once, never re-sent every 250 ms like a relayed uplink
                 // control: it lives as long as the RRLS waits for a reply.
                 crate::command_proxy::HOST_CONTROL_REPLY_MS
-            } else if q.priority == 255 || q.frame.bytes.get(3) == Some(&DOWN_DATA) {
+            } else if q.priority == 255 || kind_of(&q.frame.bytes) == Some(DOWN_DATA) {
                 // Retain sparse reports through bounded sensor bursts. Relayed
                 // downlink reliable state and receipts (board readbacks,
                 // FLIGHT_STATE, ACKs at priority 254) get the same lifetime: they
@@ -1476,7 +1476,7 @@ impl Mesh {
             if queued.priority >= 254 {
                 continue;
             }
-            if queued.frame.bytes.get(3) == Some(&SETTINGS)
+            if kind_of(&queued.frame.bytes) == Some(SETTINGS)
                 && queued.settings_origin == SettingsOrigin::None
             {
                 owned = true;
@@ -1524,7 +1524,7 @@ impl Mesh {
         let item = &self.queue[index];
         item.sdt_kind == 0
             || !self.queue.iter().take(index).any(|earlier| {
-                earlier.frame.bytes.get(3) == item.frame.bytes.get(3)
+                kind_of(&earlier.frame.bytes) == kind_of(&item.frame.bytes)
                     && earlier.sdt_kind != 0
                     && (earlier.sdt_kind == 2
                         || item.sdt_kind == 2
@@ -1564,21 +1564,18 @@ impl Mesh {
         } else {
             u16::from(priority) * 2
         };
-        if frame.bytes.len() > MAX_PAYLOAD + 8 {
+        if frame.bytes.len() > MAX_PAYLOAD + RR_CRC_OVERHEAD {
             self.dropped += 1;
             return false;
         }
         // GPS and health are current values, not history. Keep only the newest.
         if priority == 255
-            && (frame.bytes.get(3) == Some(&HEALTH)
-                || !frame
-                    .bytes
-                    .get(4..)
-                    .is_some_and(|body| body.starts_with(b"SDT")))
+            && (kind_of(&frame.bytes) == Some(HEALTH)
+                || !payload_unchecked(&frame.bytes).is_some_and(|body| body.starts_with(b"SDT")))
             && let Some(i) = self
                 .queue
                 .iter()
-                .position(|q| q.priority == 255 && q.frame.bytes.get(3) == frame.bytes.get(3))
+                .position(|q| q.priority == 255 && kind_of(&q.frame.bytes) == kind_of(&frame.bytes))
             {
                 let old = self.queue.remove(i).unwrap();
                 self.bytes -= old.frame.bytes.len();
@@ -1752,7 +1749,7 @@ impl Mesh {
             .iter()
             .enumerate()
             .find(|(index, q)| {
-                q.frame.bytes.get(3) == Some(&HOST_CONTROL) && self.dependency_ready(*index)
+                kind_of(&q.frame.bytes) == Some(HOST_CONTROL) && self.dependency_ready(*index)
             })
             .map(|(index, _)| index)?;
         if self.queued_expired(&self.queue[index], now) {
@@ -1785,7 +1782,7 @@ impl Mesh {
         let index = self
             .queue
             .iter()
-            .position(|q| q.frame.bytes.get(3) == Some(&STATION_STATE))?;
+            .position(|q| kind_of(&q.frame.bytes) == Some(STATION_STATE))?;
         if self.queued_expired(&self.queue[index], now) {
             let old = self.queue.remove(index).unwrap();
             self.bytes -= old.frame.bytes.len();
@@ -2061,8 +2058,8 @@ impl Mesh {
                         item.priority < 254
                             && !item.independent_discovery()
                             && matches!(
-                                item.frame.bytes.get(3),
-                                Some(&DOWN_DATA) | Some(&AV_BAY_DATA)
+                                kind_of(&item.frame.bytes),
+                                Some(DOWN_DATA) | Some(AV_BAY_DATA)
                             )
                             && self.dependency_ready(*index)
                     })
@@ -2102,8 +2099,8 @@ impl Mesh {
                 // routine heartbeat must not starve an accepted sensor report
                 // merely because no independent snapshot is currently queued.
                 if matches!(
-                    self.queue[highest].frame.bytes.get(3),
-                    Some(&DOWN_DATA) | Some(&AV_BAY_DATA)
+                    kind_of(&self.queue[highest].frame.bytes),
+                    Some(DOWN_DATA) | Some(AV_BAY_DATA)
                 ) && !self.queue[highest].independent_discovery()
                 {
                     ordinary.unwrap_or(highest)
@@ -2162,13 +2159,13 @@ impl Mesh {
             self.active_recovery_control=tx.recovery_control();
             self.budget_inflight = Self::budget_kind(&tx.queued.frame.bytes);
             self.active_survives_clear = matches!(
-                tx.queued.frame.bytes.get(3),
-                Some(&POSITION)
-                    | Some(&VOICE)
-                    | Some(&SETTINGS)
-                    | Some(&HOST_CONTROL)
-                    | Some(&BUDGET_CONTROL)
-                    | Some(&RF_PROFILE_CONTROL)
+                kind_of(&tx.queued.frame.bytes),
+                Some(POSITION)
+                    | Some(VOICE)
+                    | Some(SETTINGS)
+                    | Some(HOST_CONTROL)
+                    | Some(BUDGET_CONTROL)
+                    | Some(RF_PROFILE_CONTROL)
             );
             return Some(tx);
         }
@@ -2254,11 +2251,11 @@ impl Mesh {
                 .chain(transmission.follower.iter().map(|queued| &queued.frame))
             {
                 if matches!(
-                    frame.bytes.get(3),
-                    Some(&DOWN_DATA)
-                        | Some(&DOWN_COMMAND)
-                        | Some(&AV_BAY_DATA)
-                        | Some(&AV_BAY_COMMAND)
+                    kind_of(&frame.bytes),
+                    Some(DOWN_DATA)
+                        | Some(DOWN_COMMAND)
+                        | Some(AV_BAY_DATA)
+                        | Some(AV_BAY_COMMAND)
                 ) {
                     self.relayed_frames += 1;
                     self.relay_envelope_bytes += frame.bytes.len() as u64;
@@ -2281,8 +2278,8 @@ impl Mesh {
             item.priority < 254
                 && !item.independent_discovery()
                 && matches!(
-                    item.frame.bytes.get(3),
-                    Some(&DOWN_DATA) | Some(&AV_BAY_DATA)
+                    kind_of(&item.frame.bytes),
+                    Some(DOWN_DATA) | Some(AV_BAY_DATA)
                 )
                 && self.dependency_ready(index)
         });
@@ -2357,7 +2354,7 @@ impl Mesh {
         // An expired HOST_CONTROL left in the queue (expiry is applied when a
         // frame is selected) must not refuse the next one.
         if let Some(index) = self.queue.iter().position(|queued| {
-            queued.frame.bytes.get(3) == Some(&HOST_CONTROL) && self.queued_expired(queued, now)
+            kind_of(&queued.frame.bytes) == Some(HOST_CONTROL) && self.queued_expired(queued, now)
         }) {
             let old = self.queue.remove(index).unwrap();
             self.bytes -= old.frame.bytes.len();
@@ -2366,11 +2363,11 @@ impl Mesh {
         if payload.len() > crate::command_proxy::MAX_WIRE
             || crate::command_proxy::wire_boundary(payload).is_none()
             || self.queue.len() + usize::from(self.active_frame_count) >= MAX_FRAMES
-            || self.bytes + payload.len() + 8 > MAX_BYTES
+            || self.bytes + payload.len() + RR_CRC_OVERHEAD > MAX_BYTES
             || self
                 .queue
                 .iter()
-                .any(|queued| queued.frame.bytes.get(3) == Some(&HOST_CONTROL))
+                .any(|queued| kind_of(&queued.frame.bytes) == Some(HOST_CONTROL))
         {
             return false;
         }
@@ -2448,11 +2445,11 @@ impl Mesh {
         if !(mode_reply || self.settings_available(now))
             || payload.len() > paired_settings::auth::MAX_WIRE
             || self.queue.len() + usize::from(self.active_frame_count) >= MAX_FRAMES
-            || self.bytes + payload.len() + 8 > MAX_BYTES
+            || self.bytes + payload.len() + RR_CRC_OVERHEAD > MAX_BYTES
             || self
                 .queue
                 .iter()
-                .any(|q| q.frame.bytes.get(3) == Some(&SETTINGS))
+                .any(|q| kind_of(&q.frame.bytes) == Some(SETTINGS))
         {
             return false;
         }
@@ -2576,14 +2573,14 @@ impl Mesh {
         while self
             .queue
             .iter()
-            .filter(|q| q.frame.bytes.get(3) == Some(&VOICE))
+            .filter(|q| kind_of(&q.frame.bytes) == Some(VOICE))
             .count()
             >= VOICE_QUEUE
         {
             let index = self
                 .queue
                 .iter()
-                .position(|q| q.frame.bytes.get(3) == Some(&VOICE))
+                .position(|q| kind_of(&q.frame.bytes) == Some(VOICE))
                 .unwrap();
             let old = self.queue.remove(index).unwrap();
             self.bytes -= old.frame.bytes.len();
@@ -2810,7 +2807,7 @@ impl Mesh {
     }
     /// Returns only locally delivered data/commands. Wrapped traffic is never relayed twice.
     pub fn incoming(&mut self, command: bool, payload: &[u8], now: u64) -> Option<Outgoing> {
-        if command && payload.starts_with(b"RR") {
+        if command && is_envelope(payload) {
             let (kind, data) = decode(payload)?;
             match (self.role, kind) {
                 (_, BUDGET_CONTROL | RF_PROFILE_CONTROL) => {
@@ -3036,7 +3033,7 @@ impl Mesh {
                     self.direct(now);
                 }
                 // This radio's unwrapped, CRC-valid SDK traffic is the direct
-                // AV-bay path. RRLS forwarding is always an RRv1 envelope and
+                // AV-bay path. RRLS forwarding is always an RR envelope and
                 // took the separate branch above. Lean v4 headers carry source
                 // addresses, so display names (often @addr:...) cannot establish
                 // physical link liveness. Valid metadata also renews it before
@@ -3103,10 +3100,70 @@ fn crc(bytes: &[u8]) -> u32 {
     }
     !state
 }
-fn encode(kind: u8, payload: &[u8]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(payload.len() + 8);
-    v.extend_from_slice(b"RR\x01");
-    v.push(kind);
+// RR v2 mesh envelope. One marker byte in 0xE0..=0xFF opens every envelope.
+// This range must stay unused as the first byte of any SEDSnet frame
+// (canonical, compact bundle, SDT) and of the RF scheduler's "RS" windows.
+//  - CRC form, any kind 0..=16: [0xE0 + kind] payload CRC32-LE(marker + payload).
+//  - Self-checked form, kinds 1..=6 only: [S(kind)] payload, no outer CRC,
+//    when the payload's own last 4 bytes are the CRC32-LE of its other bytes
+//    (SEDSnet canonical frames, compact bundles, SDT frames).
+// S(kind) has an even-parity low nibble, so one flipped bit never turns a
+// self-checked marker into another self-checked marker. Flipping bit 4 gives
+// a CRC-form marker (0xE0 + the low nibble), whose outer CRC then fails: the
+// last four bytes are the SDK frame's own CRC, which excludes the marker.
+pub(crate) const RR_CRC_BASE: u8 = 0xE0;
+const RR_MAX_KIND: u8 = 16;
+/// S(1)..S(6).
+const RR_SELF_CHECKED: [u8; 6] = [0xF3, 0xF5, 0xF6, 0xF9, 0xFA, 0xFC];
+/// Envelope bytes beyond the payload: CRC form / self-checked form.
+pub(crate) const RR_CRC_OVERHEAD: usize = 5;
+pub(crate) const RR_SELF_CHECKED_OVERHEAD: usize = 1;
+/// Kind and whether the marker is the self-checked form.
+fn rr_marker(marker: u8) -> Option<(u8, bool)> {
+    if (RR_CRC_BASE..=RR_CRC_BASE + RR_MAX_KIND).contains(&marker) {
+        return Some((marker - RR_CRC_BASE, false));
+    }
+    RR_SELF_CHECKED
+        .iter()
+        .position(|&s| s == marker)
+        .map(|i| (i as u8 + 1, true))
+}
+/// The payload ends in the CRC32-LE of its preceding bytes.
+fn self_verifying(payload: &[u8]) -> bool {
+    payload.len() >= 4 && {
+        let n = payload.len() - 4;
+        crc(&payload[..n]) == u32::from_le_bytes(payload[n..].try_into().unwrap())
+    }
+}
+/// The first byte claims an RR envelope (valid marker or not). Such bytes
+/// are never a bare SEDSnet frame.
+pub(crate) fn is_envelope(bytes: &[u8]) -> bool {
+    bytes.first().is_some_and(|&b| b >= RR_CRC_BASE)
+}
+/// The envelope's kind from its marker alone; the CRC is not checked.
+pub(crate) fn kind_of(bytes: &[u8]) -> Option<u8> {
+    rr_marker(*bytes.first()?).map(|(kind, _)| kind)
+}
+/// The envelope's payload without checking its CRC (for classification of
+/// frames this station built). Self-checked payloads keep their own CRC.
+pub(crate) fn payload_unchecked(bytes: &[u8]) -> Option<&[u8]> {
+    match rr_marker(*bytes.first()?)? {
+        (_, true) => bytes.get(1..),
+        (_, false) => bytes.get(1..bytes.len().checked_sub(4)?),
+    }
+}
+/// Wraps `payload`: the self-checked form when the kind allows it and the
+/// payload carries its own CRC, the CRC form otherwise.
+pub(crate) fn encode(kind: u8, payload: &[u8]) -> Vec<u8> {
+    debug_assert!(kind <= RR_MAX_KIND);
+    if (1..=6).contains(&kind) && payload.len() >= 5 && self_verifying(payload) {
+        let mut v = Vec::with_capacity(payload.len() + RR_SELF_CHECKED_OVERHEAD);
+        v.push(RR_SELF_CHECKED[usize::from(kind - 1)]);
+        v.extend_from_slice(payload);
+        return v;
+    }
+    let mut v = Vec::with_capacity(payload.len() + RR_CRC_OVERHEAD);
+    v.push(RR_CRC_BASE + kind);
     v.extend_from_slice(payload);
     v.extend_from_slice(&crc(&v).to_le_bytes());
     v
@@ -3125,7 +3182,7 @@ impl Mesh {
     pub(crate) fn queued_station_state_for_test(&self) -> Vec<(Vec<u8>, u8)> {
         self.queue
             .iter()
-            .filter(|q| q.frame.bytes.get(3) == Some(&STATION_STATE))
+            .filter(|q| kind_of(&q.frame.bytes) == Some(STATION_STATE))
             .map(|q| (q.frame.bytes.clone(), q.priority))
             .collect()
     }
@@ -3134,7 +3191,7 @@ impl Mesh {
         let index = self
             .queue
             .iter()
-            .position(|q| q.frame.bytes.get(3) == Some(&STATION_STATE))?;
+            .position(|q| kind_of(&q.frame.bytes) == Some(STATION_STATE))?;
         let queued = self.queue.remove(index)?;
         self.bytes -= queued.frame.bytes.len();
         Some(queued.frame.bytes)
@@ -3178,22 +3235,165 @@ pub(crate) fn station_state_frame_for_test(session: u32, revision: u32, body: &[
     payload.extend_from_slice(body);
     encode(STATION_STATE, &payload)
 }
+#[cfg(test)]
+pub(crate) trait RrKind {
+    /// The RR envelope kind, or 0xFF when the marker is not a valid one.
+    fn rr_kind(&self) -> u8;
+}
+#[cfg(test)]
+impl RrKind for [u8] {
+    fn rr_kind(&self) -> u8 {
+        kind_of(self).unwrap_or(u8::MAX)
+    }
+}
 /// The SEDSnet frame inside an RR mesh wrapper, or the bytes unchanged.
 pub(crate) fn sdk_payload_of(bytes: &[u8]) -> &[u8] {
-    if bytes.starts_with(b"RR") {
+    if is_envelope(bytes) {
         decode(bytes).map_or(bytes, |(_, data)| data)
     } else {
         bytes
     }
 }
 
-fn decode(bytes: &[u8]) -> Option<(u8, &[u8])> {
-    if bytes.len() < 8 || bytes.len() > MAX_PAYLOAD + 8 || &bytes[..3] != b"RR\x01" {
+/// The envelope's integrity: a valid marker, and its outer CRC (CRC form) or
+/// the payload's own trailing CRC (self-checked form). No length ceiling.
+pub(crate) fn envelope_valid(bytes: &[u8]) -> bool {
+    match bytes.first().and_then(|&b| rr_marker(b)) {
+        Some((_, true)) => bytes.len() >= 1 + 4 && self_verifying(&bytes[1..]),
+        Some((_, false)) => bytes.len() >= RR_CRC_OVERHEAD && self_verifying(bytes),
+        None => false,
+    }
+}
+/// Checks an envelope (its outer CRC, or the self-checked payload's own CRC)
+/// and returns its kind and payload.
+pub(crate) fn decode(bytes: &[u8]) -> Option<(u8, &[u8])> {
+    let (kind, self_checked) = rr_marker(*bytes.first()?)?;
+    let overhead = if self_checked { RR_SELF_CHECKED_OVERHEAD } else { RR_CRC_OVERHEAD };
+    if bytes.len() > MAX_PAYLOAD + overhead || !envelope_valid(bytes) {
         return None;
     }
-    let n = bytes.len() - 4;
-    (crc(&bytes[..n]) == u32::from_le_bytes(bytes[n..].try_into().ok()?))
-        .then_some((bytes[3], &bytes[4..n]))
+    Some((kind, payload_unchecked(bytes)?))
+}
+
+/// A captured RR v1 envelope ("RR" 1 kind payload CRC32) re-encoded as RR v2,
+/// so recorded fixtures keep their payloads; any other bytes are unchanged.
+#[cfg(test)]
+pub(crate) fn from_rr_v1_for_test(bytes: &[u8]) -> Vec<u8> {
+    if bytes.len() >= 8 && bytes.starts_with(b"RR\x01") {
+        let n = bytes.len() - 4;
+        if crc(&bytes[..n]) == u32::from_le_bytes(bytes[n..].try_into().unwrap()) {
+            return encode(bytes[3], &bytes[4..n]);
+        }
+    }
+    bytes.to_vec()
+}
+#[cfg(test)]
+mod envelope_tests {
+    use super::*;
+    /// A payload carrying its own trailing CRC, like an SDK frame.
+    fn self_checked_payload(len: usize) -> Vec<u8> {
+        let mut p: Vec<u8> = (0..len as u8).map(|b| b.wrapping_mul(37) ^ 0x5a).collect();
+        p.extend_from_slice(&crc(&p).to_le_bytes());
+        p
+    }
+    #[test]
+    fn every_kind_round_trips_in_both_forms_with_the_documented_overhead() {
+        let plain = b"no own crc".to_vec();
+        let checked = self_checked_payload(20);
+        for kind in 0..=RR_MAX_KIND {
+            let crc_form = encode(kind, &plain);
+            assert_eq!(crc_form[0], 0xE0 + kind);
+            assert_eq!(crc_form.len(), plain.len() + RR_CRC_OVERHEAD);
+            assert_eq!(decode(&crc_form), Some((kind, &plain[..])));
+            assert_eq!(kind_of(&crc_form), Some(kind));
+            assert_eq!(payload_unchecked(&crc_form), Some(&plain[..]));
+            let wrapped = encode(kind, &checked);
+            if (1..=6).contains(&kind) {
+                assert_eq!(wrapped[0], RR_SELF_CHECKED[usize::from(kind - 1)]);
+                assert_eq!(wrapped.len(), checked.len() + RR_SELF_CHECKED_OVERHEAD);
+            } else {
+                assert_eq!(wrapped[0], 0xE0 + kind, "kind {kind} never uses the self-checked form");
+                assert_eq!(wrapped.len(), checked.len() + RR_CRC_OVERHEAD);
+            }
+            assert_eq!(decode(&wrapped), Some((kind, &checked[..])), "kind {kind}");
+            assert_eq!(kind_of(&wrapped), Some(kind));
+            assert_eq!(payload_unchecked(&wrapped), Some(&checked[..]));
+            assert!(envelope_valid(&wrapped) && is_envelope(&wrapped));
+        }
+        assert_eq!(RR_SELF_CHECKED, [0xF3, 0xF5, 0xF6, 0xF9, 0xFA, 0xFC]);
+    }
+    #[test]
+    fn the_self_checked_form_needs_a_payload_that_verifies_itself() {
+        // Too short (an empty body with its CRC) and a wrong trailing CRC.
+        let empty = crc(&[]).to_le_bytes().to_vec();
+        let mut wrong = self_checked_payload(12);
+        *wrong.last_mut().unwrap() ^= 1;
+        for kind in 1..=6 {
+            for payload in [&empty, &wrong, &Vec::new()] {
+                let e = encode(kind, payload);
+                assert_eq!(e[0], 0xE0 + kind);
+                assert_eq!(decode(&e), Some((kind, &payload[..])));
+            }
+            assert_eq!(encode(kind, &self_checked_payload(1)).len(), 5 + 1);
+        }
+    }
+    #[test]
+    fn single_bit_errors_in_a_marker_are_always_rejected() {
+        let plain = b"health-ish".to_vec();
+        let checked = self_checked_payload(16);
+        for kind in 0..=RR_MAX_KIND {
+            for payload in [&plain, &checked] {
+                let good = encode(kind, payload);
+                for bit in 0..8 {
+                    let mut bad = good.clone();
+                    bad[0] ^= 1 << bit;
+                    assert_eq!(decode(&bad), None, "kind {kind} marker bit {bit}");
+                }
+            }
+        }
+        // A self-checked marker with one flipped bit is never another
+        // self-checked marker; at most (bit 4) it is a CRC-form marker,
+        // whose outer CRC check rejects it (above).
+        for &marker in &RR_SELF_CHECKED {
+            for bit in 0..8 {
+                match rr_marker(marker ^ (1 << bit)) {
+                    None => {}
+                    Some((kind, false)) => {
+                        assert_eq!((kind, bit), (marker & 0x0F, 4), "{marker:#x} bit {bit}")
+                    }
+                    Some(other) => panic!("{marker:#x} bit {bit} decodes as {other:?}"),
+                }
+            }
+        }
+        for marker in 0xF1..=0xFFu8 {
+            assert_eq!(rr_marker(marker).is_some(), RR_SELF_CHECKED.contains(&marker));
+        }
+        for marker in 0..0xE0u8 {
+            assert_eq!(rr_marker(marker), None);
+            assert!(!is_envelope(&[marker]));
+        }
+    }
+    #[test]
+    fn any_payload_or_crc_corruption_is_rejected() {
+        let plain = b"settings or control body".to_vec();
+        let checked = self_checked_payload(24);
+        for kind in [0, 2, 5, 6, 11, 16] {
+            for payload in [&plain, &checked] {
+                let good = encode(kind, payload);
+                for byte in 1..good.len() {
+                    for bit in 0..8 {
+                        let mut bad = good.clone();
+                        bad[byte] ^= 1 << bit;
+                        assert_eq!(decode(&bad), None, "kind {kind} byte {byte} bit {bit}");
+                        assert!(!envelope_valid(&bad));
+                    }
+                }
+                assert_eq!(decode(&good[..good.len() - 1]), None, "truncated");
+            }
+        }
+        assert_eq!(decode(&[]), None);
+        assert_eq!(decode(&[0xE0, 0, 0, 0]), None, "shorter than the CRC form");
+    }
 }
 
 /// Why the primary last changed its relay request.
@@ -4238,7 +4438,7 @@ mod tests {
                 mesh.pop(now);
             }
             assert!(mesh.queue.len() <= VOICE_QUEUE);
-            assert!(mesh.bytes <= VOICE_QUEUE * (crate::radio_voice::MAX_PACKET + 8));
+            assert!(mesh.bytes <= VOICE_QUEUE * (crate::radio_voice::MAX_PACKET + RR_CRC_OVERHEAD));
         }
         assert_eq!((controls, gps), (6000, 6000));
         assert!(
@@ -4834,7 +5034,7 @@ mod tests {
         let mut wire = WireDrain::default();
         // The sim's RF downlink during a relay (run pyroB, 236-268 s): about
         // 33 frames/s, 839 B/s at the RF UART. The RRLS hears all of it (plus
-        // modem packet overhead) and forwards each frame in an 8 B RR envelope.
+        // modem packet overhead) and forwards each frame in a 1 B self-checked RR envelope.
         let (frame, period_ms) = (25u64, 30u64);
         let mut queue = 0u64;
         let (mut offered, mut sent) = (0u64, 0u64);
@@ -4844,10 +5044,10 @@ mod tests {
                     heard.charge(&mut cap, wall, Some(now), frame + 16);
                 }
                 queue += 1;
-                offered += frame + 8 + 8;
+                offered += frame + RR_SELF_CHECKED_OVERHEAD as u64 + 8;
             }
             if queue > 0 && wire.ready(now) && cap.ready_for(wall, Some(now), false) {
-                let len = (frame + 8 + 8) as usize;
+                let len = (frame + RR_SELF_CHECKED_OVERHEAD as u64 + 8) as usize;
                 cap.committed(wall, Some(now), len);
                 wire.committed(now, len, 115_200);
                 cap.drained_virtual(wire.stop_us());
@@ -4877,7 +5077,7 @@ mod tests {
     }
 
     /// Even uncharged, the 35% share carries about 68% of the measured
-    /// downlink: 16 B of UART framing per 25 B frame. Needs the RRLS to batch
+    /// downlink: 9 B of envelope and UART framing per 25 B frame. Needs the RRLS to batch
     /// queued downlink frames per UART write, as the station does.
     #[test]
     #[ignore = "per-frame overhead: needs RRLS downlink batching"]
@@ -4915,7 +5115,7 @@ mod tests {
         let abort = rr
             .queue
             .iter()
-            .find(|q| q.frame.bytes.get(3) == Some(&AV_BAY_DATA))
+            .find(|q| kind_of(&q.frame.bytes) == Some(AV_BAY_DATA))
             .expect("the Abort is queued for the AV bay");
         assert!(abort.priority >= 254, "relayed Abort priority {}", abort.priority);
         let first = rr.pop(10).expect("a frame goes");
@@ -4932,22 +5132,22 @@ mod tests {
         rr.tick(3_500);
         assert!(rr.active(3_500), "3.5 s without HEALTH keeps the relay");
         rr.incoming(true, &encode(UP_DATA, b"relayed command"), 3_900);
-        assert!(rr.queue.iter().any(|q| q.frame.bytes.get(3) == Some(&AV_BAY_DATA)));
+        assert!(rr.queue.iter().any(|q| kind_of(&q.frame.bytes) == Some(AV_BAY_DATA)));
         rr.tick(4_050);
         assert!(!rr.active(4_050), "the relay lease is 4 s");
         assert!(
-            rr.queue.iter().any(|q| q.frame.bytes.get(3) == Some(&AV_BAY_DATA)),
+            rr.queue.iter().any(|q| kind_of(&q.frame.bytes) == Some(AV_BAY_DATA)),
             "a lapse stops admission but keeps frames already queued"
         );
         rr.incoming(true, &encode(UP_DATA, b"late"), 4_060);
         assert_eq!(
-            rr.queue.iter().filter(|q| q.frame.bytes.get(3) == Some(&AV_BAY_DATA)).count(),
+            rr.queue.iter().filter(|q| kind_of(&q.frame.bytes) == Some(AV_BAY_DATA)).count(),
             1,
             "nothing new is admitted after the lapse"
         );
         // Direct HEALTH still ends the relay and drops queued uplink at once.
         rr.incoming(true, &health(1, 1, true), 4_100);
-        assert!(!rr.queue.iter().any(|q| q.frame.bytes.get(3) == Some(&AV_BAY_DATA)));
+        assert!(!rr.queue.iter().any(|q| kind_of(&q.frame.bytes) == Some(AV_BAY_DATA)));
     }
 
     #[test]
@@ -6253,16 +6453,16 @@ mod completed_owner_certificate_tests {
         assert!(mesh.queue_operating_mode_reply(&legacy[4..legacy.len() - 4], 0));
         let probe = mesh.begin_mode_reply_transmission(0).unwrap();
         assert_eq!(probe.settings_action, Some(settings_framing::Action::Probe));
-        assert_eq!(probe.frame().bytes.len() + 4, 59);
+        assert_eq!(probe.frame().bytes.len() + 4, 56);
         assert_eq!(probe.completed_ordinary_owner_bytes(), 0);
-        mesh.note_settings_physical_prefix(&probe, 59);
+        mesh.note_settings_physical_prefix(&probe, 56);
         mesh.note_settings_counted_drain(&probe, None);
         mesh.finish_transmission(probe, true);
         let tx = mesh.begin_mode_reply_transmission(800).unwrap();
         assert_eq!(tx.settings_action, Some(settings_framing::Action::Legacy));
         assert_eq!(tx.queued.settings_origin, SettingsOrigin::Reply);
-        assert_eq!(&tx.frame().bytes, legacy);
-        assert_eq!(tx.completed_ordinary_owner_bytes(), 374);
+        assert_eq!(tx.frame().bytes, from_rr_v1_for_test(legacy));
+        assert_eq!(tx.completed_ordinary_owner_bytes(), 371);
         assert_eq!(tx.successful_ordinary_service_bytes(), 0);
     }
     #[test]

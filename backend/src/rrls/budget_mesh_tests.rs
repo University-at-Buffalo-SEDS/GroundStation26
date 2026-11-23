@@ -25,10 +25,10 @@ fn send(from: &mut Mesh, to: &mut Mesh, now: u64) -> Vec<u8> {
     bytes
 }
 fn reply(query: &[u8]) -> Vec<u8> {
-    assert_eq!(query.len(), 26);
-    assert_eq!(query[3], 14);
-    let mut b = vec![b'R', b'R', 1, 14, 1, 1];
-    b.extend_from_slice(&query[6..22]);
+    assert_eq!(query.len(), 23);
+    assert_eq!(kind_of(query), Some(14));
+    let mut b = vec![RR_CRC_BASE + 14, 1, 1];
+    b.extend_from_slice(&query[3..19]);
     b.extend_from_slice(&115200u32.to_le_bytes());
     b.extend_from_slice(&32000u32.to_le_bytes());
     b.push(35);
@@ -37,22 +37,22 @@ fn reply(query: &[u8]) -> Vec<u8> {
     b.extend_from_slice(&55u16.to_le_bytes());
     b.push(0);
     b.extend_from_slice(&crc(&b).to_le_bytes());
-    assert_eq!(b.len(), 42);
+    assert_eq!(b.len(), 39);
     b
 }
 fn healthy() -> (Mesh, Mesh) {
     let (mut p, mut r) = paired();
     p.direct(0);
     p.tick(0);
-    assert_eq!(send(&mut p, &mut r, 0)[3], HEALTH);
-    assert_eq!(send(&mut p, &mut r, 0)[3], BUDGET_CONTROL);
+    assert_eq!(send(&mut p, &mut r, 0).rr_kind(), HEALTH);
+    assert_eq!(send(&mut p, &mut r, 0).rr_kind(), BUDGET_CONTROL);
     assert!(!r.active(0));
     r.tick(0);
     assert!(
-        r.queue.iter().any(|q| q.frame.bytes[3] == BUDGET_CONTROL),
+        r.queue.iter().any(|q| q.frame.bytes.rr_kind() == BUDGET_CONTROL),
         "inactiveclear retains BASE_ACK"
     );
-    assert_eq!(send(&mut r, &mut p, 0)[3], BUDGET_CONTROL);
+    assert_eq!(send(&mut r, &mut p, 0).rr_kind(), BUDGET_CONTROL);
     assert_eq!(p.negotiated_air_share(0), Some(25));
     assert_eq!(p.recovery_air_share(0), None, "the primary always keeps its profile share");
     r.tick(0);
@@ -63,7 +63,7 @@ fn healthy_query_is_one_owned_frame_and_never_application_forwarding() {
     let (p, mut r) = healthy();
     let tx = r.begin_transmission(0).unwrap();
     let query = tx.frame().bytes.clone();
-    assert_eq!(query[3], RF_PROFILE_CONTROL);
+    assert_eq!(query.rr_kind(), RF_PROFILE_CONTROL);
     assert!(r.budget_inflight);
     r.tick(0);
     assert!(
@@ -96,7 +96,7 @@ fn contextual_protocol_owner_survives_paid_650ms_and_no_early_loan() {
     let frame = p
         .queue
         .iter()
-        .find(|q| q.frame.bytes[3] == BUDGET_CONTROL)
+        .find(|q| q.frame.bytes.rr_kind() == BUDGET_CONTROL)
         .unwrap();
     let original = frame.frame.bytes.clone();
     assert!(
@@ -115,7 +115,7 @@ fn contextual_protocol_owner_survives_paid_650ms_and_no_early_loan() {
         );
     }
     let tx = p.begin_transmission(650).unwrap(); // May be periodic protected HEALTH.
-    if tx.frame().bytes[3] == HEALTH {
+    if tx.frame().bytes.rr_kind() == HEALTH {
         let bytes = tx.frame().bytes.clone();
         p.finish_transmission(tx, true);
         r.incoming(true, &bytes, 650);
@@ -204,11 +204,11 @@ fn dropped_initial_health_does_not_pin_owned_revoke_forever() {
     p.direct(0);
     p.tick(0);
     let dropped = p.begin_transmission(0).unwrap();
-    assert_eq!(dropped.frame().bytes[3], HEALTH);
+    assert_eq!(dropped.frame().bytes.rr_kind(), HEALTH);
     p.finish_transmission(dropped, true);
     let initial = p.begin_transmission(0).unwrap();
     let initial_bytes = initial.frame().bytes.clone();
-    assert_eq!(initial_bytes[3], BUDGET_CONTROL);
+    assert_eq!(initial_bytes.rr_kind(), BUDGET_CONTROL);
     p.finish_transmission(initial, true);
     assert!(r.incoming(true, &initial_bytes, 0).is_none());
     let mut saw_refreshed = false;
@@ -223,7 +223,7 @@ fn dropped_initial_health_does_not_pin_owned_revoke_forever() {
             };
             let bytes = tx.frame().bytes.clone();
             p.finish_transmission(tx, true);
-            if bytes[3] == BUDGET_CONTROL {
+            if bytes.rr_kind() == BUDGET_CONTROL {
                 let budget_negotiation::Message::Revoke(c) =
                     budget_negotiation::decode(&bytes).unwrap()
                 else {
@@ -271,7 +271,7 @@ fn negotiation_protected_selection_is_paid_and_has_no_control_or_fairness_credit
     let tx = p
         .begin_primary_background_transmission(0, 0, true, false)
         .expect("normal-ready protocol must not wait for SDK ordinary permission");
-    assert_eq!(tx.frame().bytes[3], BUDGET_CONTROL);
+    assert_eq!(tx.frame().bytes.rr_kind(), BUDGET_CONTROL);
     assert!(!tx.closes_packet_batch());
     assert!(tx.single_control_contract().is_none());
     assert!(tx.batch_contracts().is_none());
@@ -330,7 +330,7 @@ fn expired_protocol_owner_is_accounted_and_retried_without_pinning_service() {
         "expired completed HEALTH marker cannot authorize a new reservation"
     );
     let hh = p.begin_transmission(9001).unwrap();
-    assert_eq!(hh.frame().bytes[3], HEALTH);
+    assert_eq!(hh.frame().bytes.rr_kind(), HEALTH);
     p.finish_transmission(hh, true);
     assert!(p.queued_budget_owner(9001));
     let tx = p
@@ -353,7 +353,7 @@ fn unreserved_revoke_refreshes_only_after_full_health_and_preserves_owned_queue_
     assert!(!p.queued_budget_owner(0));
     assert!(p.begin_paid_budget_transmission(0).is_none());
     let hh = p.begin_transmission(0).unwrap();
-    assert_eq!(hh.frame().bytes[3], HEALTH);
+    assert_eq!(hh.frame().bytes.rr_kind(), HEALTH);
     p.finish_transmission(hh, false);
     assert!(
         !p.queued_budget_owner(0),
@@ -403,7 +403,7 @@ fn unreserved_revoke_refreshes_only_after_full_health_and_preserves_owned_queue_
     let tx = p
         .begin_primary_background_transmission(500, 0, true, false)
         .unwrap();
-    assert_eq!(tx.frame().bytes[3], BUDGET_CONTROL);
+    assert_eq!(tx.frame().bytes.rr_kind(), BUDGET_CONTROL);
     assert!(tx.queued.budget_ever_reserved());
     let frozen = tx.frame().bytes.clone();
     p.finish_transmission(tx, false);
@@ -500,7 +500,7 @@ fn owed_settings_turn_carries_a_queued_primary_budget_frame() {
     p.direct(0);
     p.tick(0);
     let health = p.begin_transmission(0).unwrap();
-    assert_eq!(health.frame().bytes[3], HEALTH);
+    assert_eq!(health.frame().bytes.rr_kind(), HEALTH);
     p.finish_transmission(health, true);
     // A station-mode reply is waiting too.
     let mut reply = b"OM\x02\x01".to_vec();
@@ -510,16 +510,16 @@ fn owed_settings_turn_carries_a_queued_primary_budget_frame() {
     assert!(p.queue_operating_mode_reply(&reply, 0));
     let owed = p.begin_owed_settings_transmission(0).expect("the owed turn carries the queued budget frame");
     let budget = owed.frame().bytes.clone();
-    assert_eq!(budget[3], BUDGET_CONTROL);
+    assert_eq!(budget.rr_kind(), BUDGET_CONTROL);
     p.finish_transmission(owed, true);
     // Another budget frame is queued for the next turn: the waiting mode
     // reply goes first, then the budget frame on the turn after.
     p.enqueue(Outgoing { command: true, bytes: budget }, 254, 0);
     let second = p.begin_owed_settings_transmission(0).expect("second owed turn");
-    assert!(second.frame().bytes.windows(reply.len()).any(|w| w == reply) || second.frame().bytes[3] != BUDGET_CONTROL,
+    assert!(second.frame().bytes.windows(reply.len()).any(|w| w == reply) || second.frame().bytes.rr_kind() != BUDGET_CONTROL,
         "the mode reply goes on the turn after a budget frame");
     p.finish_transmission(second, true);
     let third = p.begin_owed_settings_transmission(0).expect("third owed turn");
-    assert_eq!(third.frame().bytes[3], BUDGET_CONTROL, "then the budget frame");
+    assert_eq!(third.frame().bytes.rr_kind(), BUDGET_CONTROL, "then the budget frame");
     p.finish_transmission(third, true);
 }

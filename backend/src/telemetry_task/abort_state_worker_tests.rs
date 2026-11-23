@@ -26,10 +26,9 @@ fn frames(raw: &[u8]) -> Vec<Vec<u8>> {
 /// The SDK frames an RR AV_BAY_DATA envelope carries (a compact bundle is
 /// expanded).
 fn sdk_frames(body: &[u8]) -> Vec<Vec<u8>> {
-    if !(body.starts_with(b"RR\x01") && body.len() >= 8 && matches!(body[3], 2 | 5)) {
+    let Some((2 | 5, inner)) = crate::rrls::decode(body) else {
         return Vec::new();
-    }
-    let inner = &body[4..body.len() - 4];
+    };
     if sedsnet::wire_bundle::is_bundle(inner) {
         sedsnet::wire_bundle::unpack_bundle_frames(inner).unwrap_or_default()
     } else {

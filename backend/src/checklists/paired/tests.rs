@@ -811,8 +811,8 @@ async fn suite() {
                 let mut link = mesh.lock().unwrap();
                 let now = link.now();
                 while let Some(frame) = link.pop(now) {
-                    if frame.bytes.len() >= 8
-                        && JournalRadio::recognizes(&frame.bytes[4..frame.bytes.len() - 4])
+                    if crate::rrls::decode(&frame.bytes)
+                        .is_some_and(|(_, body)| JournalRadio::recognizes(body))
                     {
                         signed_wire = true;
                     }

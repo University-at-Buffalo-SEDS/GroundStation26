@@ -3,11 +3,11 @@
 //!
 //! Budget (32 kbit/s usable = 4000 B/s, 16 B modem allowance per frame):
 //! Codec2 1200 bit/s, eight 40 ms codec frames per radio packet (320 ms).
-//! 48 B speech, 7 B voice header, 8 B RRLS envelope, 4 B UART framing and
-//! 16 B modem allowance make 83 B every 320 ms = 259 B/s.
-//! That is 26% of the primary's 25% share (1000 B/s), 18.5% of the RRLS's
-//! 35% (1400 B/s) and 13% of its 50%. At the primary's 15% (600 B/s, an RRLS
-//! relaying) it would be 43% next to commands and telemetry, so the primary
+//! 48 B speech, 7 B voice header, 5 B RRLS envelope (CRC form), 4 B UART
+//! framing and 16 B modem allowance make 80 B every 320 ms = 250 B/s.
+//! That is 25% of the primary's 25% share (1000 B/s), 18% of the RRLS's
+//! 35% (1400 B/s) and 12.5% of its 50%. At the primary's 15% (600 B/s, an RRLS
+//! relaying) it would be 42% next to commands and telemetry, so the primary
 //! does not send voice below 25%. The previous Opus 8 kbit/s profile needed
 //! 99 B per 60 ms (1650 B/s) and fit no host share.
 use crate::rrls::Role;
@@ -30,7 +30,7 @@ const HEADER: usize = 7;
 const KIND_CODEC2_1200: u8 = 0x20;
 pub const MAX_PACKET: usize = HEADER + CODEC_BYTES * FRAMES_PER_PACKET;
 /// RRLS envelope + UART framing + configured modem allowance per radio frame.
-pub(crate) const LINK_OVERHEAD: usize = 8 + 4 + 16;
+pub(crate) const LINK_OVERHEAD: usize = crate::rrls::RR_CRC_OVERHEAD + 4 + 16;
 pub(crate) const BITRATE_BPS: u32 = 1200;
 /// Smallest host share that leaves room for commands and telemetry.
 pub(crate) const MIN_SENDER_SHARE_PERCENT: u8 = 25;
@@ -327,18 +327,18 @@ mod tests {
     }
     #[test]
     fn airtime_fits_the_primary_share_with_room_for_control() {
-        // 48 B speech + 7 B header + 8 B envelope + 4 B UART + 16 B modem = 83 B.
+        // 48 B speech + 7 B header + 5 B envelope + 4 B UART + 16 B modem = 80 B.
         assert_eq!(MAX_PACKET, 55);
-        assert_eq!(MAX_PACKET + LINK_OVERHEAD, 83);
+        assert_eq!(MAX_PACKET + LINK_OVERHEAD, 80);
         assert_eq!(PACKET_MS, 320);
-        assert_eq!(air_bytes_per_second(), 260); // 259.4 rounded up
+        assert_eq!(air_bytes_per_second(), 250);
         let usable = 32_000u64 / 8; // B/s on the matched profile
         let share = |percent: u64| usable * percent / 100;
         assert_eq!(share(25), 1000);
         // Primary at 25%: voice takes about a quarter, leaving 740 B/s.
         assert!(air_bytes_per_second() * 100 / share(25) <= 26);
-        // At 15% (RRLS relaying) it would be 43%: the primary does not send.
-        assert!(air_bytes_per_second() * 100 / share(15) >= 43);
+        // At 15% (RRLS relaying) it would be 41%: the primary does not send.
+        assert!(air_bytes_per_second() * 100 / share(15) >= 41);
         assert!(air_bytes_per_second() * 100 / share(MIN_SENDER_SHARE_PERCENT.into()) <= 26);
         // RRLS at its 35% base and 50% relay share.
         assert!(air_bytes_per_second() * 1000 / share(35) <= 186);

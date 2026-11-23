@@ -2631,8 +2631,8 @@ static AIR_AV_BAY_VIRTUAL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// fragment) is AV-bay air: only the AV bay writes plain frames on the air, and
 /// in the cons-b fullnet 60% of RF's bursts carried only those.
 fn heard_frame_source(payload: &[u8]) -> Option<rfd_capacity::HeardSource> {
-    if payload.len() >= 8 && payload.starts_with(b"RR\x01") {
-        return matches!(payload[3], 5 | 6).then_some(rfd_capacity::HeardSource::Station);
+    if let Some(kind) = crate::rrls::kind_of(payload) {
+        return matches!(kind, 5 | 6).then_some(rfd_capacity::HeardSource::Station);
     }
     let Ok(info) = serialize::peek_frame_info_unchecked(payload) else {
         return Some(rfd_capacity::HeardSource::AvBay);
@@ -2678,7 +2678,7 @@ fn last_air_rx() -> Option<(Instant, Option<u64>)> {
 }
 /// RR mesh control the station sends at priority 255: HEALTH, READY and the
 /// budget/RF-profile control frames (BASE/REVOKE/ACK and paid budget frames).
-/// Byte 3 is the mesh kind (rrls.rs HEALTH 0, READY 7, BUDGET_CONTROL 13,
+/// The RR marker gives the mesh kind (rrls.rs HEALTH 0, READY 7, BUDGET_CONTROL 13,
 /// RF_PROFILE_CONTROL 14). They take the station's turn gap after the AV
 /// bay's air like ordinary frames, held at most MESH_CONTROL_TURN_HOLD_MS.
 /// Sent out of turn, the 500 ms HEALTH met RF's burst on air: in the confirm6
@@ -2686,14 +2686,14 @@ fn last_air_rx() -> Option<(Instant, Option<u64>)> {
 /// HEALTH, two of them the Abort's reply with every AV-bay Abort status
 /// (FC shown at 990 and 964 ms instead of about 210 ms).
 fn is_mesh_control_frame(bytes: &[u8]) -> bool {
-    matches!(bytes.get(3), Some(0 | 7 | 13 | 14))
+    matches!(crate::rrls::kind_of(bytes), Some(0 | 7 | 13 | 14))
 }
 /// A station's own RR mesh frames other than mesh control: POSITION 8,
 /// SETTINGS 10 (pairing included), HOST_CONTROL 11 (the RRLS's observe
 /// refresh and discovery queries) and the primary's STATION_STATE 16. Relayed
 /// DOWN/UP data and commands are not.
 fn is_station_own_mesh_frame(bytes: &[u8]) -> bool {
-    matches!(bytes.get(3), Some(8 | 10 | 11 | 16))
+    matches!(crate::rrls::kind_of(bytes), Some(8 | 10 | 11 | 16))
 }
 /// Longest a write of RR mesh control alone waits for the station's turn gap
 /// before it goes anyway. RF's turns open a gap every 200 ms, so this only
@@ -2713,7 +2713,8 @@ pub(crate) const MESH_CONTROL_GAP_WINDOW_MS: u64 = 60;
 /// `control_may_bypass` (it has waited MESH_CONTROL_TURN_HOLD_MS).
 fn mesh_write_bypasses_turn(first: &[u8], follower: Option<&[u8]>, control_may_bypass: bool) -> bool {
     let abort = |bytes: &[u8]| {
-        matches!(bytes.get(3), Some(2 | 5)) && bytes.len() >= 8 && is_abort_frame(&bytes[4..bytes.len() - 4])
+        matches!(crate::rrls::kind_of(bytes), Some(2 | 5))
+            && crate::rrls::payload_unchecked(bytes).is_some_and(is_abort_frame)
     };
     let bypass = |bytes: &[u8]| is_mesh_control_frame(bytes) || abort(bytes);
     bypass(first)
@@ -3133,9 +3134,12 @@ fn raw_uart_requires_inner_crc(kind: RawUartFrameKind, body: &[u8]) -> bool {
     (kind == RawUartFrameKind::Data
         && (body.starts_with(b"SDT") || serialize::peek_frame_info_unchecked(body).is_ok()))
         || (matches!(kind, RawUartFrameKind::Data | RawUartFrameKind::Command)
-            && body.starts_with(b"RR\x01"))
+            && crate::rrls::is_envelope(body))
 }
 fn raw_uart_inner_crc_valid(body: &[u8]) -> bool {
+    if crate::rrls::is_envelope(body) {
+        return crate::rrls::envelope_valid(body);
+    }
     body.len() >= 8
         && crc32fast::hash(&body[..body.len() - 4])
             == u32::from_le_bytes(body[body.len() - 4..].try_into().unwrap())
@@ -3196,24 +3200,26 @@ mod native_uart_integrity_tests {
         assert!(stream.is_empty());
     }
 
-    /// One corrupted RR-v1 relay frame whose payload happens to contain a
+    /// One corrupted RR relay frame whose payload happens to contain a
     /// UART sync and short length. Before the fix the parser resynchronized
     /// inside the rejected span: it delivered the fake inner bytes as a frame
     /// (or rejected them again as another CRC mismatch) instead of skipping to
     /// the next real frame.
     #[test]
-    fn rejected_rr_v1_span_is_never_reparsed_for_a_false_sync() {
-        let mut body = b"RR\x01\x05".to_vec();
-        body.extend_from_slice(&[9, 9, 0xA5, 0x5A, 0x04, 0x00, 1, 2, 3, 4, 9, 9]);
-        let crc = crc32fast::hash(&body) ^ 0xDEAD_BEEF; // damaged
-        body.extend_from_slice(&crc.to_le_bytes());
+    fn rejected_rr_span_is_never_reparsed_for_a_false_sync() {
+        let mut body =
+            crate::rrls::encode(5, &[9, 9, 0xA5, 0x5A, 0x04, 0x00, 1, 2, 3, 4, 9, 9]);
+        let n = body.len() - 4;
+        for (b, damage) in body[n..].iter_mut().zip(0xDEAD_BEEFu32.to_le_bytes()) {
+            *b ^= damage; // damaged CRC
+        }
         let mut stream = build_raw_uart_frame(&body).unwrap();
         let following = native_heartbeat(43);
         let now = Instant::now();
         let mut wait = RawUartFrameWait::default();
         assert!(matches!(
             take_raw_uart_framed_payload_with_clock(&mut stream, &mut wait, now, Some(0)),
-            Err(TelemetryError::Unpack("raw UART RR-v1 crc32 mismatch"))
+            Err(TelemetryError::Unpack("raw UART RR crc32 mismatch"))
         ));
         // Nothing beyond the rejected span has arrived yet.
         for ms in 1..4 {
@@ -3382,7 +3388,7 @@ mod native_uart_integrity_tests {
     }
 }
 
-// Only known-rejected bytes permit lookahead. A complete CRC-valid SDK/RR-v1 frame
+// Only known-rejected bytes permit lookahead. A complete CRC-valid SDK/RR frame
 // can restore framing inside that span. The first candidate outside the span
 // is handled normally, even when incomplete: never inspect its payload for a
 // nested frame. Unexpired ordinary frames never enter this recovery path.
@@ -3490,8 +3496,8 @@ fn take_raw_uart_framed_payload_recovering(
             // checksum before consuming that frame, preserving bytes for resync.
             let error = if body.starts_with(b"SDT") {
                 "raw UART SDT crc32 mismatch"
-            } else if body.starts_with(b"RR\x01") {
-                "raw UART RR-v1 crc32 mismatch"
+            } else if crate::rrls::is_envelope(body) {
+                "raw UART RR crc32 mismatch"
             } else {
                 "raw UART native crc32 mismatch"
             };
@@ -6270,7 +6276,11 @@ mod raw_uart_tests {
         framing: bool,
     ) -> (UartComms, crate::rrls::Shared, serialport::TTYPort, Instant) {
         crate::telemetry_schema::initialize().unwrap();
-        let legacy = include_bytes!("comms/fixtures/legacy374-settings-body.bin");
+        let fixture = include_bytes!("comms/fixtures/legacy374-settings-body.bin");
+        // The captured RR v1 SETTINGS envelope's body, re-wrapped as RR v2.
+        let settings_body = &fixture[4..fixture.len() - 4];
+        let legacy_wire = crate::rrls::encode(10, settings_body);
+        let legacy = &legacy_wire[..];
         let (mut peer, port) = serialport::TTYPort::pair().unwrap();
         peer.set_timeout(Duration::from_secs(1)).unwrap();
         let (mut uart, shared, _) = recovery_uart_fixture(port);
@@ -6278,33 +6288,31 @@ mod raw_uart_tests {
             let mut mesh = shared.lock().unwrap();
             let health = mesh.begin_transmission(0).unwrap();
             mesh.finish_transmission(health, true);
-            let mut ready = b"RR\x01\x07".to_vec();
-            ready.extend(1u32.to_le_bytes());
+            let mut ready = 1u32.to_le_bytes().to_vec();
             ready.extend(0u32.to_le_bytes());
-            ready.extend(crc32fast::hash(&ready).to_le_bytes());
-            mesh.incoming(true, &ready, 0);
+            mesh.incoming(true, &crate::rrls::encode(7, &ready), 0);
             if framing {
                 mesh.enable_settings_framing();
-                assert!(mesh.queue_operating_mode_reply(&legacy[4..legacy.len() - 4], 0));
+                assert!(mesh.queue_operating_mode_reply(settings_body, 0));
             } else {
-                assert!(mesh.queue_settings(&legacy[4..legacy.len() - 4], 0));
+                assert!(mesh.queue_settings(settings_body, 0));
             }
         }
         uart.write_lock.lock().unwrap().radio_capacity =
             Some(rfd_capacity::Capacity::new(32_000, 15, 16));
         if framing {
             uart.service_background_transmit().unwrap();
-            let mut probe = vec![0; 59];
+            let mut probe = vec![0; 56];
             peer.read_exact(&mut probe).unwrap();
-            assert_eq!(&probe[4..8], b"RR\x01\x0f", "real negotiation probe");
-            assert_eq!(probe[8], 0x10);
+            assert_eq!(crate::rrls::decode(&probe[4..]).map(|(kind, _)| kind), Some(15), "real negotiation probe");
+            assert_eq!(probe[5], 0x10);
             // No OFFER is supplied. The same actual framer must select Legacy
             // after its 750 ms completed-probe timeout, not an unnegotiated send.
             std::thread::sleep(Duration::from_millis(770));
         }
         let started = Instant::now();
         uart.service_background_transmit().unwrap();
-        let mut actual = vec![0; 374];
+        let mut actual = vec![0; legacy.len() + 4];
         peer.read_exact(&mut actual).unwrap();
         assert_eq!(actual, build_raw_uart_command_frame(legacy).unwrap());
         assert_eq!(
@@ -6342,9 +6350,10 @@ mod raw_uart_tests {
         )
         .unwrap();
         let bytes = serialize::pack_packet(&command);
-        let legacy = include_bytes!("comms/fixtures/legacy374-settings-body.bin");
+        let fixture = include_bytes!("comms/fixtures/legacy374-settings-body.bin");
+        let legacy = crate::rrls::encode(10, &fixture[4..fixture.len() - 4]);
         assert!(
-            !uart.transmit_ready_for(255, legacy),
+            !uart.transmit_ready_for(255, &legacy),
             "opaque SETTINGS is not a control beneficiary"
         );
         assert!(!uart.transmit_ready_for(255, b"SDT\x03opaque"));
@@ -6589,7 +6598,7 @@ mod raw_uart_tests {
         malformed.extend_from_slice(&crc32fast::hash(&malformed).to_le_bytes());
         assert!(!is_radio_packet_receipt(255, &malformed));
         assert!(!is_radio_packet_receipt(255, b"SDT\x03\x01\x08 fake ack"));
-        assert!(!is_radio_packet_receipt(255, b"RR\x01\x06 fake ack"));
+        assert!(!is_radio_packet_receipt(255, &crate::rrls::encode(6, b" fake ack")));
         let hop_ack = serialize::pack_reliable_ack(
             "RF",
             crate::telemetry_schema::data_type("FLIGHT_COMMAND"),
@@ -6646,11 +6655,10 @@ mod raw_uart_tests {
             uart.recovery = None;
             let expected = if mesh_path {
                 let mut mesh = crate::rrls::Mesh::new(crate::rrls::Role::Rrls, 1);
-                let mut health = b"RR\x01\x00".to_vec();
-                health.extend_from_slice(&1u32.to_le_bytes());
+                let mut health = 1u32.to_le_bytes().to_vec();
                 health.extend_from_slice(&0u32.to_le_bytes());
                 health.push(0);
-                health.extend_from_slice(&crc32fast::hash(&health).to_le_bytes());
+                let health = crate::rrls::encode(0, &health);
                 mesh.incoming(true, &health, 9080);
                 mesh.incoming(false, &bytes, 9080);
                 let tx = mesh.begin_transmission(9080).unwrap();
@@ -6772,7 +6780,7 @@ mod raw_uart_tests {
         );
         assert!(closes_radio_packet_batch(255, &ack));
         assert!(!closes_radio_packet_batch(255, b"SDT opaque bootstrap"));
-        assert!(!closes_radio_packet_batch(255, b"RR\x01\x00 health"));
+        assert!(!closes_radio_packet_batch(255, &crate::rrls::encode(0, b" health")));
     }
 
     #[test]
@@ -6977,11 +6985,9 @@ mod raw_uart_tests {
             let mut mesh = shared.lock().unwrap();
             let health = mesh.begin_transmission(0).unwrap();
             mesh.finish_transmission(health, true);
-            let mut ready = b"RR\x01\x07".to_vec();
-            ready.extend(1u32.to_le_bytes());
+            let mut ready = 1u32.to_le_bytes().to_vec();
             ready.extend(0u32.to_le_bytes());
-            ready.extend(crc32fast::hash(&ready).to_le_bytes());
-            mesh.incoming(true, &ready, 0);
+            mesh.incoming(true, &crate::rrls::encode(7, &ready), 0);
             assert!(mesh.queue_settings(b"TC04 opaque original owner", 0));
             let owner = mesh.begin_transmission(0).unwrap();
             let wire = build_raw_uart_command_frame(&owner.frame().bytes).unwrap();
@@ -7132,7 +7138,7 @@ mod raw_uart_tests {
                 "existing protected host-control precedence is preserved"
             );
             let owner = mesh.begin_transmission(0).unwrap();
-            assert_eq!(owner.frame().bytes[3], 11);
+            assert_eq!(crate::rrls::kind_of(&owner.frame().bytes), Some(11));
             let expected = build_raw_uart_command_frame(&owner.frame().bytes).unwrap();
             mesh.finish_transmission(owner, false);
             (expected, expected_mode)
@@ -7685,13 +7691,7 @@ mod raw_uart_tests {
         assert!(!is_abort_frame(&sdt(1, &{ let mut b = vec![0x55]; b.extend_from_slice(&command); b })));
         // The mesh writer: an ABORT wrapped as AV-bay data, alone or coalesced
         // with HEALTH, goes at once; ordinary data with HEALTH waits.
-        let wrap = |kind: u8, inner: &[u8]| {
-            let mut v = b"RR\x01".to_vec();
-            v.push(kind);
-            v.extend_from_slice(inner);
-            v.extend(crc32fast::hash(&v).to_le_bytes());
-            v
-        };
+        let wrap = crate::rrls::encode;
         let health = wrap(0, &[0; 9]);
         for held_long_enough in [false, true] {
             assert!(mesh_write_bypasses_turn(&wrap(5, &abort), None, held_long_enough));
@@ -7875,13 +7875,7 @@ mod raw_uart_tests {
         assert_eq!(heard_frame_source(&frame("RF")), Some(HeardSource::AvBay));
         assert_eq!(heard_frame_source(&frame("FC")), Some(HeardSource::AvBay));
         assert_eq!(heard_frame_source(&frame("RRLS")), None);
-        let wrap = |kind: u8, inner: &[u8]| {
-            let mut v = b"RR\x01".to_vec();
-            v.push(kind);
-            v.extend_from_slice(inner);
-            v.extend_from_slice(&[0, 0, 0, 0]);
-            v
-        };
+        let wrap = crate::rrls::encode;
         assert_eq!(heard_frame_source(&wrap(5, &frame("GS"))), Some(HeardSource::Station));
         assert_eq!(heard_frame_source(&wrap(6, &frame("VB"))), Some(HeardSource::Station));
         assert_eq!(heard_frame_source(&wrap(2, &frame("RF"))), None);
@@ -8362,7 +8356,7 @@ mod raw_uart_tests {
     }
 
     /// A compact bundle leaves as one UART frame in one RR AV_BAY_DATA
-    /// envelope (8 B once, not per SDK frame), and rebuilds every frame.
+    /// envelope (1 B once, not per SDK frame), and rebuilds every frame.
     #[test]
     #[cfg(target_os = "linux")]
     fn a_compact_bundle_is_one_rr_envelope_and_one_uart_frame() {
@@ -8416,10 +8410,10 @@ mod raw_uart_tests {
         let len = u16::from_le_bytes([header[2], header[3]]) as usize;
         let mut body = vec![0; len];
         peer.read_exact(&mut body).unwrap();
-        assert_eq!(&body[..4], b"RR\x01\x05", "one AV_BAY_DATA envelope");
-        let inner = &body[4..len - 4];
+        let (kind, inner) = crate::rrls::decode(&body).expect("a valid RR envelope");
+        assert_eq!(kind, 5, "one AV_BAY_DATA envelope");
         assert_eq!(sedsnet::wire_bundle::unpack_bundle_frames(inner).unwrap(), frames);
-        let legacy: usize = frames.iter().map(|f| f.len() + 8 + 4).sum();
+        let legacy: usize = frames.iter().map(|f| f.len() + 1 + 4).sum();
         assert!(len + 4 < legacy, "bundle {} B vs {legacy} B as single frames", len + 4);
         let mut probe = [0u8; 1];
         peer.set_timeout(Duration::from_millis(50)).unwrap();
@@ -8626,7 +8620,10 @@ mod raw_uart_tests {
                 }
                 out.extend_from_slice(&buf[..n]);
             }
-            if out.windows(4).any(|w| w == b"RR\x01\x0b") {
+            if out.windows(5).any(|w| {
+                w[..2] == [RAW_UART_COMMAND_SYNC_0, RAW_UART_COMMAND_SYNC_1]
+                    && crate::rrls::kind_of(&w[4..]) == Some(11)
+            }) {
                 break start.elapsed();
             }
             assert!(start.elapsed() < Duration::from_millis(600), "HOST_CONTROL never sent");
@@ -8959,12 +8956,7 @@ mod raw_uart_tests {
         }
         crate::telemetry_schema::initialize().unwrap();
         let clock = std::path::PathBuf::from(std::env::var_os("GS_SIM_CLOCK_FILE").unwrap());
-        let wrap = |kind: u8, payload: &[u8]| {
-            let mut bytes = vec![b'R', b'R', 1, kind];
-            bytes.extend_from_slice(payload);
-            bytes.extend_from_slice(&crc32fast::hash(&bytes).to_le_bytes());
-            bytes
-        };
+        let wrap = crate::rrls::encode;
         let packets = ["AV_BAY_UNDERGLOW", "FLIGHT_COMMAND"].map(|name| {
             serialize::pack_packet(
                 &Packet::new(
@@ -9103,12 +9095,7 @@ mod raw_uart_tests {
         }
         crate::telemetry_schema::initialize().unwrap();
         let clock = std::path::PathBuf::from(std::env::var_os("GS_SIM_CLOCK_FILE").unwrap());
-        let wrap = |kind: u8, payload: &[u8]| {
-            let mut bytes = vec![b'R', b'R', 1, kind];
-            bytes.extend_from_slice(payload);
-            bytes.extend_from_slice(&crc32fast::hash(&bytes).to_le_bytes());
-            bytes
-        };
+        let wrap = crate::rrls::encode;
         let packets = ["AV_BAY_UNDERGLOW", "FLIGHT_COMMAND", "FLIGHT_BUZZER"].map(|name| {
             serialize::pack_packet(
                 &Packet::new(
@@ -9207,12 +9194,7 @@ mod raw_uart_tests {
         }
         crate::telemetry_schema::initialize().unwrap();
         let clock = std::path::PathBuf::from(std::env::var_os("GS_SIM_CLOCK_FILE").unwrap());
-        let wrap = |kind: u8, payload: &[u8]| {
-            let mut bytes = vec![b'R', b'R', 1, kind];
-            bytes.extend_from_slice(payload);
-            bytes.extend_from_slice(&crc32fast::hash(&bytes).to_le_bytes());
-            bytes
-        };
+        let wrap = crate::rrls::encode;
         let packets = [101u64, 102, 103].map(|id| {
             serialize::pack_packet(
                 &Packet::new(
@@ -9439,11 +9421,10 @@ mod raw_uart_tests {
         crate::telemetry_schema::initialize().unwrap();
         let (uart, shared, _) = recovery_uart_fixture(port);
         let mut mesh = crate::rrls::Mesh::new(crate::rrls::Role::Rrls, 2);
-        let mut health = b"RR\x01\x00".to_vec();
-        health.extend_from_slice(&1u32.to_le_bytes());
+        let mut health = 1u32.to_le_bytes().to_vec();
         health.extend_from_slice(&1u32.to_le_bytes());
         health.push(0);
-        health.extend_from_slice(&crc32fast::hash(&health).to_le_bytes());
+        let health = crate::rrls::encode(0, &health);
         mesh.incoming(true, &health, 0);
         for id in [10u64, 11] {
             let bytes = serialize::pack_packet(
@@ -9636,11 +9617,10 @@ mod raw_uart_tests {
         peer.set_timeout(Duration::from_millis(100)).unwrap();
         let (mut uart, shared, _) = recovery_uart_fixture(port);
         let mut mesh = crate::rrls::Mesh::new(crate::rrls::Role::Rrls, 2);
-        let mut health = b"RR\x01\x00".to_vec();
-        health.extend_from_slice(&1u32.to_le_bytes());
+        let mut health = 1u32.to_le_bytes().to_vec();
         health.extend_from_slice(&1u32.to_le_bytes());
         health.push(0);
-        health.extend_from_slice(&crc32fast::hash(&health).to_le_bytes());
+        let health = crate::rrls::encode(0, &health);
         mesh.incoming(true, &health, 0);
         let bytes = serialize::pack_packet(
             &Packet::new(

@@ -59,7 +59,7 @@ fn simulate_with(loss_ppm: u64, seed: u64, delay_lo: u64, delay_hi: u64) -> Tall
     while now < end {
         primary.tick(now);
         while let Some(frame) = primary.pop(now) {
-            if frame.bytes.get(3) == Some(&0) && !rng.chance(loss_ppm) {
+            if crate::rrls::kind_of(&frame.bytes) == Some(0) && !rng.chance(loss_ppm) {
                 rrls.incoming(true, &frame.bytes, now);
             }
         }

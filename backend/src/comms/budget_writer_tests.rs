@@ -1,5 +1,6 @@
 use super::*;
 use crate::rrls::budget_negotiation::{Nonce, Profile};
+use crate::rrls::RrKind;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 fn no_entropy() -> Option<Nonce> {
@@ -173,16 +174,16 @@ fn healthy_writer(shared: &crate::rrls::Shared, now: u64) -> crate::rrls::Mesh {
     relay.enable_budget(Profile::shipped());
     let mut primary = shared.lock().unwrap();
     primary.tick(now);
-    assert_eq!(logical_send(&mut primary, &mut relay, now)[3], 0);
-    assert_eq!(logical_send(&mut primary, &mut relay, now)[3], 13);
+    assert_eq!(logical_send(&mut primary, &mut relay, now).rr_kind(), 0);
+    assert_eq!(logical_send(&mut primary, &mut relay, now).rr_kind(), 13);
     relay.tick(now);
-    assert_eq!(logical_send(&mut relay, &mut primary, now)[3], 13);
+    assert_eq!(logical_send(&mut relay, &mut primary, now).rr_kind(), 13);
     assert_eq!(primary.negotiated_air_share(now), Some(25));
     relay
 }
 fn rf_reply(query: &[u8]) -> Vec<u8> {
-    let mut b = vec![b'R', b'R', 1, 14, 1, 1];
-    b.extend_from_slice(&query[6..22]);
+    let mut b = vec![crate::rrls::RR_CRC_BASE + 14, 1, 1];
+    b.extend_from_slice(&query[3..19]);
     // The RF reports the shipped profile's tuple.
     let p = Profile::shipped();
     b.extend_from_slice(&p.baud.to_le_bytes());
@@ -288,9 +289,9 @@ fn writer_debt_case(path: &std::path::Path, wire_bytes: usize, start: u64) {
                     .airtime_config(),
                 (30000, 18)
             );
-            if body[3] == 0 {
-                assert_eq!(body[12], 0);
-                last_health_seq = u32::from_le_bytes(body[8..12].try_into().unwrap());
+            if body.rr_kind() == 0 {
+                assert_eq!(body[9], 0);
+                last_health_seq = u32::from_le_bytes(body[5..9].try_into().unwrap());
                 let first = false_health_at.is_none();
                 false_health_at.get_or_insert(now);
                 relay.incoming(true, &body, now);
@@ -303,7 +304,7 @@ fn writer_debt_case(path: &std::path::Path, wire_bytes: usize, start: u64) {
                             .expect("normaltick queues RFproof after READY");
                         let bytes = q.frame().bytes.clone();
                         relay.finish_transmission(q, true);
-                        match bytes[3] {
+                        match bytes.rr_kind() {
                             7 => {
                                 shared.lock().unwrap().incoming(true, &bytes, now);
                             }
@@ -317,13 +318,13 @@ fn writer_debt_case(path: &std::path::Path, wire_bytes: usize, start: u64) {
                     let query = query.expect("bounded READY drain reaches actual RFquery");
                     relay.incoming(true, &rf_reply(&query), now);
                     let offer = relay.begin_transmission(now).unwrap();
-                    assert_eq!(offer.frame().bytes[3], 13);
+                    assert_eq!(offer.frame().bytes.rr_kind(), 13);
                     let bytes = offer.frame().bytes.clone();
                     relay.finish_transmission(offer, true);
                     shared.lock().unwrap().incoming(true, &bytes, now);
                     shared.lock().unwrap().tick(now);
                 }
-            } else if body[3] == 13 && body[5] == 1 {
+            } else if body.rr_kind() == 13 && body[2] == 1 {
                 grant_at = Some(now);
                 relay.incoming(true, &body, now);
                 assert_eq!(relay.recovery_air_share(now), Some(50));
@@ -360,12 +361,10 @@ fn inactive_base_ack_writer(
     use crate::rrls::budget_negotiation::{Context, Message, encode};
     clock(path, now);
     assert_eq!(relay.recovery_air_share(now), Some(50));
-    let mut health = vec![b'R', b'R', 1, 0];
-    health.extend_from_slice(&7u32.to_le_bytes());
+    let mut health = 7u32.to_le_bytes().to_vec();
     health.extend_from_slice(&seq.to_le_bytes());
     health.push(1);
-    let crc = crate::rrls::budget_negotiation::crc(&health);
-    health.extend_from_slice(&crc.to_le_bytes());
+    let health = crate::rrls::encode(0, &health);
     relay.incoming(true, &health, now);
     relay.tick(now);
     let revoke = encode(Message::Revoke(Context {

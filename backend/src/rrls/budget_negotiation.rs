@@ -3,6 +3,9 @@
 //! Existing HEALTH/READY payloads and readiness leases remain unchanged.
 const KIND: u8 = 13;
 const RF_KIND: u8 = 14;
+/// CRC-form RR markers of the two kinds (super::encode's layout, built in place).
+const MARKER: u8 = super::RR_CRC_BASE + KIND;
+const RF_MARKER: u8 = super::RR_CRC_BASE + RF_KIND;
 const LEASE_MS: u64 = 2_000;
 /// Primary without any observed RRLS: after this long on the direct path with
 /// no relay budget message, use the confirmed-direct share. Much longer than
@@ -187,7 +190,7 @@ pub(crate) struct Context {
 pub(crate) enum Message {
     Offer {
         context: Context,
-        rf_reply: [u8; 42],
+        rf_reply: [u8; 39],
     },
     Grant(Context),
     HighAck(Context),
@@ -208,7 +211,7 @@ impl Message {
 }
 #[derive(Clone, Copy)]
 pub(crate) struct Frame {
-    bytes: [u8; 76],
+    bytes: [u8; 70],
     len: usize,
 }
 impl Frame {
@@ -232,12 +235,12 @@ pub(crate) fn u32le(b: &[u8]) -> Option<u32> {
 pub(crate) fn u16le(b: &[u8]) -> Option<u16> {
     Some(u16::from_le_bytes(b.try_into().ok()?))
 }
-pub(crate) fn rf_query(nonce: Nonce) -> [u8; 26] {
-    let mut b = [0; 26];
-    b[..6].copy_from_slice(&[b'R', b'R', 1, RF_KIND, 1, 0]);
-    b[6..22].copy_from_slice(&nonce.0);
-    let checksum = crc(&b[..22]);
-    b[22..].copy_from_slice(&checksum.to_le_bytes());
+pub(crate) fn rf_query(nonce: Nonce) -> [u8; 23] {
+    let mut b = [0; 23];
+    b[..3].copy_from_slice(&[RF_MARKER, 1, 0]);
+    b[3..19].copy_from_slice(&nonce.0);
+    let checksum = crc(&b[..19]);
+    b[19..].copy_from_slice(&checksum.to_le_bytes());
     b
 }
 /// A tuple mismatch disables the negotiated relay budget (the conservative
@@ -250,21 +253,21 @@ pub(crate) fn log_profile_mismatch(reason: &str) {
         *last = Some(reason.to_string());
     }
 }
-pub(crate) fn rf_profile(reply: &[u8; 42], nonce: Nonce) -> Option<Profile> {
-    if reply[..6] != [b'R', b'R', 1, RF_KIND, 1, 1]
-        || reply[6..22] != nonce.0
-        || crc(&reply[..38]) != u32le(&reply[38..])?
+pub(crate) fn rf_profile(reply: &[u8; 39], nonce: Nonce) -> Option<Profile> {
+    if reply[..3] != [RF_MARKER, 1, 1]
+        || reply[3..19] != nonce.0
+        || crc(&reply[..35]) != u32le(&reply[35..])?
     {
         return None;
     }
     let p = Profile {
-        baud: u32le(&reply[22..26])?,
-        usable_bps: u32le(&reply[26..30])?,
-        rf_share: reply[30],
-        overhead: u16le(&reply[31..33])?,
-        burst_ms: u16le(&reply[33..35])?,
-        gap_ms: u16le(&reply[35..37])?,
-        flags: reply[37],
+        baud: u32le(&reply[19..23])?,
+        usable_bps: u32le(&reply[23..27])?,
+        rf_share: reply[27],
+        overhead: u16le(&reply[28..30])?,
+        burst_ms: u16le(&reply[30..32])?,
+        gap_ms: u16le(&reply[32..34])?,
+        flags: reply[34],
     };
     (p.baud != 0
         && p.baud <= 2_000_000
@@ -279,8 +282,8 @@ pub(crate) fn rf_profile(reply: &[u8; 42], nonce: Nonce) -> Option<Profile> {
 pub(crate) fn encode(message: Message) -> Frame {
     let c = message.context();
     let mut f = Frame {
-        bytes: [0; 76],
-        len: 34,
+        bytes: [0; 70],
+        len: 31,
     };
     let tag = match message {
         Message::Offer { .. } => 0,
@@ -289,18 +292,18 @@ pub(crate) fn encode(message: Message) -> Frame {
         Message::Revoke(_) => 3,
         Message::BaseAck { .. } => 4,
     };
-    f.bytes[..6].copy_from_slice(&[b'R', b'R', 1, KIND, 1, tag]);
-    f.bytes[6..10].copy_from_slice(&c.session.to_le_bytes());
-    f.bytes[10..14].copy_from_slice(&c.seq.to_le_bytes());
-    f.bytes[14..30].copy_from_slice(&c.nonce.0);
+    f.bytes[..3].copy_from_slice(&[MARKER, 1, tag]);
+    f.bytes[3..7].copy_from_slice(&c.session.to_le_bytes());
+    f.bytes[7..11].copy_from_slice(&c.seq.to_le_bytes());
+    f.bytes[11..27].copy_from_slice(&c.nonce.0);
     match message {
         Message::Offer { rf_reply, .. } => {
-            f.bytes[30..72].copy_from_slice(&rf_reply);
-            f.len = 76;
+            f.bytes[27..66].copy_from_slice(&rf_reply);
+            f.len = 70;
         }
         Message::BaseAck { relay_nonce, .. } => {
-            f.bytes[30..46].copy_from_slice(&relay_nonce.0);
-            f.len = 50;
+            f.bytes[27..43].copy_from_slice(&relay_nonce.0);
+            f.len = 47;
         }
         _ => {}
     }
@@ -309,32 +312,32 @@ pub(crate) fn encode(message: Message) -> Frame {
     f
 }
 pub(crate) fn decode(bytes: &[u8]) -> Option<Message> {
-    if bytes.len() < 34
-        || bytes[..5] != [b'R', b'R', 1, KIND, 1]
+    if bytes.len() < 31
+        || bytes[..2] != [MARKER, 1]
         || crc(&bytes[..bytes.len() - 4]) != u32le(&bytes[bytes.len() - 4..])?
     {
         return None;
     }
     let c = Context {
-        session: u32le(&bytes[6..10])?,
-        seq: u32le(&bytes[10..14])?,
-        nonce: Nonce::new(bytes[14..30].try_into().ok()?)?,
+        session: u32le(&bytes[3..7])?,
+        seq: u32le(&bytes[7..11])?,
+        nonce: Nonce::new(bytes[11..27].try_into().ok()?)?,
     };
-    match (bytes[5], bytes.len()) {
-        (0, 76) => {
-            let reply = bytes[30..72].try_into().ok()?;
+    match (bytes[2], bytes.len()) {
+        (0, 70) => {
+            let reply = bytes[27..66].try_into().ok()?;
             rf_profile(&reply, c.nonce)?;
             Some(Message::Offer {
                 context: c,
                 rf_reply: reply,
             })
         }
-        (1, 34) => Some(Message::Grant(c)),
-        (2, 34) => Some(Message::HighAck(c)),
-        (3, 34) => Some(Message::Revoke(c)),
-        (4, 50) => Some(Message::BaseAck {
+        (1, 31) => Some(Message::Grant(c)),
+        (2, 31) => Some(Message::HighAck(c)),
+        (3, 31) => Some(Message::Revoke(c)),
+        (4, 47) => Some(Message::BaseAck {
             revoke: c,
-            relay_nonce: Nonce::new(bytes[30..46].try_into().ok()?)?,
+            relay_nonce: Nonce::new(bytes[27..43].try_into().ok()?)?,
         }),
         _ => None,
     }
@@ -602,7 +605,7 @@ pub(crate) struct Relay {
     history: History,
     last_health: Option<u64>,
     clock: Option<u64>,
-    rf_reply: Option<[u8; 42]>,
+    rf_reply: Option<[u8; 39]>,
     high: bool,
     offered: Option<Context>,
     grant: Option<Context>,
@@ -707,7 +710,7 @@ impl Relay {
         }
         true
     }
-    pub(crate) fn profile_observed(&mut self, reply: [u8; 42]) -> Option<Profile> {
+    pub(crate) fn profile_observed(&mut self, reply: [u8; 39]) -> Option<Profile> {
         if !self.nonce_live {
             return None;
         }
@@ -822,7 +825,7 @@ impl Relay {
         self.base_ack
             .or_else(|| self.grant.filter(|_| self.high).map(Message::HighAck))
     }
-    pub(crate) fn profile_query(&mut self, now: u64, next: Nonce) -> Option<[u8; 26]> {
+    pub(crate) fn profile_query(&mut self, now: u64, next: Nonce) -> Option<[u8; 23]> {
         if !self.time(now, next)
             || !self.nonce_live
             || self.history.latest.is_none()
@@ -998,9 +1001,9 @@ impl Driver {
         let Some(next) = self.next else {
             return;
         };
-        if bytes.get(3) == Some(&RF_KIND) {
+        if super::kind_of(bytes) == Some(RF_KIND) {
             if let State::Relay(r) = &mut self.state
-                && let Ok(reply) = <&[u8; 42]>::try_from(bytes)
+                && let Ok(reply) = <&[u8; 39]>::try_from(bytes)
             {
                 r.time(now, next);
                 r.profile_observed(*reply);
@@ -1029,10 +1032,10 @@ impl Driver {
                     encode(message)
                 } else if let Some(query) = r.profile_query(now, next) {
                     let mut f = Frame {
-                        bytes: [0; 76],
-                        len: 26,
+                        bytes: [0; 70],
+                        len: 23,
                     };
-                    f.bytes[..26].copy_from_slice(&query);
+                    f.bytes[..23].copy_from_slice(&query);
                     f
                 } else {
                     encode(r.offer(now, next)?)
@@ -1067,7 +1070,7 @@ impl Driver {
         if self.next.is_none() {
             return false;
         }
-        if bytes.get(3) == Some(&RF_KIND) {
+        if super::kind_of(bytes) == Some(RF_KIND) {
             return matches!(&self.state,State::Relay(r)if r.nonce_live && r.history.latest.is_some()&&r.rf_reply.is_none()&&bytes==rf_query(r.nonce));
         }
         let Some(message) = decode(bytes) else {
@@ -1104,7 +1107,7 @@ impl Driver {
                 }
             }
             State::Relay(r) => {
-                if bytes.get(3) == Some(&RF_KIND) {
+                if super::kind_of(bytes) == Some(RF_KIND) {
                     r.query_committed(bytes, now, next, full_drained);
                 } else if let Some(message) = decode(bytes) {
                     r.committed(message, now, next, full_drained);
@@ -1121,19 +1124,19 @@ mod tests {
     fn n(value: u8) -> Nonce {
         Nonce::new([value; 16]).unwrap()
     }
-    fn reply(nonce: Nonce, profile: Profile) -> [u8; 42] {
-        let mut b = [0; 42];
-        b[..6].copy_from_slice(&[b'R', b'R', 1, 14, 1, 1]);
-        b[6..22].copy_from_slice(&nonce.0);
-        b[22..26].copy_from_slice(&profile.baud.to_le_bytes());
-        b[26..30].copy_from_slice(&profile.usable_bps.to_le_bytes());
-        b[30] = profile.rf_share;
-        b[31..33].copy_from_slice(&profile.overhead.to_le_bytes());
-        b[33..35].copy_from_slice(&profile.burst_ms.to_le_bytes());
-        b[35..37].copy_from_slice(&profile.gap_ms.to_le_bytes());
-        b[37] = profile.flags;
-        let c = crc(&b[..38]);
-        b[38..].copy_from_slice(&c.to_le_bytes());
+    fn reply(nonce: Nonce, profile: Profile) -> [u8; 39] {
+        let mut b = [0; 39];
+        b[..3].copy_from_slice(&[RF_MARKER, 1, 1]);
+        b[3..19].copy_from_slice(&nonce.0);
+        b[19..23].copy_from_slice(&profile.baud.to_le_bytes());
+        b[23..27].copy_from_slice(&profile.usable_bps.to_le_bytes());
+        b[27] = profile.rf_share;
+        b[28..30].copy_from_slice(&profile.overhead.to_le_bytes());
+        b[30..32].copy_from_slice(&profile.burst_ms.to_le_bytes());
+        b[32..34].copy_from_slice(&profile.gap_ms.to_le_bytes());
+        b[34] = profile.flags;
+        let c = crc(&b[..35]);
+        b[35..].copy_from_slice(&c.to_le_bytes());
         b
     }
     fn pair() -> (Primary, Relay) {
@@ -1238,27 +1241,27 @@ mod tests {
     #[test]
     fn rf_exact_wire_sizes_crc_nonce_and_mismatches() {
         let query = rf_query(n(2));
-        assert_eq!(query.len(), 26);
+        assert_eq!(query.len(), 23);
         assert_eq!(
             query,
             [
-                82, 82, 1, 14, 1, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 50, 21, 14, 7
+                0xEE, 1, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 241, 234, 253, 247
             ]
         );
-        assert_eq!(&query[..6], b"RR\x01\x0e\x01\x00");
-        assert_eq!(crc(&query[..22]), u32le(&query[22..]).unwrap());
+        assert_eq!(super::super::decode(&query).map(|(kind, _)| kind), Some(RF_KIND));
+        assert_eq!(crc(&query[..19]), u32le(&query[19..]).unwrap());
         let good = reply(n(2), Profile::MATCHED);
         assert_eq!(
             good,
             [
-                82, 82, 1, 14, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 0, 194, 1, 0,
-                0, 125, 0, 0, 35, 16, 0, 100, 0, 55, 0, 0, 12, 214, 14, 180
+                0xEE, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 0, 194, 1, 0, 0, 125, 0,
+                0, 35, 16, 0, 100, 0, 55, 0, 0, 149, 176, 245, 252
             ]
         );
         assert_eq!(rf_profile(&good, n(2)), Some(Profile::MATCHED));
         assert!(rf_profile(&good, n(3)).is_none());
         let mut bad = good;
-        bad[41] ^= 1;
+        bad[38] ^= 1;
         assert!(rf_profile(&bad, n(2)).is_none());
         for flags in [1, 2, 4] {
             let observed = Profile {
@@ -1320,7 +1323,7 @@ mod tests {
             let frame = encode(message);
             assert_eq!(decode(frame.wire()), Some(message));
             let mut bad = frame;
-            bad.bytes[5] = 99;
+            bad.bytes[2] = 99;
             let v = crc(&bad.bytes[..bad.len - 4]);
             bad.bytes[bad.len - 4..bad.len].copy_from_slice(&v.to_le_bytes());
             assert!(decode(bad.wire()).is_none());
@@ -1328,7 +1331,7 @@ mod tests {
             extra.push(0);
             assert!(decode(&extra).is_none());
             let mut zero = frame;
-            zero.bytes[14..30].fill(0);
+            zero.bytes[11..27].fill(0);
             let v = crc(&zero.bytes[..zero.len - 4]);
             zero.bytes[zero.len - 4..zero.len].copy_from_slice(&v.to_le_bytes());
             assert!(decode(zero.wire()).is_none());
@@ -1962,10 +1965,10 @@ mod tests {
         p.incoming(base.wire(), 3);
         assert_eq!(p.peek_share(3), 25);
         let query = r.prepare(4).unwrap();
-        assert_eq!(query.wire()[3], 14);
+        assert_eq!(super::super::kind_of(query.wire()), Some(14));
         assert!(r.valid(query.wire(), 4));
         r.committed(query.wire(), 4, true);
-        let nonce = Nonce::new(query.wire()[6..22].try_into().unwrap()).unwrap();
+        let nonce = Nonce::new(query.wire()[3..19].try_into().unwrap()).unwrap();
         r.incoming(&reply(nonce, Profile::MATCHED), 5);
         assert!(
             r.prepare(6).is_none(),

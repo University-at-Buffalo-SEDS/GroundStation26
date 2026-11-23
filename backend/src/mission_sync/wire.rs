@@ -161,8 +161,8 @@ mod tests {
         let frame =
             frame.expect("signed metadata admitted after slow work must not be born expired");
         assert_eq!(
-            &frame.bytes[4..frame.bytes.len() - 4],
-            signed_wire.as_slice()
+            crate::rrls::decode(&frame.bytes).map(|(_, body)| body),
+            Some(signed_wire.as_slice())
         );
         let interval =
             (signed_wire.len() as u64 * 1000).div_ceil(paired_settings::radio::BYTES_PER_SECOND);

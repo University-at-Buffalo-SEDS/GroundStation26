@@ -228,24 +228,18 @@ async fn cold_routing_cannot_hide_paid_bootstrap_before_catalog_owner_starts() {
             }
             let body = raw[cursor + 4..cursor + 4 + n].to_vec();
             cursor += 4 + n;
-            let is_revoke = body.starts_with(b"RR\x01\x0d") && body.get(5) == Some(&3);
+            let is_revoke = crate::rrls::kind_of(&body) == Some(13) && body.get(2) == Some(&3);
             if is_revoke {
                 first_revoke.get_or_insert(now);
             }
-            let inner = if body.starts_with(b"RR\x01")
-                && matches!(body.get(3), Some(1..=6))
-            {
-                &body[4..body.len() - 4]
-            } else {
-                body.as_slice()
-            };
-            if body.starts_with(b"RR\x01") {
-                assert_eq!(
-                    crc32fast::hash(&body[..body.len() - 4]),
-                    u32::from_le_bytes(body[body.len() - 4..].try_into().unwrap())
-                );
+            if crate::rrls::is_envelope(&body) {
+                assert!(crate::rrls::decode(&body).is_some(), "a valid RR envelope");
             }
-            if !inner.starts_with(b"RR\x01") {
+            let inner = match crate::rrls::decode(&body) {
+                Some((1..=6, inner)) => inner,
+                _ => body.as_slice(),
+            };
+            if !crate::rrls::is_envelope(inner) {
                 strict
                     .rx_packed_from_side(inner, strict_side)
                     .expect("official public434 strict receiver rejects no SDK frame");
@@ -644,9 +638,8 @@ fn replay_fault_stream(
     let mut mesh = crate::rrls::Mesh::new(crate::rrls::Role::Rrls, 9);
     let mut consume = |frames: Vec<(bool, Vec<u8>)>| {
         for (command_frame, body) in frames {
-            let valid_rr = if body.starts_with(b"RR\x01") {
-                let valid = crc32fast::hash(&body[..body.len() - 4])
-                    == u32::from_le_bytes(body[body.len() - 4..].try_into().unwrap());
+            let valid_rr = if crate::rrls::is_envelope(&body) {
+                let valid = crate::rrls::decode(&body).is_some();
                 if !valid {
                     invalid_rr += 1;
                 }
@@ -654,14 +647,14 @@ fn replay_fault_stream(
             } else {
                 false
             };
-            if valid_rr && body.get(3) == Some(&13) {
+            if valid_rr && crate::rrls::kind_of(&body) == Some(13) {
                 assert!(matches!(
                     crate::rrls::budget_negotiation::decode(&body),
                     Some(crate::rrls::budget_negotiation::Message::Revoke(_))
                 ));
                 protocol += 1;
             }
-            inventory.push(serde_json::json!({"at_ms":clock.load(Ordering::SeqCst),"len":body.len(),"rr_prefix":body.starts_with(b"RR\x01"),"rr_kind":body.get(3),"rr_crc_valid":valid_rr,"hex":body.iter().map(|b|format!("{b:02x}")).collect::<String>()}));
+            inventory.push(serde_json::json!({"at_ms":clock.load(Ordering::SeqCst),"len":body.len(),"rr_prefix":crate::rrls::is_envelope(&body),"rr_kind":crate::rrls::kind_of(&body),"rr_crc_valid":valid_rr,"hex":body.iter().map(|b|format!("{b:02x}")).collect::<String>()}));
             if let Some(frame) = mesh.incoming(command_frame, &body, clock.load(Ordering::SeqCst)) {
                 if let Err(error) = strict.rx_packed_from_side(&frame.bytes, side) {
                     sdk_errors.push(format!("{error:?}"));
@@ -871,8 +864,8 @@ async fn queued_revoke_follows_completed_health_before_startup_controls() {
                 break;
             }
             for (command, body) in decoder.push(&read[..n], now) {
-                if body.starts_with(b"RR\x01\x00") {
-                    let seq = u32::from_le_bytes(body[8..12].try_into().unwrap());
+                if crate::rrls::kind_of(&body) == Some(0) {
+                    let seq = u32::from_le_bytes(body[5..9].try_into().unwrap());
                     first_health.get_or_insert(seq);
                     events
                         .push(serde_json::json!({"event":"GS_HEALTH_UART","seq":seq,"at_ms":now}));
@@ -885,10 +878,9 @@ async fn queued_revoke_follows_completed_health_before_startup_controls() {
                         serde_json::json!({"event":"GS_REVOKE_UART","seq":c.seq,"at_ms":now}),
                     );
                 }
-                let inner = if body.starts_with(b"RR\x01") && matches!(body.get(3), Some(1..=6)) {
-                    &body[4..body.len() - 4]
-                } else {
-                    body.as_slice()
+                let inner = match crate::rrls::decode(&body) {
+                    Some((1..=6, inner)) => inner,
+                    _ => body.as_slice(),
                 };
                 if let Ok(id) = serialize::packet_id_from_wire(inner)
                     && command_ids.contains(&id) {

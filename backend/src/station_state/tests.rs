@@ -90,7 +90,7 @@ fn a_change_goes_at_once_then_two_copies_within_a_second_then_every_five_seconds
         }
         while let Some(frame) = primary.take_station_state_for_test() {
             sent.push(now);
-            revisions.push(u32::from_le_bytes(frame[9..13].try_into().unwrap()));
+            revisions.push(u32::from_le_bytes(frame[6..10].try_into().unwrap()));
         }
     }
     assert_eq!(sent, [1_000, 1_250, 1_750, 6_750, 11_750]);
@@ -103,12 +103,12 @@ fn a_change_goes_at_once_then_two_copies_within_a_second_then_every_five_seconds
     primary.publish_station_state(reset.encode(), 12_010);
     let frame = primary.take_station_state_for_test().unwrap();
     assert_eq!(
-        u32::from_le_bytes(frame[9..13].try_into().unwrap()),
+        u32::from_le_bytes(frame[6..10].try_into().unwrap()),
         revisions[0] + 1
     );
-    assert_eq!(frame[4], 1, "version");
+    assert_eq!(frame[1], 1, "version");
     assert_eq!(
-        &frame[5..9],
+        &frame[2..6],
         &SESSION.to_le_bytes(),
         "the primary's HEALTH session"
     );
@@ -125,11 +125,11 @@ fn the_broadcast_waits_behind_abort_and_control_and_takes_an_owed_settings_turn(
     assert!(queued[0].1 < 254, "below Abort and control (254)");
     // Protected selection (Abort, control, HEALTH) never takes it.
     let first = primary.begin_critical_for_test(1_000).unwrap();
-    assert_eq!(first[3], 11, "the control goes first");
+    assert_eq!(crate::rrls::kind_of(&first), Some(11), "the control goes first");
     assert_eq!(primary.begin_critical_for_test(1_000), None);
     // The owed settings turn carries it when nothing else is owed.
     let owed = primary.begin_owed_for_test(1_000).unwrap();
-    assert_eq!(owed[3], 16);
+    assert_eq!(crate::rrls::kind_of(&owed), Some(16));
     // An unsent copy older than TTL_MS is dropped; the next copy replaces it.
     primary.publish_station_state(
         body(S::Aborted, MissionPhase::Idle, idle_clock(), 0).encode(),

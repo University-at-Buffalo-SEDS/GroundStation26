@@ -352,18 +352,10 @@ async fn recovery_submission_rechecks_session_is_bounded_and_never_claims_device
     let (root, _, _) = super::tests::fixtures();
     let mesh = configure();
     // Complete real mesh HEALTH decoding instead of inventing a connected flag.
-    let mut health = b"RR\x01\x00".to_vec();
-    health.extend(7u32.to_le_bytes());
+    let mut health = 7u32.to_le_bytes().to_vec();
     health.extend(20u32.to_le_bytes());
     health.push(1);
-    let mut crc = u32::MAX;
-    for b in &health {
-        crc ^= u32::from(*b);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xedb88320 & 0u32.wrapping_sub(crc & 1));
-        }
-    }
-    health.extend((!crc).to_le_bytes());
+    let health = crate::rrls::encode(0, &health);
     {
         let mut mesh = mesh.lock().unwrap();
         let now = mesh.now();
@@ -1148,18 +1140,10 @@ async fn rrls_operator_abort_is_forwarded_to_the_primary_at_once_and_replaces_a_
     }
     let (root, _, _) = super::tests::fixtures();
     let mesh = configure();
-    let mut health = b"RR\x01\x00".to_vec();
-    health.extend(7u32.to_le_bytes());
+    let mut health = 7u32.to_le_bytes().to_vec();
     health.extend(20u32.to_le_bytes());
     health.push(1);
-    let mut crc = u32::MAX;
-    for b in &health {
-        crc ^= u32::from(*b);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xedb88320 & 0u32.wrapping_sub(crc & 1));
-        }
-    }
-    health.extend((!crc).to_le_bytes());
+    let health = crate::rrls::encode(0, &health);
     {
         let mut mesh = mesh.lock().unwrap();
         let now = mesh.now();

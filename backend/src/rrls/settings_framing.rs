@@ -11,7 +11,7 @@ const PROBE: u8 = 0x10;
 const OFFER: u8 = 0x11;
 const FRAGMENT: u8 = 0x12;
 pub(super) const QUANTUM: usize = 92; // TOTAL UART bytes, not an inner payload MTU.
-const OUTER: usize = 12; // RR8 + UART4.
+const OUTER: usize = super::RR_CRC_OVERHEAD + 4; // RR CRC form + UART4.
 const FRAGMENT_HEADER: usize = 18; // tag + full receiver nonce + index.
 const DATA: usize = QUANTUM - OUTER - FRAGMENT_HEADER;
 const MAX_INNER: usize = paired_settings::auth::MAX_WIRE;
@@ -20,8 +20,8 @@ const RETRY_MS: u64 = 375;
 const UNUSED_MS: u64 = 2_000;
 const RX_MS: u64 = 5_000;
 const COOLDOWN_MS: u64 = 30_000;
-const PROBE_CHARGE: usize = 75; //47-byte body + RR/UART12 + air overhead16.
-const OFFER_CHARGE: usize = 73;
+const PROBE_CHARGE: usize = 47 + OUTER + 16; // body + RR/UART + air overhead.
+const OFFER_CHARGE: usize = 45 + OUTER + 16;
 const SETTINGS_KIND: u8 = 10;
 /// A message of at most this many UART bytes is sent whole, in one write,
 /// with no probe/offer handshake. Every RFD air packet costs about 45 ms
@@ -200,11 +200,7 @@ fn fragments(length: usize) -> usize {
     length.div_ceil(DATA)
 }
 pub(super) fn wrap(body: &[u8]) -> Vec<u8> {
-    let mut wire = Vec::with_capacity(body.len() + 8);
-    wire.extend([b'R', b'R', 1, KIND]);
-    wire.extend(body);
-    wire.extend(crc32fast::hash(&wire).to_le_bytes());
-    wire
+    super::encode(KIND, body)
 }
 
 fn u32_at(body: &[u8], offset: usize) -> Option<u32> {
