@@ -483,6 +483,36 @@ async fn legacy_recordings_replay_with_inferred_mode_and_legacy_decoders() {
     assert_eq!(tab["channels"], json!(["Altitude", "Pressure", "Temp"]));
 }
 
+/// Bytes 14 and 15 were EvaluationRelax and EvaluationFocus, retired with
+/// the FC's estimator guard. A HITL recording that carries them still replays
+/// them as ordinary FLIGHT_COMMAND rows; nothing parses them as a command.
+#[tokio::test]
+async fn hitl_recordings_with_the_retired_evaluation_commands_still_replay() {
+    let _live = thread_mode(Mode::Normal);
+    let h = harness().await;
+    let payload = mode_row("hitl", "hardware", false, false);
+    let mut rows = mode_rows(&payload, "hitl");
+    rows.extend([
+        (T0 + 3_500, "GS", "FLIGHT_COMMAND", Some("[14]"), None),
+        (T0 + 3_600, "GS", "FLIGHT_COMMAND", Some("[15]"), None),
+        (T0 + 3_700, "GS", "FLIGHT_COMMAND", Some("[16]"), None),
+    ]);
+    let segment = write_segment(&h.root, T0 - 1_000, &rows).await;
+    let ctx = h.context(&segment).await;
+    assert_eq!(ctx["recorded_mode"], "hitl");
+    let commands: Vec<Value> = h
+        .rows(&segment, &["FLIGHT_COMMAND"])
+        .await
+        .into_iter()
+        .map(|r| r["values"].clone())
+        .collect();
+    assert_eq!(commands, vec![json!([14.0]), json!([15.0]), json!([16.0])]);
+    // The live command set no longer has them.
+    for retired in ["EvaluationRelax", "EvaluationFocus"] {
+        assert!(serde_json::from_value::<crate::types::TelemetryCommand>(json!(retired)).is_err());
+    }
+}
+
 /// A layout saved before the label fix (in an SD import manifest or portable
 /// replay) is relabelled; the shipped layouts are already right.
 #[test]
