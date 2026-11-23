@@ -64,7 +64,17 @@ impl Default for FillTargetsConfig {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Per-test-thread fill targets file (tests must not write the shipped config).
+    pub(crate) static TEST_CONFIG_PATH: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
 pub fn config_path() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = TEST_CONFIG_PATH.with(|p| p.borrow().clone()) {
+        return path;
+    }
     std::env::var("GS_FILL_TARGETS_CONFIG")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {

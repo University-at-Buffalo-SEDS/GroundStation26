@@ -371,6 +371,8 @@ pub struct Tracker {
     tx: watch::Sender<Status>,
     /// The configured FC launch site (doc section 7.4).
     pub(crate) launch_site: crate::launch_site::Runtime,
+    /// The apogee planner's settings and plans (docs/apogee-planner.md).
+    pub(crate) apogee_planner: crate::apogee_planner::Runtime,
 }
 
 impl Default for Tracker {
@@ -379,6 +381,7 @@ impl Default for Tracker {
             inner: Mutex::new(Inner::default()),
             tx: watch::channel(Status::of(&Inner::default(), Instant::now())).0,
             launch_site: Default::default(),
+            apogee_planner: Default::default(),
         }
     }
 }
@@ -1108,6 +1111,7 @@ pub(crate) fn load_persisted(state: &AppState) {
         .unwrap_or_else(|| PathBuf::from("."));
     settings::load(state, dir.clone());
     crate::launch_site::load(state, dir.clone());
+    crate::apogee_planner::load(state, dir.clone());
     crate::proximity_lock::load(state, dir);
 }
 

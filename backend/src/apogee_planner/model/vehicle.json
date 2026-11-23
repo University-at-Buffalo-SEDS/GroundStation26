@@ -1,0 +1,198 @@
+{
+  "_about": "Vehicle, motor, recovery, environment and sensor assumptions for the IGT mock flight (tools/flight_profile/generate.py). Every number carries its source in the matching _source key. 'Rylan' = stated by the team; 'repo' = read from GroundStation26/FlightComputer26; 'assumed' = engineering estimate from public data where the repos have no spec. Swap in measured values as they become available; nothing else needs to change.",
+
+  "vehicle": {
+    "length_m": 4.572,
+    "length_source": "Rylan 2026-11-22: about 15 ft tall",
+    "diameter_m": 0.1524,
+    "diameter_source": "Rylan: 6 in airframe",
+    "dry_mass_kg": 31.6,
+    "dry_mass_source": "assumed: sum of mass_breakdown_kg (no as-built mass in the repos). generate.py --tune-dry-mass solves the dry mass that would reach a target apogee with the configured motor.",
+    "mass_breakdown_kg": {
+      "nose_cone_fiberglass_ogive_0p76m": 1.8,
+      "body_tubes_3m_at_1p6kg_per_m": 4.8,
+      "fin_can_and_4_fins": 2.5,
+      "n2o_run_tank_al6061_12L_with_bulkheads": 7.0,
+      "plumbing_injector_pilot_valve_fill_vent": 2.5,
+      "combustion_chamber_liner_nozzle": 6.0,
+      "recovery_drogue_main_harness_co2": 3.0,
+      "av_bay_fc_rf_pb_batteries": 2.5,
+      "couplers_hardware_misc": 1.5
+    },
+    "mass_breakdown_source": "assumed: typical student 6 in N2O hybrids (e.g. published IREC/SA Cup technical reports put 6 in hybrids at 25-40 kg dry); run-tank sized for the GS default 8 kg N2O fill",
+    "nose_length_m": 0.762,
+    "nose_source": "assumed: 5:1 tangent ogive",
+    "fins": {"count": 4, "root_m": 0.30, "tip_m": 0.10, "span_m": 0.15, "thickness_m": 0.0048},
+    "fins_source": "assumed: trapezoidal fins sized for about 2 cal static margin on a 30:1 body",
+    "surface_roughness_m": 2.0e-5,
+    "surface_roughness_source": "OpenRocket 'regular paint' (20 um)",
+    "cn_alpha_per_rad": 12.0,
+    "static_margin_cal": 2.0,
+    "stability_source": "assumed: Barrowman CNa about 2 (nose) + about 10 (4 fins, this planform); 1.5-2.5 cal is the usual IREC/SA Cup requirement (DTEG: at least 1.5 cal off the rail)",
+    "pitch_inertia_factor": 0.85,
+    "pitch_inertia_source": "assumed: I = factor * m L^2 / 12 (uniform rod); mass is concentrated toward the middle (tank, chamber)",
+    "roll_rate_dps_per_mps": 1.2,
+    "roll_damping_length_m": 30.0,
+    "roll_direction": "ccw",
+    "roll_source": "assumed: about 0.2 deg of fin cant/misalignment gives about 1 rev/s near Mach 0.8, typical of amateur flight logs; roll time constant = 30 m / airspeed",
+    "fc_station_from_aft_m": 3.0,
+    "fc_station_source": "assumed: AV bay between the drogue and main bays"
+  },
+
+  "motor": {
+    "thrust_curve_csv": "motors/testfire_20261116.csv",
+    "total_impulse_ns": null,
+    "propellant_mass_kg": 6.7,
+    "scale_propellant_with_impulse": true,
+    "impulse_scaling_thrust_exponent": 0.5,
+    "residual_fraction": 0.04,
+    "nozzle_exit_diameter_m": 0.07,
+    "oscillation_amplitude": 0.03,
+    "oscillation_hz": 14.0,
+    "source": "repo-measured: thrust curve from the 2026-11-16 static fire, thrust = g*(KG1000 + KG50 unloading - burned) (extract_thrust.py; the rocket hangs from the 50 kg fill cell and presses the 1000 kg cell only once lifted), 9.19 kN s (7.6-10.1; the KG1000 alone gave 7.1), burn 5.65 s, peak about 3.3 kN; see motors/testfire_20261116.json. Propellant 6.7 kg = 5.6 kg N2O (KG50 fill cell before valve open) + about 1.1 kg fuel (assumed O/F 5), so delivered Isp about 140 s. total_impulse_ns null = the measured curve as is; a number rescales the curve to that impulse, by k^e on the thrust axis and k^(1-e) on the time axis (e = impulse_scaling_thrust_exponent; 0.5 = a bigger tank and injector), keeping the measured shape, and, with scale_propellant_with_impulse, the propellant mass at the measured delivered Isp. Nozzle exit diameter not in the repos (assumed 70 mm; only affects base drag while thrusting). Residual vapour 4% assumed. A +-3% 14 Hz feed-coupled oscillation is assumed (the smoothed curve removes it)."
+  },
+
+  "aero": {
+    "protuberance_factor": 1.10,
+    "cd_extra": 0.02,
+    "transonic_wave_cd": 0.30,
+    "transonic_mach_start": 0.80,
+    "cd_scale": 1.0,
+    "source": "OpenRocket technical documentation ch. 3.4 component build-up (friction with roughness limit and compressibility, base drag 0.12+0.13M^2 removed over the nozzle exit while thrusting, fin LE/TE pressure drag); +10% friction and 0.02 for rail buttons, fill/vent ports, joints. Transonic wave-drag rise of 0.3 from M 0.8 to 1.05 approximates a 5:1 ogive (no measured data). Gives Cd about 0.45-0.55 subsonic for a 30:1 body."
+  },
+
+  "launch": {
+    "ignition_s": 10.0,
+    "ignition_source": "repo: docs/integrated-ground-test.md 4.2: VB pilot at Launch + 10 s; replayed liftoff about t_ms 10000",
+    "rail_length_m": 5.18,
+    "rail_source": "17 ft rail (SA Cup/IREC tower); effective travel taken as the full length",
+    "tilt_deg": 5.0,
+    "azimuth_deg": 60.0,
+    "rail_friction": 0.03,
+    "tilt_source": "IREC/SA Cup launch angle about 5 deg (DTEG allows up to 10); azimuth = tools/igt_csv.py default"
+  },
+
+  "attitude": {
+    "pad_roll_deg": 30.0,
+    "pitch_damping_ratio": 0.08,
+    "hang_damping_ratio": 0.12,
+    "source": "assumed: aerodynamic pitch damping ratio 0.05-0.1 for finned rockets; hanging airframe lightly damped"
+  },
+
+  "recovery": {
+    "drogue_delay_after_apogee_s": 1.2,
+    "drogue_source": "assumed: FC detect_descent needs vel <= -4.25 m/s for 4 samples after Apogee + 80 ms (fcconfig.h), so about 1-1.5 s after true apogee",
+    "drogue_descent_mps": 25.0,
+    "drogue_rate_ref_alt_agl_m": 1500.0,
+    "drogue_line_stretch_s": 0.6,
+    "drogue_fill_s": 0.5,
+    "drogue_opening_overshoot": 1.3,
+    "drogue_line_m": 6.0,
+    "drogue_swing_deg": 12.0,
+    "drogue_spin_dps": 30.0,
+    "drogue_ejection_dv_mps": 1.5,
+    "drogue_snatch_dv_mps": 3.0,
+    "drogue_cda_under_main_fraction": 1.0,
+    "main_deploy_alt_agl_m": 457.2,
+    "main_source": "repo: REEF_TARGET_ALT 457.2 m (1500 ft), fcconfig.h",
+    "main_deploy_lag_s": 0.3,
+    "main_descent_mps": 6.0,
+    "main_line_stretch_s": 0.8,
+    "main_fill_s": 1.6,
+    "main_opening_overshoot": 1.4,
+    "main_line_m": 8.0,
+    "main_swing_deg": 8.0,
+    "main_spin_dps": 12.0,
+    "main_ejection_dv_mps": 1.0,
+    "main_snatch_dv_mps": 4.0,
+    "ejection_pulse_s": 0.025,
+    "snatch_pulse_s": 0.08,
+    "ejection_tumble_dps": 120.0,
+    "body_cda_descent_m2": 0.05,
+    "landing_crush_m": 0.25,
+    "tipover_thump_s": 0.10,
+    "rest_tilt_deg": 86.0,
+    "rates_source": "task: drogue about 25 m/s, main about 6 m/s; canopy CdA solved from these rates. Fill times, opening-shock overshoot (Ck 1.3-1.4) and swing from Knacke, Parachute Recovery Systems Design Manual (NWC TP 6575) typical values; ejection/snatch impulses assumed (CO2 separation, shock-cord snatch)"
+  },
+
+  "environment": {
+    "site_lat_deg": 31.758,
+    "site_lon_deg": -102.046,
+    "site_msl_m": 890.016,
+    "site_source": "repo: FC LAUNCH_SITE_*_DEFAULT (fcconfig.h, IREC 2026, Midland TX); override with --site to match the station's Launch site setting",
+    "temp_offset_k": 0.0,
+    "temp_source": "USSA-76 standard day; set e.g. +15 for a June afternoon in west Texas",
+    "pad_temp_c": 25.0,
+    "wind_mps": 4.0,
+    "wind_from_deg": 300.0,
+    "wind_shear_exponent": 0.14,
+    "wind_profile_cap": 1.4,
+    "gust_sigma_mps": 1.0,
+    "gust_tau_s": 2.0,
+    "wind_source": "task: 3-5 m/s with gusts; 1/7 power-law profile from 10 m, capped at 1.4x (reached near 110 m: the power law only describes the surface layer); Gauss-Markov gusts",
+    "pressure_drift_pa_per_min": -2.0,
+    "pressure_drift_source": "assumed: slow synoptic drift, enough to leave a sub-metre baro offset at landing"
+  },
+
+  "sensors": {
+    "imu": {
+      "part": "Bosch BMI088 (accel 24 g @ 1600 Hz ODR, gyro 2000 dps @ 2000 Hz ODR; repo accelerometer.c/gyroscope.c)",
+      "accel_range_mps2": 235.35,
+      "accel_lsb_mps2": 0.0071842,
+      "accel_noise_density_ug_rthz": 175.0,
+      "accel_bandwidth_hz": 280.0,
+      "accel_bias_sigma_mg": 20.0,
+      "accel_scale_sigma": 0.005,
+      "gyro_range_dps": 2000.0,
+      "gyro_lsb_dps": 0.0610352,
+      "gyro_noise_density_dps_rthz": 0.014,
+      "gyro_bandwidth_hz": 523.0,
+      "gyro_bias_sigma_dps": 0.5,
+      "gyro_scale_sigma": 0.01,
+      "vibration_burn_axial_mps2": 3.0,
+      "vibration_burn_lateral_mps2": 2.0,
+      "vibration_burn_gyro_dps": 2.0,
+      "buffet_mps2_per_10kpa": 0.4,
+      "source": "BMI088 datasheet (BST-BMI088-DS001): accel 175 ug/sqrt(Hz), zero-g offset +-20 mg typ, 16 bit (1365 LSB/g at 24 g); gyro 0.014 dps/sqrt(Hz), zero-rate offset +-1 dps, 16.384 LSB/dps at 2000 dps. Range clipped just inside the FC's MAX_ACC = 24 g validator. Burn vibration and buffet assumed (no flight data in the repos); point-sampled like the FC, which takes the latest sample each cycle."
+    },
+    "baro": {
+      "part": "Bosch BMP390 (OSR x8 pressure, ODR 100 Hz, IIR coef 3; repo barometer.c)",
+      "odr_hz": 100,
+      "iir_coef": 3,
+      "noise_pa": 2.0,
+      "abs_offset_sigma_pa": 25.0,
+      "port_lag_s": 0.05,
+      "port_cp_subsonic": -0.01,
+      "port_cp_transonic": -0.04,
+      "ejection_spike_pa": 250.0,
+      "ejection_spike_s": 0.12,
+      "bay_temp_tau_s": 400.0,
+      "bay_temp_offset_c": 5.0,
+      "alt_formula": "44330 * (1 - (p/p0)^0.1903), the FC's own (barometer.h ALT_PRES_CONST, BARO_HYPSOMETRIC_EXPONENT), p0 = pad pressure",
+      "source": "BMP390 datasheet (BST-BMP390-DS002): relative accuracy +-3 Pa, absolute +-50 Pa, raw RMS noise a few Pa at x8 (we use 2 Pa before the IIR); IIR coef 3 as configured; static-port Cp and AV-bay lag assumed (port-location dependent); CO2 ejection pressure pulse in the AV bay assumed (well known in amateur rocketry, magnitude varies)"
+    },
+    "gps": {
+      "rate_hz": 10,
+      "rate_source": "repo: FC replay delivers GPS at 10 Hz (ground_test.c IGT_GPS_PERIOD_MS)",
+      "horiz_gm_sigma_m": 1.5,
+      "horiz_gm_tau_s": 30.0,
+      "horiz_white_m": 0.3,
+      "vert_gm_sigma_m": 3.0,
+      "vert_white_m": 0.8,
+      "dropout_from_liftoff_s": 0.5,
+      "dropout_after_burnout_s": 3.0,
+      "source": "assumed u-blox class receiver: CEP about 2.5 m; loses lock under boost (>4 g dynamic-model limit) and reacquires a few seconds after burnout. Rows are omitted during the dropout (the FC replay bridges the gap; the ascent filter does not use GPS)."
+    }
+  },
+
+  "output": {
+    "imu_hz": 100,
+    "imu_descent_hz": 20,
+    "imu_full_rate_after_apogee_s": 15.0,
+    "imu_full_rate_window_s": 4.0,
+    "baro_hz": 50,
+    "gps_hz": 10,
+    "rest_after_landing_s": 30.0,
+    "source": "repo: docs/integrated-ground-test.md 4.2 recommends IMU 100 Hz, baro 50 Hz, GPS 10 Hz. The FC disables the IMU in descent (kalman.c descent_initialize), so IMU rows drop to imu_descent_hz from apogee + imu_full_rate_after_apogee_s, except +-window around the main deployment and the landing. The replay interpolates linearly between rows."
+  }
+}

@@ -530,6 +530,7 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .merge(crate::firmware_sim_mode::routes())
         .merge(crate::igt::routes())
         .merge(crate::launch_site::routes())
+        .merge(crate::apogee_planner::routes())
         .merge(crate::proximity_lock::routes())
         .merge(crate::station_pairing::manage::routes())
         .merge(crate::launch_history::api::routes())
@@ -2235,6 +2236,19 @@ async fn set_fill_targets(
     let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
         return admission_refused(&state, "Saving the fill targets");
     };
+    match save_fill_targets(&state, cfg) {
+        Ok(saved) => Json(saved).into_response(),
+        Err((status, err)) => (status, err).into_response(),
+    }
+}
+
+/// Validates, persists and broadcasts new fill targets: the one path for a
+/// manual edit and an approved apogee plan. The caller holds the operator
+/// dispatch claim and has checked the permission.
+pub(crate) fn save_fill_targets(
+    state: &AppState,
+    cfg: FillTargetsConfig,
+) -> Result<FillTargetsConfig, (StatusCode, String)> {
     let result = (|| -> Result<FillTargetsConfig, (StatusCode, String)> {
         let mut gse = state.gse.lock().unwrap();
         let zero = state.auto_zero.lock().unwrap();
@@ -2255,13 +2269,10 @@ async fn set_fill_targets(
         }
         Ok(next)
     })();
-    match result {
-        Ok(saved) => {
-            state.broadcast_fill_targets_snapshot();
-            Json(saved).into_response()
-        }
-        Err((status, err)) => (status, err).into_response(),
+    if result.is_ok() {
+        state.broadcast_fill_targets_snapshot();
     }
+    result
 }
 
 #[derive(Serialize)]

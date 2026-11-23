@@ -955,7 +955,10 @@ pub(crate) fn observe_flight_state(state: &AppState, code: i64) {
             key: FLIGHT_KEY,
             label: flight_kind.title(),
             operator: None,
-            details: serde_json::json!({"trigger_flight_state": code}),
+            details: serde_json::json!({
+                "trigger_flight_state": code,
+                "apogee_plan": crate::apogee_planner::capture_details(state),
+            }),
         });
     } else if let Some(kind) = flight_open {
         let result = if code == F::Landed as i64 {

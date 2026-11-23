@@ -35,6 +35,8 @@ const FLIGHT: Modes = Modes { flight: true, hitl: false, test_fire: false, igt: 
 const FLIGHT_ONLY: Modes = Modes { flight: true, hitl: false, test_fire: false, igt: false };
 const HITL: Modes = Modes { flight: false, hitl: true, test_fire: false, igt: false };
 const IGT: Modes = Modes { flight: false, hitl: false, test_fire: false, igt: true };
+/// Every mode that plans a flight (not test fire; testing follows test fire).
+const NOT_TEST_FIRE: Modes = Modes { flight: true, hitl: true, test_fire: false, igt: true };
 
 #[derive(Serialize, Debug)]
 pub(crate) struct Rule {

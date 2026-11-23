@@ -87,6 +87,7 @@ mod fc_estimator;
 mod igt;
 mod proximity_lock;
 mod launch_site;
+mod apogee_planner;
 mod valve_report_health;
 mod mission_sync;
 mod fc_command_gate;

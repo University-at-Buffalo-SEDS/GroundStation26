@@ -112,7 +112,7 @@ shorter. The propellant mass for the trajectory is `m_fill · (1 + 1/OF)` with O
 15 %) in the run tank (default 12 L, `vehicle.json`) at the warmest expected tank
 temperature (forecast + 5 °C), plus the vapour: `m_max = ρ_l·V(1−u) + ρ_v·V·u`
 (N2O saturated densities and vapour pressure from the ESDU 91022 correlations, as used
-in the hybrid literature). 15 % at 20 °C gives 8.0 kg, the station's default target.
+in the hybrid literature). 15 % at 20 °C gives 8.3 kg (8.0 kg liquid + 0.3 kg vapour), about the station's default 8 kg target.
 The supercharge target must be at or above `P_vap(T)` (lower means no nitrogen is
 added) and below the hardware limits in section 4.
 

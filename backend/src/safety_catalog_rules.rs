@@ -218,6 +218,19 @@ const SEQUENCES: &[Spec] = &[
         config_keys: &["gse.fill_overfill_kg", "gse.fill_settle_ms", "gse.fill_tolerance_kg", "station.refill_noop_kg", "fill_targets.nitrous.target_mass_kg", "fill_targets.nitrous.target_pressure_psi"],
     },
     Spec {
+        id: "apogee-plan-apply",
+        title: "Apogee plan: applying fill targets",
+        summary: "An apogee plan only sets the nitrous fill mass and supercharge pressure targets (now {fill_targets.nitrous.target_mass_kg} kg and {fill_targets.nitrous.target_pressure_psi} psi); it never actuates anything. Applying needs an operator's confirmation and is refused in Test fire and Testing modes, outside Idle/PreFill, while a GSE sequence runs, and for an unreachable, stale or outdated plan.",
+        details: &[
+            "The targets are written through the same save path and validation as a manual fill-target edit, and each apply is logged with who, when and the plan's inputs.",
+            "The supercharge target stays below the planner MEOP, the GSE pressure ceiling ({gse.pressure_ceiling_psi} psi) minus the {gse.turbocharge_pressure_deadband_psi} psi turbocharge deadband, and the overpressure relief ({gse.overpressure_relief_psi} psi) minus 50 psi.",
+            "The fill target stays within the run tank's ullage limit at the warm-case temperature and above the planner's minimum fill.",
+        ],
+        modes: NOT_TEST_FIRE,
+        enforced_in: &["backend/src/apogee_planner.rs:apply_refusal", "backend/src/apogee_planner.rs:apply", "backend/src/apogee_planner/solver.rs:solve", "backend/src/web.rs:save_fill_targets"],
+        config_keys: &["fill_targets.nitrous.target_mass_kg", "fill_targets.nitrous.target_pressure_psi", "gse.pressure_ceiling_psi", "gse.turbocharge_pressure_deadband_psi", "gse.overpressure_relief_psi"],
+    },
+    Spec {
         id: "valve-freshness",
         title: "Valve feedback freshness",
         summary: "Only board reports newer than the command and younger than {station.valve_report_fresh_ms} ms confirm a valve. A requested state shows as unconfirmed for up to {station.unconfirmed_valve_timeout_ms} ms; acknowledgements time out after {station.valve_ack_timeout_ms} ms.",
