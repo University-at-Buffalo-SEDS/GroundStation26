@@ -17,9 +17,11 @@ fn principal(admin: bool, send: bool) -> AuthPrincipal {
 }
 
 fn temp_dir(tag: &str) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
-        "seds-apogee-{tag}-{}-{}",
+        "seds-apogee-{tag}-{}-{}-{}",
         std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     ));
     std::fs::create_dir_all(&dir).unwrap();
@@ -540,4 +542,27 @@ fn print_reference_plans() {
             s.rail_exit_mps, s.max_mach, s.drift_m, s.impulse_ns, s.impulse_sigma_ns, s.limits.vapour_pressure_psi, s.limits.max_fill_kg, s.flights, s.warnings
         );
     }
+}
+
+#[test]
+fn archive_fires_become_fit_points_and_the_seed_reproduces_the_reference() {
+    let seed = crate::fire_archive::FitInput {
+        id: "2026-11-16_static_fire".into(),
+        label: "seed".into(),
+        fill_kg: 5.65,
+        tank_psi_at_ignition: Some(404.0),
+        supercharge_psi: None,
+        ambient_c: None,
+        impulse_ns: 9192.0,
+        impulse_sigma_ns: 900.0,
+    };
+    let pts = fit_points_from(vec![seed.clone()]);
+    assert!((pts[0].mean_pressure_pa / motor::reference_mean_pressure_pa() - 1.0).abs() < 1e-6);
+    let fit = motor::MotorFit::fit(&pts);
+    assert!((fit.c_ref_ns_per_kg - 9192.0 / 5.65).abs() < 0.01);
+    // A supercharged fire sits at a higher mean pressure.
+    let hot = crate::fire_archive::FitInput { id: "b".into(), supercharge_psi: Some(750.0), tank_psi_at_ignition: Some(750.0), ..seed };
+    let pts = fit_points_from(vec![hot]);
+    assert!(pts[0].mean_pressure_pa > motor::reference_mean_pressure_pa() * 1.3);
+    assert_eq!(fit_points_from(Vec::new()), vec![motor::FitPoint::reference()], "empty archive: the reference fire");
 }

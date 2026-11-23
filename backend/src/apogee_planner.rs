@@ -286,8 +286,23 @@ fn site(state: &AppState) -> weather::Site {
 
 /// Accepted archive fires as fit points (the 2026-11-16 fire when the archive
 /// has none).
-fn fit_points(_state: &AppState) -> Vec<motor::FitPoint> {
-    vec![motor::FitPoint::reference()]
+fn fit_points(state: &AppState) -> Vec<motor::FitPoint> {
+    fit_points_from(crate::fire_archive::fit_inputs(state))
+}
+
+fn fit_points_from(inputs: Vec<crate::fire_archive::FitInput>) -> Vec<motor::FitPoint> {
+    let points: Vec<motor::FitPoint> = inputs
+        .into_iter()
+        .map(|f| motor::FitPoint {
+            mean_pressure_pa: motor::mean_pressure_for_fire(f.tank_psi_at_ignition, f.supercharge_psi, f.ambient_c, f.fill_kg),
+            id: f.id,
+            label: f.label,
+            fill_kg: f.fill_kg,
+            impulse_ns: f.impulse_ns,
+            impulse_sigma_ns: f.impulse_sigma_ns,
+        })
+        .collect();
+    if points.is_empty() { vec![motor::FitPoint::reference()] } else { points }
 }
 
 fn fnv(text: &str) -> String {
@@ -601,7 +616,7 @@ fn solve_cd_scale(state: &AppState, plan: &Plan, actual_m: f64) -> Result<f64, S
     let fit = motor::MotorFit::fit(&fit_points(state));
     let env = plan.weather.environment(cfg.environment.wind_shear_exponent, cfg.environment.wind_profile_cap);
     let m = motor::motor_for_fill(&cfg, &fit, plan.solution.fill_mass_kg, plan.tank_temp_c, plan.solution.supercharge_psi, plan.settings.tank_volume_l, 1.0);
-    let mut apogee = |k: f64| {
+    let apogee = |k: f64| {
         let mut c = cfg.clone();
         c.aero.cd_scale = k;
         flight::fly(&c, &env, &m.motor, 0.002).apogee_m

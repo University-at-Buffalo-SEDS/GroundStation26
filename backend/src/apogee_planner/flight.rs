@@ -246,6 +246,8 @@ pub struct Environment {
 }
 
 impl Environment {
+    /// vehicle.json's own environment (the reference cases).
+    #[cfg(test)]
     pub fn from_config(cfg: &Config) -> Self {
         let e = &cfg.environment;
         Self {

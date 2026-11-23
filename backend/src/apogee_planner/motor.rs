@@ -171,6 +171,7 @@ pub struct FillMotor {
     pub motor: Motor,
     pub impulse_ns: f64,
     pub sigma_rel: f64,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub mean_pressure_pa: f64,
 }
 
