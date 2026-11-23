@@ -50,10 +50,16 @@ fn recovery_control_owned_commands_remain_pending_across_pop_partial_retry_and_c
         mesh.finish_transmission(retry,true);
         assert!(!mesh.pending_recovery_control());
     }
-    for kind in [DOWN_COMMAND,UP_COMMAND,AV_BAY_COMMAND,HOST_CONTROL,SETTINGS,255] {
+    // RR v2 has no byte for an out-of-range kind: an unassigned kind (12) and
+    // an invalid marker (0xF1, never decoded) stand for unknown envelopes.
+    for kind in [DOWN_COMMAND,UP_COMMAND,AV_BAY_COMMAND,HOST_CONTROL,SETTINGS,12] {
         let mut mesh=Mesh::new(Role::Primary,1);queue(&mut mesh,kind,b"opaque");
         assert!(mesh.pending_recovery_control(),"unknown/control envelope must remain conservative");
     }
+    let mut mesh=Mesh::new(Role::Primary,1);
+    let mut invalid=vec![0xF1];invalid.extend_from_slice(b"opaque");invalid.extend_from_slice(&crc(&invalid).to_le_bytes());
+    mesh.enqueue(Outgoing{command:false,bytes:invalid},128,0);
+    assert!(mesh.pending_recovery_control(),"an undecodable envelope must remain conservative");
 }
 #[test]
 fn recovery_control_sdt_templates_preserve_type_and_namespace_without_guessing_chunks() {
