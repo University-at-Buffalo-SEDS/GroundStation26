@@ -106,6 +106,12 @@ class Motor:
     osc_hz: float = 0.0
     impulse: float = 0.0
     cum: list[float] = field(default_factory=list)
+    # Physics motor (hybrid_motor.py): propellant left on the same time base (overrides the impulse-fraction
+    # mass model and the residual fraction), and the nozzle exit area with the ambient pressure the curve was
+    # computed at, so thrust gains (pa_ref - p_air) * exit area with altitude. None/0 = the measured curve as is.
+    prop_curve: list[float] | None = None
+    exit_area_m2: float = 0.0
+    pa_ref: float = 0.0
 
     @classmethod
     def load(cls, path: Path, prop_kg: float, exit_d: float, scale_to_ns: float | None,
@@ -161,6 +167,37 @@ class Motor:
         k = (tb - self.t[i]) / (self.t[i + 1] - self.t[i])
         part = self.cum[i] + (self.f[i] + 0.5 * (self.f[i + 1] - self.f[i]) * k) * (tb - self.t[i])
         return part / self.impulse
+
+    @classmethod
+    def hybrid(cls, fill_kg: float, tank_c: float, supercharge_psig: float, ambient_pa: float, exit_d: float = 0.0,
+               osc_amp: float = 0.0, osc_hz: float = 0.0, overrides: dict | None = None) -> 'Motor':
+        """The physics motor for a fill (hybrid_motor.py, calibrated spec) at the pad's ambient pressure."""
+        import hybrid_motor as hm
+        p = hm.params(hm.load_spec(), overrides)
+        res = hm.simulate(p, hm.load_data(), fill_kg, tank_c, supercharge_psig, ambient_pa, 0.01)
+        t, f, pl = hm.curve_for_flight(res, 0.05)
+        m = cls(t, f, pl[0], exit_d or p['exit_d_m'], osc_amp, osc_hz)
+        m.prop_curve = pl
+        m.exit_area_m2 = math.pi / 4.0 * p['exit_d_m'] ** 2
+        m.pa_ref = ambient_pa
+        m._integrate()
+        m.summary = res['summary']
+        return m
+
+    def thrust_at(self, tb: float, p_air: float) -> float:
+        f = self.thrust(tb)
+        if f > 0.0 and self.exit_area_m2 > 0.0:
+            f += (self.pa_ref - p_air) * self.exit_area_m2
+        return max(f, 0.0)
+
+    def prop_left(self, tb: float) -> float:
+        if tb <= 0.0:
+            return self.prop_curve[0]
+        if tb >= self.t[-1]:
+            return self.prop_curve[-1]
+        i = bisect.bisect_right(self.t, tb) - 1
+        k = (tb - self.t[i]) / (self.t[i + 1] - self.t[i])
+        return self.prop_curve[i] + (self.prop_curve[i + 1] - self.prop_curve[i]) * k
 
     def time_at_fraction_of_peak(self, frac: float) -> tuple[float, float]:
         peak = max(self.f)
@@ -324,6 +361,8 @@ def fly(cfg: dict, rng: random.Random, motor: Motor, record: bool = True,
                 env['gust_sigma_mps'], env['gust_tau_s'], rng, cap=env.get('wind_profile_cap', 1.4))
     m_dry = v['dry_mass_kg']
     resid = motor.prop_kg * cfg['motor'].get('residual_fraction', 0.0)
+    if motor.prop_curve:
+        resid = motor.prop_curve[-1]
     m_burn = motor.prop_kg - resid
     L, d = v['length_m'], v['diameter_m']
     aref = aero.aref
@@ -368,8 +407,11 @@ def fly(cfg: dict, rng: random.Random, motor: Motor, record: bool = True,
         g = gravity(lat, site_msl + h)
         gvec = (0.0, 0.0, -g)
         tb = t - t_ign
-        thrust = motor.thrust(tb)
-        mass = m_dry + resid + m_burn * (1.0 - motor.burnt_fraction(tb))
+        thrust = motor.thrust_at(tb, p_air)
+        if motor.prop_curve:
+            mass = m_dry + motor.prop_left(tb)
+        else:
+            mass = m_dry + resid + m_burn * (1.0 - motor.burnt_fraction(tb))
         wind.step(dt)
         w = wind.at(h)
         vair = (vel[0] - w[0], vel[1] - w[1], vel[2] - w[2])

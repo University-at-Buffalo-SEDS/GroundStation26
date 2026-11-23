@@ -34,6 +34,9 @@ fn temp_dir(tag: &str) -> PathBuf {
 fn model_copies_match_tools_flight_profile() {
     let tools = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/flight_profile");
     assert_eq!(flight::VEHICLE_JSON, std::fs::read_to_string(tools.join("vehicle.json")).unwrap(), "copy tools/flight_profile/vehicle.json to backend/src/apogee_planner/model/");
+    for (copy, name) in [(hybrid::SPEC_JSON, "hybrid_motor.json"), (hybrid::CEA_JSON, "sweet_v6_cea.json"), (hybrid::GRAIN_JSON, "sweet_v6_grain.json"), (hybrid::VECTORS_JSON, "hybrid_vectors.json")] {
+        assert_eq!(copy, std::fs::read_to_string(tools.join("motors").join(name)).unwrap(), "copy tools/flight_profile/motors/{name} to backend/src/apogee_planner/model/");
+    }
     assert_eq!(flight::THRUST_CSV, std::fs::read_to_string(tools.join("motors/testfire_20261116.csv")).unwrap(), "copy the thrust curve to backend/src/apogee_planner/model/");
     let reference = flight::Motor::from_config(&flight::Config::reference().motor, flight::THRUST_CSV);
     assert!((reference.impulse - motor::REF_IMPULSE_NS).abs() < 1.0, "REF_IMPULSE_NS follows the curve: {}", reference.impulse);

@@ -20,6 +20,8 @@ use std::sync::{Arc, Mutex};
 
 #[path = "apogee_planner/flight.rs"]
 pub(crate) mod flight;
+#[path = "apogee_planner/hybrid.rs"]
+pub(crate) mod hybrid;
 #[path = "apogee_planner/motor.rs"]
 pub(crate) mod motor;
 #[path = "apogee_planner/n2o.rs"]
