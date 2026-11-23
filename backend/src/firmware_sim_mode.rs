@@ -26,6 +26,9 @@ use serde_json::{Value, json};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 pub(crate) const ENV: &str = "GS_FIRMWARE_SIM";
+/// DAC validation targets (daq_dac::model) the simulated plant can patch the DAQ's DAC output onto.
+pub(crate) const PATCH_TARGETS: [&str; 9] =
+    ["mcp_ch2", "mcp_ch3", "mcp_ch4", "mcp_ch5", "hvain1", "hvain2", "p6_diff", "loadcell_kg1000", "loadcell_kg50"];
 pub(crate) const DIR_ENV: &str = "GS_FIRMWARE_SIM_DIR";
 /// A board heard within this long means hardware is attached to this station.
 pub(crate) const HARDWARE_RECENT: Duration = Duration::from_secs(30);
@@ -167,7 +170,7 @@ pub(crate) fn validate_control(body: &Value) -> Result<Value, String> {
                 for (k, v) in faults {
                     match k.as_str() {
                         "dead_tank_pt" | "dead_chamber_pt" | "radio_drop" | "kg1000_supply_dip" | "kg1000_open_lead"
-                        | "kg50_open_lead"
+                        | "kg50_open_lead" | "p10_inputs_swapped"
                             if v.is_boolean() => {}
                         "kg50_bypass" | "kg1000_bypass" if v.as_f64().is_some_and(|x| (0.0..=1.0).contains(&x)) => {}
                         "kg50_drift_kg_per_c" | "kg1000_drift_kg_per_c" if v.as_f64().is_some_and(|x| x.abs() <= 5.0) => {}
@@ -199,6 +202,26 @@ pub(crate) fn validate_control(body: &Value) -> Result<Value, String> {
                     };
                     if !ok {
                         return Err(format!("condition {k} out of range"));
+                    }
+                }
+                out.insert(key.clone(), value.clone());
+            }
+            "patch" => {
+                // DAQ DAC output -> DAQ input (the DAC validation targets the plant can route)
+                let p = value.as_object().ok_or("patch must be an object")?;
+                for (k, v) in p {
+                    match k.as_str() {
+                        "dac1" | "dac2" => {
+                            if !(v.is_null() || v.as_str().is_some_and(|t| PATCH_TARGETS.contains(&t))) {
+                                return Err(format!("{k} must be null or one of {}", PATCH_TARGETS.join(", ")));
+                            }
+                        }
+                        "dac1_attenuation" | "dac2_attenuation" => {
+                            if !v.as_f64().is_some_and(|x| x > 0.0 && x <= 1.0) {
+                                return Err(format!("{k} must be in (0, 1]"));
+                            }
+                        }
+                        _ => return Err(format!("unknown patch key {k}")),
                     }
                 }
                 out.insert(key.clone(), value.clone());
@@ -247,6 +270,17 @@ fn write_control(dir: &std::path::Path, control: &Value) -> std::io::Result<()> 
         .and_then(|_| std::fs::rename(&tmp, dir.join("control.json")))
 }
 
+/// Top-level sections of `update` replace those of `current`.
+pub(crate) fn merge_control(current: Option<Value>, update: Value) -> Value {
+    let mut merged = current.filter(Value::is_object).unwrap_or_else(|| json!({}));
+    if let (Some(m), Some(u)) = (merged.as_object_mut(), update.as_object()) {
+        for (k, v) in u {
+            m.insert(k.clone(), v.clone());
+        }
+    }
+    merged
+}
+
 async fn get_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Err(response) = crate::web::authorize_headers(&state, &headers, Permission::ViewData).await {
         return response;
@@ -272,6 +306,9 @@ async fn post_control(State(state): State<Arc<AppState>>, headers: HeaderMap, Js
     let Some(dir) = run_dir() else {
         return (StatusCode::CONFLICT, "No firmware simulation run directory.").into_response();
     };
+    // sections replace the current ones; sections not sent are kept (the DAC page sends only "patch", the
+    // apogee planner only "conditions")
+    let control = merge_control(read_json(dir.join("control.json")), control);
     match write_control(&dir, &control) {
         Ok(()) => {
             log::warn!("Firmware simulation control set by {}: {control}", principal.username.as_deref().unwrap_or("?"));
@@ -290,6 +327,12 @@ pub(crate) fn routes() -> Router<Arc<AppState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_sections_merge() {
+        let merged = merge_control(Some(json!({"patch": {"dac1": "hvain1"}, "loads": {"kg50_kg": 5.0}})), json!({"loads": {"kg50_kg": 10.0}}));
+        assert_eq!(merged, json!({"patch": {"dac1": "hvain1"}, "loads": {"kg50_kg": 10.0}}));
+    }
 
     #[tokio::test]
     async fn real_boards_heard_recently_refuse_firmware_simulation() {
@@ -314,7 +357,8 @@ mod tests {
     fn control_validation_accepts_plant_inputs_and_faults_only() {
         let ok = json!({"plant": {"qd_connected": false}, "faults": {"stuck_valves": {"vent": "closed"}, "dead_tank_pt": true,
                         "kg50_bypass": 0.2, "kg1000_supply_dip": true},
-                        "conditions": {"ambient_c": 35.0, "wind_mps": 9.0, "wind_from_deg": 300.0}, "loads": {"kg50_kg": 10.0}});
+                        "conditions": {"ambient_c": 35.0, "wind_mps": 9.0, "wind_from_deg": 300.0}, "loads": {"kg50_kg": 10.0},
+                        "patch": {"dac1": "hvain1", "dac2": null, "dac1_attenuation": 0.5}});
         assert_eq!(validate_control(&ok).unwrap(), ok);
         for bad in [
             json!({"plant": {"qd_connected": "no"}}),
@@ -326,6 +370,8 @@ mod tests {
             json!({"conditions": {"ambient_c": 90.0}}),
             json!({"loads": {"kg50_kg": 500.0}}),
             json!({"faults": {"kg50_bypass": 2.0}}),
+            json!({"patch": {"dac1": "sar1"}}),
+            json!({"patch": {"dac1_attenuation": 0.0}}),
             json!([1]),
         ] {
             assert!(validate_control(&bad).is_err(), "{bad}");
