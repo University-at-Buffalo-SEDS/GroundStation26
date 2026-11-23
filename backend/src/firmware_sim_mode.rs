@@ -224,6 +224,29 @@ pub(crate) fn validate_control(body: &Value) -> Result<Value, String> {
     Ok(Value::Object(out))
 }
 
+/// Replaces the plant `conditions` (ambient, wind) in the run's control file, keeping its other sections; used to
+/// rehearse an apogee plan's weather (docs/apogee-planner.md section 6). The caller checks the permission.
+pub(crate) fn set_conditions(conditions: Value) -> Result<Value, String> {
+    if !enabled() {
+        return Err("This station is not running simulated firmware.".into());
+    }
+    let dir = run_dir().ok_or("No firmware simulation run directory.")?;
+    let mut control = read_json(dir.join("control.json")).unwrap_or_else(|| json!({}));
+    control
+        .as_object_mut()
+        .ok_or("The current control file is not an object.")?
+        .insert("conditions".into(), conditions);
+    let control = validate_control(&control)?;
+    write_control(&dir, &control).map_err(|e| format!("could not write the control file: {e}"))?;
+    Ok(control)
+}
+
+fn write_control(dir: &std::path::Path, control: &Value) -> std::io::Result<()> {
+    let tmp = dir.join("control.json.pending");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(control).unwrap_or_default())
+        .and_then(|_| std::fs::rename(&tmp, dir.join("control.json")))
+}
+
 async fn get_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Err(response) = crate::web::authorize_headers(&state, &headers, Permission::ViewData).await {
         return response;
@@ -249,10 +272,7 @@ async fn post_control(State(state): State<Arc<AppState>>, headers: HeaderMap, Js
     let Some(dir) = run_dir() else {
         return (StatusCode::CONFLICT, "No firmware simulation run directory.").into_response();
     };
-    let tmp = dir.join("control.json.pending");
-    let written = std::fs::write(&tmp, serde_json::to_vec_pretty(&control).unwrap_or_default())
-        .and_then(|_| std::fs::rename(&tmp, dir.join("control.json")));
-    match written {
+    match write_control(&dir, &control) {
         Ok(()) => {
             log::warn!("Firmware simulation control set by {}: {control}", principal.username.as_deref().unwrap_or("?"));
             Json(json!({"control": control})).into_response()

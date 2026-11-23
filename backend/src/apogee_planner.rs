@@ -668,6 +668,30 @@ pub(crate) fn calibrate_flight(state: &AppState, principal: &AuthPrincipal, actu
     Ok(view(state))
 }
 
+/// The snapshot as the firmware sim's plant `conditions`, clamped to its ranges.
+fn firmware_sim_conditions(snap: &weather::Snapshot) -> Value {
+    json!({
+        "ambient_c": snap.surface_temp_c.clamp(-30.0, 50.0),
+        "wind_mps": snap.wind_mps.clamp(0.0, 40.0),
+        "wind_from_deg": snap.wind_from_deg.rem_euclid(360.0),
+        "gust_mps": snap.gust_mps.clamp(0.0, 20.0),
+    })
+}
+
+/// Sends the plan's weather to the firmware sim (admin; only when this station runs simulated firmware).
+pub(crate) fn rehearse_in_firmware_sim(state: &AppState, principal: &AuthPrincipal) -> Result<Value, (StatusCode, String)> {
+    if principal.anonymous || !principal.is_admin() {
+        return Err((StatusCode::FORBIDDEN, "Firmware simulation controls need an administrator.".into()));
+    }
+    let env = sim_environment(state);
+    let control = crate::firmware_sim_mode::set_conditions(env["firmware_sim_conditions"].clone()).map_err(|e| (StatusCode::CONFLICT, e))?;
+    crate::web::persist_message_db_only(
+        state,
+        format!("Apogee plan weather sent to the firmware simulation by {}: {}.", actor(principal).unwrap_or_default(), control["conditions"]),
+    );
+    Ok(json!({"control": control, "sim_environment": env}))
+}
+
 pub(crate) fn sim_environment(state: &AppState) -> Value {
     let inner = rt(state).inner.lock().unwrap();
     let snap = inner
@@ -688,6 +712,7 @@ pub(crate) fn sim_environment(state: &AppState) -> Value {
             "winds_aloft": snap.levels.iter().map(|l| json!({"h_agl_m": l.h_agl_m, "speed_mps": l.speed_mps, "from_deg": l.from_deg})).collect::<Vec<_>>(),
         },
         "fill": fill.map(|t| json!({"nitrous_target_mass_kg": t.nitrous_target_mass_kg, "nitrous_target_pressure_psi": t.nitrous_target_pressure_psi})),
+        "firmware_sim_conditions": firmware_sim_conditions(&snap),
         "source": snap.provider,
         "valid_time_ms": snap.valid_time_ms,
         "fetched_ms": snap.fetched_ms,
@@ -954,6 +979,17 @@ async fn post_calibrate(State(state): State<Arc<AppState>>, headers: HeaderMap, 
     }
 }
 
+async fn post_rehearse(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let p = match principal(&state, &headers, Permission::ViewData).await {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    match rehearse_in_firmware_sim(&state, &p) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => error(e),
+    }
+}
+
 async fn get_sim_environment(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Err(r) = principal(&state, &headers, Permission::ViewData).await {
         return r;
@@ -975,4 +1011,5 @@ pub(crate) fn routes() -> axum::Router<Arc<AppState>> {
         )
         .route("/api/apogee_planner/calibrate_flight", post(post_calibrate))
         .route("/api/apogee_planner/sim_environment", get(get_sim_environment))
+        .route("/api/apogee_planner/sim_environment/apply", post(post_rehearse))
 }

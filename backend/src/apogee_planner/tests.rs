@@ -501,6 +501,13 @@ async fn open_meteo_source_needs_a_cached_forecast_and_the_opt_in() {
     let sim = sim_environment(&r.state);
     assert!((sim["environment"]["ambient_temp_c"].as_f64().unwrap() - 1.9).abs() < 1e-9);
     assert!(!sim["environment"]["winds_aloft"].as_array().unwrap().is_empty());
+    let conditions = &sim["firmware_sim_conditions"];
+    assert!((conditions["ambient_c"].as_f64().unwrap() - 1.9).abs() < 1e-9);
+    // The firmware sim accepts them as its plant conditions.
+    assert!(crate::firmware_sim_mode::validate_control(&json!({"conditions": conditions})).is_ok());
+    // Not running simulated firmware: refused, nothing written.
+    assert_eq!(rehearse_in_firmware_sim(&r.state, &principal(true, true)).unwrap_err().0, StatusCode::CONFLICT);
+    assert_eq!(rehearse_in_firmware_sim(&r.state, &principal(false, true)).unwrap_err().0, StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]

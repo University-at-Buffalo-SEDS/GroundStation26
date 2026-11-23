@@ -328,6 +328,8 @@ fn manifest(folder: &str, mode: &str, details: serde_json::Value) -> Manifest {
         saved_at_ms: T0 + 90_000,
         details,
         board_sd: vec![],
+        provenance: Some("hardware".into()),
+        simulated: false,
     }
 }
 
@@ -611,6 +613,7 @@ fn saved_flight_captures_queue_a_report_in_every_mode() {
             station_mode: crate::station_mode_switch::mode_id(mode).into(),
             details: serde_json::Value::Null,
             materializing: false,
+            provenance: Some("hardware".into()),
         };
         capture_saved(&capture, &folder);
         assert!(RUNTIME.lock().unwrap().queue.contains(&folder), "{mode:?}");
@@ -632,6 +635,7 @@ fn saved_flight_captures_queue_a_report_in_every_mode() {
         station_mode: "normal".into(),
         details: serde_json::Value::Null,
         materializing: false,
+        provenance: None,
     };
     let folder = PathBuf::from("/tmp/burn-queue-test-fill");
     capture_saved(&other, &folder);
@@ -673,4 +677,15 @@ fn kg50_floor_ignores_the_burnt_out_hanging_level() {
     let (floor, flat_s) = thrust::kg50_floor_for_test(&k50, 8.0, 2.0);
     assert_eq!(floor, -32.0);
     assert!(flat_s > 4.0, "{flat_s}");
+}
+
+#[test]
+fn firmware_sim_captures_are_simulated_in_any_mode() {
+    let mut m = manifest("2027-01-01_08-00-00_launch", "test_fire", serde_json::Value::Null);
+    assert!(!meta_for(&m, "f", 0).simulated || crate::flight_sim_runtime::enabled());
+    m.provenance = Some("firmware_sim".into());
+    assert!(meta_for(&m, "f", 0).simulated);
+    m.provenance = Some("hardware".into());
+    m.simulated = true;
+    assert!(meta_for(&m, "f", 0).simulated);
 }

@@ -387,7 +387,12 @@ pub(crate) fn compute(inputs: &Inputs, meta: Meta) -> Result<BurnReport, String>
 }
 
 fn mode_is_simulated(mode_id: &str) -> bool {
-    mode_id == "hitl" || crate::flight_sim_runtime::enabled()
+    mode_id == "hitl" || crate::flight_sim_runtime::enabled() || crate::firmware_sim_mode::enabled()
+}
+
+/// A capture recorded from simulated firmware or the internal flight sim is simulated whatever its mode.
+fn provenance_is_simulated(provenance: Option<&str>) -> bool {
+    provenance.is_some_and(|p| p != "hardware")
 }
 
 // ------------------------------------------------------------------ store
@@ -527,7 +532,7 @@ fn live_tick(state: &Arc<AppState>, now: i64) {
             capture_id: None,
             capture_label: capture.label.clone(),
             mode: capture.station_mode.clone(),
-            simulated: mode_is_simulated(&capture.station_mode),
+            simulated: mode_is_simulated(&capture.station_mode) || provenance_is_simulated(capture.provenance.as_deref()),
             created_ms: now,
         };
         match compute(&inputs, meta) {
@@ -629,7 +634,9 @@ pub(crate) fn meta_for(manifest: &Manifest, folder_name: &str, now_ms: i64) -> M
         capture_id: Some(manifest.id.clone()),
         capture_label: manifest.label.clone(),
         mode: manifest.station_mode.clone(),
-        simulated: mode_is_simulated(&manifest.station_mode),
+        simulated: manifest.simulated
+            || mode_is_simulated(&manifest.station_mode)
+            || provenance_is_simulated(manifest.provenance.as_deref()),
         created_ms: now_ms,
     }
 }

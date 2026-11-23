@@ -268,10 +268,14 @@ unreachable target (it reports the reach and disables Apply), and that path is t
  "source": "open_meteo", "valid_time_ms": 0, "fetched_ms": 0}
 ```
 
-The firmware-backed sim (`FirmwareSimulator`, `scripts/gs_bay.py` control file) can
-take the `environment` object under `control.json → "environment"` to set its ambient
-temperature (N2O vapour pressure in its plant) and wind, so a planned fill can be
-rehearsed. The sim's plant does not read it yet; see "Notes for the sim" below.
+The response also carries `firmware_sim_conditions` (`ambient_c`, `wind_mps`,
+`wind_from_deg`, `gust_mps`, clamped to the sim's ranges): the plant `conditions` of the
+firmware simulation's control file (`backend/src/firmware_sim_mode.rs`). On a station
+running simulated firmware, an administrator can press **Rehearse in firmware sim**
+(`POST /api/apogee_planner/sim_environment/apply`): the planner writes those conditions
+into the run's `control.json`, keeping its other sections, so the planned fill is
+rehearsed at the plan's ambient temperature and wind. It is refused (409) on a hardware
+station. Winds aloft are not part of the sim's conditions yet.
 
 ## 7. Thrust from the stand load cells
 
@@ -392,6 +396,7 @@ report was saved; ambient temperature and weather come from the launch capture's
 | `POST /api/apogee_planner/ork` / `DELETE` | admin | import a `.ork` (raw body) / back to the default vehicle |
 | `POST /api/apogee_planner/calibrate_flight` | send commands | `{actual_apogee_m?}` add a drag calibration point from the last flight |
 | `GET /api/apogee_planner/sim_environment` | view | weather snapshot for the sim |
+| `POST /api/apogee_planner/sim_environment/apply` | admin | write the plan's weather into the firmware sim's `conditions` |
 | `GET /api/burn_reports`, `GET /api/burn_reports/{id}` | view | burn reports (provisional/final) |
 | `GET /api/fire_archive` | view | archived fires |
 | `PATCH /api/fire_archive/{id}` | send commands | review: status, exclude_from_fit, notes, metadata |
@@ -404,6 +409,7 @@ the burn report sees what the real stand produces: KG50 reads hanging mass (rock
 propellant) minus thrust/g until thrust exceeds the weight, then its zero-load value
 (plus the supply-dip spikes if those faults are modelled); KG1000 reads 0 until lift-off
 and thrust/g − m(t) after, with a short gap-closing delay (tens of ms) and contact
-spike; the rocket drops back onto KG50 when thrust falls below the weight. The plant
-should also accept `control.json → "environment"` (section 6) for ambient temperature
-(N2O vapour pressure) and wind.
+spike; the rocket drops back onto KG50 when thrust falls below the weight. Its
+`conditions.ambient_c` should drive the N2O vapour pressure in the tank model (ESDU 91022,
+`backend/src/apogee_planner/n2o.rs`), and winds aloft could be added to `conditions` so a
+rehearsal flies the plan's whole wind profile.
