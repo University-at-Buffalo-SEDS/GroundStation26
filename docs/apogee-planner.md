@@ -243,9 +243,18 @@ and every warning.
   (`details.apogee_plan`) and into the fire archive record of that burn.
 - **After a flight** the planner shows predicted vs actual apogee (FC apogee if
   reported, else the GS flight maxima). "Add calibration point" solves the `cd_scale`
-  that makes the model hit the actual apogee with the plan's weather and the burn's
-  measured impulse (if a burn report exists, else the plan's), and stores it; the
-  planner uses the mean `cd_scale` of the stored flight points.
+  that makes the model hit the actual apogee with the plan's weather, fill and supercharge
+  (the motor from the current fit), and stores it; the planner uses the mean `cd_scale` of
+  the stored flight points. A flight has no stand load cells, so the drag scale absorbs
+  any motor error of that flight too; a fire archived from the same fill (static fire or
+  IGT) separates the two.
+
+**What the numbers say today.** With the corrected 9.19 kN·s fire and the pressure
+exponent prior (n = 0.3), a 20 °C day with the nominal 750 psi supercharge reaches
+10,000 ft with about 6.0 kg (band ±600 m, from the single fire's 10 % impulse
+uncertainty, extrapolation to a warmer, harder-pressurised tank, and the weather). The
+pre-correction 7.05 kN·s curve could not reach 10k ft; the planner handles an
+unreachable target (it reports the reach and disables Apply), and that path is tested.
 
 ## 6. Sim link
 
