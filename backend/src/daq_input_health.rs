@@ -5,16 +5,22 @@
 //! that already depend on a sensor (e.g. fill mass from a railed load cell,
 //! which the live conversion withholds) keep their own behaviour.
 //!
-//! Wire format (DAQ-Board Core/Inc/daq_input_faults.h), 10 UInt32 words:
+//! Wire format (DAQ-Board Core/Inc/daq_input_faults.h), version 2, 18 UInt32
+//! words (version 1 sent the first 10):
 //! 0 version | flags, 1 active | latched masks, 2-5 u16 episode counters,
 //! 6 VMAIN min|now, 7 chamber min|now, 8 P6 imbalance max|common now,
 //! 9 supply level|chamber level; all in mV, 0xFFFF = no reading.
+//! 10-13 noise (uV, u16, 0xFFFF none) | drift (uV/min, i16, 0x8000 none) of
+//! KG1000, selected KG50, chamber PT, excitation; 14 excitation min|now (mV);
+//! 15 MCP3564R frames skipped | slot items skipped; 16 scans restarted |
+//! device recoveries; 17 latest fast-scan end | slot end (us in the frame).
 use crate::types::{DaqInputFaultStatus, DaqInputHealthStatus};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, OnceLock};
 
-pub const WORDS: usize = 10;
-const VERSION: u32 = 1;
+pub const WORDS: usize = 18;
+pub const WORDS_V1: usize = 10;
+const VERSION: u32 = 2;
 const NO_MV: u16 = 0xFFFF;
 /// Re-alert on a fault no sooner than this after its last alert, so an input
 /// that flaps cannot flood the alert list (same holdoff as the rail alert).
@@ -109,6 +115,38 @@ pub struct Report {
     pub p6_common_mv: Option<u16>,
     pub supply_low_mv: u16,
     pub chamber_floor_mv: u16,
+    /// Version 2 only (None from version-1 firmware).
+    pub v2: Option<ReportV2>,
+}
+
+/// Noise and drift of one channel over the DAQ's last 1 s / 60 s.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct ChannelNoise {
+    pub noise_uv: Option<u16>,
+    pub drift_uv_per_min: Option<i16>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReportV2 {
+    /// KG1000, selected KG50, chamber PT, excitation monitor.
+    pub noise: [ChannelNoise; 4],
+    pub excitation_min_mv: Option<u16>,
+    pub excitation_mv: Option<u16>,
+    pub frames_skipped: u16,
+    pub slots_skipped: u16,
+    pub scans_restarted: u16,
+    pub device_recoveries: u16,
+    pub fast_scan_end_us: u16,
+    pub slot_end_us: u16,
+}
+
+fn channel_noise(word: u32) -> ChannelNoise {
+    let noise = word as u16;
+    let drift = (word >> 16) as u16 as i16;
+    ChannelNoise {
+        noise_uv: (noise != 0xFFFF).then_some(noise),
+        drift_uv_per_min: (drift != i16::MIN).then_some(drift),
+    }
 }
 
 fn mv(value: u32) -> Option<u16> {
@@ -123,9 +161,26 @@ fn volts(mv: u16) -> String {
 
 impl Report {
     pub fn decode(words: &[u32]) -> Option<Self> {
-        if words.len() != WORDS || words[0] & 0xFF != VERSION || words[0] & !0x3FF != 0 {
+        let version = words.first()? & 0xFF;
+        let shape = match version {
+            1 => WORDS_V1,
+            VERSION => WORDS,
+            _ => return None,
+        };
+        if words.len() != shape || words[0] & !0x3FF != 0 {
             return None;
         }
+        let v2 = (version == VERSION).then(|| ReportV2 {
+            noise: [channel_noise(words[10]), channel_noise(words[11]), channel_noise(words[12]), channel_noise(words[13])],
+            excitation_min_mv: mv(words[14]),
+            excitation_mv: mv(words[14] >> 16),
+            frames_skipped: words[15] as u16,
+            slots_skipped: (words[15] >> 16) as u16,
+            scans_restarted: words[16] as u16,
+            device_recoveries: (words[16] >> 16) as u16,
+            fast_scan_end_us: words[17] as u16,
+            slot_end_us: (words[17] >> 16) as u16,
+        });
         let mut episodes = [0u16; 8];
         for (i, count) in episodes.iter_mut().enumerate() {
             *count = (words[2 + i / 2] >> (16 * (i & 1))) as u16;
@@ -144,6 +199,7 @@ impl Report {
             p6_common_mv: mv(words[8] >> 16),
             supply_low_mv: words[9] as u16,
             chamber_floor_mv: (words[9] >> 16) as u16,
+            v2,
         })
     }
 
@@ -183,6 +239,18 @@ impl Report {
             p6_common_mv: self.p6_common_mv,
             supply_low_mv: self.supply_low_mv,
             chamber_floor_mv: self.chamber_floor_mv,
+            kg1000_noise: self.v2.as_ref().map(|v| v.noise[0]),
+            kg50_noise: self.v2.as_ref().map(|v| v.noise[1]),
+            chamber_noise: self.v2.as_ref().map(|v| v.noise[2]),
+            excitation_noise: self.v2.as_ref().map(|v| v.noise[3]),
+            excitation_mv: self.v2.as_ref().and_then(|v| v.excitation_mv),
+            excitation_min_mv: self.v2.as_ref().and_then(|v| v.excitation_min_mv),
+            adc_frames_skipped: self.v2.as_ref().map(|v| v.frames_skipped),
+            adc_slots_skipped: self.v2.as_ref().map(|v| v.slots_skipped),
+            adc_scans_restarted: self.v2.as_ref().map(|v| v.scans_restarted),
+            adc_device_recoveries: self.v2.as_ref().map(|v| v.device_recoveries),
+            adc_fast_scan_end_us: self.v2.as_ref().map(|v| v.fast_scan_end_us),
+            adc_slot_end_us: self.v2.as_ref().map(|v| v.slot_end_us),
         }
     }
 
@@ -354,6 +422,30 @@ mod tests {
     }
 
     #[test]
+    fn decode_reads_version_2_noise_excitation_and_frame_counters() {
+        let mut w = words(0, 0, [0; 8], HEALTHY, (8, 17), NONE, 0x200);
+        w[0] = 2 | 0x200;
+        // KG1000 48 uV noise, +600 uV/min; KG50 unknown; chamber 120 uV, -3 uV/min;
+        // no excitation monitor.
+        w.extend([48 | (600 << 16), 0x8000_FFFF, 120 | (u32::from(-3i16 as u16) << 16), 0x8000_FFFF]);
+        w.extend([0xFFFF_FFFF, 2 | (7 << 16), 1 | (0 << 16), 770 | (930 << 16)]);
+        let r = decode(&w);
+        let v2 = r.v2.clone().unwrap();
+        assert_eq!(v2.noise[0], ChannelNoise { noise_uv: Some(48), drift_uv_per_min: Some(600) });
+        assert_eq!(v2.noise[1], ChannelNoise::default());
+        assert_eq!(v2.noise[2], ChannelNoise { noise_uv: Some(120), drift_uv_per_min: Some(-3) });
+        assert_eq!((v2.excitation_min_mv, v2.excitation_mv), (None, None));
+        assert_eq!((v2.frames_skipped, v2.slots_skipped, v2.scans_restarted, v2.device_recoveries), (2, 7, 1, 0));
+        assert_eq!((v2.fast_scan_end_us, v2.slot_end_us), (770, 930));
+        let status = r.status(0, true);
+        assert_eq!(status.kg1000_noise.unwrap().noise_uv, Some(48));
+        assert_eq!(status.adc_slots_skipped, Some(7));
+        assert!(Report::decode(&w[..10]).is_none(), "version 2 must carry 18 words");
+        // Version-1 firmware still decodes, without the version-2 block.
+        assert!(decode(&words(0, 0, [0; 8], HEALTHY, NONE, NONE, 0)).v2.is_none());
+    }
+
+    #[test]
     fn decode_reads_every_field_and_rejects_other_shapes() {
         let mut episodes = [0u16; 8];
         episodes[0] = 53;
@@ -372,8 +464,10 @@ mod tests {
         assert_eq!((r.vmain_mv, r.chamber_mv, r.p6_common_mv), (None, None, None));
         assert!(Report::decode(&w[..9]).is_none());
         let mut bad = w.clone();
-        bad[0] = 2;
+        bad[0] = 3;
         assert!(Report::decode(&bad).is_none(), "unknown version");
+        bad[0] = 2;
+        assert!(Report::decode(&bad).is_none(), "version 2 needs 18 words");
         bad[0] = 1 | 0x400;
         assert!(Report::decode(&bad).is_none(), "unknown flag");
     }

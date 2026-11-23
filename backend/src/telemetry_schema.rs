@@ -96,7 +96,7 @@ mod tests {
             ("DAQ_SD_HEALTH", 8),
             ("DAQ_SD_RETRY", 1),
             ("DAQ_LAUNCH_LOG_STATUS", 7),
-            ("DAQ_INPUT_HEALTH", 10),
+            ("DAQ_INPUT_HEALTH", 18),
         ] {
             let good = vec![0u8; count * 4];
             assert!(

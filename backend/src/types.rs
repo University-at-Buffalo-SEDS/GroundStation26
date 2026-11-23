@@ -654,6 +654,34 @@ pub struct DaqInputHealthStatus {
     /// The DAQ's configured supply undervoltage and chamber no-signal levels.
     pub supply_low_mv: u16,
     pub chamber_floor_mv: u16,
+    /// DAQ_INPUT_HEALTH v2: per-channel noise (1 s) and drift (60 s); load
+    /// cells in ADC-pin uV (P6 input uV), chamber/excitation in connector uV.
+    #[serde(default)]
+    pub kg1000_noise: Option<crate::daq_input_health::ChannelNoise>,
+    #[serde(default)]
+    pub kg50_noise: Option<crate::daq_input_health::ChannelNoise>,
+    #[serde(default)]
+    pub chamber_noise: Option<crate::daq_input_health::ChannelNoise>,
+    #[serde(default)]
+    pub excitation_noise: Option<crate::daq_input_health::ChannelNoise>,
+    /// Load-cell excitation monitor (HVAIN2), when wired.
+    #[serde(default)]
+    pub excitation_mv: Option<u16>,
+    #[serde(default)]
+    pub excitation_min_mv: Option<u16>,
+    /// MCP3564R frame engine counters since boot and timing (us in the 1 ms frame).
+    #[serde(default)]
+    pub adc_frames_skipped: Option<u16>,
+    #[serde(default)]
+    pub adc_slots_skipped: Option<u16>,
+    #[serde(default)]
+    pub adc_scans_restarted: Option<u16>,
+    #[serde(default)]
+    pub adc_device_recoveries: Option<u16>,
+    #[serde(default)]
+    pub adc_fast_scan_end_us: Option<u16>,
+    #[serde(default)]
+    pub adc_slot_end_us: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default, Hash)]

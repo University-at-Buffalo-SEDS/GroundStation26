@@ -107,29 +107,31 @@ Captures, CSV export and report windows all use `timestamp_ms` (Section 5).
 
 ### 2.2 DAQ (fill CAN, then gateway, then Pico-Fi)
 
-The DAQ caps sensor packets at `DAQ_NETWORK_RATE_HZ 100` and shares them by
-weight (DAQ-Board `Core/Inc/daq_network_config.h`):
+The DAQ caps sensor packets at `DAQ_NETWORK_RATE_HZ 100`
+(DAQ-Board `Core/Inc/daq_network_config.h`, `daq_network_schedule.h`):
 
-- KG50 10 and KG1000 10.
-- Temperature, SDADC, SAR, current and power 1 each.
+- Every fast-pair bin (KG1000 + chamber PT, 20 ms, 50/s) and every KG50 bin
+  (50 ms, 20/s) gets a slot, dated at the bin centre.
+- Temperature, SDADC, SAR, current and power share the remaining ≥ 30 slots/s
+  by weight 1/2/1/1/2; each keeps only its latest value.
 
-That is 40, 40, 4, 4, 4, 4 and 4 packets/s. Each slot keeps only its latest
-sample, so the slot's packet rate is lower than the 250 Hz rate at which the
-DAQ produces values (`DAQ_BROADCAST_RATE_HZ 250`, `Core/Inc/daq_rates.h:29`).
+The DAQ converts KG1000 and the chamber PT at 1 kHz and KG50 at 800–900/s; the
+packets carry the mean of each bin of a 3- (fast) or 5-sample (KG50) running
+median. Every conversion is on the DAQ SD (DAQ-Board `docs/data-pipeline.md`).
 Health types bypass the cap.
 
 | SEDSnet type | Payload | Rate at GS | GS decoder | Rows recorded and shown | Units |
 | --- | --- | --- | --- | --- | --- |
-| `KG1000` | f32[1]: 4 ms boxcar of the 1000 kg cell | 40/s, shared with `DAQ_LOADCELL_CHAMBER` | generic f32 path (`telemetry_task/derived.rs` `telemetry_rows_from_packet_values`) | `KG1000`; derived `LOADCELL_WEIGHT_KG`; `LOADCELL_FILL_PERCENT` when the fill source is KG1000 | ADC-pin V; kg; % |
-| `DAQ_LOADCELL_CHAMBER` | f32[3]: [KG1000, chamber psig, chamber connector V]. Sent in the KG1000 slot when the chamber sample is fresh | 40/s, shared | `telemetry_task/derived.rs` `chamber_pressure_rows` | raw `DAQ_LOADCELL_CHAMBER`, `KG1000`, `COMBUSTION_CHAMBER_PRESSURE`, `COMBUSTION_CHAMBER_VOLTAGE`, `COMBUSTION_CHAMBER_RANGE_STATUS`, `COMBUSTION_CHAMBER_PT_INSTALLED`, plus the KG1000 derived rows | V; psig; V; 0/1 |
-| `KG50` | f32[1]: AMP2 (CH1) boxcar | 40/s, shared with `DAQ_KG50_SELECTED` | `loadcell::selected_kg50_value` | `KG50`; derived `LOADCELL_50_WEIGHT_KG`; `LOADCELL_FILL_PERCENT` (default fill source) | V; kg; % |
-| `DAQ_KG50_SELECTED` | f32[2]: [source, value]; source 1 = P6 differential | 40/s, shared. Sent instead of `KG50` when the DAQ input is not AMP2 (`Core/Src/daq_thread.c` `daq_offer_live_report`) | `loadcell::selected_kg50_value` | recorded as `KG50` (8-byte payload); same derived rows | V |
-| `DAQ_ADC_TEMPERATURE` | f32[1] | 4/s | generic | `DAQ_ADC_TEMPERATURE`; also read by `loadcell::recent_adc_temperature` (2 s freshness) | °C |
-| `DAQ_SDADC_VOLTAGES` | f32[6]: CH2, CH3, CH4, CH5, HVAIN1, HVAIN2 | 4/s | generic; DAC check `daq_dac::observe_values` | as received | connector V (HVAIN includes the 11x divider) |
-| `DAQ_SAR_VOLTAGES` | f32[8]: SAR_IN1..8 | 4/s | generic; `daq_dac::observe_values` | as received | V |
-| `DAQ_CURRENT_SENSE` | f32[4]: J7 V, J8 V, J7 A, J8 A | 4/s | generic | as received | V, A |
-| `DAQ_POWER_MONITOR` | f32[4]: VMON V, IMON V, VMAIN V, input A | 4/s | generic | as received | V, A |
-| `DAQ_INPUT_HEALTH` | u32[10] (layout in `daq_input_health.rs` header) | 1/s, at most every 200 ms (`DAQ_INPUT_HEALTH_PERIOD_MS`, `Core/Inc/daq_input_fault_config.h:131`) | `network_health::observe_input_health`, `daq_input_health::observe_alerts` | raw payload row, `values_json` `[]`; alerts | mV fields |
+| `KG1000` | f32[1]: 20 ms bin of the 3-sample median of the 1000 kg cell | 50/s, shared with `DAQ_LOADCELL_CHAMBER` | generic f32 path (`telemetry_task/derived.rs` `telemetry_rows_from_packet_values`) | `KG1000`; derived `LOADCELL_WEIGHT_KG`; `LOADCELL_FILL_PERCENT` when the fill source is KG1000 | ADC-pin V; kg; % |
+| `DAQ_LOADCELL_CHAMBER` | f32[3]: [KG1000, chamber psig, chamber connector V], both 20 ms bins of the same centre. Sent in the KG1000 slot when the chamber bin matches | 50/s, shared | `telemetry_task/derived.rs` `chamber_pressure_rows` | raw `DAQ_LOADCELL_CHAMBER`, `KG1000`, `COMBUSTION_CHAMBER_PRESSURE`, `COMBUSTION_CHAMBER_VOLTAGE`, `COMBUSTION_CHAMBER_RANGE_STATUS`, `COMBUSTION_CHAMBER_PT_INSTALLED`, plus the KG1000 derived rows | V; psig; V; 0/1 |
+| `KG50` | f32[1]: AMP2 (CH1), 50 ms bin of the 5-sample median | 20/s, shared with `DAQ_KG50_SELECTED` | `loadcell::selected_kg50_value` | `KG50`; derived `LOADCELL_50_WEIGHT_KG`; `LOADCELL_FILL_PERCENT` (default fill source) | V; kg; % |
+| `DAQ_KG50_SELECTED` | f32[2]: [source, value]; source 1 = P6 differential | 20/s, shared. Sent instead of `KG50` when the DAQ input is not AMP2 (`Core/Src/daq_thread.c` `daq_offer_live_report`) | `loadcell::selected_kg50_value` | recorded as `KG50` (8-byte payload); same derived rows | V |
+| `DAQ_ADC_TEMPERATURE` | f32[1] | ≈ 4/s (interleave weight 1) | generic | `DAQ_ADC_TEMPERATURE`; also read by `loadcell::recent_adc_temperature` (2 s freshness) | °C |
+| `DAQ_SDADC_VOLTAGES` | f32[6]: CH2, CH3, CH4, CH5, HVAIN1, HVAIN2 (latest 3-sample medians; HVAIN1 = chamber 20 ms bin) | ≈ 8/s (weight 2) | generic; DAC check `daq_dac::observe_values` | as received | connector V (HVAIN includes the 11x divider) |
+| `DAQ_SAR_VOLTAGES` | f32[8]: SAR_IN1..8 | ≈ 4/s (weight 1) | generic; `daq_dac::observe_values` | as received | V |
+| `DAQ_CURRENT_SENSE` | f32[4]: J7 V, J8 V, J7 A, J8 A | ≈ 4/s (weight 1) | generic | as received | V, A |
+| `DAQ_POWER_MONITOR` | f32[4]: VMON V, IMON V, VMAIN V, input A | ≈ 8/s (weight 2) | generic | as received | V, A |
+| `DAQ_INPUT_HEALTH` | u32[18], version 2 (layout in `daq_input_health.rs` header; version 1 u32[10] still decodes): faults plus per-channel noise/drift, excitation mV, ADC frame counters | 1/s, at most every 200 ms (`DAQ_INPUT_HEALTH_PERIOD_MS`, `Core/Inc/daq_input_fault_config.h:131`) | `network_health::observe_input_health`, `daq_input_health::observe_alerts` | raw payload row, `values_json` `[]`; alerts | mV fields |
 | `DAQ_SD_HEALTH` | u32[8] | every 5 s | `network_health::observe_sd_status` | raw payload row | |
 | `DAQ_LAUNCH_LOG_STATUS` | u32[7] | every 5 s | `network_health::observe_launch_log_status` | raw payload row; `/api/network_topology` `launch_log` | |
 | `DAQ_DAC_STATUS` | u8[80] | while the DAC runs | `network_health::observe_dac_status`, `daq_dac::observe_status` | raw payload row | |
@@ -381,6 +383,15 @@ sequenceDiagram
   It stores rows in `sd_samples` and the original bytes in `sd_source_chunks`.
 - `resolve_recording` builds `sd_replay_telemetry`. SD rows replace network rows of the same sender and type wherever the SD gives continuous coverage (gap ≤ `max_gap_ms`).
 
+**DAQ mapping profile `daq-20261123`** (firmware head `DAQ_SD_HEAD_US` = DAQ-Board `e5fad32`, the 1 kHz frame schedule). MCP3564R rows carry microsecond `uptime_ticks` (`uptime_frequency_hz` 1000000):
+
+| Mapping | SD sensor(s) | GS type |
+| --- | --- | --- |
+| `kg1000_v` | `kg1000_v` | `KG1000` (rebuilt with `MedianBin`: 3-sample median, 20000 µs bins, dated at the bin centre; bit-identical to the DAQ's packets) |
+| `kg50_v` | `kg50_v`, `kg50_p6_v` | `KG50` (5-sample median, 50000 µs bins; restarts on an input switch) |
+| `kg1000_kg`, `kg50_kg` | `calibrated_value` | `LOADCELL_WEIGHT_KG`, `LOADCELL_50_WEIGHT_KG` (every conversion) |
+| `input_supply` | `input_voltage_v` + `input_current_a` | `DAQ_POWER_MONITOR` |
+
 **DAQ mapping profile `daq-20261117`.** It accepts firmware heads `44a9195` and `55fe7a8` only:
 
 | Mapping | SD sensor(s) | GS type |
@@ -409,6 +420,18 @@ has these steps:
 6. Write `burn_report.json` and `burn_thrust.csv` into the capture folder.
 
 The expected DAQ input is the 13-column SD CSV with `time_source = network` rows.
+With the DAQ's 1 kHz frame schedule (DAQ-Board `docs/data-pipeline.md`) the
+reader must:
+
+- take `kg1000_v`, `kg50_v`/`kg50_p6_v` and `chamber_pressure_v`;
+- integrate on `uptime_ticks / uptime_frequency_hz`. That is microseconds for
+  these rows: KG1000 and the chamber PT are exactly 1000 µs apart.
+  `timestamp_ms` keeps 1 ms resolution and serves only for network-time
+  alignment.
+
+The work-in-progress merge outside dev reads the removed `kg1000_network`,
+`kg50_network` and `chamber_pressure_raw_volts_psi` names, and millisecond
+times.
 
 ### 3.7 CSV export (`recording_export.rs`)
 
@@ -451,10 +474,10 @@ The two rate columns cover different things:
 
 | Stream | On the board SD | Reaches the GS and is recorded |
 | --- | --- | --- |
-| KG1000 cell | `kg1000_v`: every MCP3564R conversion, ADC code + pin V + on-board kg (nominally about 870/s per channel at OSR 256, 3-channel scan, DAQ-Board `docs/chamber-pressure.md`); `kg1000_window_*` every 100 ms | `KG1000` or `DAQ_LOADCELL_CHAMBER` at 40/s, each a 4 ms boxcar (f32 V); plus GS `LOADCELL_WEIGHT_KG` at the same rate |
-| KG50 cell | `kg50_v` (AMP2) or `kg50_p6_v` (P6) per conversion; `kg50_window_v` every 100 ms | `KG50` at 40/s (4 ms boxcar, V); `LOADCELL_50_WEIGHT_KG` and `LOADCELL_FILL_PERCENT` |
-| Chamber PT | `chamber_pressure_v` per conversion (connector V, psig) | inside `DAQ_LOADCELL_CHAMBER` at up to 40/s; `COMBUSTION_CHAMBER_*` rows |
-| DAQ supply | `input_voltage_v`, `input_current_a`: every 100 ms, every 4 ms from 0.5 s before the launch window to its end (`DAQ_SUPPLY_LAUNCH_PERIOD_MS`) | `DAQ_POWER_MONITOR` at 4/s |
+| KG1000 cell | `kg1000_v`: every MCP3564R conversion, exactly 1000/s, µs `uptime_ticks`, ADC code + pin V + on-board kg; `kg1000_window_*` every 100 ms | `KG1000` or `DAQ_LOADCELL_CHAMBER` at 50/s, each a 20 ms bin of a 3-sample median (f32 V); plus GS `LOADCELL_WEIGHT_KG` at the same rate |
+| KG50 cell | `kg50_v` (AMP2) or `kg50_p6_v` (P6) per conversion, 800/s (900/s in the launch window), µs `uptime_ticks`; `kg50_window_v` every 100 ms | `KG50` at 20/s (50 ms bin of a 5-sample median, V); `LOADCELL_50_WEIGHT_KG` and `LOADCELL_FILL_PERCENT` |
+| Chamber PT | `chamber_pressure_v` per conversion, exactly 1000/s (connector V, psig) | inside `DAQ_LOADCELL_CHAMBER` at 50/s; `COMBUSTION_CHAMBER_*` rows |
+| DAQ supply | `input_voltage_v`, `input_current_a`: every 100 ms, every 4 ms from 0.5 s before the launch window to its end (`DAQ_SUPPLY_LAUNCH_PERIOD_MS`) | `DAQ_POWER_MONITOR` at about 8/s |
 | SAR / current / aux analog | `analog_in_1..8_v`, `isense*`, `vmon_v`, `imon_v`, `analog_out_*`: every 100 ms | `DAQ_SAR_VOLTAGES`, `DAQ_CURRENT_SENSE`, `DAQ_POWER_MONITOR` at 4/s each |
 | MCP CH2–7 | `mcp3564r_ch2_v`..`ch7_v`: aux pass every 100 ms | `DAQ_SDADC_VOLTAGES` at 4/s |
 | ADC die temperature | `adc_temperature_c` on every raw row; `mcp3564r_temp_c` every 100 ms | `DAQ_ADC_TEMPERATURE` at 4/s |
@@ -471,7 +494,7 @@ DAQ SD files:
 
 - Regular sessions: `/UTC/DAQ_<stamp>_<NNN>.CSV` or `/NO_UTC/…`.
 - Launch window: `/LAUNCH/DAQ_LAUNCH_<stamp>_<NNN>.CSV`, `SD_LAUNCH_WINDOW_MS 20000` (`Core/Src/sd_card.c:329`).
-- Each file starts with the header and a `# calibration,…,loadcell_input=adc_volts,loadcell_boxcar_ms=N` line.
+- Each file starts with the header and a `# calibration,…,loadcell_input=adc_volts,…` line: `loadcell_report=median_bin,kg1000_median=3,kg1000_bin_us=20000,kg50_median=5,kg50_bin_us=50000,adc_uptime_hz=1000000` (older files: `loadcell_boxcar_ms=N`).
 
 FC files are `irec-…csv` and `irec_LAUNCH-…csv` at the card root (`Core/Src/sdpipeline.c`).
 
@@ -479,8 +502,8 @@ FC files are `irec-…csv` and `irec_LAUNCH-…csv` at the card root (`Core/Src/
 
 | Segment | Determinable value | Source |
 | --- | --- | --- |
-| DAQ conversion to 250 Hz value | 4 ms boxcar | `DAQ_BROADCAST_PERIOD_MS` |
-| DAQ value to packet | waits up to one slot period (25 ms at 40/s; 250 ms at 4/s). Only the latest sample is kept | `daq_network_config.h` |
+| DAQ conversion to load-cell value | 20 ms (fast pair) or 50 ms (KG50) bin of a running median, dated at the bin centre | DAQ `daq_rates.h` `DAQ_FAST_REPORT_US`, `DAQ_KG50_REPORT_US` |
+| DAQ value to packet | load-cell bins: next 10 ms slot, every bin sent; auxiliary: up to a few hundred ms, latest value only | `daq_network_schedule.h` |
 | Fill CAN to gateway to Pico-Fi | UART at 1 Mbaud; Pico-Fi queues 128 frames each way | gateway `CMakeLists.txt:77`; [picofi-ethernet.md](picofi-ethernet.md) |
 | FC to radio | 5 Hz; radio UART 115200 baud | FlightComputer26 `telemetry_rate.h`; `comms.json` |
 | GS ring to worker | 1 ms pump tick, 256 packets per tick | `telemetry_task.rs:1026` |
@@ -494,10 +517,10 @@ The latency from board to GS is not fixed. Each row records it as
 
 **GS rows per second from the DAQ** (chamber PT installed, default KG50 fill source):
 
-- KG1000 slot: 7 rows per packet × 40/s.
-- KG50 slot: 3 rows per packet × 40/s.
-- Five 4/s types.
-- Total about 420 rows/s.
+- KG1000 slot: 7 rows per packet × 50/s.
+- KG50 slot: 3 rows per packet × 20/s.
+- Five auxiliary types sharing about 30 packets/s.
+- Total about 450 rows/s.
 
 Each row repeats the packet's `payload_json`.
 

@@ -6986,9 +6986,12 @@ mod tests {
         let mut warnings_rx = state.warnings_tx.subscribe();
         // Chamber no signal active (bit 7), one episode, CH6 at 0.012 V as in
         // the 2026-11-16 test fire; VMAIN healthy.
-        let words: [u32; 10] = [
-            1 | 0x200, 0x80 | (0x80 << 16), 0, 0, 0, 1 << 16,
+        // Version 2: the first ten words, then noise/drift (none yet), no
+        // excitation monitor and zero frame-engine counters.
+        let words: [u32; 18] = [
+            2 | 0x200, 0x80 | (0x80 << 16), 0, 0, 0, 1 << 16,
             14_180 | (14_200 << 16), 8 | (12 << 16), 0xFFFF_FFFF, 12_500 | (50 << 16),
+            0x8000_FFFF, 0x8000_FFFF, 0x8000_FFFF, 0x8000_FFFF, 0xFFFF_FFFF, 0, 0, 0,
         ];
         let packet = |timestamp| {
             Packet::new(

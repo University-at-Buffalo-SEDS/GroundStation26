@@ -14,6 +14,10 @@ DAQ_SD_HEAD='44a9195cb6a793ab89d0848683a140509f72cbbc'
 # scalar row kg1000_window_input_v (always equal to kg1000_window_v; removed).
 # Its files still import under the same profile; no mapping reads that row.
 DAQ_SD_HEAD_WITH_WINDOW_INPUT='55fe7a811b74001ea2e9db07de24f57b97feb176'
+# DAQ firmware with the 1 kHz frame schedule: MCP3564R raw rows carry
+# microsecond uptime_ticks (uptime_frequency_hz=1000000), and the network
+# KG1000/KG50 values are fixed-bin means of running medians (daq_median.h).
+DAQ_SD_HEAD_US='e5fad32e33f065771887770cc8a650bf9692aaf0'
 # field, element reordering, target type, units. BARO existing summary is alt/prs/tmp;
 # raw barometer_sample is pressure/temperature/altitude. These must not be swapped.
 PROFILES={
@@ -40,6 +44,17 @@ PROFILES={
  # KG1000/KG50 are rebuilt from those records with the DAQ's own boxcar, so
  # SD backfill equals what the station would have received. Selections are
  # mapping names; 'sensors' lists the SD rows each one reads.
+ 'daq-20261123': {'head':DAQ_SD_HEAD_US,'mappings':{
+  # KG1000 network value: mean of each 20000 us bin of a 3-sample running median.
+  'kg1000_v':('raw_value',[0],'KG1000',['V'],{'median_bin':(3,20000),'uptime_hz':1000000,'sensors':('kg1000_v',)}),
+  # Selected KG50 (AMP2 or P6): 5-sample median, 50000 us bins; both restart
+  # when the selection changes, as on the DAQ.
+  'kg50_v':('raw_value',[0],'KG50',['V'],{'median_bin':(5,50000),'uptime_hz':1000000,'sensors':('kg50_v','kg50_p6_v')}),
+  'kg1000_kg':('calibrated_value',[0],'LOADCELL_WEIGHT_KG',['kg'],{'uptime_hz':1000000,'sensors':('kg1000_v',)}),
+  'kg50_kg':('calibrated_value',[0],'LOADCELL_50_WEIGHT_KG',['kg'],{'uptime_hz':1000000,'sensors':('kg50_v',)}),
+  'input_supply':(None,[0,1,2,3],'DAQ_POWER_MONITOR',['V','V','V','A'],{'pair':('input_voltage_v','input_current_a'),
+      'sensors':('input_voltage_v','input_current_a')}),
+ }},
  'daq-20261117': {'head':DAQ_SD_HEAD,'heads':(DAQ_SD_HEAD,DAQ_SD_HEAD_WITH_WINDOW_INPUT),'mappings':{
   'kg1000_v':('raw_value',[0],'KG1000',['V'],{'boxcar':True,'sensors':('kg1000_v',)}),
   # The selected KG50 input: AMP2 (CH1) or P6. The DAQ restarts the boxcar
@@ -89,6 +104,32 @@ class Boxcar:
             done=(_f32(self.sum/self.count),self.count,self.first,self.last)
             self.sum=0.0;self.count=0;self.first=None
         self.bin=bin_;self.sum+=value;self.count+=1;self.last=sample
+        if self.first is None:self.first=sample
+        return done
+
+
+class MedianBin:
+    """daq_median_add then daq_bin_us_add on SD raw records: a running median
+    of the last `size` finite binary32 values (fewer at the start; lower middle
+    for an even count), then the mean of each fixed bin of uptime microseconds,
+    summed in double precision in record order and rounded once to binary32.
+    A bin is complete when a record of a later bin arrives; it is dated at the
+    bin centre."""
+    def __init__(self,size,period_us):
+        self.size=size;self.period=period_us;self.reset()
+    def reset(self):
+        self.window=[];self.bin=None;self.sum=0.0;self.count=0;self.last=None;self.first=None
+    def add(self,value,uptime_us,sample):
+        """Returns (mean, count, first sample, last sample, centre_us) of a completed bin, or None."""
+        value=_f32(value)
+        if not math.isfinite(value):return None
+        self.window=(self.window+[value])[-self.size:]
+        median=sorted(self.window)[(len(self.window)-1)//2]
+        bin_=uptime_us//self.period;done=None
+        if self.count and bin_!=self.bin:
+            done=(_f32(self.sum/self.count),self.count,self.first,self.last,self.bin*self.period+self.period//2)
+            self.sum=0.0;self.count=0;self.first=None
+        self.bin=bin_;self.sum+=median;self.count+=1;self.last=sample
         if self.first is None:self.first=sample
         return done
 
@@ -273,7 +314,22 @@ def resolve_recording(db,max_database_bytes=MAX_DATABASE_BYTES):
                     mapping=profile['mappings'][name];field,indices,kind,units=mapping[:4];options=_options(mapping)
                     stamp=sample['utc_timestamp_ms']
                     try:
-                        if int(fields['uptime_frequency_hz'])!=1000:raise ValueError('Uptime scale')
+                        if int(fields['uptime_frequency_hz'])!=options.get('uptime_hz',1000):raise ValueError('Uptime scale')
+                        if options.get('median_bin'):
+                            size,period=options['median_bin']
+                            box=boxcars.get(name)
+                            if box is None:box=boxcars[name]=[MedianBin(size,period),sensor]
+                            if box[1]!=sensor:box[0].reset();box[1]=sensor
+                            done=box[0].add(float(fields[field]),int(fields['uptime_ticks']),sample)
+                            if done:
+                                mean,count,first,last,centre_us=done
+                                # Dated at the bin centre, like the DAQ's packet.
+                                age_ms=int(last['fields']['uptime_ticks'])//1000-centre_us//1000
+                                stamp=last['utc_timestamp_ms']
+                                emit(name,None if stamp is None else stamp-age_ms,[mean if math.isfinite(mean) else None],last,
+                                     {'derived':'median_bin','median':size,'bin_us':period,'records':count,'source_sensor':last['sensor'],
+                                      'first_sd_sample_id':first['sample_id'],'last_sd_sample_id':last['sample_id']},last['ambiguous'])
+                            continue
                         if options.get('boxcar'):
                             # Accumulate every record whatever its clock; a bin is
                             # dated by its last record when it completes.

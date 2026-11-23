@@ -266,4 +266,91 @@ int main(void){
             sd._boxcar_ms([{'fields':['# calibration','loadcell_boxcar_ms=4']},{'fields':['# calibration','loadcell_boxcar_ms=5']}])
 
 
+
+def _daq_median_checkout():
+    """A DAQ-Board checkout whose network values are median bins (daq_median.h)."""
+    for parent in Path(__file__).resolve().parents:
+        header=parent/'DAQ-Board/Core/Inc/daq_median.h'
+        if header.is_file() and 'daq_bin_us_add' in header.read_text():
+            return parent/'DAQ-Board'
+    return None
+
+
+class LoadcellMedianBinTests(unittest.TestCase):
+    """SD backfill of KG1000/KG50 from microsecond raw records (profile daq-20261123)."""
+    tearDown=fixture.RecoveryTests.tearDown
+    def setUp(self):
+        fixture.RecoveryTests.setUp(self)
+        self.db.execute('DELETE FROM telemetry');self.db.commit()
+    def median_manifest(self):
+        schema={'types':[{'name':kind,'element':{'kind':'Static','data_type':'Float32','count':1}}
+                         for kind in ('KG1000','KG50')]}
+        return {'board_id':'DAQ-serial-1','boot_id':'boot1','stream_id':'raw','launch_session':'fire-1',
+            'mapping_profile':'daq-20261123','firmware_head':sd.DAQ_SD_HEAD_US,'selected_sensors':['kg1000_v','kg50_v'],
+            'config':{'schema':schema},'sensor_types':{},'assignment':{'sender_id':'DAQ','boot_and_session_verified':True,
+                'units_axes_calibration_verified':True,'start_utc_ms':BASE_UTC-10000,'end_utc_ms':BASE_UTC+600000,'max_gap_ms':60}}
+
+    def test_resolver_matches_the_daq_median_bins_bit_for_bit(self):
+        daq=_daq_median_checkout()
+        if daq is None:
+            self.skipTest('No DAQ-Board checkout with daq_median.h next to this GroundStation checkout')
+        # Production DAQ code: daq_median_add + daq_bin_us_add as the drain uses
+        # them (restarting KG50 when its input changes) and the SD raw formatter.
+        program=r"""
+#include "daq_median.h"
+#include "sd_raw_record_format.h"
+#include <stdio.h>
+#include <string.h>
+int main(void){
+ daq_median_t m1000,m50; daq_median_init(&m1000,3); daq_median_init(&m50,5);
+ daq_bin_us_t b1000={0},b50={0}; unsigned kg50_channel=1; daq_bin_out_t out;
+ sd_raw_format_cache_t cache={0};char line[256];uint32_t state=12345,seq=0;
+ for(unsigned frame=0;frame<6000;frame++){
+  const uint64_t frame_us=1000000000ULL+frame*1000ULL;
+  for(unsigned k=0;k<2;k++){
+   state^=state<<13;state^=state>>17;state^=state<<5;
+   const unsigned channel=k==0?0:(frame>=2000&&frame<4000?9:1);   /* P6 selected mid-run */
+   if(k==1&&frame%10>=8)continue;                                   /* temperature and aux slots */
+   const uint64_t t_us=frame_us+(k==0?288:620);
+   const int32_t code=(int32_t)(state>>8)-8388608;
+   const float volts=(float)code*2.4f/8388608.0f/(channel==9?16.0f:1.0f);
+   const char*name=channel==0?"kg1000_v":channel==1?"kg50_v":"kg50_p6_v";
+   const uint64_t ms=t_us/1000;
+   sd_format_csv_raw_record(line,sizeof line,1800000000000ULL+(ms-1000000),ms,t_us,1000000,name,code,volts,volts*2.0f,25.0f,7,++seq,&cache);
+   fputs(line,stdout);
+   uint32_t bits;
+   if(channel==0){
+    if(daq_bin_us_add(&b1000,daq_median_add(&m1000,volts),t_us,20000,&out)){memcpy(&bits,&out.mean,4);printf("#KG1000,%llu,%u\n",(unsigned long long)(out.centre_us/1000),bits);}
+   }else{
+    if(channel!=kg50_channel){b50=(daq_bin_us_t){0};daq_median_init(&m50,5);kg50_channel=channel;}
+    if(daq_bin_us_add(&b50,daq_median_add(&m50,volts),t_us,50000,&out)){memcpy(&bits,&out.mean,4);printf("#KG50,%llu,%u\n",(unsigned long long)(out.centre_us/1000),bits);}
+   }
+  }
+ }
+}
+"""
+        binary=Path(self.temp.name)/'daq-median'
+        subprocess.run(['cc','-std=c11','-O2','-I',str(daq/'Core/Inc'),'-x','c','-','-lm','-o',str(binary)],input=program.encode(),check=True)
+        output=[line.rstrip('\r') for line in subprocess.check_output([str(binary)]).decode().split('\n') if line]
+        daq_bins={}
+        for mark in (line for line in output if line.startswith('#')):
+            kind,uptime_ms,bits=mark[1:].split(',')
+            daq_bins.setdefault(kind,[]).append((BASE_UTC+int(uptime_ms)-1000000,int(bits)))
+        csv_rows=''.join(line+'\r\n' for line in output if not line.startswith('#'))
+        path=Path(self.temp.name)/'fire.csv'
+        path.write_bytes((HEADER+'# calibration,kg1000_slope=2.00000000e+00,loadcell_input=adc_volts,loadcell_report=median_bin\r\n'+csv_rows).encode())
+        sd.import_csv(self.db,path,self.median_manifest())
+        sd.resolve_recording(self.db)
+        resolved={}
+        for t,kind,values,provenance in [(t,k,json.loads(v),json.loads(p)) for t,k,v,p in self.db.execute(
+                'SELECT timestamp_ms,data_type,values_json,provenance_json FROM sd_replay_telemetry ORDER BY id')]:
+            self.assertEqual(provenance['mapping']['derived'],'median_bin')
+            resolved.setdefault(kind,[]).append((t,struct.unpack('<I',struct.pack('<f',values[0]))[0]))
+        self.assertGreater(len(daq_bins['KG1000']),290)
+        self.assertGreater(len(daq_bins['KG50']),100)
+        # Every bin the DAQ closed: value bits, dated at the bin centre.
+        self.assertEqual(resolved['KG1000'],daq_bins['KG1000'])
+        self.assertEqual(resolved['KG50'],daq_bins['KG50'])
+
+
 if __name__=='__main__':unittest.main()

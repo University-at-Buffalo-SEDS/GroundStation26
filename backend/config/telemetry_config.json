@@ -905,12 +905,12 @@
     },
     {
       "name": "DAQ_INPUT_HEALTH",
-      "doc": "DAQ live input faults; layout in daq_input_health.rs. Warnings only.",
+      "doc": "DAQ live input faults (v2: noise/drift, excitation, frame-engine counters); layout in daq_input_health.rs. Warnings only.",
       "class": "Data",
       "element": {
         "kind": "Static",
         "data_type": "UInt32",
-        "count": 10
+        "count": 18
       },
       "endpoints": [
         "GROUND_STATION"
