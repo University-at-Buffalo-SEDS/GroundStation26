@@ -32,7 +32,7 @@ CEA = [  # (of, pc, h cal/mol, abs mass fraction)
     (2.0, 1.0e5, 15000.0, 0.0), (3.3, 2.2e6, 16300.0, 0.1), (5.0, 1.0e6, 16900.0, 0.0), (7.25, 3.0e6, 16500.0, 0.2),
     (9.5, 4.0e6, 18600.0, 0.05), (30.0, 2e6, 17100.0, 0.6), (150.0, 9e6, 19000.0, 1.0)]
 ENTHALPY_T = [230.0, 260.0, 275.0, 293.15, 303.0]
-GRAIN_W = [0.0, 0.001, 0.004, 0.008, 0.012, 0.016, 0.0185, 0.0205, 0.03]
+GRAIN_W = [0.0, 0.001, 0.004, 0.008, 0.0085, 0.012, 0.016, 0.0185, 0.025, 0.029, 0.031]
 NOZZLE = [  # (gamma, eps, pc, pa)
     (1.2, 4.9, 2.5e6, 1.0e5), (1.2, 4.9, 2.5e6, 2.0e4), (1.15, 4.9, 4.0e5, 1.0e5), (1.25, 1.36, 8.0e5, 1.0e5),
     (1.2, 4.9, 1.5e5, 1.0e5), (1.2, 8.0, 1.0e6, 1.0e5),
@@ -40,8 +40,8 @@ NOZZLE = [  # (gamma, eps, pc, pa)
 BURNS = [  # (name, grain, fill reading kg, tank C or None = saturated at tank psig, tank psig, supercharge psig, ambient Pa)
     ('fire_20261116', 'cylindrical_preset', 5.65, None, 404.1, 0.0, 99000.0),
     ('fill_8kg_20C_cylinder', 'cylindrical_preset', 8.0, 20.0, None, 0.0, 101325.0),
-    ('fill_8kg_20C_star', 'star_placeholder', 8.0, 20.0, None, 0.0, 101325.0),
-    ('fill_7kg_10C_supercharged_star', 'star_placeholder', 7.0, 10.0, None, 750.0, 90000.0),
+    ('fill_8kg_20C_star', 'star_stl', 8.0, 20.0, None, 0.0, 101325.0),
+    ('fill_7kg_10C_supercharged_star', 'star_stl', 7.0, 10.0, None, 750.0, 90000.0),
     ('fill_4kg_cold_altitude_cylinder', 'cylindrical_preset', 4.0, -5.0, None, 0.0, 30000.0),
 ]
 SAMPLE_T = [0.05, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
@@ -85,7 +85,8 @@ def build():
         g = data.grain(hm.grain_config(spec, name))
         out['grains'].append({'name': name, 'w_max': r(g.w_max), 'mass': r(g.mass), 'abs_mass': r(g.abs_mass),
                               'at': [{'w': w, 'area': r(g.at(w)[0]), 'perim': r(g.at(w)[1]), 'abs_share': r(g.at(w)[2]),
-                                      'mass_burned': r(g.mass_burned(w))} for w in GRAIN_W]})
+                                      'mass_burned': r(g.mass_burned(w)), 'liner_exposed': r(g.wall_fraction(w))}
+                                     for w in GRAIN_W]})
     for g, eps, pc, pa in NOZZLE:
         cf, e = hm.thrust_coefficient(g, eps, pc, pa, p['eta_nozzle'])
         cea_cf = hm.nozzle_cf(1.55, 0.06, g, eps, pc, pa, p['eta_nozzle'])

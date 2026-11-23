@@ -401,9 +401,18 @@ class Grain:
                         lo = mid
                 self.core = [(self.rt - self.fil, 0.0), (0.5 * (lo + hi), half)]
         self.w_max = self.r_out - self.r_min
+        if self.n:
+            # the last fuel burns where the OD is farthest from the outline (between the tips, at the valley
+            # angle): offset fronts close a sharp valley faster than its radial depth
+            half = math.pi / self.n
+            self.w_max = max(self._dist_core(self.r_out * math.cos(half * j / 2000), self.r_out * math.sin(half * j / 2000))
+                             for j in range(2001)) - self.fil + 1e-9
+        # web at which the outline first touches the OD (the star tips; the whole port for a circle)
+        self.w_tip = self.r_out - (self.rt if self.n else self.r0)
         self._tabulate()
 
     def abs_share_at(self, r):
+        """The print profile at radius r of the preset (circular-port) grain."""
         if self.prof_edges is None:
             return self.abs_uniform
         e = self.prof_edges
@@ -413,6 +422,19 @@ class Grain:
             return self.prof_share[-1]
         i = min(bisect.bisect_right(e, r) - 1, len(self.prof_share) - 1)
         return self.prof_share[i]
+
+    def abs_share(self, d_in, d_out):
+        """ABS share of the printed matrix at distance d_in from the initial port outline and d_out from the OD.
+        The print's inner wall follows the port outline (a star here), its outer wall the OD and the gyroid fills
+        between: the preset profile read from the nearer wall. For the circular preset grain this is exactly
+        the radial profile."""
+        if self.prof_edges is None:
+            return self.abs_uniform
+        r0, r1 = self.prof_edges[0], self.prof_edges[-1]
+        half = 0.5 * (r1 - r0)
+        if d_in <= d_out:
+            return self.abs_share_at(r0 + min(d_in, half))
+        return self.abs_share_at(r1 - min(d_out, half))
 
     def _dist_core(self, x, y):
         """Distance from (x, y) to the core star polygon region (0 inside), using the sector symmetry."""
@@ -463,6 +485,8 @@ class Grain:
         radii = [[min(self.boundary_r(th, w), self.r_out) for th in thetas] for w in self.w]
         dth = span / len(thetas)
         self.area = [0.5 * sum(r * r for r in row) * dth for row in radii]
+        # share of the OD wall (liner) uncovered by fuel: the angles where the front has reached the OD
+        self.wall = [sum(1 for th in thetas if self.boundary_r(th, w) >= self.r_out) / len(thetas) for w in self.w]
         # ABS share of the material burned between w[i] and w[i+1] (area-weighted over the shell)
         self.abs_shell = []
         for i in range(n_w):
@@ -472,9 +496,11 @@ class Grain:
                     continue
                 k = 6
                 for s in range(k):
-                    r = a + (b - a) * (s + 0.5) / k
+                    u = (s + 0.5) / k
+                    r = a + (b - a) * u
                     da = r * (b - a) / k
-                    num += self.abs_share_at(r) * da
+                    d_in = self.w[i] + (self.w[i + 1] - self.w[i]) * u
+                    num += self.abs_share(d_in, self.r_out - r) * da
                     den += da
             self.abs_shell.append(num / den if den > 0 else 0.0)
         # perimeter = dA/dw at the nodes (central differences, one-sided at the ends)
@@ -500,6 +526,14 @@ class Grain:
         a = self.area[i] + (self.area[i + 1] - self.area[i]) * u
         p = self.perim[i] + (self.perim[i + 1] - self.perim[i]) * u
         return a, max(p, 0.0), self.abs_shell[i]
+
+    def wall_fraction(self, w):
+        """Share of the OD (chamber liner) exposed to the flame at web w."""
+        if w >= self.w_max:
+            return 1.0
+        x = w / self.w_max * self.N_W
+        i = min(int(x), self.N_W - 1)
+        return self.wall[i] + (self.wall[i + 1] - self.wall[i]) * (x - i)
 
     def mass_burned(self, w):
         if w >= self.w_max:
@@ -723,7 +757,8 @@ class HybridMotor:
             cf = nozzle_cf(row[2], row[3], row[1], self.eps, pc, ambient_pa, p['eta_nozzle'])
             thrust = max(cf * pc * math.pi / 4.0 * self.dt_throat ** 2, 0.0)
         out.update(thrust=thrust, pc=pc, mdot_ox=n2o, mdot_n2=n2, mdot_f=fr[0], of=of, liquid=liquid,
-                   abs_frac=fr[1], web=self.w, port_area=self.grain.at(self.w)[0])
+                   abs_frac=fr[1], web=self.w, port_area=self.grain.at(self.w)[0],
+                   liner_exposed=self.grain.wall_fraction(self.w))
         if liquid:
             vap_before = self.m - self.liquid_volume() * rho_l(self.T)
             self.m -= n2o * dt
@@ -755,7 +790,7 @@ def simulate(p: dict, data: ModelData, fill_kg: float, tank_c: float, supercharg
              ambient_pa: float = ATM, dt: float = 0.01) -> dict:
     """Run a burn to the end. Returns the time series (lists) and a summary."""
     m = HybridMotor(p, data, fill_kg, tank_c, supercharge_psig, ambient_pa)
-    keys = ['t', 'thrust', 'pc', 'p_tank', 'T_tank', 'mdot_ox', 'mdot_f', 'of', 'm_n2o', 'abs_frac', 'web']
+    keys = ['t', 'thrust', 'pc', 'p_tank', 'T_tank', 'mdot_ox', 'mdot_f', 'of', 'm_n2o', 'abs_frac', 'web', 'liner_exposed']
     series = {k: [] for k in keys}
     series['prop_left'] = []
     series['cg_from_aft'] = []
@@ -768,6 +803,7 @@ def simulate(p: dict, data: ModelData, fill_kg: float, tank_c: float, supercharg
         series['cg_from_aft'].append(prop_cg(m))
         if liquid_end is None and not o['liquid'] and m.t > p['ignition_delay_s']:
             liquid_end = o['t']
+    tip_t = next((t for t, w in zip(series['t'], series['web']) if w >= m.grain.w_tip - 1e-12), None)
     for k in keys:
         series[k].append(0.0 if k in ('thrust', 'mdot_ox', 'mdot_f') else series[k][-1])
     series['t'][-1] = m.t
@@ -791,6 +827,12 @@ def simulate(p: dict, data: ModelData, fill_kg: float, tank_c: float, supercharg
         'fuel_initial_kg': m.fuel0,
         'mean_of': m.ox_out / m.fuel_burned if m.fuel_burned > 0 else 0.0,
         'web_burned_m': m.w,
+        # liner exposure (thermal): the outline first reaches the OD (star tips) and how long the burn
+        # (thrust above 5 % of peak) continues after it; the fuel left is the unburned sliver
+        'tip_burnthrough_s': tip_t if tip_t is not None else -1.0,
+        'liner_exposed_s': max(off - tip_t, 0.0) if tip_t is not None else 0.0,
+        'liner_exposed_frac_end': series['liner_exposed'][-1],
+        'sliver_kg': m.fuel0 - m.fuel_burned,
         'peak_pc_pa': max(s['pc']),
         'isp_s': imp / ((m.ox_out + m.fuel_burned) * G0) if m.ox_out > 0 else 0.0,
     }

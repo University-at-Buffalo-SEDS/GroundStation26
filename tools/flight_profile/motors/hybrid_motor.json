@@ -1,5 +1,5 @@
 {
-  "_about": "Hybrid motor model spec (docs/hybrid-motor-model.md) for tools/flight_profile/hybrid_motor.py and its ports (GS backend/src/apogee_planner/hybrid.rs, FirmwareSimulator src/bay/hybrid_motor.rs). Geometry comes from the team's motor design preset (motor_design/current_single_port_baseline.preset.yaml); 'assumed' marks numbers Rylan should replace; grains holds the port geometries (the 2026-11-16 fire burned the cylindrical preset grain; the flight grain is a star whose dimensions are PLACEHOLDERS until Rylan gives them). 'calibrated' holds what hybrid_calibrate.py fitted to the accepted archive fires; it overrides the model priors. After editing: hybrid_calibrate.py, then hybrid_vectors.py, then copy to backend/src/apogee_planner/model/ and FirmwareSimulator.",
+  "_about": "Hybrid motor model spec (docs/hybrid-motor-model.md) for tools/flight_profile/hybrid_motor.py and its ports (GS backend/src/apogee_planner/hybrid.rs, FirmwareSimulator src/bay/hybrid_motor.rs). Geometry comes from the team's motor design preset (motor_design/current_single_port_baseline.preset.yaml); 'assumed' marks numbers Rylan should replace; grains holds the port geometries (the 2026-11-16 fire burned the cylindrical preset grain; the flight grain is the star of motor_design/star_grain.stl). 'calibrated' holds what hybrid_calibrate.py fitted to the accepted archive fires; it overrides the model priors. After editing: hybrid_calibrate.py, then hybrid_vectors.py, then copy to backend/src/apogee_planner/model/ and FirmwareSimulator.",
   "geometry": {
     "tank_volume_l": {
       "value": 15.8537,
@@ -185,61 +185,61 @@
         "source": "motors/sweet_v6_grain.json: ABS share vs radius from the voxelised print (hybrid_preset.py), scaled to the preset 0.188 kg of ABS"
       }
     },
-    "star_placeholder": {
-      "_about": "PLACEHOLDER star port for the flight grain (the team is switching to a star grain; Rylan to supply the dimensions). Same length, OD and materials as the preset; 6 points with about the preset initial port area. Replace every value marked PLACEHOLDER.",
+    "star_stl": {
+      "_about": "The flight grain: the 10-point star of motor_design/star_grain.stl (prismatic, sharp straight-sided points). The tips reach the OD after 8.2 mm of web, the valleys after 29.8 mm. Same material as the preset grain (Rylan 2026-11-23): a printed ABS gyroid infill filled with paraffin; only the port differs. The print's ABS share is remapped onto the star: its inner wall follows the star outline, its outer wall the OD, the gyroid between (hybrid_motor.py Grain.abs_share).",
       "port_shape": {
         "value": "star",
         "unit": "-",
-        "source": "PLACEHOLDER"
+        "source": "motor_design/star_grain.stl (from Rylan 2026-11-23; hybrid_stl.py slices it: area 1345.7 mm^2 and perimeter 451.1 mm, reproduced exactly by this straight-sided star)"
       },
       "star_points": {
-        "value": 6,
+        "value": 10,
         "unit": "-",
-        "source": "PLACEHOLDER"
+        "source": "motor_design/star_grain.stl (from Rylan 2026-11-23; hybrid_stl.py slices it: area 1345.7 mm^2 and perimeter 451.1 mm, reproduced exactly by this straight-sided star)"
       },
       "star_tip_radius_m": {
-        "value": 0.032,
+        "value": 0.03429,
         "unit": "m",
-        "source": "PLACEHOLDER"
+        "source": "motor_design/star_grain.stl (from Rylan 2026-11-23; hybrid_stl.py slices it: area 1345.7 mm^2 and perimeter 451.1 mm, reproduced exactly by this straight-sided star): 1.35 in"
       },
       "star_root_radius_m": {
-        "value": 0.0204,
+        "value": 0.0127,
         "unit": "m",
-        "source": "PLACEHOLDER: about the preset initial port area (2.03e-3 m^2) with the tip fillet"
+        "source": "motor_design/star_grain.stl (from Rylan 2026-11-23; hybrid_stl.py slices it: area 1345.7 mm^2 and perimeter 451.1 mm, reproduced exactly by this straight-sided star): 0.50 in"
       },
       "star_tip_fillet_m": {
-        "value": 0.0015,
+        "value": 0.0,
         "unit": "m",
-        "source": "PLACEHOLDER"
+        "source": "motor_design/star_grain.stl (from Rylan 2026-11-23; hybrid_stl.py slices it: area 1345.7 mm^2 and perimeter 451.1 mm, reproduced exactly by this straight-sided star): sharp"
       },
       "grain_length_m": {
-        "value": 0.3302,
+        "value": 0.2032,
         "unit": "m",
-        "source": "PLACEHOLDER: the preset length"
+        "source": "motor_design/star_grain.stl (from Rylan 2026-11-23; hybrid_stl.py slices it: area 1345.7 mm^2 and perimeter 451.1 mm, reproduced exactly by this straight-sided star): 8 in"
       },
       "grain_od_m": {
-        "value": 0.0849884,
+        "value": 0.08499,
         "unit": "m",
-        "source": "PLACEHOLDER: the preset OD"
+        "source": "motor_design/star_grain.stl (from Rylan 2026-11-23; hybrid_stl.py slices it: area 1345.7 mm^2 and perimeter 451.1 mm, reproduced exactly by this straight-sided star)"
       },
       "paraffin_rho": {
         "value": 900.0,
         "unit": "kg/m^3",
-        "source": "preset: motor_design/current_single_port_baseline.preset.yaml (\"Current single-port motor baseline\", fingerprint 19dab2f3...)"
+        "source": "preset (same material, Rylan 2026-11-23)"
       },
       "abs_rho": {
         "value": 1020.0,
         "unit": "kg/m^3",
-        "source": "preset: motor_design/current_single_port_baseline.preset.yaml (\"Current single-port motor baseline\", fingerprint 19dab2f3...)"
+        "source": "preset (same material, Rylan 2026-11-23)"
       },
       "abs_profile": {
         "value": "gyroid_print",
         "unit": "-",
-        "source": "assumed: the same printed gyroid matrix, ABS share as a function of radius (the print field cannot be remapped to an unknown star print)"
+        "source": "Rylan 2026-11-23: same ABS gyroid infill filled with paraffin as the preset grain; motors/sweet_v6_grain.json remapped by distance from the port outline and the OD (the axial pattern repeats, so the 203.2 mm length takes the same profile)"
       }
     }
   },
-  "flight_grain": "star_placeholder",
+  "flight_grain": "star_stl",
   "fire_grain_default": "cylindrical_preset",
   "calibrated": {
     "values": {

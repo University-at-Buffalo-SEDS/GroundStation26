@@ -445,7 +445,11 @@ pub struct Grain {
     pub cfg: GrainCfg,
     pub r_out: f64,
     pub w_max: f64,
+    /// Web at which the outline first touches the OD (the star tips; the whole port for a circle).
+    pub w_tip: f64,
     core: (f64, f64),
+    /// Share of the OD (chamber liner) exposed at each table web.
+    pub wall: Vec<f64>,
     pub area: Vec<f64>,
     pub perim: Vec<f64>,
     pub abs_shell: Vec<f64>,
@@ -465,7 +469,9 @@ impl Grain {
             cfg: cfg.clone(),
             r_out,
             w_max: r_out - r_min,
+            w_tip: r_out - if cfg.star_points == 0 { cfg.port_d_m / 2.0 } else { cfg.star_tip_radius_m },
             core: (cfg.star_tip_radius_m - cfg.star_tip_fillet_m, cfg.star_root_radius_m),
+            wall: Vec::new(),
             area: Vec::new(),
             perim: Vec::new(),
             abs_shell: Vec::new(),
@@ -486,6 +492,15 @@ impl Grain {
                 }
             }
             g.core.1 = 0.5 * (lo + hi);
+        }
+        if cfg.star_points > 0 {
+            // the last fuel burns where the OD is farthest from the outline (the Python Grain)
+            let half = std::f64::consts::PI / cfg.star_points as f64;
+            let far = (0..=2000).map(|j| {
+                let th = half * j as f64 / 2000.0;
+                g.dist_core(r_out * th.cos(), r_out * th.sin())
+            });
+            g.w_max = far.fold(0.0, f64::max) - cfg.star_tip_fillet_m + 1e-9;
         }
         g.tabulate(profile);
         g
@@ -543,7 +558,19 @@ impl Grain {
         let radii: Vec<Vec<f64>> = ws.iter().map(|w| thetas.iter().map(|th| self.boundary_r(*th, *w).min(self.r_out)).collect()).collect();
         let dth = 2.0 * std::f64::consts::PI / thetas.len() as f64;
         self.area = radii.iter().map(|row| 0.5 * row.iter().map(|r| r * r).sum::<f64>() * dth).collect();
-        let share = |r: f64| profile.map(|p| p.at(r)).unwrap_or(0.0);
+        self.wall = ws.iter().map(|w| thetas.iter().filter(|th| self.boundary_r(**th, *w) >= self.r_out).count() as f64 / thetas.len() as f64).collect();
+        // ABS share at distance d_in from the initial port outline and d_out from the OD: the print's inner wall
+        // follows the port outline, its outer wall the OD, the gyroid fills between (the Python `abs_share`).
+        let r_out = self.r_out;
+        let share = |d_in: f64, d_out: f64| {
+            profile
+                .map(|p| {
+                    let (r0, r1) = (p.edges[0], p.edges[p.edges.len() - 1]);
+                    let half = 0.5 * (r1 - r0);
+                    if d_in <= d_out { p.at(r0 + d_in.min(half)) } else { p.at(r1 - d_out.min(half)) }
+                })
+                .unwrap_or(0.0)
+        };
         self.abs_shell = (0..n_w)
             .map(|i| {
                 let (mut num, mut den) = (0.0, 0.0);
@@ -553,9 +580,11 @@ impl Grain {
                     }
                     let k = 6;
                     for s in 0..k {
-                        let r = a + (b - a) * (s as f64 + 0.5) / k as f64;
+                        let u = (s as f64 + 0.5) / k as f64;
+                        let r = a + (b - a) * u;
                         let da = r * (b - a) / k as f64;
-                        num += share(r) * da;
+                        let d_in = ws[i] + (ws[i + 1] - ws[i]) * u;
+                        num += share(d_in, r_out - r) * da;
                         den += da;
                     }
                 }
@@ -585,6 +614,16 @@ impl Grain {
         let a = self.area[i] + (self.area[i + 1] - self.area[i]) * u;
         let p = self.perim[i] + (self.perim[i + 1] - self.perim[i]) * u;
         (a, p.max(0.0), self.abs_shell[i])
+    }
+
+    /// Share of the OD (chamber liner) exposed to the flame at web `w`.
+    pub fn wall_fraction(&self, w: f64) -> f64 {
+        if w >= self.w_max {
+            return 1.0;
+        }
+        let x = w / self.w_max * GRAIN_N_W as f64;
+        let i = (x as usize).min(GRAIN_N_W - 1);
+        self.wall[i] + (self.wall[i + 1] - self.wall[i]) * (x - i as f64)
     }
 
     pub fn mass_burned(&self, w: f64) -> f64 {
@@ -783,6 +822,7 @@ pub struct Sample {
     pub of: f64,
     pub abs_frac: f64,
     pub web: f64,
+    pub liner_exposed: f64,
     pub liquid: bool,
 }
 
@@ -1007,6 +1047,7 @@ impl Motor {
         out.mdot_f = fr.0;
         out.of = of;
         out.abs_frac = fr.1;
+        out.liner_exposed = self.grain.wall_fraction(self.w);
         out.liquid = liquid;
         if liquid {
             let vap_before = self.m - self.liquid_volume() * rho_l(self.temp);
@@ -1076,6 +1117,12 @@ pub struct Summary {
     pub fuel_initial_kg: f64,
     pub mean_of: f64,
     pub web_burned_m: f64,
+    /// Liner exposure (thermal): when the outline first reaches the OD, how long the burn (thrust above 5 % of
+    /// peak) continues after it (-1 / 0 when it never does), the exposed share at the end, the unburned sliver.
+    pub tip_burnthrough_s: f64,
+    pub liner_exposed_s: f64,
+    pub liner_exposed_frac_end: f64,
+    pub sliver_kg: f64,
     pub peak_pc_pa: f64,
     pub isp_s: f64,
 }
@@ -1127,7 +1174,12 @@ pub fn simulate(p: &Params, data: &ModelData, fill_kg: f64, tank_c: f64, superch
     let peak = s.iter().map(|x| x.thrust).fold(0.0, f64::max);
     let on = s.iter().find(|x| x.thrust >= 0.05 * peak).map(|x| x.t).unwrap_or(0.0);
     let off = s.iter().rev().find(|x| x.thrust >= 0.05 * peak).map(|x| x.t).unwrap_or(0.0);
+    let tip = s.iter().find(|x| x.web >= m.grain.w_tip - 1e-12).map(|x| x.t);
     b.summary = Summary {
+        tip_burnthrough_s: tip.unwrap_or(-1.0),
+        liner_exposed_s: tip.map(|t| (off - t).max(0.0)).unwrap_or(0.0),
+        liner_exposed_frac_end: s.last().map(|x| x.liner_exposed).unwrap_or(0.0),
+        sliver_kg: m.fuel0 - m.fuel_burned,
         impulse_ns: imp,
         peak_thrust_n: peak,
         burn_time_s: off - on,
@@ -1144,6 +1196,18 @@ pub fn simulate(p: &Params, data: &ModelData, fill_kg: f64, tank_c: f64, superch
         isp_s: if m.ox_out > 0.0 { imp / ((m.ox_out + m.fuel_burned) * G0) } else { 0.0 },
     };
     b
+}
+
+/// Quasi-steady liquid N2O flow (kg/s) of the burning motor for a tank at `tank_pa` absolute whose N2O is
+/// saturated at `sat_pa` (the rest is nitrogen pad): the feed, injector and chamber solved together, with
+/// the grain at its initial port. For plants that keep their own tank model (the HITL ground plant).
+pub fn ox_flow_at(p: &Params, data: &ModelData, tank_pa: f64, sat_pa: f64, ambient_pa: f64) -> f64 {
+    let temp = tsat(sat_pa.max(psat(T_MIN) * 1.01));
+    let cap = (rho_l(temp) * 0.5 + rho_v(temp) * 0.5) * p.tank_volume_l / 1000.0;
+    let mut m = Motor::new(p, data, cap / p.fill_scale.max(1e-6), temp - 273.15, 0.0, ambient_pa);
+    m.mn = (tank_pa - psat(temp)).max(0.0) * m.ullage() / (R_N2 * temp);
+    m.t = p.ignition_delay_s;
+    m.step(data, 1e-3, ambient_pa).mdot_ox
 }
 
 /// Linear interpolation of (ts, ys) at t, clamped at the ends.
@@ -1304,6 +1368,7 @@ mod tests {
                 close(p + 1e-12, x["perim"].as_f64().unwrap() + 1e-12, 1e-7, &format!("{name} perimeter w={w}"));
                 close(f + 1e-12, x["abs_share"].as_f64().unwrap() + 1e-12, 1e-8, &format!("{name} abs w={w}"));
                 close(gr.mass_burned(w), x["mass_burned"].as_f64().unwrap(), 1e-8, "mass burned");
+                close(gr.wall_fraction(w) + 1e-12, x["liner_exposed"].as_f64().unwrap() + 1e-12, 1e-9, "liner exposed");
             }
         }
     }
@@ -1340,8 +1405,10 @@ mod tests {
             let sm = &burn.summary;
             for (k, mine) in [("impulse_ns", sm.impulse_ns), ("peak_thrust_n", sm.peak_thrust_n), ("burn_time_s", sm.burn_time_s), ("end_s", sm.end_s),
                 ("liquid_end_s", sm.liquid_end_s), ("ox_used_kg", sm.ox_used_kg), ("fuel_used_kg", sm.fuel_used_kg), ("abs_used_kg", sm.abs_used_kg),
-                ("peak_pc_pa", sm.peak_pc_pa), ("isp_s", sm.isp_s), ("web_burned_m", sm.web_burned_m)] {
-                close(mine, s[k].as_f64().unwrap(), 1e-6, &format!("{name} {k}"));
+                ("peak_pc_pa", sm.peak_pc_pa), ("isp_s", sm.isp_s), ("web_burned_m", sm.web_burned_m), ("tip_burnthrough_s", sm.tip_burnthrough_s + 10.0),
+                ("liner_exposed_s", sm.liner_exposed_s + 10.0), ("sliver_kg", sm.sliver_kg)] {
+                let want = s[k].as_f64().unwrap() + if k.starts_with("tip_") || k.starts_with("liner_exposed_s") { 10.0 } else { 0.0 };
+                close(mine, want, 1e-6, &format!("{name} {k}"));
             }
             for x in b["samples"].as_array().unwrap() {
                 let t = x["t"].as_f64().unwrap();
@@ -1365,7 +1432,13 @@ mod tests {
         close(b.summary.burn_time_s, 5.65, 0.15, "burn time");
         close(b.summary.liquid_end_s, 3.0, 0.15, "liquid phase (tank-pressure knee)");
         let csv = include_str!("model/testfire_20261116.csv");
-        let (mt, mf) = super::super::flight::parse_curve(csv);
+        let (mt, mf): (Vec<f64>, Vec<f64>) = csv
+            .lines()
+            .filter_map(|l| {
+                let (a, b) = l.split_once(',')?;
+                Some((a.trim().parse::<f64>().ok()?, b.trim().parse::<f64>().ok()?))
+            })
+            .unzip();
         let (t, f) = (b.times(), b.thrust());
         let (mut se, mut n) = (0.0, 0.0);
         for (tm, fm) in mt.iter().zip(&mf) {
