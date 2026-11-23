@@ -246,7 +246,7 @@ pub(crate) fn is_retired(router: &Router, packet_id: u64) -> bool {
 /// The radio writer's check: true for a canonical ABORT frame whose packet id
 /// was retired. Such a copy must be dropped, never written.
 pub(crate) fn suppress_write(payload: &[u8]) -> bool {
-    if RETIRED.load(Ordering::Acquire) == 0 || payload.starts_with(b"SDT") {
+    if RETIRED.load(Ordering::Acquire) == 0 || sedsnet::side_peek::is_side_transport_frame(payload) {
         // Reliable end-to-end frames are never SDT-compacted by the SDK.
         return false;
     }

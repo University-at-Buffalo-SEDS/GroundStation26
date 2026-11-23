@@ -33,7 +33,7 @@ const TIME_SYNC_PRIORITY: u8 = crate::comms::RADIO_TIME_SYNC_PRIORITY;
 /// frames when no heartbeat install is still waiting ahead of it.
 fn liveness_compact_index<'a>(frames: impl Iterator<Item = (u8, &'a [u8])>, tag: u8) -> Option<usize> {
     for (index, (priority, bytes)) in frames.enumerate() {
-        if priority != tag || !bytes.starts_with(b"SDT") {
+        if priority != tag || !sedsnet::side_peek::is_side_transport_frame(bytes) {
             continue;
         }
         return Some(index);
@@ -43,7 +43,7 @@ fn liveness_compact_index<'a>(frames: impl Iterator<Item = (u8, &'a [u8])>, tag:
 
 fn radio_transport_priority(priority: u8, payload: &[u8]) -> u8 {
     if (priority == 254
-        && !payload.starts_with(b"SDT")
+        && !sedsnet::side_peek::is_side_transport_frame(payload)
         && serialize::peek_frame_info_unchecked(payload)
             .is_ok_and(|info| !sedsnet::discovery::is_discovery_type(info.envelope.ty)))
         || is_abort_frame(payload)
@@ -71,7 +71,7 @@ pub(crate) fn radio_abort_frame_for_test(payload: &[u8]) -> bool {
 /// (including MANAGED_VARIABLE_REQUEST) and LEAVE are excluded.
 #[cfg(test)]
 fn must_not_starve(payload: &[u8]) -> bool {
-    !payload.starts_with(b"SDT")
+    !sedsnet::side_peek::is_side_transport_frame(payload)
         && must_not_starve_type(
             serialize::peek_frame_info_unchecked(payload)
                 .ok()
@@ -127,7 +127,7 @@ fn is_protected_type(ty: Option<sedsnet::config::DataType>) -> bool {
 /// Compact SDT frames and discovery keep their priority. Radio only; the
 /// result is what the writer and `complete` see, so accounting stays exact.
 fn radio_lane_priority(priority: u8, payload: &[u8]) -> u8 {
-    if payload.starts_with(b"SDT") {
+    if sedsnet::side_peek::is_side_transport_frame(payload) {
         return priority;
     }
     // CRC-checked: only a real canonical frame changes lane.
@@ -150,7 +150,7 @@ fn radio_lane_priority(priority: u8, payload: &[u8]) -> u8 {
 /// writer's control lane.
 fn urgent_control(payload: &[u8]) -> bool {
     is_abort_frame(payload)
-        || (!payload.starts_with(b"SDT")
+        || (!sedsnet::side_peek::is_side_transport_frame(payload)
             && serialize::peek_frame_info_unchecked(payload).is_ok_and(|info| {
                 let ty = info.envelope.ty;
                 !own_retransmit(payload)
@@ -164,7 +164,7 @@ fn urgent_control(payload: &[u8]) -> bool {
 /// sync go before them so the far side stops retransmitting.
 fn own_retransmit(payload: &[u8]) -> bool {
     use sedsnet::config::DataType;
-    !payload.starts_with(b"SDT")
+    !sedsnet::side_peek::is_side_transport_frame(payload)
         && serialize::peek_frame_info_unchecked(payload).is_ok_and(|info| {
             let ty = info.envelope.ty;
             ty == crate::telemetry_schema::data_type("BOARD_RECOVERY_REQUEST")
@@ -182,7 +182,7 @@ fn is_operator_control_type(ty: sedsnet::config::DataType) -> bool {
 const PROTECTED_ORDINARY_HEADROOM: usize = 128;
 
 fn is_managed_variable_request(payload: &[u8]) -> bool {
-    !payload.starts_with(b"SDT")
+    !sedsnet::side_peek::is_side_transport_frame(payload)
         && serialize::peek_frame_info_unchecked(payload).is_ok_and(|info| {
             info.envelope.ty == sedsnet::config::DataType::ManagedVariableRequest
         })
@@ -205,7 +205,7 @@ fn station_answered_request(payload: &[u8]) -> bool {
 const SETTINGS_TURN_MS: u64 = 1_000;
 
 fn is_delivery_receipt(payload: &[u8]) -> bool {
-    !payload.starts_with(b"SDT")
+    !sedsnet::side_peek::is_side_transport_frame(payload)
         && serialize::peek_frame_info_unchecked(payload).is_ok_and(|info| {
             matches!(
                 info.envelope.ty,
@@ -236,7 +236,7 @@ fn receipt_key(payload: &[u8]) -> Option<u64> {
 fn uses_command_reserve(priority: u8, payload: &[u8]) -> bool {
     priority >= 200
         && priority != 254
-        && !payload.starts_with(b"SDT")
+        && !sedsnet::side_peek::is_side_transport_frame(payload)
         && !serialize::peek_frame_info_unchecked(payload)
             .is_ok_and(|info| sedsnet::discovery::is_discovery_type(info.envelope.ty))
 }
@@ -590,13 +590,11 @@ impl TxQueueBudget {
         let time_sync = |ty: DataType| {
             matches!(ty, DataType::TimeSyncAnnounce | DataType::TimeSyncRequest | DataType::TimeSyncResponse)
         };
-        if payload.starts_with(b"SDT") {
-            let body = sdt_body(payload)?;
-            if payload.get(3) != Some(&2) {
+        if sedsnet::side_peek::is_side_transport_frame(payload) {
+            if !sedsnet::side_peek::is_side_compact_frame(payload) {
                 return None;
             }
-            let mut off = 1;
-            let template = sdt_template_id(body, &mut off)?;
+            let template = sedsnet::side_peek::side_template_id(payload)?;
             return self
                 .recovery_classifier
                 .peek_type(payload)
@@ -620,13 +618,8 @@ impl TxQueueBudget {
     /// since later compact frames depend on it.
     fn replaceable_install(&self, payload: &[u8]) -> Option<u64> {
         use sedsnet::config::DataType;
-        if !payload.starts_with(b"SDT\x01") {
-            return None;
-        }
-        let body = sdt_body(payload)?;
-        let mut off = 0;
-        let template = sdt_template_id(body, &mut off)?;
-        let info = serialize::peek_frame_info(body.get(off..)?).ok()?;
+        let (template, frame) = sedsnet::side_peek::side_full_frame(payload)?;
+        let info = serialize::peek_frame_info(&frame).ok()?;
         let ty = info.envelope.ty;
         let best_effort = info.reliable.is_none()
             && info.envelope.target_senders.is_empty()
@@ -833,7 +826,7 @@ impl TxQueueBudget {
         }
         let priority = radio_transport_priority(priority, payload);
         let priority = if self.short_lookahead { radio_lane_priority(priority, payload) } else { priority };
-        let sdt_type = (self.short_lookahead && payload.starts_with(b"SDT"))
+        let sdt_type = (self.short_lookahead && sedsnet::side_peek::is_side_transport_frame(payload))
             .then(|| self.recovery_classifier.peek_type(payload))
             .flatten();
         let priority = match sdt_type {
@@ -878,7 +871,7 @@ impl TxQueueBudget {
         // the same transmission. SDT frames are never compared: identical
         // compact bytes are distinct frames of a stateful stream.
         if self.short_lookahead
-            && !payload.starts_with(b"SDT")
+            && !sedsnet::side_peek::is_side_transport_frame(payload)
             && self.parked.lock().unwrap().iter().any(|p| p.bytes == payload)
         {
             self.coalesced_frames.fetch_add(1, Ordering::Relaxed);
@@ -887,10 +880,10 @@ impl TxQueueBudget {
         // Side callbacks receive schema chunks individually. Once the first
         // chunk is admitted, finish that transfer even when it crosses the
         // normal queue target; otherwise every retry can stall at chunk two.
-        // These are locally generated SDT v3 chunk envelopes (not RX input).
-        let continuation = if payload.starts_with(b"SDT\x03") && payload.len() >= 16 {
-            let index = u16::from_le_bytes([payload[8], payload[9]]) as usize;
-            let total = u16::from_le_bytes([payload[10], payload[11]]) as usize;
+        // These are locally generated side-transport chunks (not RX input).
+        let continuation = if let Some(chunk) = sedsnet::side_peek::side_chunk_unchecked(payload) {
+            let index = usize::from(chunk.index);
+            let total = usize::from(chunk.total);
             // Smaller airtime chunks must not reduce the existing 64 KiB
             // byte allowance for a dynamic schema. Keep a separate bounded
             // frame count; the aggregate byte ceiling below still applies.
@@ -1274,13 +1267,11 @@ impl TxQueueBudget {
     /// variables, receipts, operator controls or anything reliable.
     fn shed_stream(&self, payload: &[u8]) -> Option<u64> {
         use sedsnet::config::DataType;
-        if payload.starts_with(b"SDT") {
-            let body = sdt_body(payload)?;
-            if payload.get(3) != Some(&2) {
+        if sedsnet::side_peek::is_side_transport_frame(payload) {
+            if !sedsnet::side_peek::is_side_compact_frame(payload) {
                 return None;
             }
-            let mut off = 1;
-            let template = sdt_template_id(body, &mut off)?;
+            let template = sedsnet::side_peek::side_template_id(payload)?;
             return self
                 .recovery_classifier
                 .peek_type(payload)
@@ -1310,14 +1301,14 @@ impl TxQueueBudget {
     /// (is an SDT chunk, its transfer wraps a template install). Transfers
     /// are learned from their first chunk; an unknown one is conservative.
     fn chunk_kind(&self, payload: &[u8]) -> (bool, bool) {
-        if !payload.starts_with(b"SDT\x03") || payload.len() < 16 {
+        let Some(chunk) = sedsnet::side_peek::side_chunk_unchecked(payload) else {
             return (false, false);
-        }
-        let id = u32::from_le_bytes(payload[4..8].try_into().unwrap());
-        let index = u16::from_le_bytes([payload[8], payload[9]]);
+        };
+        let id = u32::from(chunk.transfer);
+        let index = chunk.index;
         let mut transfers = self.chunk_transfers.lock().unwrap();
         if index == 0 {
-            let dictionary = payload[12..payload.len() - 4].starts_with(b"SDT\x01");
+            let dictionary = sedsnet::side_peek::is_side_full_frame(chunk.payload);
             transfers.retain(|(known, _)| *known != id);
             if transfers.len() >= 32 {
                 transfers.pop_front();
@@ -1353,7 +1344,7 @@ impl TxQueueBudget {
             let first_chunk = parked.iter().position(|p| p.chunk);
             let first_other = parked.iter().enumerate().position(|(i, p)| {
                 !p.chunk
-                    && (!p.bytes.starts_with(b"SDT")
+                    && (!sedsnet::side_peek::is_side_transport_frame(&p.bytes)
                         || !parked.iter().take(i).any(|earlier| earlier.chunk_dictionary))
             });
             let chunk_turn = self.park_chunk_turn.load(Ordering::Relaxed);
@@ -1466,7 +1457,7 @@ fn radio_heartbeat_skip_enabled() -> bool {
 }
 
 fn is_station_heartbeat_frame(payload: &[u8]) -> bool {
-    !payload.starts_with(b"SDT")
+    !sedsnet::side_peek::is_side_transport_frame(payload)
         && serialize::peek_frame_info_unchecked(payload)
             .is_ok_and(|info| info.envelope.ty == crate::telemetry_schema::data_type("HEARTBEAT"))
 }
@@ -1541,46 +1532,37 @@ pub struct RecoveryFrameClassifier {
     /// control. Learned from the first chunk; an unknown transfer is control.
     chunk_transfers:Mutex<VecDeque<(u32,bool)>>,
 }
-fn sdt_template_id(bytes:&[u8],off:&mut usize)->Option<u32>{let mut value=0;for shift in (0..35).step_by(7){let b=*bytes.get(*off)?;*off+=1;if shift==28&&b>15{return None;}value|=u32::from(b&127)<<shift;if b&128==0{return Some(value);}}None}
-/// CRC-checked SDT body (between the 4-byte tag and the CRC).
-fn sdt_body(bytes:&[u8])->Option<&[u8]>{
-    if !bytes.starts_with(b"SDT")||bytes.len()<8{return None;}let end=bytes.len()-4;
-    (crc32fast::hash(&bytes[..end])==u32::from_le_bytes(bytes[end..].try_into().unwrap())).then(||&bytes[4..end])
-}
 impl RecoveryFrameClassifier {
     /// Call once per frame the transport accepted, in callback order: only
     /// accepted templates are ever referenced by later compact frames.
     pub fn classify(&self,bytes:&[u8])->bool {
-        if !bytes.starts_with(b"SDT"){return is_recovery_control_frame(bytes);}
-        let Some(body)=sdt_body(bytes) else {return true;};
+        if !sedsnet::side_peek::is_side_transport_frame(bytes){return is_recovery_control_frame(bytes);}
+        if sedsnet::side_peek::is_side_transport_chunk(bytes) {return self.classify_chunk(bytes);}
         let mut templates=self.templates.lock().unwrap();
-        match bytes[3] {
-            1=>{let mut off=0;let Some(key)=sdt_template_id(body,&mut off)else{return true;};let Some(frame)=body.get(off..)else{return true;};
-                let Ok(info)=serialize::peek_frame_info_unchecked(frame) else {return true;};
-                let control=is_recovery_control_frame(frame);
-                if let Some(i)=templates.iter().position(|(id,_,_)|*id==key){templates.remove(i);}
-                if templates.len()>=256{templates.pop_front();}templates.push_back((key,control,info.envelope.ty));control},
-            2|4|5=>{let mut off=1;sdt_template_id(body,&mut off).and_then(|id|templates.iter().find(|(key,_,_)|*key==id).map(|(_,control,_)|*control)).unwrap_or(true)},
-            3=>{drop(templates);self.classify_chunk(bytes)},
-            _=>true,
+        if let Some((key,frame))=sedsnet::side_peek::side_full_frame(bytes) {
+            let Ok(info)=serialize::peek_frame_info_unchecked(&frame) else {return true;};
+            let control=is_recovery_control_frame(&frame);
+            if let Some(i)=templates.iter().position(|(id,_,_)|*id==key){templates.remove(i);}
+            if templates.len()>=256{templates.pop_front();}templates.push_back((key,control,info.envelope.ty));
+            return control;
         }
+        if !sedsnet::side_peek::is_side_compact_frame(bytes) {return true;}
+        sedsnet::side_peek::side_template_id(bytes).and_then(|id|templates.iter().find(|(key,_,_)|*key==id).map(|(_,control,_)|*control)).unwrap_or(true)
     }
     /// A schema or other bulk transfer split into SDT chunks is not recovery
     /// control (it never blocks recovery quiesce); a chunked control frame,
     /// or a chunk of a transfer whose first chunk was not seen, is.
     fn classify_chunk(&self,bytes:&[u8])->bool {
-        if bytes.len()<16 {return true;}
-        let id=u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-        let index=u16::from_le_bytes([bytes[8],bytes[9]]);
+        let Some(chunk)=sedsnet::side_peek::side_chunk(bytes) else {return true;};
+        let id=u32::from(chunk.transfer);
         let mut transfers=self.chunk_transfers.lock().unwrap();
-        if index!=0 {
+        if chunk.index!=0 {
             return transfers.iter().find(|(known,_)|*known==id).is_none_or(|(_,control)|*control);
         }
-        let data=&bytes[12..bytes.len()-4];
-        let frame=if data.starts_with(b"SDT\x01") {
-            let mut off=4;
-            if sdt_template_id(data,&mut off).is_none() {return true;}
-            &data[off..]
+        let data=chunk.payload;
+        let frame=if sedsnet::side_peek::is_side_full_frame(data) {
+            let Some(frame)=sedsnet::side_peek::side_full_frame_prefix(data) else {return true;};
+            frame
         } else {
             data
         };
@@ -1593,13 +1575,13 @@ impl RecoveryFrameClassifier {
     /// The wire type of a canonical frame or of an SDT frame whose template
     /// this side already accepted. Read-only: a refused frame teaches nothing.
     fn peek_type(&self,bytes:&[u8])->Option<sedsnet::config::DataType>{
-        if !bytes.starts_with(b"SDT"){return serialize::peek_frame_info(bytes).ok().map(|info|info.envelope.ty);}
-        let body=sdt_body(bytes)?;
-        match bytes[3] {
-            1=>{let mut off=0;sdt_template_id(body,&mut off)?;serialize::peek_frame_info(body.get(off..)?).ok().map(|info|info.envelope.ty)},
-            2|4|5=>{let mut off=1;let id=sdt_template_id(body,&mut off)?;self.templates.lock().unwrap().iter().find(|(key,_,_)|*key==id).map(|(_,_,ty)|*ty)},
-            _=>None,
+        if !sedsnet::side_peek::is_side_transport_frame(bytes){return serialize::peek_frame_info(bytes).ok().map(|info|info.envelope.ty);}
+        if let Some((_,frame))=sedsnet::side_peek::side_full_frame(bytes) {
+            return serialize::peek_frame_info(&frame).ok().map(|info|info.envelope.ty);
         }
+        if !sedsnet::side_peek::is_side_compact_frame(bytes) {return None;}
+        let id=sedsnet::side_peek::side_template_id(bytes)?;
+        self.templates.lock().unwrap().iter().find(|(key,_,_)|*key==id).map(|(_,_,ty)|*ty)
     }
 }
 /// Ownership lasts through queue pop and an entire partial/failed physical
@@ -1785,13 +1767,13 @@ impl WireBacklog {
         let priority = radio_transport_priority(priority, &payload);
         // These bytes come from the local router callback. SDT envelopes may
         // depend on earlier dictionary/chunk frames; canonical controls do not.
-        let independent_control = priority >= 16 && priority != 254 && !payload.starts_with(b"SDT");
+        let independent_control = priority >= 16 && priority != 254 && !sedsnet::side_peek::is_side_transport_frame(&payload);
         // Route advertisements and application controls both carry priority
         // 255. A FIFO in that band put a newly requested state change behind
         // seconds of startup advertisements. Preserve every accepted route
         // update, but service it separately from independent commands/ACKs.
         let routing = priority == 255
-            && !payload.starts_with(b"SDT")
+            && !sedsnet::side_peek::is_side_transport_frame(&payload)
             && serialize::peek_frame_info_unchecked(&payload)
                 .is_ok_and(|info| sedsnet::discovery::is_discovery_type(info.envelope.ty));
         if self.preserve_order && is_delivery_receipt(&payload) {
@@ -2795,7 +2777,7 @@ mod priority_tests {
     fn command_pair_does_not_bypass_metadata_fair_turn_or_consume_invalid_follower() {
         let command = batch_test_command("FLIGHT_COMMAND", &[1]);
         for follower in [
-            b"SDT\x03opaque".to_vec(),
+            b"\x61opaque".to_vec(),
             serialize::pack_packet(
                 &Packet::new(
                     sedsnet::config::DataType::ReliableAck,
@@ -2841,7 +2823,7 @@ mod priority_tests {
         let mut q = WireBacklog::new(true);
         q.push(255, command.clone(), false);
         q.push(255, command.clone(), false);
-        q.push(253, b"SDT\x03metadata".to_vec(), false);
+        q.push(253, b"\x61metadata".to_vec(), false);
         q.control_bytes = MAX_CONTROL_BYTES - 1;
         let first = q.pop().unwrap();
         assert!(q.control_bytes >= MAX_CONTROL_BYTES);
@@ -2849,7 +2831,7 @@ mod priority_tests {
             q.batch_follower(&BatchTestComms, (first.0, &first.1))
                 .is_none()
         );
-        assert_eq!(q.pop().unwrap().1, b"SDT\x03metadata");
+        assert_eq!(q.pop().unwrap().1, b"\x61metadata");
         assert_eq!(q.pop().unwrap().1, command);
     }
 
@@ -2919,7 +2901,7 @@ mod priority_tests {
             .is_none()
         );
         assert_eq!(q.selection_state(), state);
-        q.push(253, b"SDT\x03owned".to_vec(), false);
+        q.push(253, b"\x61owned".to_vec(), false);
         q.control_bytes = MAX_CONTROL_BYTES;
         let state = q.selection_state();
         assert!(
@@ -2927,7 +2909,7 @@ mod priority_tests {
                 .is_none()
         );
         assert_eq!(q.selection_state(), state);
-        assert_eq!(q.pop().unwrap().1, b"SDT\x03owned");
+        assert_eq!(q.pop().unwrap().1, b"\x61owned");
         assert_eq!(q.pop().unwrap().1, receipt);
         assert_eq!(q.pop().unwrap().1, command);
     }
@@ -2961,10 +2943,10 @@ mod priority_tests {
                 q.push(255, command.clone(), false);
             }
             if q.ordered.is_empty() {
-                q.push(253, b"SDT\x03owned".to_vec(), false);
+                q.push(253, b"\x61owned".to_vec(), false);
             }
             let first = q.pop().unwrap();
-            if first.1.starts_with(b"SDT") {
+            if sedsnet::side_peek::is_side_transport_frame(&first.1) {
                 metadata += 1;
                 since_metadata = 0;
             } else {
@@ -3023,6 +3005,9 @@ mod priority_tests {
                 RouterSideOptions {
                     header_template_enabled: true,
                     max_side_transport_templates: 16,
+                    // No discovery here: declare the link point to point so
+                    // header templates are used (SEDSnet 7).
+                    point_to_point: true,
                     ..Default::default()
                 },
             );
@@ -3057,18 +3042,18 @@ mod priority_tests {
         let mut backlog = WireBacklog::new(true);
         // A low-priority template followed by control/chunk traffic must not
         // be overtaken after its callback has accepted the encoded bytes.
-        backlog.push(0, b"SDT\x01template".to_vec(), false);
-        backlog.push(255, b"SDT\x03chunk".to_vec(), false);
-        backlog.push(254, b"SDT\x02compact".to_vec(), false);
+        backlog.push(0, b"\x60template".to_vec(), false);
+        backlog.push(255, b"\x61chunk".to_vec(), false);
+        backlog.push(254, b"\x70compact".to_vec(), false);
         let (priority, first) = backlog.pop().unwrap();
-        assert_eq!(first, b"SDT\x01template");
+        assert_eq!(first, b"\x60template");
         backlog.push(priority, first, true);
-        backlog.push(255, b"SDT\x01new".to_vec(), false);
+        backlog.push(255, b"\x60new".to_vec(), false);
         for expected in [
-            b"SDT\x01template".as_slice(),
-            b"SDT\x03chunk",
-            b"SDT\x02compact",
-            b"SDT\x01new",
+            b"\x60template".as_slice(),
+            b"\x61chunk",
+            b"\x70compact",
+            b"\x60new",
         ] {
             assert_eq!(backlog.pop().unwrap().1, expected);
         }
@@ -3173,7 +3158,9 @@ mod priority_tests {
         // A full schema allowance cannot reject a small application update.
         let budget = TxQueueBudget::new(2048);
         let (tx, mut rx) = mpsc::unbounded_channel();
-        budget.try_send(&tx, 254, &[0; 2048]).unwrap();
+        // Opaque metadata bytes (0x64 is a reserved first byte, never an SDK
+        // frame; zero bytes now decode as a SEDSnet 7 frame header).
+        budget.try_send(&tx, 254, &[0x64; 2048]).unwrap();
         budget.try_send(&tx, priority, &control).unwrap();
         let (metadata_priority, metadata) = rx.try_recv().unwrap();
         let (app_priority, application) = rx.try_recv().unwrap();
@@ -3183,10 +3170,10 @@ mod priority_tests {
         assert_eq!(budget.pending_control.load(Ordering::Acquire), 0);
         assert_eq!(budget.pending.load(Ordering::Acquire), 0);
         let mut backlog = WireBacklog::new(true);
-        backlog.push(254, b"SDT\x03pending-schema".to_vec(), false);
+        backlog.push(254, b"\x61pending-schema".to_vec(), false);
         backlog.push(priority, control.clone(), false);
         assert_eq!(backlog.pop(), Some((scheduled_priority, control)));
-        assert_eq!(backlog.pop().unwrap().1, b"SDT\x03pending-schema");
+        assert_eq!(backlog.pop().unwrap().1, b"\x61pending-schema");
     }
 
     #[test]
@@ -3230,15 +3217,15 @@ mod priority_tests {
         for _ in 0..32 {
             backlog.push(255, route.clone(), false);
         }
-        backlog.push(254, b"SDT\x03schema-first".to_vec(), false);
-        backlog.push(254, b"SDT\x03schema-second".to_vec(), false);
+        backlog.push(254, b"\x61schema-first".to_vec(), false);
+        backlog.push(254, b"\x61schema-second".to_vec(), false);
         backlog.push(254, control.clone(), false);
         assert_eq!(backlog.pop(), Some((255, control)));
         // Accepted route updates are retained, and schema order is unchanged.
         assert_eq!(backlog.pop(), Some((255, route.clone())));
-        assert_eq!(backlog.pop().unwrap().1, b"SDT\x03schema-first");
+        assert_eq!(backlog.pop().unwrap().1, b"\x61schema-first");
         assert_eq!(backlog.pop(), Some((255, route.clone())));
-        assert_eq!(backlog.pop().unwrap().1, b"SDT\x03schema-second");
+        assert_eq!(backlog.pop().unwrap().1, b"\x61schema-second");
         for _ in 0..30 {
             assert_eq!(backlog.pop(), Some((255, route.clone())));
         }
@@ -3248,7 +3235,7 @@ mod priority_tests {
     #[test]
     fn ack_flood_yields_to_commands_as_well_as_both_metadata_streams() {
         let mut backlog = WireBacklog::new(true);
-        backlog.push(254, b"SDT\x03schema".to_vec(), false);
+        backlog.push(254, b"\x61schema".to_vec(), false);
         for _ in 0..100 {
             backlog.push(255, vec![0; 128], false);
         }
@@ -3258,7 +3245,7 @@ mod priority_tests {
         for _ in 0..(MAX_CONTROL_BYTES / 128 + 3) {
             let (priority, payload) = backlog.pop().unwrap();
             command_seen |= priority == 200 && payload == [42];
-            schema_seen |= payload == b"SDT\x03schema";
+            schema_seen |= payload == b"\x61schema";
         }
         assert!(command_seen, "ACKs must not starve lower-priority commands");
         assert!(
@@ -3323,15 +3310,15 @@ mod priority_tests {
 
         // Sustained commands must still yield to accepted ACKs and metadata.
         backlog.push(255, ack.clone(), false);
-        backlog.push(254, b"SDT\x03first".to_vec(), false);
-        backlog.push(254, b"SDT\x03second".to_vec(), false);
+        backlog.push(254, b"\x61first".to_vec(), false);
+        backlog.push(254, b"\x61second".to_vec(), false);
         let mut receipt_seen = false;
         let mut metadata = Vec::new();
         for _ in 0..(2 * MAX_CONTROL_BYTES / command.len() + 20) {
             backlog.push(254, command.clone(), false);
             let (_, bytes) = backlog.pop().unwrap();
             receipt_seen |= bytes == ack;
-            if bytes.starts_with(b"SDT") {
+            if sedsnet::side_peek::is_side_transport_frame(&bytes) {
                 metadata.push(bytes);
             }
             if receipt_seen && metadata.len() == 2 {
@@ -3341,14 +3328,14 @@ mod priority_tests {
         assert!(receipt_seen);
         assert_eq!(
             metadata,
-            [b"SDT\x03first".to_vec(), b"SDT\x03second".to_vec()]
+            [b"\x61first".to_vec(), b"\x61second".to_vec()]
         );
     }
 
     #[test]
     fn continuous_canonical_controls_cannot_starve_the_stateful_stream() {
         let mut backlog = WireBacklog::new(true);
-        backlog.push(254, b"SDT\x03schema".to_vec(), false);
+        backlog.push(254, b"\x61schema".to_vec(), false);
         for _ in 0..100 {
             backlog.push(16, vec![0; 128], false);
         }
@@ -3554,15 +3541,14 @@ mod priority_tests {
     fn short_radio_lookahead_preserves_schema_prefix_and_separate_command_credit() {
         let budget = TxQueueBudget::new_radio(2048, 256);
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut chunk = vec![0u8; 192];
-        chunk[..4].copy_from_slice(b"SDT\x03");
-        chunk[10..12].copy_from_slice(&18u16.to_le_bytes());
+        let chunk_at = |index| crate::side_frame_test_support::chunk_of_len(0, index, 18, 192);
+        let mut chunk = chunk_at(0);
         budget.try_send(&tx, 254, &chunk).unwrap();
-        chunk[8..10].copy_from_slice(&1u16.to_le_bytes());
+        chunk = chunk_at(1);
         // The next chunk is parked (accepted, not yet handed to the writer).
         budget.try_send(&tx, 254, &chunk).unwrap();
         assert_eq!(budget.diagnostics()["parked_frames"], 1);
-        chunk[8..10].copy_from_slice(&2u16.to_le_bytes());
+        chunk = chunk_at(2);
         budget.try_send(&tx, 254, &chunk).unwrap();
         assert_eq!(budget.diagnostics()["parked_frames"], 2, "schema chunks are never shed");
         // The same protected allowance survives a full ordinary lookahead.
@@ -3572,7 +3558,7 @@ mod priority_tests {
             budget.try_send(&tx, 255, &control).unwrap();
         }
         let (priority, prefix) = rx.try_recv().unwrap();
-        assert_eq!(&prefix[8..10], &[0, 0]);
+        assert_eq!(crate::side_frame_test_support::chunk_index(&prefix), Some(0));
         budget.complete(priority, &prefix);
         // Completion moved the next parked chunk to the writer, in order.
         assert_eq!(budget.diagnostics()["parked_frames"], 1);
@@ -3610,10 +3596,9 @@ mod priority_tests {
             now.store(1000 + step, Ordering::Release);
             source.process_all_queues_with_timeout(0).unwrap();
             while let Ok((priority, bytes)) = rx.try_recv() {
-                if bytes.starts_with(b"SDT\x03") {
-                    let id = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-                    let index = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
-                    let total = u16::from_le_bytes(bytes[10..12].try_into().unwrap());
+                if bytes.starts_with(b"\x61") {
+                    let peeked = sedsnet::side_peek::side_chunk_unchecked(&bytes).unwrap();
+                    let (id, index, total) = (u32::from(peeked.transfer), peeked.index, peeked.total);
                     assert_eq!(
                         crc32fast::hash(&bytes[..bytes.len() - 4]),
                         u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().unwrap())
@@ -3752,10 +3737,7 @@ mod priority_tests {
         let budget = TxQueueBudget::new(2048);
         let (tx, mut rx) = mpsc::unbounded_channel();
         for index in 0u16..8 {
-            let mut chunk = vec![0u8; 1024];
-            chunk[..4].copy_from_slice(b"SDT\x03");
-            chunk[8..10].copy_from_slice(&index.to_le_bytes());
-            chunk[10..12].copy_from_slice(&8u16.to_le_bytes());
+            let chunk = crate::side_frame_test_support::chunk_of_len(0, index, 8, 1024);
             budget.try_send(&tx, 254, &chunk).unwrap();
         }
         assert!(budget.try_send(&tx, 0, &[0; 32]).is_err());
@@ -3779,10 +3761,7 @@ mod priority_tests {
         let budget = TxQueueBudget::new(2048);
         let (tx, mut rx) = mpsc::unbounded_channel();
         for index in 0u16..200 {
-            let mut chunk = vec![0; 256];
-            chunk[..4].copy_from_slice(b"SDT\x03");
-            chunk[8..10].copy_from_slice(&index.to_le_bytes());
-            chunk[10..12].copy_from_slice(&200u16.to_le_bytes());
+            let chunk = crate::side_frame_test_support::chunk_of_len(0, index, 200, 256);
             budget.try_send(&tx, 254, &chunk).unwrap();
         }
         budget.try_send(&tx, 255, &[1; 32]).unwrap();
@@ -3935,11 +3914,9 @@ mod priority_tests {
     }
 
     fn sdt_wrapped(frame: &[u8], template: u8) -> Vec<u8> {
-        let mut bytes = b"SDT\x01".to_vec();
-        bytes.push(template);
-        bytes.extend_from_slice(frame);
-        bytes.extend(crc32fast::hash(&bytes).to_le_bytes());
-        bytes
+        let mut body = vec![template];
+        body.extend_from_slice(frame);
+        crate::side_frame_test_support::side_frame(1, &body)
     }
 
     /// Time sync and receipts wrapped by the side transport are opaque to a
@@ -3956,13 +3933,12 @@ mod priority_tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         budget.try_send(&tx, 0, &[1; 100]).unwrap();
         // A schema chunk waits for its room: ordinary frames must leave it.
-        assert!(budget.try_send(&tx, 254, &[2; 192]).is_err());
-        assert!(budget.try_send(&tx, 254, &[3; 40]).is_err());
+        // Opaque ordinary frames (0x64/0x65 are reserved first bytes).
+        assert!(budget.try_send(&tx, 254, &[0x64; 192]).is_err());
+        assert!(budget.try_send(&tx, 254, &[0x65; 40]).is_err());
         budget.try_send(&tx, 254, &announce).expect("time sync is not held for the chunk");
         // Its accepted template now identifies the compact references too.
-        let mut reference = b"SDT\x02".to_vec();
-        reference.extend_from_slice(&[0, 3, 1, 2, 3]);
-        reference.extend(crc32fast::hash(&reference).to_le_bytes());
+        let reference = crate::side_frame_test_support::side_frame(2, &[0, 3, 1, 2, 3]);
         budget.try_send(&tx, 254, &reference).expect("a compact reference to time sync is protected");
         assert!(rx.try_recv().is_ok());
     }
@@ -6239,7 +6215,7 @@ mod rfd_worker_tests {
         // Receipts arrive faster than 115200 baud drains them, for 3 s, and a
         // station heartbeat (compact, LIVENESS priority) is queued every 200 ms.
         let feeder_budget = budget.clone();
-        let heartbeat = b"SDT\x01owed-turn-heartbeat-marker".to_vec();
+        let heartbeat = b"\x60owed-turn-heartbeat-marker".to_vec();
         let feeder_heartbeat = heartbeat.clone();
         let feeder = std::thread::spawn(move || {
             let start = std::time::Instant::now();
@@ -6702,7 +6678,7 @@ mod rfd_worker_tests {
         )
         .unwrap();
         let command = serialize::pack_packet(&packet).to_vec();
-        let bulk = b"SDT opaque schema retains FIFO ownership".to_vec();
+        let bulk = b"\x61 opaque schema retains FIFO ownership".to_vec();
         let state = crate::state::tests::test_app_state().await;
         let sent = Arc::new(Mutex::new(Vec::new()));
         let unused = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -7130,7 +7106,7 @@ mod retained_write_retries;
 mod recovery_control_tests {
  use super::*;
  fn frame(name:&str)->Vec<u8>{let payload=vec![1u8;if name=="KG50"{4}else{1}];serialize::pack_packet(&Packet::new(crate::telemetry_schema::data_type(name),&[crate::telemetry_schema::endpoint("GROUND_STATION")],"GS",123,Arc::from(payload)).unwrap()).to_vec()}
- fn sdt(kind:u8,body:&[u8])->Vec<u8>{let mut bytes=b"SDT".to_vec();bytes.push(kind);bytes.extend(body);bytes.extend(crc32fast::hash(&bytes).to_le_bytes());bytes}
+ fn sdt(kind:u8,body:&[u8])->Vec<u8>{crate::side_frame_test_support::side_frame(kind,body)}
  #[test]
  fn continuous_100hz_sdt_samples_and_ack_ownership_do_not_hold_recovery() {
   let activity=TransportTxActivity::default();let classifier=RecoveryFrameClassifier::default();let mut held=Vec::new();
@@ -7150,13 +7126,13 @@ mod recovery_control_tests {
   let router=Router::new_with_clock(RouterConfig::default(),Box::new(||0));
   router.add_side_packed_with_options("recovery_sdt",move|wire|{
    owner.try_enqueue_owned(classifier.classify(wire),wire.to_vec(),|bytes|{output.lock().unwrap().push(bytes);Ok(())})
-  },RouterSideOptions::default().with_small_packet_transport(128));
+  },RouterSideOptions::default().with_small_packet_transport(128).with_point_to_point());
   for tick in 0..100u64 {
    router.tx(Packet::new(crate::telemetry_schema::data_type("KG50"),&[crate::telemetry_schema::endpoint("GROUND_STATION")],"DAQ",tick*10,Arc::from((tick as f32).to_le_bytes())).unwrap()).unwrap();
   }
   let held=captured.lock().unwrap();assert!(held.len()>=100,"actual SDK callbacks, not handwritten frames");
-  assert!(held.iter().any(|bytes|bytes.starts_with(b"SDT\x01")),"SDK emits a real template");
-  assert!(held.iter().any(|bytes|bytes.starts_with(b"SDT")&&matches!(bytes.get(3),Some(2|4|5))),"SDK emits real compact samples");
+  assert!(held.iter().any(|bytes|bytes.starts_with(b"\x60")),"SDK emits a real template");
+  assert!(held.iter().any(|bytes|sedsnet::side_peek::is_side_compact_frame(bytes)),"SDK emits real compact samples");
   assert!(activity.has_pending());assert!(!activity.has_pending_control(),"100Hz source samples cannot block recovery");
   for bytes in held.iter(){activity.complete_frame(bytes);}assert!(!activity.has_pending());assert!(!activity.has_pending_control());
  }

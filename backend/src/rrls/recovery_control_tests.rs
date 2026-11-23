@@ -11,8 +11,7 @@ fn queue(mesh:&mut Mesh,kind:u8,body:&[u8]) {
     mesh.enqueue(Outgoing{command:false,bytes:encode(kind,body)},128,0);
 }
 fn sdt(kind:u8,body:&[u8])->Vec<u8> {
-    let mut bytes=b"SDT".to_vec();bytes.push(kind);bytes.extend_from_slice(body);
-    bytes.extend_from_slice(&crc(&bytes).to_le_bytes());bytes
+    crate::side_frame_test_support::side_frame(kind,body)
 }
 #[test]
 fn recovery_control_continuous_telemetry_queue_and_active_send_do_not_block() {

@@ -67,7 +67,7 @@ fn packets(frame: &[u8]) -> Vec<Packet> {
                     .collect()
             })
             .unwrap_or_default()
-    } else if frame.starts_with(b"SDT") {
+    } else if sedsnet::side_peek::is_side_transport_frame(frame) {
         Vec::new()
     } else {
         sedsnet::wire_format::unpack_packet(frame).into_iter().collect()

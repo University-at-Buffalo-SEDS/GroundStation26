@@ -47,7 +47,7 @@ fn captured_canonical_unsequenced_controls_preserve_the_interactive_boundary_tag
         let Some((_, body)) = decode(&bytes) else {
             continue;
         };
-        if body.starts_with(b"SDT") {
+        if sedsnet::side_peek::is_side_transport_frame(body) {
             continue;
         }
         let info = sedsnet::wire_format::peek_frame_info(body).unwrap();
@@ -82,7 +82,7 @@ fn captured_canonical_unsequenced_controls_preserve_the_interactive_boundary_tag
         relay.enqueue(
             Outgoing {
                 command: false,
-                bytes: encode(DOWN_DATA, b"SDT\x03opaque"),
+                bytes: encode(DOWN_DATA, b"\x61opaque"),
             },
             253,
             0,
@@ -128,7 +128,7 @@ fn captured_control_can_borrow_after_184ms_bulk_debt_with_health_pending() {
         .find_map(|event| {
             let bytes = from_rr_v1_for_test(&STANDARD.decode(&event.payload).unwrap());
             let (_, body) = decode(&bytes)?;
-            (!body.starts_with(b"SDT")).then(|| body.to_vec())
+            (!sedsnet::side_peek::is_side_transport_frame(body)).then(|| body.to_vec())
         })
         .unwrap();
     assert!(crate::comms::closes_radio_packet_batch(254, &command));

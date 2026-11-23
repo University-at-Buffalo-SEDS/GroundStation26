@@ -51,13 +51,11 @@ impl Decoder {
 mod tests {
     use super::*;
     fn chunk(value: u8) -> Vec<u8> {
-        let mut body = b"SDT\x03".to_vec();
-        body.extend_from_slice(&42u32.to_le_bytes());
+        let mut body = 42u32.to_le_bytes().to_vec();
         body.extend_from_slice(&0u16.to_le_bytes());
         body.extend_from_slice(&1u16.to_le_bytes());
         body.extend_from_slice(&[value; 3]);
-        body.extend_from_slice(&crc32fast::hash(&body).to_le_bytes());
-        body
+        crate::side_frame_test_support::side_frame(3, &body)
     }
     #[test]
     fn split_and_coalesced_modem_reads_preserve_two_frames() {

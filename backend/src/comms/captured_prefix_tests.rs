@@ -33,7 +33,7 @@ fn only_body(frame: &[u8]) -> &[u8] {
     &frame[4..]
 }
 fn assert_valid_wrapper(body: &[u8]) {
-    assert_eq!(&body[..3], b"SDT");
+    assert!(sedsnet::side_peek::is_side_transport_frame(body));
     assert_eq!(
         crc32fast::hash(&body[..body.len() - 4]),
         u32::from_le_bytes(body[body.len() - 4..].try_into().unwrap())
@@ -163,12 +163,11 @@ fn captured_compact_gap_with_explicit_poll_expires_only_at_existing_deadline() {
 fn valid_unexpired_crc_wrapper_keeps_nested_frame_bytes_as_its_payload() {
     // A wrapper-valid synthetic chunk may carry frame-looking bytes. This is
     // only a framing invariant, not a claim that its SDK catalog is meaningful.
-    let mut outer_body = b"SDT\x03".to_vec();
-    outer_body.extend_from_slice(&0x12345678u32.to_le_bytes());
-    outer_body.extend_from_slice(&0u16.to_le_bytes());
-    outer_body.extend_from_slice(&1u16.to_le_bytes());
-    outer_body.extend_from_slice(MESSAGE);
-    outer_body.extend_from_slice(&crc32fast::hash(&outer_body).to_le_bytes());
+    let mut chunk_body = 0x12345678u32.to_le_bytes().to_vec();
+    chunk_body.extend_from_slice(&0u16.to_le_bytes());
+    chunk_body.extend_from_slice(&1u16.to_le_bytes());
+    chunk_body.extend_from_slice(MESSAGE);
+    let outer_body = crate::side_frame_test_support::side_frame(3, &chunk_body);
     assert_valid_wrapper(&outer_body);
     let frame = build_raw_uart_frame(&outer_body).unwrap();
     let wall = Instant::now();

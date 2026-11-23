@@ -249,15 +249,15 @@ async fn root_profile_clock_and_catalog_share_ordinary_service() {
     let callback_stages = stages.clone();
     let (side,tracker)=router.add_side_packed_leased_with_priority_and_options("rocket_comms",move|lease,priority|{
         if !accepting.load(Ordering::SeqCst){return Ok(());}
-        let b=lease.bytes();let chunk=b.starts_with(b"SDT\x03") && b.len()>=16 && u16::from_le_bytes(b[10..12].try_into().unwrap())>1;
+        let b=lease.bytes();let peeked=sedsnet::side_peek::side_chunk_unchecked(b);let chunk=peeked.as_ref().is_some_and(|c|c.total>1);
         let is_ack=serialize::peek_frame_info_unchecked(b).is_ok_and(|i|i.envelope.ty==sedsnet::config::DataType::ReliableAck);
         if !chunk && !is_ack{return Ok(());}
         if chunk {
-            let id=u32::from_le_bytes(b[4..8].try_into().unwrap());let index=u16::from_le_bytes(b[8..10].try_into().unwrap());let mut known=seen_transfer.lock().unwrap();
-            if index==0 && b.get(12..32)==Some(&include_bytes!("../test-fixtures/root-default-catalog.bin")[..20]){assert!(known.is_none_or(|v|v==id));*known=Some(id);}
+            let c=peeked.as_ref().unwrap();let id=u32::from(c.transfer);let index=c.index;let mut known=seen_transfer.lock().unwrap();
+            if index==0 && c.payload.get(..20)==Some(&include_bytes!("../test-fixtures/root-default-catalog.bin")[..20]){assert!(known.is_none_or(|v|v==id));*known=Some(id);}
             if *known!=Some(id){return Ok(());}
         }
-        let index=chunk.then(||u16::from_le_bytes(b[8..10].try_into().unwrap()));
+        let index=chunk.then(||peeked.as_ref().unwrap().index);
         let result=queue_budget.try_send_leased(&sender,priority,lease);
         if result.is_ok(){let row=serde_json::json!({"at_ms":crate::simulation_clock_ms(),"chunk_index":index,"priority":priority});callback_stages.lock().unwrap().push(row.clone());event(&callback_events,"actual_SDK_accepted",row);}
         result
@@ -300,7 +300,7 @@ async fn root_profile_clock_and_catalog_share_ordinary_service() {
     relay_peer.set_timeout(Duration::from_millis(1)).unwrap();
     let mut relay_uart = crate::comms::UartComms::test_mesh_pty(relay_port, relay.clone());
     let source = include_bytes!("../test-fixtures/root-default-catalog.bin");
-    assert_eq!(source.len(), 3725);
+    assert_eq!(source.len(), 3721);
     let source_packet = serialize::unpack_packet(source).unwrap();
     assert_eq!(
         source_packet.data_type(),
@@ -445,14 +445,13 @@ async fn root_profile_clock_and_catalog_share_ordinary_service() {
             let frames = physical_frames(&primary_bytes, false);
             for body in frames.iter().skip(pi) {
                 let (kind, inner) = crate::rrls::decode(body).unwrap();
-                if kind == 2 && inner.starts_with(b"SDT\x03") {
-                    physical.push(serde_json::json!({"at_ms":tick,"index":u16::from_le_bytes(inner[8..10].try_into().unwrap()),"inner_hex":inner.iter().map(|b|format!("{b:02x}")).collect::<String>()}));
+                if kind == 2 && inner.starts_with(b"\x61") {
+                    physical.push(serde_json::json!({"at_ms":tick,"index":crate::side_frame_test_support::chunk_index(inner),"inner_hex":inner.iter().map(|b|format!("{b:02x}")).collect::<String>()}));
                 }
                 if with_clock
                     && clock_offer_at.is_none()
                     && kind == 2
-                    && inner.starts_with(b"SDT\x03")
-                    && u16::from_le_bytes(inner[8..10].try_into().unwrap()) == 0
+                    && crate::side_frame_test_support::chunk_index(inner) == Some(0)
                 {
                     clock_offer_at = Some(tick + 1);
                 }
@@ -659,7 +658,7 @@ async fn root_profile_clock_and_catalog_share_ordinary_service() {
     );
     assert!(
         physical.len() > 1,
-        "actual root192 policy must encode the genuine3725B catalog into multiple physical chunks"
+        "actual root192 policy must encode the genuine3721B catalog into multiple physical chunks"
     );
     let reconstructed: Vec<u8> = physical
         .iter()

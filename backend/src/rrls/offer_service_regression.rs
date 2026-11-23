@@ -71,7 +71,7 @@ fn accepted_offer_must_reach_paid_service_before_original_probe_deadline() {
     let before = mesh.dropped;
     for value in fixture["pressure"].as_array().unwrap() {
         let chunk = unhex(value.as_str().unwrap());
-        assert!(chunk.starts_with(b"SDT\x03"));
+        assert!(chunk.starts_with(b"\x61"));
         mesh.incoming(false, &chunk, 10070);
     }
     assert_eq!(

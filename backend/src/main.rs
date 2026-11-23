@@ -1,4 +1,6 @@
 mod abort_input;
+#[cfg(test)]
+mod side_frame_test_support;
 mod abort_retirement;
 mod admin;
 mod sequence_access;

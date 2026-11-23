@@ -1363,7 +1363,7 @@ impl Mesh {
         };
         // Canonical snapshots have no SDT dictionary/chunk dependency. Never
         // classify ground SDT through the avionics-side template namespace.
-        !body.starts_with(b"SDT")
+        !sedsnet::side_peek::is_side_transport_frame(body)
             && sedsnet::wire_format::peek_frame_info(body).is_ok_and(|packet| {
                 packet.envelope.ty == sedsnet::config::DataType::DiscoveryAddress
             })
@@ -1376,7 +1376,7 @@ impl Mesh {
         let Some(bytes) = payload_unchecked(&frame.bytes) else {
             return (0, 0);
         };
-        if !bytes.starts_with(b"SDT") {
+        if !sedsnet::side_peek::is_side_transport_frame(bytes) {
             return (0, 0);
         }
         if bytes.len() < 8 {
@@ -1386,27 +1386,15 @@ impl Mesh {
         if crc(&bytes[..end]) != u32::from_le_bytes(bytes[end..].try_into().unwrap()) {
             return (2, 0);
         }
-        let offset = match bytes[3] {
-            1 => 4,
-            2 | 4 | 5 => 5,
-            // A chunk's template cannot be known without reassembly. It is a
-            // conservative barrier within its explicit RR wire namespace.
-            _ => return (2, 0),
-        };
-        let mut template = 0u32;
-        for (offset, shift) in (offset..).zip((0..=28).step_by(7)) {
-            let Some(&byte) = bytes.get(offset).filter(|_| offset < end) else {
-                return (2, 0);
-            };
-            if shift == 28 && byte > 15 {
-                return (2, 0);
-            }
-            template |= u32::from(byte & 127) << shift;
-            if byte & 128 == 0 {
-                return (1, template);
-            }
+        // A chunk's template cannot be known without reassembly. It is a
+        // conservative barrier within its explicit RR wire namespace.
+        if sedsnet::side_peek::is_side_transport_chunk(bytes) {
+            return (2, 0);
         }
-        (2, 0)
+        match sedsnet::side_peek::side_template_id(bytes) {
+            Some(template) => (1, template),
+            None => (2, 0),
+        }
     }
 
     fn queued_expired(&self, q: &Queued, now: u64) -> bool {
@@ -1571,7 +1559,7 @@ impl Mesh {
         // GPS and health are current values, not history. Keep only the newest.
         if priority == 255
             && (kind_of(&frame.bytes) == Some(HEALTH)
-                || !payload_unchecked(&frame.bytes).is_some_and(|body| body.starts_with(b"SDT")))
+                || !payload_unchecked(&frame.bytes).is_some_and(sedsnet::side_peek::is_side_transport_frame))
             && let Some(i) = self
                 .queue
                 .iter()
@@ -2599,21 +2587,6 @@ impl Mesh {
         self.classify_namespace(bytes, false)
     }
     fn classify_namespace(&mut self, bytes: &[u8], uplink: bool) -> Option<FrameClass> {
-        fn id(bytes: &[u8], off: &mut usize) -> Option<u32> {
-            let mut value = 0u32;
-            for shift in (0..35).step_by(7) {
-                let b = *bytes.get(*off)?;
-                *off += 1;
-                if shift == 28 && b > 15 {
-                    return None;
-                }
-                value |= u32::from(b & 127) << shift;
-                if b & 128 == 0 {
-                    return Some(value);
-                }
-            }
-            None
-        }
         fn canonical(bytes: &[u8]) -> Option<FrameClass> {
             let p = sedsnet::wire_format::peek_frame_info(bytes).ok()?;
             let gps = p.envelope.ty == crate::telemetry_schema::data_type("GPS_DATA");
@@ -2655,7 +2628,7 @@ impl Mesh {
                 }))
             })?;
         }
-        if !bytes.starts_with(b"SDT") {
+        if !sedsnet::side_peek::is_side_transport_frame(bytes) {
             return canonical(bytes);
         }
         if bytes.len() < 8 {
@@ -2665,43 +2638,33 @@ impl Mesh {
         if crc(&bytes[..end]) != u32::from_le_bytes(bytes[end..].try_into().ok()?) {
             return None;
         }
-        let body = &bytes[4..end];
-        match bytes[3] {
-            1 => {
-                let mut off = 0;
-                let template = id(body, &mut off)?;
-                if let Some(class) = canonical(&body[off..]) {
-                    if let Some(i) = self
-                        .templates
-                        .iter()
-                        .position(|entry| entry.id == template && entry.uplink == uplink)
-                    {
-                        self.templates.remove(i);
-                    }
-                    if self.templates.len() >= 256 {
-                        self.templates.pop_front();
-                    }
-                    self.templates.push_back(TemplateClass {
-                        id: template,
-                        uplink,
-                        class,
-                    });
-                    Some(class)
-                } else {
-                    canonical(body)
-                }
-            }
-            2 | 4 | 5 => {
-                let mut off = 1;
-                let template = id(body, &mut off)?;
-                self.templates
-                    .iter()
-                    .find(|entry| entry.id == template && entry.uplink == uplink)
-                    .map(|entry| entry.class)
-            }
-            3 => Some(FrameClass { priority: 253, recovery_control: true }),
-            _ => None,
+        if sedsnet::side_peek::is_side_transport_chunk(bytes) {
+            return Some(FrameClass { priority: 253, recovery_control: true });
         }
+        let template = sedsnet::side_peek::side_template_id(bytes)?;
+        if let Some((_, frame)) = sedsnet::side_peek::side_full_frame(bytes) {
+            let class = canonical(&frame)?;
+            if let Some(i) = self
+                .templates
+                .iter()
+                .position(|entry| entry.id == template && entry.uplink == uplink)
+            {
+                self.templates.remove(i);
+            }
+            if self.templates.len() >= 256 {
+                self.templates.pop_front();
+            }
+            self.templates.push_back(TemplateClass {
+                id: template,
+                uplink,
+                class,
+            });
+            return Some(class);
+        }
+        self.templates
+            .iter()
+            .find(|entry| entry.id == template && entry.uplink == uplink)
+            .map(|entry| entry.class)
     }
 
     /// RRLS takeover: the primary unheard for TAKEOVER_MS while the AV bay is
@@ -2990,7 +2953,7 @@ impl Mesh {
                         254
                     } else {
                         self.classify_namespace(data, true)
-                            .map_or(if data.starts_with(b"SDT") { 254 } else { 128 }, |class| {
+                            .map_or(if sedsnet::side_peek::is_side_transport_frame(data) { 254 } else { 128 }, |class| {
                                 class.priority
                             })
                     };
@@ -3061,7 +3024,7 @@ impl Mesh {
                     254
                 } else {
                     frame_class.map_or(
-                        if payload.starts_with(b"SDT") {
+                        if sedsnet::side_peek::is_side_transport_frame(payload) {
                             254
                         } else {
                             128
@@ -4167,7 +4130,7 @@ mod tests {
         let (rr, now) = handed_back_rrls();
         assert!(rr.handback_grace_open(now));
 
-        let wrapped = frames.iter().filter(|(w, b)| (*w == "leave" || *w == "ack") && b.starts_with(b"SDT")).count();
+        let wrapped = frames.iter().filter(|(w, b)| (*w == "leave" || *w == "ack") && sedsnet::side_peek::is_side_transport_frame(b)).count();
         let outcomes: Vec<(&str, bool, usize, u8)> = frames.iter()
             .map(|(what, bytes)| (*what, rr.local_tx(false, bytes, now).is_some(), bytes.len(), bytes.get(3).copied().unwrap_or(0)))
             .collect();
@@ -4685,13 +4648,7 @@ mod tests {
                 },
             )
         };
-        let wrap = |kind: u8, body: &[u8]| {
-            let mut out = b"SDT".to_vec();
-            out.push(kind);
-            out.extend_from_slice(body);
-            out.extend_from_slice(&crc(&out).to_le_bytes());
-            out
-        };
+        let wrap = crate::side_frame_test_support::side_frame;
         let mut gps = vec![7];
         gps.extend_from_slice(&canonical("GPS_DATA"));
         let mut heartbeat = vec![7];
@@ -4725,13 +4682,7 @@ mod tests {
         .unwrap();
         let mut full = vec![7];
         full.extend_from_slice(&sedsnet::wire_format::pack_packet(&p));
-        let wrap = |kind: u8, body: &[u8]| {
-            let mut b = b"SDT".to_vec();
-            b.push(kind);
-            b.extend_from_slice(body);
-            b.extend_from_slice(&crc(&b).to_le_bytes());
-            b
-        };
+        let wrap = crate::side_frame_test_support::side_frame;
         let mut r = Mesh::new(Role::Rrls, 2);
         r.incoming(true, &health(1, 0, false), 0);
         assert_eq!(r.classify(&wrap(1, &full)).unwrap().priority, 255);
@@ -5510,15 +5461,21 @@ mod tests {
         let output = captured.clone();
         let source =
             Router::new_with_clock(RouterConfig::new([]).with_sender("FC"), Box::new(|| 0));
-        source.add_side_packed_small_packets(
+        // A point-to-point radio side uses header templates (SEDSnet 7).
+        // 41-byte frames carry the 41-byte canonical frame whole, so its FULL
+        // template install (3 bytes longer) is chunked and the compact
+        // follower is not.
+        source.add_side_packed_with_options(
             "radio",
-            move |bytes| {
-                if bytes.starts_with(b"SDT") {
+            move |bytes: &[u8]| {
+                if sedsnet::side_peek::is_side_transport_frame(bytes) {
                     output.lock().unwrap().push(bytes.to_vec());
                 }
                 Ok(())
             },
-            48,
+            sedsnet::router::RouterSideOptions::default()
+                .with_small_packet_transport(41)
+                .with_point_to_point(),
         );
         for timestamp in [1, 2] {
             source
@@ -5535,11 +5492,11 @@ mod tests {
         }
         let frames = captured.lock().unwrap().clone();
         assert!(
-            frames.iter().any(|frame| frame[3] == 3),
+            frames.iter().any(|frame| frame[0] == 0x61),
             "actual SDK chunks the bootstrap"
         );
         assert!(
-            frames.iter().any(|frame| matches!(frame[3], 2 | 4 | 5)),
+            frames.iter().any(|frame| sedsnet::side_peek::is_side_compact_frame(frame)),
             "actual SDK compact follower"
         );
         let timestamps = Arc::new(Mutex::new(Vec::new()));
@@ -5568,7 +5525,7 @@ mod tests {
             mesh.note_receipt_packet_boundary(154);
             let Some(frame) = mesh.pop(0) else { break };
             let (_, body) = decode(&frame.bytes).unwrap();
-            if body.starts_with(b"SDT") {
+            if sedsnet::side_peek::is_side_transport_frame(body) {
                 forwarded.push(body.to_vec());
                 receiver.rx_packed_from_side(body, side).unwrap();
             }
@@ -6200,7 +6157,7 @@ mod pair_tests {
         for blocker in [
             encode(DOWN_DATA, &control(false, 11)),
             encode(READY, &[0; 8]),
-            encode(DOWN_DATA, b"SDT\x03opaque"),
+            encode(DOWN_DATA, b"\x61opaque"),
             encode(DOWN_DATA, &gps),
         ] {
             let mut mesh = Mesh::new(Role::Rrls, 2);
@@ -6262,8 +6219,8 @@ mod pair_tests {
         let command = control(false, 10);
         for (blocker, priority) in [
             (encode(READY, &[0; 8]), 255),
-            (encode(DOWN_DATA, b"SDT\x03opaque"), 255),
-            (encode(DOWN_DATA, b"SDT\x03opaque"), 254),
+            (encode(DOWN_DATA, b"\x61opaque"), 255),
+            (encode(DOWN_DATA, b"\x61opaque"), 254),
         ] {
             let mut mesh = Mesh::new(Role::Rrls, 2);
             enqueue(&mut mesh, &command, 0);

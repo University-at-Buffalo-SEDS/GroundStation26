@@ -120,7 +120,7 @@ async fn cold_routing_cannot_hide_paid_bootstrap_before_catalog_owner_starts() {
         .add_side_packed_leased_with_priority_and_options(
             "cold-radio",
             move |lease, priority| {
-                if lease.bytes().starts_with(b"SDT\x03") {
+                if lease.bytes().starts_with(b"\x61") {
                     q.try_send_leased(&send, priority, lease)?;
                     accepted_copy.fetch_add(1, Ordering::SeqCst);
                 }
@@ -245,7 +245,7 @@ async fn cold_routing_cannot_hide_paid_bootstrap_before_catalog_owner_starts() {
                     .expect("official public434 strict receiver rejects no SDK frame");
                 strict.dispatch_tx_queue_with_timeout(0).unwrap();
             }
-            let is_chunk = inner.starts_with(b"SDT\x03");
+            let is_chunk = inner.starts_with(b"\x61");
             if is_chunk {
                 first_chunk.get_or_insert(now);
             }

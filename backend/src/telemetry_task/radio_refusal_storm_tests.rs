@@ -567,7 +567,11 @@ fn primary_requesting_a_relay_still_carries_the_bench_receipt_load() {
     primary.tick(3_000); // no direct AV-bay frame for 3 s, no RRLS answers
     let profile_share = 25;
     let share = primary.recovery_air_share(3_000).map_or(profile_share, u64::from);
-    let bench_ack_bytes_per_s = 5.8 * 67.0;
+    // 5.8 ACKs/s at the current SDK ACK size plus the modem's 16 B per frame
+    // (67 B per ACK on SEDSnet 6).
+    let ack = serialize::pack_packet(&Packet::new(DataType::ReliableAck, &[sedsnet::config::DataEndpoint::TelemetryError], "GS", 1_000, Arc::from(1u64.to_le_bytes())).unwrap()).to_vec();
+    let ack_bytes = (crate::comms::reference_decoder::frame_data(&ack).unwrap().len() + 16) as f64;
+    let bench_ack_bytes_per_s = 5.8 * ack_bytes;
     let (frames, bytes) = capacity_frames_per_second(share, 55, true);
     assert!(
         bytes > bench_ack_bytes_per_s * 1.5,
@@ -749,11 +753,7 @@ fn schema_transfer_does_not_hold_frames_queued_behind_it() {
     let budget = TxQueueBudget::new_radio(2048, 256);
     let (tx, mut rx) = mpsc::unbounded_channel::<(u8, Vec<u8>)>();
     for index in 0u16..20 {
-        let mut chunk = vec![0u8; 192];
-        chunk[..4].copy_from_slice(b"SDT\x03");
-        chunk[4..8].copy_from_slice(&77u32.to_le_bytes());
-        chunk[8..10].copy_from_slice(&index.to_le_bytes());
-        chunk[10..12].copy_from_slice(&20u16.to_le_bytes());
+        let chunk = crate::side_frame_test_support::chunk_of_len(77, index, 20, 192);
         budget.try_send(&tx, 254, &chunk).unwrap();
     }
     let heartbeat = serialize::pack_packet(&Packet::new(crate::telemetry_schema::data_type("HEARTBEAT"),
@@ -780,8 +780,8 @@ fn schema_transfer_does_not_hold_frames_queued_behind_it() {
             if bytes == heartbeat && heartbeat_at.is_none() {
                 heartbeat_at = Some(now);
             }
-            if bytes.starts_with(b"SDT\x03") {
-                chunks_written.push(u16::from_le_bytes([bytes[8], bytes[9]]));
+            if let Some(index) = crate::side_frame_test_support::chunk_index(&bytes) {
+                chunks_written.push(index);
             }
             budget.complete(priority, &bytes);
         }
@@ -902,11 +902,7 @@ fn radio_never_refuses_for_a_large_frame_reservation() {
     // Fill the park with frames that cannot be shed (schema chunks).
     let mut transfer = 0u32;
     loop {
-        let mut chunk = vec![0u8; 1000];
-        chunk[..4].copy_from_slice(b"SDT\x03");
-        chunk[4..8].copy_from_slice(&transfer.to_le_bytes());
-        chunk[8..10].copy_from_slice(&1u16.to_le_bytes());
-        chunk[10..12].copy_from_slice(&2u16.to_le_bytes());
+        let chunk = crate::side_frame_test_support::chunk_of_len(transfer, 1, 2, 1000);
         transfer += 1;
         if budget.try_send(&tx, 254, &chunk).is_err() {
             break;
@@ -1217,13 +1213,11 @@ fn time_sync_waiting_more_than_half_a_second_is_dropped_not_sent() {
 fn schema_chunks_never_hold_recovery_quiesce_but_chunked_controls_do() {
     crate::telemetry_schema::initialize().unwrap();
     let chunk = |id: u32, index: u16, total: u16, data: &[u8]| {
-        let mut bytes = b"SDT\x03".to_vec();
-        bytes.extend(id.to_le_bytes());
-        bytes.extend(index.to_le_bytes());
-        bytes.extend(total.to_le_bytes());
-        bytes.extend_from_slice(data);
-        bytes.extend(crc32fast::hash(&bytes).to_le_bytes());
-        bytes
+        let mut body = id.to_le_bytes().to_vec();
+        body.extend(index.to_le_bytes());
+        body.extend(total.to_le_bytes());
+        body.extend_from_slice(data);
+        crate::side_frame_test_support::side_frame(3, &body)
     };
     let schema = serialize::pack_packet(&Packet::new(DataType::DiscoverySchema,
         &[sedsnet::config::DataEndpoint::Discovery], "GS", 1, Arc::from(vec![7u8; 600])).unwrap()).to_vec();
@@ -1276,11 +1270,9 @@ fn heartbeat_template_install_parks_even_when_schema_chunks_fill_the_park() {
     let install = |stamp: u64| {
         let frame = serialize::pack_packet(&Packet::new(crate::telemetry_schema::data_type("HEARTBEAT"),
             &[crate::telemetry_schema::endpoint("HEART_BEAT")], "GS", stamp, Arc::from([])).unwrap()).to_vec();
-        let mut bytes = b"SDT\x01".to_vec();
-        bytes.push(9);
-        bytes.extend_from_slice(&frame);
-        bytes.extend(crc32fast::hash(&bytes).to_le_bytes());
-        bytes
+        let mut body = vec![9];
+        body.extend_from_slice(&frame);
+        crate::side_frame_test_support::side_frame(1, &body)
     };
     let budget = TxQueueBudget::new_radio(2048, 256);
     budget.set_paced_bytes_per_s(400);
@@ -1289,11 +1281,7 @@ fn heartbeat_template_install_parks_even_when_schema_chunks_fill_the_park() {
     // Schema chunks (never shed) fill the 1.5 s park.
     let mut transfer = 0u32;
     loop {
-        let mut chunk = vec![0u8; 192];
-        chunk[..4].copy_from_slice(b"SDT\x03");
-        chunk[4..8].copy_from_slice(&transfer.to_le_bytes());
-        chunk[8..10].copy_from_slice(&1u16.to_le_bytes());
-        chunk[10..12].copy_from_slice(&2u16.to_le_bytes());
+        let chunk = crate::side_frame_test_support::chunk_of_len(transfer, 1, 2, 192);
         transfer += 1;
         if budget.try_send(&tx, 254, &chunk).is_err() {
             break;

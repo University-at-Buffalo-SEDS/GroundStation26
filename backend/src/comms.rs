@@ -126,7 +126,7 @@ pub(crate) const RADIO_TIME_SYNC_PRIORITY: u8 = 250;
 fn radio_liveness_frame(priority: u8, payload: &[u8]) -> bool {
     // With compact bundles the SDK hands over canonical frames instead of SDT.
     matches!(priority, RADIO_LIVENESS_PRIORITY | RADIO_TIME_SYNC_PRIORITY)
-        && (payload.starts_with(b"SDT") || sedsnet::wire_bundle::frame_bundleable(payload))
+        && (sedsnet::side_peek::is_side_transport_frame(payload) || sedsnet::wire_bundle::frame_bundleable(payload))
 }
 
 /// Largest compact bundle the station writes at once (SDK bytes before the RR
@@ -174,7 +174,7 @@ fn note_sdk_wire_written(side: Option<sedsnet::router::RouterSideId>, frame: &[u
 }
 
 pub(crate) fn closes_radio_packet_batch(priority: u8, payload: &[u8]) -> bool {
-    if priority < 200 || payload.starts_with(b"SDT") {
+    if priority < 200 || sedsnet::side_peek::is_side_transport_frame(payload) {
         return false;
     }
     let Ok(info) = serialize::peek_frame_info(payload) else {
@@ -198,9 +198,8 @@ fn is_completed_sdk_ordinary_owner(priority: u8, payload: &[u8]) -> bool {
     if priority >= 254 || closes_radio_packet_batch(priority, payload) {
         return false;
     }
-    if payload.starts_with(b"SDT") {
+    if sedsnet::side_peek::is_side_transport_frame(payload) {
         return payload.len() >= 8
-            && matches!(payload[3], 1..=3)
             && crc32fast::hash(&payload[..payload.len() - 4])
                 == u32::from_le_bytes(payload[payload.len() - 4..].try_into().unwrap());
     }
@@ -3132,7 +3131,7 @@ fn raw_uart_requires_inner_crc(kind: RawUartFrameKind, body: &[u8]) -> bool {
     // trusting it, then require integrity before consuming the UART length.
     // Unrecognized opaque payloads retain the legacy framing contract.
     (kind == RawUartFrameKind::Data
-        && (body.starts_with(b"SDT") || serialize::peek_frame_info_unchecked(body).is_ok()))
+        && (sedsnet::side_peek::is_side_transport_frame(body) || serialize::peek_frame_info_unchecked(body).is_ok()))
         || (matches!(kind, RawUartFrameKind::Data | RawUartFrameKind::Command)
             && crate::rrls::is_envelope(body))
 }
@@ -3160,7 +3159,7 @@ mod native_uart_integrity_tests {
         )
         .unwrap();
         let bytes = serialize::pack_packet(&packet).to_vec();
-        assert!(!bytes.starts_with(b"SDT"));
+        assert!(!sedsnet::side_peek::is_side_transport_frame(&bytes));
         assert_eq!(
             serialize::unpack_packet(&bytes).unwrap().timestamp(),
             timestamp
@@ -3494,7 +3493,7 @@ fn take_raw_uart_framed_payload_recovering(
         && !raw_uart_inner_crc_valid(body) {
             // A damaged length may include the next frame's sync. Reject the
             // checksum before consuming that frame, preserving bytes for resync.
-            let error = if body.starts_with(b"SDT") {
+            let error = if sedsnet::side_peek::is_side_transport_frame(body) {
                 "raw UART SDT crc32 mismatch"
             } else if crate::rrls::is_envelope(body) {
                 "raw UART RR crc32 mismatch"
@@ -6356,7 +6355,7 @@ mod raw_uart_tests {
             !uart.transmit_ready_for(255, &legacy),
             "opaque SETTINGS is not a control beneficiary"
         );
-        assert!(!uart.transmit_ready_for(255, b"SDT\x03opaque"));
+        assert!(!uart.transmit_ready_for(255, b"\x61opaque"));
         let mut corrupt = bytes.to_vec();
         *corrupt.last_mut().unwrap() ^= 1;
         assert!(
@@ -6590,14 +6589,13 @@ mod raw_uart_tests {
         let mut corrupt = bytes.to_vec();
         *corrupt.last_mut().unwrap() ^= 1;
         assert!(!is_radio_packet_receipt(255, &corrupt));
+        // A CRC-valid ACK whose payload is one byte short of a packet ID.
         let mut malformed = bytes.to_vec();
-        assert_eq!(&malformed[2..4], &[1, 8]);
         malformed.truncate(malformed.len() - 4);
         malformed.pop();
-        malformed[3] = 7;
         malformed.extend_from_slice(&crc32fast::hash(&malformed).to_le_bytes());
         assert!(!is_radio_packet_receipt(255, &malformed));
-        assert!(!is_radio_packet_receipt(255, b"SDT\x03\x01\x08 fake ack"));
+        assert!(!is_radio_packet_receipt(255, b"\x61\x01\x08 fake ack"));
         assert!(!is_radio_packet_receipt(255, &crate::rrls::encode(6, b" fake ack")));
         let hop_ack = serialize::pack_reliable_ack(
             "RF",
@@ -6779,7 +6777,7 @@ mod raw_uart_tests {
             1,
         );
         assert!(closes_radio_packet_batch(255, &ack));
-        assert!(!closes_radio_packet_batch(255, b"SDT opaque bootstrap"));
+        assert!(!closes_radio_packet_batch(255, b"\x61 opaque bootstrap"));
         assert!(!closes_radio_packet_batch(255, &crate::rrls::encode(0, b" health")));
     }
 
@@ -7668,14 +7666,7 @@ mod raw_uart_tests {
         // The same ABORT as a side-transport FULL frame (templated: template
         // ID first) and then as a compact frame naming that template: both
         // are ABORT for every classifier (writer turn, radio priority).
-        let sdt = |kind: u8, body: &[u8]| {
-            let mut frame = b"SDT".to_vec();
-            frame.push(kind);
-            frame.extend_from_slice(body);
-            let crc = crc32fast::hash(&frame);
-            frame.extend_from_slice(&crc.to_le_bytes());
-            frame
-        };
+        let sdt = crate::side_frame_test_support::side_frame;
         let template_id = 0x1234_5678u32;
         let mut full = Vec::new();
         let mut id = template_id as u64;
@@ -9755,7 +9746,7 @@ mod raw_uart_tests {
                 },
             ),
         ]));
-        let receiver_side = receiver.add_side_packed_small_packets("pico-i2c", |_| Ok(()), 32);
+        let receiver_side = receiver.add_side_packed_small_packets("pico-i2c", |_| Ok(()), 24);
         let fragments = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
         let fragments_from_tx = fragments.clone();
         let sender = Router::new(sedsnet::router::RouterConfig::new([]));
@@ -9765,7 +9756,7 @@ mod raw_uart_tests {
                 fragments_from_tx.lock().unwrap().push(payload.to_vec());
                 Ok(())
             },
-            32,
+            24,
         );
         let packet = Packet::from_f32_slice(
             crate::telemetry_schema::data_type("GPS_DATA"),
@@ -9806,7 +9797,7 @@ mod raw_uart_tests {
                 },
             ),
         ]));
-        let receiver_side = receiver.add_side_packed_small_packets("radio", |_| Ok(()), 32);
+        let receiver_side = receiver.add_side_packed_small_packets("radio", |_| Ok(()), 24);
 
         let fragments = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
         let fragments_from_tx = fragments.clone();
@@ -9817,7 +9808,7 @@ mod raw_uart_tests {
                 fragments_from_tx.lock().unwrap().push(payload.to_vec());
                 Ok(())
             },
-            32,
+            24,
         );
         let packet = Packet::from_f32_slice(
             crate::telemetry_schema::data_type("GPS_DATA"),
@@ -9908,7 +9899,7 @@ mod raw_uart_tests {
                 Ok(())
             }),
         ]));
-        let side = receiver.add_side_packed_small_packets("shared radio", |_| Ok(()), 32);
+        let side = receiver.add_side_packed_small_packets("shared radio", |_| Ok(()), 24);
         let mut streams = Vec::new();
         for (index, name) in ["GS", "RF", "RRLS"].iter().enumerate() {
             let output = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
@@ -9920,7 +9911,7 @@ mod raw_uart_tests {
                     wire.lock().unwrap().push(bytes.to_vec());
                     Ok(())
                 },
-                32,
+                24,
             );
             let payload = [index as f32, 2.0, 3.0]
                 .into_iter()
@@ -10126,7 +10117,7 @@ mod raw_uart_tests {
     fn raw_uart_corrupt_frame_cannot_swallow_a_valid_following_frame() {
         // Captured failure shape: a 192-byte SDT frame loses 30 bytes, then
         // its claimed length absorbs the next frame's sync and payload.
-        let mut damaged = vec![b'S', b'D', b'T', 3];
+        let mut damaged = vec![0x61, b'D', b'T', 3];
         damaged.resize(162, 0x31);
         // The following data frame must itself be a valid SDK packet. The
         // historical arbitrary 0..92 fixture had no CRC and only happened to
@@ -10153,7 +10144,7 @@ mod raw_uart_tests {
     }
 
     fn crc_recovery_valid_body(payload: &[u8]) -> Vec<u8> {
-        let mut body = b"SDT\x03".to_vec();
+        let mut body = b"\x61".to_vec();
         body.extend_from_slice(payload);
         body.extend_from_slice(&crc32fast::hash(&body).to_le_bytes());
         body
@@ -10161,7 +10152,7 @@ mod raw_uart_tests {
 
     fn crc_recovery_damaged_frame() -> Vec<u8> {
         let mut body = vec![0_u8; 64];
-        body[..4].copy_from_slice(b"SDT\x03");
+        body[0] = 0x61;
         // Plausible 4096-byte header inside the CRC-rejected payload.
         body[16..20].copy_from_slice(&[0xa5, 0x5a, 0, 16]);
         build_raw_uart_frame(&body).unwrap()
@@ -10349,7 +10340,7 @@ mod raw_uart_tests {
         let last = 80;
         for offset in (0..=last).step_by(8) {
             bytes[offset..offset + 4].copy_from_slice(&[0xa5, 0x5a, 0, 8]);
-            bytes[offset + 4..offset + 8].copy_from_slice(b"SDT\x03");
+            bytes[offset + 4] = 0x61;
         }
         let body_start = last + RAW_UART_FRAME_HEADER_SIZE;
         let crc_at = body_start + payload_len - 4;
@@ -10448,8 +10439,10 @@ mod raw_uart_tests {
     /// instant minus the bytes that came in after it.
     #[test]
     fn a_burst_read_at_once_stamps_each_frame_at_its_own_end() {
-        let first = vec![7u8; 40];
-        let second = vec![9u8; 100];
+        // Opaque bodies (0x64/0x65 are reserved first bytes, never a
+        // SEDSnet frame) keep the plain length-framing contract.
+        let first = vec![0x64u8; 40];
+        let second = vec![0x65u8; 100];
         let mut rx_buf = build_raw_uart_frame(&first).unwrap();
         let second_wire = build_raw_uart_frame(&second).unwrap();
         rx_buf.extend_from_slice(&second_wire);
