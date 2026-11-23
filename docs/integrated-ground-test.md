@@ -508,13 +508,13 @@ FAT32. Use 8.3 names; do not rename the folder.
 
 ### 11.1 Using the committed mock flights
 
-`test-data/igt/` holds ready-made flights of the 6 in, 15 ft vehicle. Their
+`test-data/igt/` holds ready-made flights of the SWEET_V6 vehicle (6 in, 4.39 m, 40.84 kg dry; `tools/flight_profile/vehicle/SWEET_V6.ork`). Their
 README gives each one's apogee, Mach, accelerations and event times:
 
 | Folder | Use |
 | --- | --- |
 | `nominal_10k` | the default: a nominal flight to 10,000 ft AGL |
-| `measured_motor` | the 2026-11-16 motor as measured (9.2 kN s with the fill-cell unloading, about 7,000 ft) |
+| `measured_motor` | the 2026-11-16 motor as measured (9.2 kN s with the fill-cell unloading, about 5,000 ft on this vehicle) |
 | `high_wind` | 9 m/s wind with gusts: weathercocking and drift |
 | `early_apogee_noise` | Kalman stress: baro noise, outliers, Mach error and a false-descent step before apogee |
 | `off_nominal` | FC logic: a late main, an IMU saturation glitch, a frozen baro and a GPS dropout |

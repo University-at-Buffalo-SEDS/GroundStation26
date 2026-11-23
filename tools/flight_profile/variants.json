@@ -9,7 +9,7 @@
     },
     {
       "name": "measured_motor",
-      "description": "the 2026-11-16 measured motor, unscaled, on the assumed airframe",
+      "description": "the 2026-11-16 measured motor, unscaled, on the SWEET_V6 airframe",
       "seed": 11
     },
     {
