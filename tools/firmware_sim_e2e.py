@@ -361,10 +361,52 @@ def peak(st: Station, data_type: str, seconds: float, index=0):
     return best
 
 
+def gse(st: Station):
+    code, g = st.api("/api/gse/status")
+    return g if code == 200 and isinstance(g, dict) else {}
+
+
+def gse_procedure(st: Station, check, result):
+    """The operator's GSE procedure: valve self-test, nitrogen test (dump at its hold), fill to the target; the
+    station goes Armed when the fill target is reached (FirmwareSimulator test-operational-flight-sim.py gse_step)."""
+    ready = st.wait(lambda: gse(st).get("topology_stable") and gse(st).get("phase") in ("idle", "cancelled", None) and gse(st), 120, "GSE topology stable", poll=2)
+    check("GSE topology stable", ready, phase=gse(st).get("phase"))
+    st.api("/api/gse/self-test-confirmation", {"confirmed": True})
+    st.command("ValveSelfTest")
+    ok = st.wait(lambda: (gse(st).get("qualification") or {}).get("self_test"), 180, "valve self-test", poll=2)
+    check("valve self-test passes through the real VB/AB", ok, phase=gse(st).get("phase"), message=gse(st).get("message"))
+    st.command("NitrogenTest")
+    def n2():
+        g = gse(st)
+        if (g.get("qualification") or {}).get("nitrogen_test") and g.get("phase") == "passed":
+            return g
+        live = [c for c in (g.get("sequence_progress") or {}).get("controls", []) if c.get("hold_choice")]
+        if live and g.get("phase") == "paused" and (live[0]["hold_choice"].get("dump") or {}).get("allowed"):
+            st.api("/api/gse/sequences/dump", live[0]["key"])
+        return None
+    ok = st.wait(n2, 400, "nitrogen test", poll=2)
+    check("nitrogen test passes (pressure steps on the plant, dump at the hold)", ok, phase=gse(st).get("phase"), message=gse(st).get("message"))
+    st.command("StartFill")
+    last_resume = [0.0]
+    def filled():
+        g = gse(st)
+        if (g.get("qualification") or {}).get("fill_target"):
+            return g
+        if g.get("phase") == "paused" and "below target" in str(g.get("message")) and time.monotonic() - last_resume[0] > 5:
+            last_resume[0] = time.monotonic()
+            st.command("StartFill")
+        return None
+    ok = st.wait(filled, 600, "fill target", poll=2)
+    check("fill reaches its target through the station's own fill sequence", ok, phase=gse(st).get("phase"),
+          message=gse(st).get("message"), plant=st.plant().get("tank"))
+    result["gse"] = gse(st)
+
+
 def scenario_test_fire(st, check, result):
     # test fire uses the fill-side boards on the umbilical (the AV bay is not on the stand's radio)
     boards_up(st, check, ["GB", "AB", "VB", "DAQ"])
-    fill(st, check)
+    # the operator's procedure from an empty tank (the manual fill rules are checked in the other modes)
+    gse_procedure(st, check, result)
     kg1000_rest = (st.latest("KG1000", "DAQ") or {}).get("values", [None])[0]
     arm_and_launch(st, check)
     lit = st.wait(lambda: st.plant().get("motor", {}).get("burning") or st.plant().get("motor", {}).get("burned_out"), 90, "ignition on the stand")

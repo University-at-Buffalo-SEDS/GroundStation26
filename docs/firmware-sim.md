@@ -234,7 +234,7 @@ Additions since the MVP:
   through the real acquisition path (MCP CH2-5, HVAIN1/2, P6 differential, KG1000/KG50 amplifiers with an
   attenuator; SAR inputs are not modelled). Control `patch: {dac1, dac2, dac1_attenuation, dac2_attenuation}`;
   fault `p10_inputs_swapped` latches the buffer to a rail (the unreworked board). The table is sampled every 10 ms of
-  plant time, so waveforms up to about 25 Hz come through faithfully.
+  plant time normally and every 1 ms while a patch is active (see the DAQ frame engine section).
 * **AB current sense**: the N2O/N2 solenoid and igniter channels (ADC1) read current while energized; fault
   `igniter_open` reads no igniter current.
 * **RF link quality**: packet loss grows with the slant range (none to 3 km, about 30 % at 12 km).
@@ -337,8 +337,10 @@ Per mode (the e2e: `python3 tools/firmware_sim_e2e.py --out DIR --mode <mode>`):
 * **HITL**: fill by hand (Nitrogen/Nitrous/NormallyOpen/Dump), AdvanceFlightState to Armed, Launch: the VB opens the
   pilot at T+10 s, the plant lights the motor (no igniter in HITL) and flies; the FC runs its estimator and fires its
   pyro outputs.
-* **Test fire**: the fill-side boards on the umbilical; the fill takes the station to Armed, Launch fires the igniter
-  and the pilot, the motor burns on the stand (chamber PT, KG50 unloading, KG1000 after the gap).
+* **Test fire**: the fill-side boards on the umbilical. Armed comes from the station's own GSE procedure (valve
+  self-test, nitrogen test, fill to target), not from manual valve commands; the e2e drives that procedure. In the
+  sim the valve self-test currently pauses on "Valve acknowledgement timed out ... no fresh report" after the pilot
+  open/close steps (the station does not accept the VB/AB valve-state reports as fresh in time); open.
 * **Normal**: the RF NEO-M9N fix reaches the station, so the GPS gate passes; the full procedure (self-test, nitrogen
   test, fill, QD retract, Launch) is the station's own and was not driven end to end yet.
 * **IGT**: the FC ground-test variant; pick a dataset in the sim panel (card out, dataset, card in, Retry SD), Ground
@@ -376,19 +378,22 @@ the supplies and opens dump and vent through the real boards.
 Not verified: Normal (RF GPS not modelled), Test fire, Testing and IGT end to end (the modes are offered and the plant
 follows them, but only HITL was driven through), aarch64, the remote build, the DAC patch.
 
-### DAQ 99db2e6 and later (not supported natively yet)
+### DAQ frame engine (DAQ-Board 99db2e6 and later)
 
-DAQ-Board 99db2e6 moved the MCP3564R to a TIM2 1 ms frame engine: TIM2 compare interrupts (CC1 frame tick, CC2 slot
-start) programmed at register level, a free-running µs counter, one-shot SCAN cycles started per frame and DMA SPI
-reads on DRDY. The native shim emulates timers only through the HAL (update interrupts) and the MCP3564R model
-converts continuously, so a native DAQ at 99db2e6 builds and runs but produces no load-cell or chamber samples (the
-fill load cell reads 0, and test fire never reaches Armed). Until the shim gains register-level TIM compare
-emulation (CNT, CCRx/DIER/EGR, the TIM2 vector the replaced `stm32u5xx_it.c` routes) and a one-shot SCAN model,
-build the DAQ at 6f29611: `python3 tools/firmware_sim.py build --board daq=6f29611`.
+The DAQ's MCP3564R frame engine runs natively: the shim emulates TIM2 at register level (a live CNT from virtual
+time, CCRx compare matches and EGR events setting SR.CCxIF with rc_w0 clears, calling `mcp3564r_timer_irq`, the body
+of the DAQ's replaced TIM2 vector), and the MCP3564R model converts the SCAN list once per START in one-shot mode
+(CONFIG3 0xB0) and returns to standby. Verified: about 1 kHz frame ticks, and the fill load cell, KG1000 and chamber
+PT values reach the station through the new engine (the test-fire e2e fill check). The engine's own counters still
+show scans timing out in about a third of the frames in the sim (`g_mcp3564r_diag.scans_timed_out`), so some
+samples are dropped; the cause (SPI DMA timing against DRDY in the model) is open.
+
+DAC patch sampling: while a DAC output is patched the plant steps every 1 ms (else every 10 ms), so with the 1 kHz
+frame engine waveforms up to about 250 Hz come through faithfully (500 Hz Nyquist).
 
 ## 7. Follow-ups
 
-* The DAQ 99db2e6 frame engine in the native shim (above); IGT reaching FC `Ready` (the e2e mounts the card, sees the
+* The frame engine's dropped scans in the sim (above); IGT reaching FC `Ready` (the e2e mounts the card, sees the
   ground-test image and enters ground test, but the FC mode stays `off`; not diagnosed yet).
 * Thermocouples and tank wall temperature telemetry, power rails and battery discharge (the LTC2990 monitors still
   read static values), weathercocking/3-DOF attitude, SAR inputs in the DAC patch.

@@ -89,7 +89,7 @@ FIRMWARE_SIM_SEEDS = {
                       "dry_self_test_confirmed": False, "grouped_panel": True, "turbocharge_max_added_mass_kg": 0.5,
                       "turbocharge_pressure_deadband_psi": 12},
     "GS_FILL_TARGETS_CONFIG": {"version": 1, "fill_source": "kg50", "nitrogen": {"target_mass_kg": 0.5, "target_pressure_psi": 500},
-                               "nitrous": {"target_mass_kg": 8, "target_pressure_psi": 700}},
+                               "nitrous": {"target_mass_kg": 5, "target_pressure_psi": 700}},
     "GS_CHECKLISTS_FILE": {"revision": 0, "enforce_before_launch": False, "checklists": []},
     # Links are always the bay's (simulator overrides below); nothing here names a physical device.
     "GS_COMMS_LINK_CONFIG": {"version": 1, "av_bay": {"interface": "serial", "port": "/dev/null", "baud_rate": 115200, "protocol": "raw_uart"},
