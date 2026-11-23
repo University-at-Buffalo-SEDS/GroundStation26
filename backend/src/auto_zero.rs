@@ -7,15 +7,23 @@ mod capture_clock;
 use capture_clock::CaptureClock;
 pub(crate) mod before_launch;
 
+/// Samples a KG1000 zero needs (and the most either stream keeps).
 const COUNT: usize = 200;
-// The live DAQ stream is nominally 40 Hz (39.86 Hz in the incident recording).
-// 200 samples consume five seconds before transport/scheduler jitter. Retain
-// the same sample/quality minimum with two bounded seconds of delivery margin.
-const NOMINAL_SAMPLES_PER_SECOND: u64 = 40;
+/// Five seconds of each live DAQ stream (DAQ-Board daq_rates.h): KG1000 in
+/// 20 ms bins (50 Hz, 200 samples in 4 s), the selected KG50 in 50 ms bins
+/// (20 Hz). Asking the KG50 for 200 samples took ten seconds and could never
+/// finish inside the window, so every automatic zero before a fill failed
+/// (and Start fill with it).
+const KG50_COUNT: usize = 100;
+const CAPTURE_MS: u64 = 5_000;
+// Two bounded seconds of delivery margin beyond the five-second capture.
 const TRANSPORT_MARGIN_MS: u64 = 2_000;
-const WINDOW: Duration = Duration::from_millis(
-    (COUNT as u64 * 1_000).div_ceil(NOMINAL_SAMPLES_PER_SECOND) + TRANSPORT_MARGIN_MS,
-);
+const WINDOW: Duration = Duration::from_millis(CAPTURE_MS + TRANSPORT_MARGIN_MS);
+
+/// Fresh samples an automatic zero of `sensor` collects.
+fn sample_count(sensor: &str) -> usize {
+    if sensor == "KG50" { KG50_COUNT } else { COUNT }
+}
 const ZERO_KG: f32 = 0.8;
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -237,7 +245,7 @@ fn stable(
     cfg: &loadcell::LoadcellCalibrationFile,
     sensor: &str,
 ) -> Result<(f32, bool), String> {
-    stable_count(raw, cfg, sensor, COUNT)
+    stable_count(raw, cfg, sensor, sample_count(sensor))
 }
 
 fn stable_count(
@@ -445,7 +453,8 @@ fn begin(state: &Arc<AppState>, sensor: &'static str, fill: bool) -> bool {
             return true;
         }
         if fill {
-            let recent = rt.samples(sensor, start.earlier(WINDOW));
+            let mut recent = rt.samples(sensor, start.earlier(WINDOW));
+            recent.drain(..recent.len().saturating_sub(sample_count(sensor)));
             // Require a live stream, not merely a recently stopped sensor.
             let history = if sensor == "KG50" {
                 &rt.kg50
@@ -482,7 +491,8 @@ fn begin(state: &Arc<AppState>, sensor: &'static str, fill: bool) -> bool {
     };
     state.add_notification_with_persistence(
         format!(
-            "Collecting 200 fresh {sensor} samples for automatic zero (up to {} seconds)",
+            "Collecting {} fresh {sensor} samples for automatic zero (up to {} seconds)",
+            sample_count(sensor),
             WINDOW.as_secs()
         ),
         false,
@@ -520,12 +530,14 @@ fn begin(state: &Arc<AppState>, sensor: &'static str, fill: bool) -> bool {
             // Never extend a capture by retrying or accept samples after its bounded budget.
             if !start.within(WINDOW) {
                 break Err(format!(
-                    "200 stable samples were not captured within the {}-second acquisition budget",
+                    "{} stable samples were not captured within the {}-second acquisition budget",
+                    sample_count(sensor),
                     WINDOW.as_secs()
                 ));
             }
-            if raw.len() == COUNT {
-                break stable(&raw, &cfg, sensor).map(|v| v.0);
+            if raw.len() >= sample_count(sensor) {
+                let raw = &raw[raw.len() - sample_count(sensor)..];
+                break stable(raw, &cfg, sensor).map(|v| v.0);
             }
         };
         // The first step was admitted before its original5s deadline. This
@@ -837,6 +849,28 @@ mod tests {
         rt.fill_pending = false;
         rt.cancel_for_command(&TelemetryCommand::Abort);
         assert!(!rt.pending);
+    }
+    /// DAQ-Board's live streams: KG1000 at 50 Hz, the selected KG50 at
+    /// 20 Hz (daq_rates.h). Each zero's samples arrive in five seconds and
+    /// the two-second delivery margin is kept; the KG50's former 200
+    /// samples needed ten seconds and never fit.
+    #[test]
+    fn every_stream_fills_its_zero_capture_inside_the_window() {
+        assert_eq!(WINDOW, Duration::from_secs(7));
+        for (sensor, hz) in [("KG1000", 50u64), ("KG50", 20u64)] {
+            let need_ms = sample_count(sensor) as u64 * 1_000 / hz;
+            assert!(need_ms <= CAPTURE_MS, "{sensor}: {need_ms} ms");
+            assert!(need_ms + TRANSPORT_MARGIN_MS <= WINDOW.as_millis() as u64);
+            assert!(sample_count(sensor) >= 100, "{sensor}: enough samples for the 5 % tails");
+        }
+        // the KG50 judges exactly its own sample count
+        let mut cfg = config();
+        cfg.extra_channels.insert(
+            "kg50".into(),
+            loadcell::GenericCalibrationChannel { linear: cfg.ch1.clone(), ..Default::default() },
+        );
+        assert!(stable(&vec![0.3; KG50_COUNT], &cfg, "KG50").unwrap().1);
+        assert!(stable(&vec![0.3; COUNT], &cfg, "KG50").is_err());
     }
     #[test]
     fn zero_band_boundaries_and_sustained_outliers() {
