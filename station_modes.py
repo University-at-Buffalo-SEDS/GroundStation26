@@ -11,6 +11,12 @@ the binary again with the selected mode and Simulation flag.
   python3 station_modes.py build                         # build the binary
   python3 station_modes.py exec [--rrls] [--default-mode hitl]   # systemd ExecStart
 
+A selection with ``firmware_sim`` runs the backend against the real firmware
+of every board, built for this machine (tools/firmware_sim.py,
+docs/firmware-sim.md): the supervisor starts the native bay first, points the
+backend's links at it, isolates its state and recordings, and stops the bay
+when the backend exits.
+
 ``run_groundstation.py --switchable-modes ...`` builds and supervises in one
 step. Without a saved selection the default mode (the launcher's usual
 choice) runs, so existing behaviour is unchanged.
@@ -24,6 +30,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping
@@ -45,6 +52,142 @@ RRLS_SIM_ISOLATED = {
     "GS_LAUNCH_CLOCK_STATE": "launch_clock.json",
     "GS_BOARD_ABORT_HISTORY_DIR": "board_abort_history",
 }
+
+
+# Modes whose firmware simulation is offered (backend station_mode_switch FIRMWARE_SIM_MODES).
+FIRMWARE_SIM_MODES = MODES
+# Backend state and configuration a firmware simulation keeps apart from the hardware installation (relative to
+# <state dir>/firmware-sim/state, fresh at every start).
+FIRMWARE_SIM_ISOLATED = {
+    "GS_LAUNCH_CLOCK_STATE": "proof/launch_clock.json",
+    "GS_BOARD_ABORT_HISTORY_DIR": "proof/board_abort_history",
+    "GS_GSE_QUALIFICATION": "proof/gse_qualification.json",
+    "GS_NETWORK_VARIABLE_CACHE": "config/network_variables.json",
+    "GS_FILL_TARGETS_CONFIG": "config/fill_targets.json",
+    "GS_FLIGHT_SETUP_CONFIG": "config/flight_setup.json",
+    "GS_LOADCELL_CALIBRATION_PATH": "config/loadcell_calibration.json",
+    "GS_CALIBRATION_CONFIG_PATH": "config/calibration_config.json",
+    "GS_AUTO_ZERO_CONFIG": "config/auto_zero.json",
+    "GS_GSE_CONFIG": "config/gse_sequence.json",
+    "GS_CHECKLISTS_FILE": "config/checklists.json",
+    "GS_ACTUATOR_PLUMBING_CONFIG": "config/plumbing.json",
+    "GS_BOARD_CONFIG_SYNC_PATH": "config/board_config_sync.json",
+    "GS_MISSION_SETTINGS_PATH": "config/mission_settings.json",
+    "GS_ZERO_CAPTURE_DIR": "calibration/zero_captures",
+    "GS_LOG_DIR": "logs",
+    "GS_COMMS_LINK_CONFIG": "config/comms.json",
+}
+# Seeds matching the bay's plant (FirmwareSimulator native_plant.rs): the DAQ load cell at 100 kg/V, a nitrogen
+# supply of 1000 psi and nitrous at 745 psi (so targets stay below them and below the VB relief at 850 psi).
+FIRMWARE_SIM_SEEDS = {
+    # KG1000 (ch1) 545.8 kg/V, zero 0.2126 V; KG50 12 915 kg/V, zero 0.2112 V (docs/loadcell-investigation-2026-11.md),
+    # on the calibration's legacy-raw scale (volts x 921/16000, DAQ MCP3564R_LEGACY_RAW_TO_VOLTS): KG1000 is then the
+    # recorded 9481.62 raw - 116.03. Operators can recalibrate against the sim's calibration masses.
+    "GS_LOADCELL_CALIBRATION_PATH": {"version": 1, "ch1": {"m": 9481.62, "b": -116.03}, "iadc": {"m": 1, "b": 0}, "kg50_input": "amp2",
+                                     "extra_channels": {"kg50": {"linear": {"m": 224366.0, "b": -2727.65}, "zero_raw": None, "points": [], "fit": None}}},
+    "GS_GSE_CONFIG": {"nitrogen_target_psi": 500, "pressure_step_psi": 50, "pressure_ceiling_psi": 800, "maximum_zero_offset_psi": 20,
+                      "dry_self_test_confirmed": False, "grouped_panel": True, "turbocharge_max_added_mass_kg": 0.5,
+                      "turbocharge_pressure_deadband_psi": 12},
+    "GS_FILL_TARGETS_CONFIG": {"version": 1, "fill_source": "kg50", "nitrogen": {"target_mass_kg": 0.5, "target_pressure_psi": 500},
+                               "nitrous": {"target_mass_kg": 8, "target_pressure_psi": 700}},
+    "GS_CHECKLISTS_FILE": {"revision": 0, "enforce_before_launch": False, "checklists": []},
+    # Links are always the bay's (simulator overrides below); nothing here names a physical device.
+    "GS_COMMS_LINK_CONFIG": {"version": 1, "av_bay": {"interface": "serial", "port": "/dev/null", "baud_rate": 115200, "protocol": "raw_uart"},
+                             "fill_box": {"interface": "pico_fi_tcp", "mode": "server", "address": "127.0.0.1:0", "discovery": True}},
+}
+
+
+def firmware_sim_root(directory: Path) -> Path:
+    return directory / "firmware-sim"
+
+
+def firmware_sim_env(base: Mapping[str, str], root: Path, endpoints: dict | None) -> dict[str, str]:
+    """The backend's environment against a running bay (``endpoints``: its endpoints.json, or None when the bay
+    did not start: the links then point nowhere and the station shows the bay as not running)."""
+    env = dict(base)
+    state = root / "state"
+    for key, relative in FIRMWARE_SIM_ISOLATED.items():
+        env[key] = str(state / relative)
+    env["GS_FIRMWARE_SIM"] = "1"
+    env["GS_FIRMWARE_SIM_DIR"] = str(root / "run")
+    env["GS_RECORDINGS_DIR"] = str(root / "recordings")
+    env["GS_SIMULATED_SERIAL_PTY"] = "1"
+    env["GS_SIM_MODE"] = "0"
+    env["GS_VIDEO_MANAGED"] = "0"
+    env["GS_VIDEO_DISCOVERY"] = "0"
+    for key in ("GS_AV_BAY_SERIAL_PORT", "GS_FILL_PICO_DISCOVERY_PORT", "GS_FILL_PICO_TCP_ADDRESS", "GS_FILL_SERIAL_PORT",
+                "GS_RRLS_ROLE", "GS_EXECUTION_MODE", "GS_LAYOUT_PATH"):
+        env.pop(key, None)
+    links = ((endpoints or {}).get("hosts") or {}).get("groundstation") or {}
+    env["GS_AV_BAY_SERIAL_PORT"] = links.get("GS_AV_BAY_SERIAL_PORT", "/dev/null")
+    # a closed loopback port: discovery finds no Pico-Fi when the bay is not running
+    env["GS_FILL_PICO_DISCOVERY_PORT"] = links.get("GS_FILL_PICO_DISCOVERY_PORT", "9")
+    return env
+
+
+def prepare_firmware_sim_state(root: Path) -> None:
+    """Fresh isolated state and configuration at every start; recordings persist (they are all simulated)."""
+    state = root / "state"
+    if state.exists():
+        shutil.rmtree(state)
+    for key, relative in FIRMWARE_SIM_ISOLATED.items():
+        path = state / relative
+        # Only parents: some owners (the board abort history) treat an existing empty directory as theirs.
+        path.parent.mkdir(parents=True, exist_ok=True)
+    for key, seed in FIRMWARE_SIM_SEEDS.items():
+        (state / FIRMWARE_SIM_ISOLATED[key]).write_text(json.dumps(seed, indent=2) + "\n", encoding="utf-8")
+    (root / "recordings").mkdir(parents=True, exist_ok=True)
+
+
+class FirmwareSimBay:
+    """The native bay (every board's real firmware plus the plant), started before the backend and stopped after
+    it. ``tools/firmware_sim.py run`` resolves the build cache and FirmwareSimulator's launcher."""
+
+    def __init__(self, repo_root: Path, root: Path, popen: Callable = subprocess.Popen, timeout_s: float = 90.0, mode: str = "normal"):
+        self.repo_root, self.root, self.popen, self.timeout_s, self.mode = repo_root, root, popen, timeout_s, mode
+        self.process = None
+
+    def start(self) -> dict | None:
+        run = self.root / "run"
+        if run.exists():
+            shutil.rmtree(run)
+        run.mkdir(parents=True)
+        command = [sys.executable, str(self.repo_root / "tools" / "firmware_sim.py"), "run", "--out", str(run), "--mode", self.mode]
+        print(f"Starting the firmware simulation bay: {' '.join(command)}", flush=True)
+        log = (run / "supervisor-bay.log").open("ab")
+        self.process = self.popen(command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        deadline = time.monotonic() + self.timeout_s
+        endpoints = run / "endpoints.json"
+        while time.monotonic() < deadline:
+            if endpoints.exists():
+                try:
+                    return json.loads(endpoints.read_text(encoding="utf-8"))
+                except ValueError:
+                    pass
+            if self.process.poll() is not None:
+                print(f"Warning: the firmware simulation bay exited ({self.process.returncode}); see {run / 'supervisor-bay.log'}",
+                      file=sys.stderr)
+                return None
+            time.sleep(0.2)
+        print("Warning: the firmware simulation bay did not publish its endpoints in time", file=sys.stderr)
+        return None
+
+    def stop(self) -> None:
+        if self.process is None or self.process.poll() is not None:
+            return
+        self.process.send_signal(signal.SIGTERM)
+        try:
+            self.process.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait()
+
+
+def pi_build(root: Path) -> bool:
+    try:
+        return "raspberry_pi" in json.loads((root / "build.json").read_text(encoding="utf-8")).get("features", [])
+    except (OSError, ValueError):
+        return False
 
 
 def simulation_supported(mode: str, rrls: bool) -> bool:
@@ -94,6 +237,7 @@ class Choice:
     mode: str
     simulation: bool
     reason: str
+    firmware_sim: bool = False
 
 
 def read_selection(directory: Path) -> dict | None:
@@ -126,6 +270,11 @@ def choose(selection: dict | None, installed: list[str], default_mode: str, rrls
         elif simulation and not simulation_supported(mode, rrls):
             print(f"Warning: {mode} has no simulation on this station; starting it without", file=sys.stderr)
             return Choice(mode, False, "selection (simulation unsupported)")
+        elif selection.get("firmware_sim") is True:
+            if rrls or mode not in FIRMWARE_SIM_MODES:
+                print(f"Warning: firmware simulation is not offered for {role} {mode}; starting it without", file=sys.stderr)
+                return Choice(mode, False, "selection (firmware simulation unsupported)")
+            return Choice(mode, False, "selection", firmware_sim=True)
         else:
             return Choice(mode, simulation, "selection")
     return Choice(default_mode, bool(default_simulation), "default")
@@ -211,7 +360,9 @@ def plan(repo_root: Path, root: Path, environ: Mapping[str, str], default_mode: 
 
 def describe(choice: Choice, rrls: bool) -> str:
     sim = ""
-    if choice.simulation:
+    if choice.firmware_sim:
+        sim = " against SIMULATED FIRMWARE (native board builds, no physical links)"
+    elif choice.simulation:
         sim = " with a SIMULATED paired primary (no radio output)" if rrls else " in internal flight simulation"
     return f"{'RRLS' if rrls else 'Ground station'} mode {choice.mode}{sim} ({choice.reason})"
 
@@ -222,19 +373,19 @@ def supervise(repo_root: Path, root: Path, default_mode: str, rrls: bool, cwd: P
     environ = dict(os.environ if environ is None else environ)
     while True:
         choice, binary, env = plan(repo_root, root, environ, default_mode, rrls, default_simulation)
+        bay = None
+        if choice.firmware_sim:
+            if pi_build(root):
+                print("Warning: firmware simulation is not run by a Raspberry Pi build; starting the mode without it", file=sys.stderr)
+                choice = Choice(choice.mode, False, "selection (firmware simulation unsupported on the Pi)")
+            else:
+                sim_root = firmware_sim_root(state_dir(repo_root, environ))
+                prepare_firmware_sim_state(sim_root)
+                bay = FirmwareSimBay(repo_root, sim_root, popen, mode=choice.mode)
+                env = firmware_sim_env(env, sim_root, bay.start())
         print(f"Starting {describe(choice, rrls)}: {binary}")
-        process = popen([str(binary)], cwd=cwd, env=env)
-        try:
-            code = process.wait()
-        except KeyboardInterrupt:
-            process.send_signal(signal.SIGINT)
-            try:
-                code = process.wait(timeout=12)
-            except subprocess.TimeoutExpired:
-                process.terminate()
-                code = process.wait()
-            return code
-        if code != RESTART_EXIT_CODE:
+        code, interrupted = run_backend(popen, binary, cwd, env, bay)
+        if interrupted or code != RESTART_EXIT_CODE:
             return code
         print("Backend requested a restart for a Simulation change; starting the selected mode.")
 
@@ -243,8 +394,55 @@ def exec_selected(repo_root: Path, root: Path, default_mode: str, rrls: bool) ->
     """For systemd: replace this process with the selected binary. The unit
     restarts it after RESTART_EXIT_CODE and this runs again."""
     choice, binary, env = plan(repo_root, root, os.environ, default_mode, rrls)
+    if choice.firmware_sim:
+        # The bay is a child that must outlive nothing: supervise this one start, then exit with the backend's
+        # status (the unit restarts after RESTART_EXIT_CODE and this runs again).
+        sys.exit(supervise_once(repo_root, root, default_mode, rrls))
     print(f"Starting {describe(choice, rrls)}: {binary}", flush=True)
     os.execve(binary, [str(binary)], env)
+
+
+def supervise_once(repo_root: Path, root: Path, default_mode: str, rrls: bool, popen: Callable = subprocess.Popen) -> int:
+    environ = dict(os.environ)
+    choice, binary, env = plan(repo_root, root, environ, default_mode, rrls)
+    sim_root = firmware_sim_root(state_dir(repo_root, environ))
+    prepare_firmware_sim_state(sim_root)
+    bay = FirmwareSimBay(repo_root, sim_root, popen, mode=choice.mode)
+    env = firmware_sim_env(env, sim_root, bay.start())
+    print(f"Starting {describe(choice, rrls)}: {binary}", flush=True)
+    return run_backend(popen, binary, Path.cwd(), env, bay)[0]
+
+
+def run_backend(popen: Callable, binary: Path, cwd: Path, env: Mapping[str, str], bay: "FirmwareSimBay | None") -> tuple[int, bool]:
+    """Run the backend once; (exit status, interrupted). With a bay, SIGTERM to this supervisor is passed to the
+    backend (its clean shutdown) and the bay always stops after the backend, whatever ends it."""
+    process = popen([str(binary)], cwd=cwd, env=env)
+    previous = None
+    if bay is not None:
+        def on_term(_signum, _frame):
+            try:
+                process.send_signal(signal.SIGTERM)
+            except (OSError, AttributeError):
+                pass
+        try:
+            previous = signal.signal(signal.SIGTERM, on_term)
+        except ValueError:  # not the main thread
+            previous = None
+    try:
+        return process.wait(), False
+    except KeyboardInterrupt:
+        process.send_signal(signal.SIGINT)
+        try:
+            code = process.wait(timeout=12)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            code = process.wait()
+        return code, True
+    finally:
+        if bay is not None:
+            bay.stop()
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)
 
 
 def main(argv: list[str] | None = None) -> int:

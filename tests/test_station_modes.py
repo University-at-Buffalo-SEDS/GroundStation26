@@ -193,6 +193,107 @@ class BuildAndSuperviseTests(unittest.TestCase):
             self.assertEqual(env["GS_RRLS_SIM_ROOT"], str((state / "rrls-simulation").resolve()))
 
 
+def firmware_selection(directory: Path, mode):
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / sm.SELECTION_FILE).write_text(json.dumps({
+        "version": 1, "role": "primary", "mode": mode, "simulation": False, "firmware_sim": True,
+        "target_id": mode + "-firmware-sim", "transition_id": "switch-test", "requested_by": "user:op", "requested_at_ms": 1,
+    }))
+
+
+class FirmwareSimTests(unittest.TestCase):
+    def test_firmware_selection_is_offered_for_every_mode_on_the_primary_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            firmware_selection(d, "hitl")
+            self.assertEqual(sm.choose(sm.read_selection(d), list(sm.MODES), "normal", False),
+                             sm.Choice("hitl", False, "selection", firmware_sim=True))
+            for mode in sm.MODES:  # a sim backend for every mode
+                firmware_selection(d, mode)
+                choice = sm.choose(sm.read_selection(d), list(sm.MODES), "normal", False)
+                self.assertTrue(choice.firmware_sim and not choice.simulation, mode)
+            self.assertFalse(sm.choose(sm.read_selection(d), list(sm.MODES), "normal", True).firmware_sim, "never on an RRLS")
+
+    def test_firmware_env_isolates_state_and_points_links_only_at_the_bay(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "firmware-sim"
+            base = {"GS_AV_BAY_SERIAL_PORT": "/dev/ttyAMA0", "GS_FILL_SERIAL_PORT": "/dev/ttyUSB0", "GS_SIM_MODE": "1",
+                    "GS_LAUNCH_CLOCK_STATE": "/real/launch_clock.json", "GS_USERS_FILE": "/real/users.json"}
+            endpoints = {"hosts": {"groundstation": {"GS_AV_BAY_SERIAL_PORT": "/dev/pts/7", "GS_FILL_PICO_DISCOVERY_PORT": "40123"}}}
+            env = sm.firmware_sim_env(base, root, endpoints)
+            self.assertEqual(env["GS_FIRMWARE_SIM"], "1")
+            self.assertEqual(env["GS_SIMULATED_SERIAL_PTY"], "1")
+            self.assertEqual(env["GS_AV_BAY_SERIAL_PORT"], "/dev/pts/7")
+            self.assertEqual(env["GS_FILL_PICO_DISCOVERY_PORT"], "40123")
+            self.assertNotIn("GS_FILL_SERIAL_PORT", env, "no physical fill link survives")
+            self.assertEqual(env["GS_SIM_MODE"], "0")
+            for key in sm.FIRMWARE_SIM_ISOLATED:
+                self.assertTrue(env[key].startswith(str(root / "state")), key)
+            self.assertEqual(env["GS_USERS_FILE"], "/real/users.json", "same accounts")
+            self.assertTrue(env["GS_RECORDINGS_DIR"].startswith(str(root)))
+            # bay not running: still no physical device
+            env = sm.firmware_sim_env(base, root, None)
+            self.assertEqual(env["GS_AV_BAY_SERIAL_PORT"], "/dev/null")
+
+    def test_supervisor_starts_the_bay_before_the_backend_and_stops_it_after(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            root = repo / "bins"
+            install(root)
+            state = repo / "state"
+            firmware_selection(state, "hitl")
+            events = []
+
+            class Process:
+                def __init__(self, argv, **kwargs):
+                    self.argv = argv
+                    self.bay = "firmware_sim.py" in " ".join(map(str, argv))
+                    self.returncode = None
+                    if self.bay:
+                        out = Path(argv[argv.index("--out") + 1])
+                        (out / "endpoints.json").write_text(json.dumps(
+                            {"hosts": {"groundstation": {"GS_AV_BAY_SERIAL_PORT": "/dev/pts/9", "GS_FILL_PICO_DISCOVERY_PORT": "41000"}}}))
+                        events.append("bay started")
+                    else:
+                        events.append(("backend", kwargs["env"]["GS_AV_BAY_SERIAL_PORT"], kwargs["env"]["GS_FIRMWARE_SIM"]))
+
+                def poll(self):
+                    return self.returncode
+
+                def send_signal(self, sig):
+                    events.append("bay stopped")
+                    self.returncode = 0
+
+                def wait(self, timeout=None):
+                    return 0
+
+            code = sm.supervise(repo, root, "normal", False, cwd=repo, environ={"GS_STATION_MODE_DIR": str(state)}, popen=Process)
+            self.assertEqual(code, 0)
+            self.assertEqual(events, ["bay started", ("backend", "/dev/pts/9", "1"), "bay stopped"])
+            seeded = json.loads((state / "firmware-sim/state/config/loadcell_calibration.json").read_text())
+            self.assertAlmostEqual(seeded["ch1"]["m"], 9481.62)
+
+    def test_a_pi_build_never_runs_firmware_simulation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            root = repo / "bins"
+            install(root)
+            (root / "build.json").write_text(json.dumps({"features": ["raspberry_pi"]}))
+            state = repo / "state"
+            firmware_selection(state, "hitl")
+            started = []
+
+            class Process:
+                def __init__(self, argv, **kwargs):
+                    started.append(kwargs["env"])
+
+                def wait(self, timeout=None):
+                    return 0
+            sm.supervise(repo, root, "normal", False, cwd=repo, environ={"GS_STATION_MODE_DIR": str(state)}, popen=Process)
+            self.assertEqual(len(started), 1)
+            self.assertNotIn("GS_FIRMWARE_SIM", started[0])
+
+
 class LauncherTests(unittest.TestCase):
     def test_switchable_modes_builds_requested_modes_and_supervises_default(self):
         import importlib.util

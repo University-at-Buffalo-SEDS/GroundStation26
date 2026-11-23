@@ -226,10 +226,13 @@ async fn station_modes(root: &Path, state: &Arc<AppState>, out: &mut Fixtures) {
         dir,
         simulation: false,
         flight_model: false,
+        firmware: false,
+        firmware_unavailable: None,
         restart_delay: Duration::ZERO,
         switch_delay: Duration::ZERO,
         station_resets: false,
         stand_in_links: || 0,
+        hardware_connected: |_| None,
     };
     let switch = Arc::new(Switch::new(config, Arc::new(RestartSignal::default())));
     let app = crate::station_mode_switch::routes_with(Some(switch)).with_state(state.clone());

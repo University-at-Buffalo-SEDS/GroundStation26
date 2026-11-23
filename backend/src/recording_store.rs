@@ -563,6 +563,9 @@ pub struct Capture {
     pub result: Option<String>,
     pub operator: Option<String>,
     pub station_mode: String,
+    /// "hardware", "firmware_sim" or "internal_flight_sim" (None: recorded before provenance was kept).
+    #[serde(default)]
+    pub provenance: Option<String>,
     #[serde(default)]
     pub details: serde_json::Value,
     #[serde(default, skip)]
@@ -700,6 +703,7 @@ impl Store {
             result: None,
             operator: request.operator.map(str::to_owned),
             station_mode: station_mode.to_owned(),
+            provenance: Some(crate::firmware_sim_mode::provenance().to_owned()),
             details: request.details,
             materializing: false,
         });
@@ -762,6 +766,7 @@ impl Store {
             result: Some("Saved by operator".into()),
             operator: operator.map(str::to_owned),
             station_mode: station_mode.to_owned(),
+            provenance: Some(crate::firmware_sim_mode::provenance().to_owned()),
             details: serde_json::json!({"before_s": before_s, "after_s": after_s}),
             materializing: false,
         });
@@ -1100,6 +1105,11 @@ pub struct Manifest {
     pub pre_roll_s: i64,
     pub post_roll_s: i64,
     pub station_mode: String,
+    /// Where the data came from: "hardware", "firmware_sim" (simulated board firmware) or "internal_flight_sim".
+    #[serde(default)]
+    pub provenance: Option<String>,
+    #[serde(default)]
+    pub simulated: bool,
     pub versions: serde_json::Value,
     pub operator: Option<String>,
     pub result: Option<String>,
@@ -1181,7 +1191,15 @@ pub(crate) async fn materialize(root: &Path, capture: &Capture, now: i64) -> any
         pre_roll_s: (capture.event_start_ms - window_start) / 1000,
         post_roll_s: (window_end - event_end) / 1000,
         station_mode: capture.station_mode.clone(),
-        versions: serde_json::json!({"groundstation_backend": env!("CARGO_PKG_VERSION")}),
+        provenance: capture.provenance.clone(),
+        simulated: capture.provenance.as_deref().is_some_and(|p| p != "hardware"),
+        versions: if capture.provenance.as_deref() == Some("firmware_sim") {
+            serde_json::json!({"groundstation_backend": env!("CARGO_PKG_VERSION"),
+                               "simulated_firmware": crate::firmware_sim_mode::manifest(),
+                               "simulated_conditions": crate::firmware_sim_mode::current_control()})
+        } else {
+            serde_json::json!({"groundstation_backend": env!("CARGO_PKG_VERSION")})
+        },
         operator: capture.operator.clone(),
         result: capture.result.clone(),
         pre_roll_truncated: covered_from.is_none_or(|from| from > window_start),

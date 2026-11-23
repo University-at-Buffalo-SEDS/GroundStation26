@@ -7,6 +7,8 @@
   "change_supported": true,
   "control_origin_required": false,
   "current": {
+    "banner": null,
+    "firmware_sim": false,
     "id": "hitl",
     "label": "HITL · live outputs",
     "mode_id": "hitl",
@@ -40,6 +42,7 @@
   "options": [
     {
       "available": true,
+      "firmware_sim": false,
       "id": "normal",
       "in_process": true,
       "label": "Normal · live outputs",
@@ -51,6 +54,7 @@
     },
     {
       "available": true,
+      "firmware_sim": false,
       "id": "hitl",
       "in_process": true,
       "label": "HITL · live outputs",
@@ -62,6 +66,7 @@
     },
     {
       "available": true,
+      "firmware_sim": false,
       "id": "test_fire",
       "in_process": true,
       "label": "Test fire · live outputs",
@@ -73,6 +78,7 @@
     },
     {
       "available": true,
+      "firmware_sim": false,
       "id": "testing",
       "in_process": true,
       "label": "Testing · hardware links",
@@ -84,6 +90,7 @@
     },
     {
       "available": true,
+      "firmware_sim": false,
       "id": "testing-simulation",
       "in_process": false,
       "label": "Testing · internal flight simulation",
@@ -95,11 +102,72 @@
     },
     {
       "available": true,
+      "firmware_sim": false,
       "id": "integrated_ground_test",
       "in_process": true,
       "label": "Integrated ground test · live outputs",
       "mode_id": "integrated_ground_test",
       "output_domain": "Physical station links and outputs as defined by Integrated ground test mode",
+      "reason": null,
+      "simulation": false,
+      "transition_kind": "restart"
+    },
+    {
+      "available": true,
+      "firmware_sim": true,
+      "id": "normal-firmware-sim",
+      "in_process": false,
+      "label": "Normal · SIMULATED FIRMWARE (every board's real firmware, native SITL)",
+      "mode_id": "normal",
+      "output_domain": "Real board firmware compiled for this machine (FirmwareSimulator native SITL) with a simulated fill plant and flight; no physical links or outputs, isolated configuration and recordings",
+      "reason": null,
+      "simulation": false,
+      "transition_kind": "restart"
+    },
+    {
+      "available": true,
+      "firmware_sim": true,
+      "id": "hitl-firmware-sim",
+      "in_process": false,
+      "label": "HITL · SIMULATED FIRMWARE (every board's real firmware, native SITL)",
+      "mode_id": "hitl",
+      "output_domain": "Real board firmware compiled for this machine (FirmwareSimulator native SITL) with a simulated fill plant and flight; no physical links or outputs, isolated configuration and recordings",
+      "reason": null,
+      "simulation": false,
+      "transition_kind": "restart"
+    },
+    {
+      "available": true,
+      "firmware_sim": true,
+      "id": "test_fire-firmware-sim",
+      "in_process": false,
+      "label": "Test fire · SIMULATED FIRMWARE (every board's real firmware, native SITL)",
+      "mode_id": "test_fire",
+      "output_domain": "Real board firmware compiled for this machine (FirmwareSimulator native SITL) with a simulated fill plant and flight; no physical links or outputs, isolated configuration and recordings",
+      "reason": null,
+      "simulation": false,
+      "transition_kind": "restart"
+    },
+    {
+      "available": true,
+      "firmware_sim": true,
+      "id": "testing-firmware-sim",
+      "in_process": false,
+      "label": "Testing · SIMULATED FIRMWARE (every board's real firmware, native SITL)",
+      "mode_id": "testing",
+      "output_domain": "Real board firmware compiled for this machine (FirmwareSimulator native SITL) with a simulated fill plant and flight; no physical links or outputs, isolated configuration and recordings",
+      "reason": null,
+      "simulation": false,
+      "transition_kind": "restart"
+    },
+    {
+      "available": true,
+      "firmware_sim": true,
+      "id": "integrated_ground_test-firmware-sim",
+      "in_process": false,
+      "label": "Integrated ground test · SIMULATED FIRMWARE (every board's real firmware, native SITL)",
+      "mode_id": "integrated_ground_test",
+      "output_domain": "Real board firmware compiled for this machine (FirmwareSimulator native SITL) with a simulated fill plant and flight; no physical links or outputs, isolated configuration and recordings",
       "reason": null,
       "simulation": false,
       "transition_kind": "restart"

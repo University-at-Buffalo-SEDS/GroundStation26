@@ -527,6 +527,7 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .merge(crate::mission_sync::routes())
         .merge(crate::station_mode::routes())
         .merge(crate::station_mode_switch::routes())
+        .merge(crate::firmware_sim_mode::routes())
         .merge(crate::igt::routes())
         .merge(crate::launch_site::routes())
         .merge(crate::proximity_lock::routes())

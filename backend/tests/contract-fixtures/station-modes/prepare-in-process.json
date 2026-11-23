@@ -2,6 +2,8 @@
   "authority_id": "station-mode-switch/primary",
   "backend_instance": "primary-contractfixture0001",
   "current": {
+    "banner": null,
+    "firmware_sim": false,
     "id": "normal",
     "label": "Normal · live outputs",
     "mode_id": "normal",
@@ -17,6 +19,7 @@
   "summary": "The station saves this selection and switches to HITL mode in place. Sign-ins and connections are kept; the layout and controls refresh on their own. The switch is allowed only while the station is idle and is checked again at the moment it happens.",
   "target": {
     "available": true,
+    "firmware_sim": false,
     "id": "hitl",
     "in_process": true,
     "label": "HITL · live outputs",

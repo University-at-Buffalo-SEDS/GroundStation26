@@ -1,0 +1,314 @@
+//! Firmware simulation (SITL) mode: this station runs against the real firmware of every board, compiled for the
+//! host by FirmwareSimulator's native engine, with a simulated plant and flight (docs/firmware-sim.md).
+//!
+//! Like Simulation, it is a start-up property. The station mode supervisor (`station_modes.py`) starts the native
+//! bay (`tools/firmware_sim.py` cache, FirmwareSimulator `scripts/gs_bay.py`) before the backend and passes:
+//!
+//! - `GS_FIRMWARE_SIM=1` and `GS_FIRMWARE_SIM_DIR` (the bay's run directory: `status.json`, `control.json`,
+//!   `endpoints.json`, board logs);
+//! - the bay's endpoints as the simulator serial overrides (`GS_SIMULATED_SERIAL_PTY`, `GS_AV_BAY_SERIAL_PORT`,
+//!   `GS_FILL_PICO_DISCOVERY_PORT`) and a comms config of its own, so no physical link is ever opened;
+//! - isolated state, configuration and recording paths under the firmware-sim root, so simulated launches,
+//!   calibrations and proofs never reach the hardware installation.
+//!
+//! The mode is never entered while real hardware is connected: the switch into it refuses while any board was heard
+//! recently on this (hardware) station ([`hardware_connected`]). Raspberry Pi builds and RRLS stations do not offer
+//! it (the boards are built and simulated on a development machine).
+use crate::{auth::{Permission, StreamRole}, state::AppState, types::Board};
+use axum::{
+    Json, Router,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
+use serde_json::{Value, json};
+use std::{path::PathBuf, sync::Arc, time::Duration};
+
+pub(crate) const ENV: &str = "GS_FIRMWARE_SIM";
+pub(crate) const DIR_ENV: &str = "GS_FIRMWARE_SIM_DIR";
+/// A board heard within this long means hardware is attached to this station.
+pub(crate) const HARDWARE_RECENT: Duration = Duration::from_secs(30);
+
+/// This process talks to simulated firmware (fixed at start).
+pub(crate) fn enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var(ENV).as_deref() == Ok("1"))
+}
+
+/// Recording provenance for captures and exports.
+pub(crate) fn provenance() -> &'static str {
+    if enabled() {
+        "firmware_sim"
+    } else if crate::flight_sim::sim_mode_enabled() {
+        "internal_flight_sim"
+    } else {
+        "hardware"
+    }
+}
+
+fn run_dir() -> Option<PathBuf> {
+    std::env::var_os(DIR_ENV).map(PathBuf::from)
+}
+
+/// The firmware-sim build cache (tools/firmware_sim.py).
+pub(crate) fn cache_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("GS_FIRMWARE_SIM_CACHE") {
+        return PathBuf::from(dir);
+    }
+    std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".cache").join("seds-firmware-sim"))
+        .unwrap_or_else(|| PathBuf::from(".cache/seds-firmware-sim"))
+}
+
+pub(crate) fn manifest() -> Option<Value> {
+    serde_json::from_slice(&std::fs::read(cache_dir().join("manifest.json")).ok()?).ok()
+}
+
+/// Why this station cannot offer firmware simulation at all (None: it can).
+pub(crate) fn unavailable_reason(rrls: bool) -> Option<String> {
+    if rrls {
+        return Some("Firmware simulation runs on the primary station only.".into());
+    }
+    if cfg!(feature = "raspberry_pi") {
+        return Some("Firmware simulation runs on a development machine, not on the Raspberry Pi station.".into());
+    }
+    match manifest() {
+        Some(m) if m.get("boards").and_then(Value::as_object).is_some_and(|b| b.len() == 7) => None,
+        Some(_) => Some("The firmware simulation cache is incomplete. Run: python3 tools/firmware_sim.py build".into()),
+        None => Some("No firmware simulation build on this machine. Run: python3 tools/firmware_sim.py build".into()),
+    }
+}
+
+/// Boards heard within `recent` on this station's links, newest first: real hardware, unless this process is
+/// itself the firmware simulation.
+pub(crate) fn boards_heard(state: &AppState, recent: Duration) -> Vec<(Board, Duration)> {
+    let status = state.board_status.lock().unwrap_or_else(|e| e.into_inner());
+    let mut heard: Vec<(Board, Duration)> = status
+        .iter()
+        .filter(|(board, _)| **board != Board::GroundStation)
+        .filter_map(|(board, s)| s.last_seen_instant.map(|at| (*board, at.elapsed())))
+        .filter(|(_, age)| *age <= recent)
+        .collect();
+    heard.sort_by_key(|(_, age)| *age);
+    heard
+}
+
+/// Why entering firmware simulation must be refused now: real boards are talking to this station.
+pub(crate) fn hardware_connected(state: &AppState) -> Option<String> {
+    if enabled() {
+        return None;
+    }
+    let heard = boards_heard(state, HARDWARE_RECENT);
+    if heard.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = heard
+        .iter()
+        .map(|(board, age)| format!("{} {:.0} s ago", board.as_str(), age.as_secs_f64()))
+        .collect();
+    Some(format!(
+        "Real hardware is connected: {} heard on this station's links ({}). Firmware simulation is never entered while boards are attached; disconnect them and wait {} s.",
+        if heard.len() == 1 { "a board was" } else { "boards were" },
+        names.join(", "),
+        HARDWARE_RECENT.as_secs()
+    ))
+}
+
+fn read_json(path: PathBuf) -> Option<Value> {
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
+/// The current plant control (conditions, loads, faults) for recording metadata.
+pub(crate) fn current_control() -> Option<Value> {
+    run_dir().and_then(|d| read_json(d.join("control.json")))
+}
+
+/// `GET /api/firmware-sim`: whether this station runs simulated firmware, the firmware revisions, the bay's
+/// pace, nodes and plant, and the current control (plant inputs and faults).
+pub(crate) fn status_json() -> Value {
+    let dir = run_dir();
+    let status = dir.as_ref().and_then(|d| read_json(d.join("status.json")));
+    let age_ms = status
+        .as_ref()
+        .and_then(|s| s.get("updated_unix_ms").and_then(Value::as_u64))
+        .map(|at| (crate::telemetry_task::get_current_timestamp_ms()).saturating_sub(at));
+    json!({
+        "active": enabled(),
+        "banner": enabled().then_some("SIMULATED FIRMWARE"),
+        "provenance": provenance(),
+        "available_reason": if enabled() { None } else { unavailable_reason(crate::rrls::is_rrls()) },
+        "manifest": manifest(),
+        "bay": status,
+        "bay_status_age_ms": age_ms,
+        "bay_running": age_ms.is_some_and(|age| age < 5_000),
+        "control": dir.as_ref().and_then(|d| read_json(d.join("control.json"))).unwrap_or_else(|| json!({})),
+        "run_dir": dir.map(|d| d.display().to_string()),
+    })
+}
+
+/// Validated plant/fault control document (unknown keys refused).
+pub(crate) fn validate_control(body: &Value) -> Result<Value, String> {
+    let obj = body.as_object().ok_or("control must be an object")?;
+    let mut out = serde_json::Map::new();
+    for (key, value) in obj {
+        match key.as_str() {
+            "plant" => {
+                let plant = value.as_object().ok_or("plant must be an object")?;
+                for (k, v) in plant {
+                    if !matches!(k.as_str(), "qd_connected" | "nitrogen_bottle_open" | "nitrous_bottle_open") || !v.is_boolean() {
+                        return Err(format!("unknown or non-boolean plant input {k}"));
+                    }
+                }
+                out.insert(key.clone(), value.clone());
+            }
+            "faults" => {
+                let faults = value.as_object().ok_or("faults must be an object")?;
+                for (k, v) in faults {
+                    match k.as_str() {
+                        "dead_tank_pt" | "dead_chamber_pt" | "radio_drop" | "kg1000_supply_dip" | "kg1000_open_lead"
+                        | "kg50_open_lead"
+                            if v.is_boolean() => {}
+                        "kg50_bypass" | "kg1000_bypass" if v.as_f64().is_some_and(|x| (0.0..=1.0).contains(&x)) => {}
+                        "kg50_drift_kg_per_c" | "kg1000_drift_kg_per_c" if v.as_f64().is_some_and(|x| x.abs() <= 5.0) => {}
+                        "stuck_valves" => {
+                            let valves = v.as_object().ok_or("stuck_valves must be an object")?;
+                            for (name, state) in valves {
+                                if !matches!(name.as_str(), "nitrogen" | "nitrous" | "vent" | "dump" | "pilot")
+                                    || !matches!(state.as_str(), Some("open" | "closed"))
+                                {
+                                    return Err(format!("stuck valve {name} must be nitrogen|nitrous|vent|dump|pilot = open|closed"));
+                                }
+                            }
+                        }
+                        _ => return Err(format!("unknown fault {k}")),
+                    }
+                }
+                out.insert(key.clone(), value.clone());
+            }
+            "conditions" => {
+                let c = value.as_object().ok_or("conditions must be an object")?;
+                for (k, v) in c {
+                    let x = v.as_f64().ok_or_else(|| format!("condition {k} must be a number"))?;
+                    let ok = match k.as_str() {
+                        "ambient_c" => (-30.0..=50.0).contains(&x),
+                        "wind_mps" => (0.0..=40.0).contains(&x),
+                        "wind_from_deg" => (0.0..=360.0).contains(&x),
+                        "gust_mps" => (0.0..=20.0).contains(&x),
+                        _ => return Err(format!("unknown condition {k}")),
+                    };
+                    if !ok {
+                        return Err(format!("condition {k} out of range"));
+                    }
+                }
+                out.insert(key.clone(), value.clone());
+            }
+            "loads" => {
+                let l = value.as_object().ok_or("loads must be an object")?;
+                for (k, v) in l {
+                    let x = v.as_f64().ok_or_else(|| format!("load {k} must be a number"))?;
+                    let max = match k.as_str() {
+                        "kg50_kg" => 60.0,
+                        "kg1000_kg" => 1200.0,
+                        _ => return Err(format!("unknown load cell {k}")),
+                    };
+                    if !(0.0..=max).contains(&x) {
+                        return Err(format!("load {k} out of range"));
+                    }
+                }
+                out.insert(key.clone(), value.clone());
+            }
+            _ => return Err(format!("unknown control section {key}")),
+        }
+    }
+    Ok(Value::Object(out))
+}
+
+async fn get_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Err(response) = crate::web::authorize_headers(&state, &headers, Permission::ViewData).await {
+        return response;
+    }
+    Json(status_json()).into_response()
+}
+
+async fn post_control(State(state): State<Arc<AppState>>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
+    let principal = match crate::web::authorize_headers(&state, &headers, Permission::ViewData).await {
+        Ok(p) => p,
+        Err(response) => return response,
+    };
+    if principal.anonymous || !principal.roles.contains(&StreamRole::Admin) {
+        return (StatusCode::FORBIDDEN, "Firmware simulation controls need an administrator.").into_response();
+    }
+    if !enabled() {
+        return (StatusCode::CONFLICT, "This station is not running simulated firmware.").into_response();
+    }
+    let control = match validate_control(&body) {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    let Some(dir) = run_dir() else {
+        return (StatusCode::CONFLICT, "No firmware simulation run directory.").into_response();
+    };
+    let tmp = dir.join("control.json.pending");
+    let written = std::fs::write(&tmp, serde_json::to_vec_pretty(&control).unwrap_or_default())
+        .and_then(|_| std::fs::rename(&tmp, dir.join("control.json")));
+    match written {
+        Ok(()) => {
+            log::warn!("Firmware simulation control set by {}: {control}", principal.username.as_deref().unwrap_or("?"));
+            Json(json!({"control": control})).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("could not write the control file: {e}")).into_response(),
+    }
+}
+
+pub(crate) fn routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/api/firmware-sim", get(get_status))
+        .route("/api/firmware-sim/control", post(post_control))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn real_boards_heard_recently_refuse_firmware_simulation() {
+        use crate::recording_export::tests::{TestDirectory, export_state};
+        let root = TestDirectory::new();
+        let state = export_state(&root.0, false).await;
+        assert_eq!(hardware_connected(&state), None, "no board heard: no hardware");
+        let set = |board: Board, ago: Duration| {
+            let mut status = state.board_status.lock().unwrap();
+            status.get_mut(&board).unwrap().last_seen_instant = Some(std::time::Instant::now() - ago);
+        };
+        set(Board::GroundStation, Duration::ZERO);
+        assert_eq!(hardware_connected(&state), None, "the station itself is not hardware");
+        set(Board::ValveBoard, HARDWARE_RECENT + Duration::from_secs(5));
+        assert_eq!(hardware_connected(&state), None, "heard long ago");
+        set(Board::FlightComputer, Duration::from_secs(2));
+        let reason = hardware_connected(&state).expect("a board heard 2 s ago is attached hardware");
+        assert!(reason.contains("Flight Computer") && !reason.contains("Valve Board"), "{reason}");
+    }
+
+    #[test]
+    fn control_validation_accepts_plant_inputs_and_faults_only() {
+        let ok = json!({"plant": {"qd_connected": false}, "faults": {"stuck_valves": {"vent": "closed"}, "dead_tank_pt": true,
+                        "kg50_bypass": 0.2, "kg1000_supply_dip": true},
+                        "conditions": {"ambient_c": 35.0, "wind_mps": 9.0, "wind_from_deg": 300.0}, "loads": {"kg50_kg": 10.0}});
+        assert_eq!(validate_control(&ok).unwrap(), ok);
+        for bad in [
+            json!({"plant": {"qd_connected": "no"}}),
+            json!({"plant": {"tank_pressure_psi": 500}}),
+            json!({"faults": {"stuck_valves": {"igniter": "open"}}}),
+            json!({"faults": {"stuck_valves": {"vent": "half"}}}),
+            json!({"faults": {"fire": true}}),
+            json!({"flight": {"apogee": 1}}),
+            json!({"conditions": {"ambient_c": 90.0}}),
+            json!({"loads": {"kg50_kg": 500.0}}),
+            json!({"faults": {"kg50_bypass": 2.0}}),
+            json!([1]),
+        ] {
+            assert!(validate_control(&bad).is_err(), "{bad}");
+        }
+    }
+}

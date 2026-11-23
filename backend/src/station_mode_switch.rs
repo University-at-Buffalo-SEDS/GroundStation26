@@ -93,21 +93,30 @@ fn mode_label(mode: Mode) -> &'static str {
     }
 }
 
-/// One selectable mode plus its simulation flag.
+/// One selectable mode plus its simulation flag, or its firmware simulation (the real board firmware built for
+/// this machine, `firmware_sim_mode`). Both are start-up properties.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Target {
     pub mode: Mode,
     pub simulation: bool,
+    pub firmware: bool,
 }
+/// Firmware simulation is a sim backend for every mode: the selected mode's own logic runs against it.
+const FIRMWARE_SIM_MODES: [Mode; 5] = ALL_MODES;
 impl Target {
     pub(crate) fn id(self) -> String {
-        if self.simulation {
+        if self.firmware {
+            format!("{}-firmware-sim", mode_id(self.mode))
+        } else if self.simulation {
             format!("{}-simulation", mode_id(self.mode))
         } else {
             mode_id(self.mode).to_owned()
         }
     }
     fn parse(id: &str) -> Option<Self> {
+        if let Some(mode) = id.strip_suffix("-firmware-sim") {
+            return Some(Self { mode: parse_mode(mode)?, simulation: false, firmware: true });
+        }
         let (mode, simulation) = match id.strip_suffix("-simulation") {
             Some(mode) => (mode, true),
             None => (id, false),
@@ -115,10 +124,14 @@ impl Target {
         Some(Self {
             mode: parse_mode(mode)?,
             simulation,
+            firmware: false,
         })
     }
     fn label(self, rrls: bool) -> String {
         let mode = mode_label(self.mode);
+        if self.firmware {
+            return format!("{mode} · SIMULATED FIRMWARE (every board's real firmware, native SITL)");
+        }
         match (rrls, self.mode, self.simulation) {
             (true, _, false) => format!("RRLS {mode} · paired primary over radio"),
             (true, _, true) => format!("RRLS {mode} · SIMULATED paired primary"),
@@ -128,6 +141,9 @@ impl Target {
         }
     }
     fn output_domain(self, rrls: bool) -> String {
+        if self.firmware {
+            return "Real board firmware compiled for this machine (FirmwareSimulator native SITL) with a simulated fill plant and flight; no physical links or outputs, isolated configuration and recordings".into();
+        }
         match (rrls, self.simulation) {
             (true, false) => {
                 "Radio link to the paired primary; live operations stay read-only on the RRLS".into()
@@ -159,6 +175,10 @@ pub(crate) struct Config {
     /// The Simulation flag this process started with. It never changes in
     /// process; the mode itself is `runtime_mode::current()`.
     pub simulation: bool,
+    /// This process runs against simulated board firmware (fixed at start).
+    pub firmware: bool,
+    /// Why firmware simulation cannot be offered here (None: it can).
+    pub firmware_unavailable: Option<String>,
     /// Testing mode's internal flight model is running (fixed at start).
     /// Several checks trust it alone, so leaving testing restarts.
     pub flight_model: bool,
@@ -170,6 +190,8 @@ pub(crate) struct Config {
     pub station_resets: bool,
     /// DummyComms stand-ins alive now (`comms::dummy_links`).
     pub stand_in_links: fn() -> usize,
+    /// Real boards talking to this station (refuses entering firmware simulation).
+    pub hardware_connected: fn(&AppState) -> Option<String>,
 }
 impl Config {
     fn from_env() -> Self {
@@ -190,10 +212,13 @@ impl Config {
                 crate::flight_sim::sim_mode_enabled()
             },
             flight_model: crate::flight_sim::sim_mode_enabled(),
+            firmware: crate::firmware_sim_mode::enabled(),
+            firmware_unavailable: crate::firmware_sim_mode::unavailable_reason(rrls),
             restart_delay: RESTART_DELAY,
             switch_delay: SWITCH_DELAY,
             station_resets: true,
             stand_in_links: crate::comms::dummy_links,
+            hardware_connected: crate::firmware_sim_mode::hardware_connected,
         }
     }
     fn role(&self) -> &'static str {
@@ -203,22 +228,29 @@ impl Config {
         Target {
             mode: local_mode(),
             simulation: self.simulation,
+            firmware: self.firmware,
         }
     }
     fn targets(&self) -> Vec<Target> {
-        ALL_MODES
+        let mut targets: Vec<Target> = ALL_MODES
             .into_iter()
             .flat_map(|mode| {
                 [false, true]
                     .into_iter()
                     .filter(move |simulation| !simulation || simulation_supported(mode, self.rrls))
-                    .map(move |simulation| Target { mode, simulation })
+                    .map(move |simulation| Target { mode, simulation, firmware: false })
             })
-            .collect()
+            .collect();
+        if !self.rrls {
+            targets.extend(FIRMWARE_SIM_MODES.into_iter().map(|mode| Target { mode, simulation: false, firmware: true }));
+        }
+        targets
     }
-    /// The switch keeps the Simulation flag, so it happens in this process.
+    /// The switch keeps the Simulation and firmware simulation flags, so it happens in this process.
     fn in_process(&self, target: Target) -> bool {
-        target.simulation == self.simulation && (!self.flight_model || target.mode == Mode::Testing)
+        target.simulation == self.simulation
+            && target.firmware == self.firmware
+            && (!self.flight_model || target.mode == Mode::Testing)
     }
     /// Why no switch at all is possible here.
     fn change_supported(&self) -> Result<(), String> {
@@ -230,12 +262,18 @@ impl Config {
     /// Why this particular target cannot be selected, apart from busy checks.
     fn target_supported(&self, target: Target) -> Result<(), String> {
         self.change_supported()?;
+        if target.firmware && !self.firmware {
+            if let Some(reason) = &self.firmware_unavailable {
+                return Err(reason.clone());
+            }
+        }
         if !self.in_process(target) && !self.supervised {
             return Err("Changing Simulation restarts the backend, and this backend was started directly, not by the station mode supervisor. Start it with run_groundstation.py --switchable-modes or the station-mode systemd unit.".into());
         }
         if self.in_process(target)
             && matches!(target.mode, Mode::Normal | Mode::IntegratedGroundTest)
             && !self.rrls
+            && !self.firmware
         {
             normal_links_present(target.mode, (self.stand_in_links)())?;
         }
@@ -297,6 +335,9 @@ pub(crate) struct Selection {
     pub role: String,
     pub mode: String,
     pub simulation: bool,
+    /// Firmware simulation (absent in selections saved before it existed).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub firmware_sim: bool,
     pub target_id: String,
     pub transition_id: String,
     pub requested_by: String,
@@ -533,6 +574,7 @@ impl Switch {
             "id": target.id(),
             "mode_id": mode_id(target.mode),
             "simulation": target.simulation,
+            "firmware_sim": target.firmware,
             "label": target.label(self.config.rrls),
             "available": reason.is_none(),
             "reason": reason,
@@ -548,6 +590,8 @@ impl Switch {
             "mode_id": mode_id(current.mode),
             "label": current.label(self.config.rrls),
             "simulation": current.simulation,
+            "firmware_sim": current.firmware,
+            "banner": current.firmware.then_some("SIMULATED FIRMWARE"),
             "output_domain": current.output_domain(self.config.rrls),
         })
     }
@@ -627,6 +671,11 @@ impl Switch {
         if let Some(busy) = station_busy(state, self.config.rrls) {
             return Err(Refusal::conflict(format!("Station is not idle: {busy}")));
         }
+        if target.firmware && !self.config.firmware {
+            if let Some(hardware) = (self.config.hardware_connected)(state) {
+                return Err(Refusal::conflict(hardware));
+            }
+        }
         Ok(target)
     }
     fn prepare(&self, principal: &AuthPrincipal, state: &AppState, body: &[u8]) -> Result<Value, Refusal> {
@@ -644,7 +693,15 @@ impl Switch {
             format!(
                 "Simulation is set at start, so the station saves this selection, shuts down cleanly and its supervisor restarts it in {} mode{}. Live connections drop for a few seconds and reconnect on their own. The switch is allowed only while the station is idle and is checked again just before the restart.",
                 mode_label(target.mode),
-                if target.simulation { " in simulation" } else { "" },
+                if target.firmware {
+                    " against SIMULATED FIRMWARE (the supervisor starts every board's native firmware build first; no physical link is opened)"
+                } else if self.config.firmware {
+                    " on the physical links (the firmware simulation stops)"
+                } else if target.simulation {
+                    " in simulation"
+                } else {
+                    ""
+                },
             )
         };
         if self.config.rrls {
@@ -734,6 +791,7 @@ impl Switch {
             role: self.config.role().into(),
             mode: mode_id(target.mode).into(),
             simulation: target.simulation,
+            firmware_sim: target.firmware,
             target_id: target.id(),
             transition_id: ticket.transition_id.clone(),
             requested_by: principal_context(principal),

@@ -2,6 +2,8 @@
   "authority_id": "station-mode-switch/primary",
   "backend_instance": "primary-contractfixture0001",
   "current": {
+    "banner": null,
+    "firmware_sim": false,
     "id": "normal",
     "label": "Normal · live outputs",
     "mode_id": "normal",
@@ -17,6 +19,7 @@
   "summary": "Simulation is set at start, so the station saves this selection, shuts down cleanly and its supervisor restarts it in Testing mode in simulation. Live connections drop for a few seconds and reconnect on their own. The switch is allowed only while the station is idle and is checked again just before the restart.",
   "target": {
     "available": true,
+    "firmware_sim": false,
     "id": "testing-simulation",
     "in_process": false,
     "label": "Testing · internal flight simulation",

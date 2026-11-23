@@ -56,9 +56,31 @@ fn capture(kind: EventKind, start: i64, pre_s: i64, end: i64, post_s: i64) -> Ca
         result: Some("Passed: done".into()),
         operator: Some("operator".into()),
         station_mode: "normal".into(),
+        provenance: Some("hardware".into()),
         details: serde_json::Value::Null,
         materializing: false,
     }
+}
+
+#[test]
+fn captures_record_their_provenance_and_older_ones_read_as_unknown() {
+    let store = Store::default();
+    store.enable_rolling();
+    let request = BeginRequest {
+        kind: EventKind::Manual,
+        key: "m",
+        label: "Manual",
+        operator: None,
+        details: serde_json::Value::Null,
+    };
+    let _ = store.begin(request, 1_000, "hitl");
+    let captures = store.captures();
+    // this process is neither the firmware nor the internal simulation
+    assert!(captures.iter().all(|c| c.provenance.as_deref() == Some("hardware")));
+    let mut old = serde_json::to_value(&captures[0]).unwrap();
+    old.as_object_mut().unwrap().remove("provenance");
+    let old: Capture = serde_json::from_value(old).unwrap();
+    assert_eq!(old.provenance, None);
 }
 
 async fn wait_for(mut condition: impl FnMut() -> bool, what: &str) {

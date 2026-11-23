@@ -676,6 +676,7 @@ async fn capture_with_daq_launch(root: &FsPath, launch_name: &str) -> PathBuf {
         result: Some("Landed".into()),
         operator: None,
         station_mode: "normal".into(),
+        provenance: None,
         details: serde_json::Value::Null,
         materializing: false,
     };

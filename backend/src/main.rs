@@ -55,6 +55,7 @@ mod fill_targets;
 mod firmware_update;
 mod flight_setup;
 mod flight_sim;
+mod firmware_sim_mode;
 mod flight_sim_runtime;
 mod flight_maxima;
 mod gpio;
@@ -1464,6 +1465,12 @@ async fn main() -> anyhow::Result<()> {
         cfg!(feature = "firmware_sim")
     );
 
+    if firmware_sim_mode::enabled() {
+        log::warn!(
+            "SIMULATED FIRMWARE: every board is its real firmware built for this machine (FirmwareSimulator native SITL); run dir {:?}",
+            std::env::var_os(firmware_sim_mode::DIR_ENV)
+        );
+    }
     if flight_sim_runtime::enabled() {
         log::info!("FlightSim execution_mode=flight_sim output_domain=simulated; physical transports/proxy disabled");
     }
@@ -1478,7 +1485,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // --- DB path ---
-    let recordings_dir = PathBuf::from("./data");
+    // A firmware simulation records into its own isolated directory (station_modes.py).
+    let recordings_dir = std::env::var_os("GS_RECORDINGS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("./data"));
     telemetry_task::set_absolute_time_data_dir(&recordings_dir);
     let placeholder_db_path = recordings_dir.join(DEFAULT_TELEMETRY_DB_FILENAME);
     recover_sqlite_sidecars_in_dir(&recordings_dir).await?;
@@ -1487,7 +1497,8 @@ async fn main() -> anyhow::Result<()> {
         let _ = delete_sqlite_if_empty(&placeholder_db_path.to_string_lossy()).await;
     }
     let db = open_in_memory_telemetry_db().await?;
-    let auth_db_path = recordings_dir.join("users.db");
+    let auth_db_path = PathBuf::from("./data").join("users.db");
+    std::fs::create_dir_all(&recordings_dir)?;
     let auth_db_path_str = ensure_sqlite_db_file(&auth_db_path)?;
     let auth_db = sqlx::SqlitePool::connect(&format!("sqlite://{}", auth_db_path_str)).await?;
     apply_sqlite_pragmas(&auth_db).await;

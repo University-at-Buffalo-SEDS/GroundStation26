@@ -23,10 +23,13 @@ fn config(root: &Path, rrls: bool, supervised: bool) -> Config {
         dir: root.join("station-mode"),
         simulation: false,
         flight_model: false,
+        firmware: false,
+        firmware_unavailable: None,
         restart_delay: Duration::ZERO,
         switch_delay: Duration::ZERO,
         station_resets: false,
         stand_in_links: || 0,
+        hardware_connected: |_| None,
     }
 }
 async fn wait_for(mut done: impl FnMut() -> bool) -> bool {
@@ -155,13 +158,29 @@ async fn snapshot_follows_the_ui_v2_contract_with_server_fenced_transitions() {
     let ids: Vec<_> = s["options"].as_array().unwrap().iter().map(|o| o["id"].as_str().unwrap().to_owned()).collect();
     assert_eq!(
         ids,
-        ["normal", "hitl", "test_fire", "testing", "testing-simulation", "integrated_ground_test"]
+        [
+            "normal",
+            "hitl",
+            "test_fire",
+            "testing",
+            "testing-simulation",
+            "integrated_ground_test",
+            "normal-firmware-sim",
+            "hitl-firmware-sim",
+            "test_fire-firmware-sim",
+            "testing-firmware-sim",
+            "integrated_ground_test-firmware-sim"
+        ]
     );
     for option in s["options"].as_array().unwrap() {
         assert_eq!(option["transition_kind"], "restart");
         assert_eq!(option["available"], true);
-        // Only a Simulation change restarts the backend.
-        assert_eq!(option["in_process"], option["simulation"] == false, "{option}");
+        // Only a Simulation or firmware simulation change restarts the backend.
+        assert_eq!(
+            option["in_process"],
+            option["simulation"] == false && option["firmware_sim"] == false,
+            "{option}"
+        );
         assert!(s["modes"].as_array().unwrap().iter().any(|m| m["id"] == option["mode_id"]));
     }
     assert_eq!(s["modes"].as_array().unwrap().len(), 5);
@@ -201,8 +220,8 @@ async fn unsupervised_backends_switch_in_process_but_cannot_change_simulation() 
     let mut model = config(&root.0, true, true);
     model.flight_model = true;
     let switch = Switch::new(model, Arc::new(RestartSignal::default()));
-    assert!(!switch.config.in_process(Target { mode: Mode::TestFire, simulation: false }));
-    assert!(switch.config.in_process(Target { mode: Mode::Testing, simulation: false }));
+    assert!(!switch.config.in_process(Target { mode: Mode::TestFire, simulation: false, firmware: false }));
+    assert!(switch.config.in_process(Target { mode: Mode::Testing, simulation: false, firmware: false }));
 }
 
 #[tokio::test]
@@ -405,6 +424,7 @@ async fn activity_just_before_restart_cancels_it_and_restores_the_selection() {
         role: "primary".into(),
         mode: mode_id(local_mode()).into(),
         simulation: false,
+        firmware_sim: false,
         target_id: mode_id(local_mode()).into(),
         transition_id: "older".into(),
         requested_by: "user:administrator".into(),
@@ -516,6 +536,7 @@ async fn restarted_process_reports_the_saved_transition_as_applied_or_failed() {
         role: "primary".into(),
         mode: mode_id(local_mode()).into(),
         simulation: false,
+        firmware_sim: false,
         target_id: mode_id(local_mode()).into(),
         transition_id: "switch-abc".into(),
         requested_by: "user:operator".into(),
@@ -569,7 +590,7 @@ async fn rrls_offers_a_simulated_primary_for_every_mode_and_switches_only_itself
 fn target_ids_roundtrip_and_simulation_is_mode_specific_on_the_primary() {
     for mode in ALL_MODES {
         for simulation in [false, true] {
-            let target = Target { mode, simulation };
+            let target = Target { mode, simulation, firmware: false };
             assert_eq!(Target::parse(&target.id()), Some(target));
         }
         assert_eq!(simulation_supported(mode, false), mode == Mode::Testing);
@@ -652,6 +673,7 @@ async fn switch_is_refused_when_the_station_is_not_idle_at_the_moment_of_the_swi
         role: "primary".into(),
         mode: "test_fire".into(),
         simulation: false,
+        firmware_sim: false,
         target_id: "test_fire".into(),
         transition_id: "older".into(),
         requested_by: "user:administrator".into(),
@@ -734,4 +756,104 @@ async fn layout_follows_the_mode_after_an_in_process_switch() {
     assert!(crate::layout::load_layout().unwrap().test_fire_mode);
     switch_in_process(&f, "administrator", "hitl").await;
     assert!(!crate::layout::load_layout().unwrap().test_fire_mode);
+}
+
+async fn firmware_fixture(hardware: fn(&AppState) -> Option<String>, unavailable: Option<&str>) -> Fixture {
+    let mut f = fixture_with(false, true).await;
+    let mut cfg = config(&f._root.0, false, true);
+    cfg.hardware_connected = hardware;
+    cfg.firmware_unavailable = unavailable.map(str::to_owned);
+    f.switch = Arc::new(Switch::new(cfg, f.signal.clone()));
+    f
+}
+
+#[tokio::test]
+async fn firmware_sim_is_refused_while_real_hardware_is_connected() {
+    let _mode = thread_mode(Mode::Hitl);
+    let f = firmware_fixture(|_| Some("Real hardware is connected: a board was heard on this station's links (Flight Computer 2 s ago).".into()), None).await;
+    let (status, refusal) = f.prepare("administrator", "hitl-firmware-sim").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refusal}");
+    assert!(refusal.to_string().contains("Real hardware is connected"), "{refusal}");
+    assert!(f.selection().is_none(), "nothing saved");
+    assert!(!f.signal.requested(), "no restart");
+    // the hardware check never blocks ordinary modes
+    let (status, challenge) = f.prepare("administrator", "test_fire").await;
+    assert_eq!(status, StatusCode::OK, "{challenge}");
+}
+
+#[tokio::test]
+async fn firmware_sim_without_a_build_is_listed_but_unavailable() {
+    let _mode = thread_mode(Mode::Hitl);
+    let f = firmware_fixture(|_| None, Some("No firmware simulation build on this machine.")).await;
+    let s = f.snapshot("administrator").await;
+    let option = s["options"].as_array().unwrap().iter().find(|o| o["id"] == "hitl-firmware-sim").unwrap().clone();
+    assert_eq!(option["available"], false);
+    assert!(option["reason"].as_str().unwrap().contains("No firmware simulation build"));
+    let (status, _) = f.prepare("administrator", "hitl-firmware-sim").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn firmware_sim_switch_restarts_into_a_saved_firmware_selection() {
+    let _mode = thread_mode(Mode::Hitl);
+    let f = firmware_fixture(|_| None, None).await;
+    let s = f.snapshot("administrator").await;
+    let option = s["options"].as_array().unwrap().iter().find(|o| o["id"] == "hitl-firmware-sim").unwrap().clone();
+    assert_eq!(option["available"], true, "{option}");
+    assert_eq!(option["in_process"], false);
+    assert!(option["label"].as_str().unwrap().contains("SIMULATED FIRMWARE"));
+    assert!(option["output_domain"].as_str().unwrap().contains("no physical links"));
+    let (status, challenge) = f.prepare("administrator", "hitl-firmware-sim").await;
+    assert_eq!(status, StatusCode::OK, "{challenge}");
+    assert!(challenge["summary"].as_str().unwrap().contains("SIMULATED FIRMWARE"));
+    // operators without the StationMode command and viewers cannot enter it
+    for user in ["commander", "viewer"] {
+        let (status, _) = f.prepare(user, "hitl-firmware-sim").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{user}");
+    }
+    let (status, receipt) = f
+        .call("POST", "/api/station-modes/confirm", "administrator", Some(Fixture::confirmation(&challenge, "")))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert!(wait_for(|| f.signal.requested()).await, "a restart, not an in-process switch");
+    let selection = f.selection().unwrap();
+    assert_eq!((selection.mode.as_str(), selection.simulation, selection.firmware_sim), ("hitl", false, true));
+    assert_eq!(selection.target_id, "hitl-firmware-sim");
+}
+
+#[tokio::test]
+async fn a_firmware_sim_station_switches_modes_in_process_and_leaves_by_restart() {
+    let _mode = thread_mode(Mode::Hitl);
+    let mut f = fixture_with(false, true).await;
+    let mut cfg = config(&f._root.0, false, true);
+    cfg.firmware = true;
+    // the hardware check is not consulted inside the simulation
+    cfg.hardware_connected = |_| Some("hardware".into());
+    f.switch = Arc::new(Switch::new(cfg, f.signal.clone()));
+    let s = f.snapshot("administrator").await;
+    assert_eq!(s["current"]["id"], "hitl-firmware-sim");
+    assert_eq!(s["current"]["banner"], "SIMULATED FIRMWARE");
+    let in_process = |id: &str| s["options"].as_array().unwrap().iter().find(|o| o["id"] == id).unwrap()["in_process"].clone();
+    assert_eq!(in_process("normal-firmware-sim"), true);
+    assert_eq!(in_process("hitl"), false, "back to hardware restarts and stops the bay");
+    let (status, challenge) = f.prepare("administrator", "hitl").await;
+    assert_eq!(status, StatusCode::OK, "{challenge}");
+    assert!(challenge["summary"].as_str().unwrap().contains("physical links"));
+}
+
+#[tokio::test]
+async fn rrls_never_offers_firmware_sim() {
+    let _mode = thread_mode(Mode::Normal);
+    let f = fixture_with(true, true).await;
+    let s = f.snapshot("administrator").await;
+    assert!(s["options"].as_array().unwrap().iter().all(|o| o["firmware_sim"] == false));
+}
+
+#[test]
+fn firmware_target_ids_roundtrip() {
+    for mode in FIRMWARE_SIM_MODES {
+        let target = Target { mode, simulation: false, firmware: true };
+        assert_eq!(target.id(), format!("{}-firmware-sim", mode_id(mode)));
+        assert_eq!(Target::parse(&target.id()), Some(target));
+    }
 }
