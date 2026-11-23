@@ -184,10 +184,17 @@ class FirmwareSimBay:
 
 
 def pi_build(root: Path) -> bool:
+    """A Raspberry Pi build without an armhf firmware-sim bundle installed (it cannot run the x86 boards)."""
     try:
-        return "raspberry_pi" in json.loads((root / "build.json").read_text(encoding="utf-8")).get("features", [])
+        pi = "raspberry_pi" in json.loads((root / "build.json").read_text(encoding="utf-8")).get("features", [])
     except (OSError, ValueError):
         return False
+    cache = Path(os.environ.get("GS_FIRMWARE_SIM_CACHE") or Path.home() / ".cache" / "seds-firmware-sim")
+    try:
+        abi = json.loads((cache / "manifest.json").read_text(encoding="utf-8")).get("host_abi")
+    except (OSError, ValueError):
+        abi = None
+    return pi and abi != "armhf"
 
 
 def simulation_supported(mode: str, rrls: bool) -> bool:

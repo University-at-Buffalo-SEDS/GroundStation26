@@ -166,7 +166,7 @@ class SimBundleTests(unittest.TestCase):
                     patch.object(remote_build.Remote, "pull") as pull, \
                     patch.object(remote_build.Remote, "run") as run, \
                     patch.object(remote_build.subprocess, "run", side_effect=lambda cmd, **kw: local_runs.append(cmd)):
-                out = remote_build.build_sim_bundle(repo)
+                out = remote_build.build_sim_bundle(repo, abi="armhf")
             # sources staged locally as plain trees, then sent; the checkout pushed as for a station build
             self.assertEqual(local_runs[0][2:4], ["stage", "--out"])
             push.assert_called_once()
@@ -175,12 +175,16 @@ class SimBundleTests(unittest.TestCase):
             self.assertIn("build --sources /build/", command)
             self.assertIn("bundle --out /build/firmware-sim-bundle.tar.gz", command)
             self.assertNotIn("Secret", command, "no credentials reach the remote command")
+            self.assertIn("FIRMWARE_SIM_HOST=armhf", command)
+            self.assertIn("FIRMWARE_SIM_COORDINATOR_TARGET=aarch64-unknown-linux-gnu", command)
+            self.assertIn("/build/sim-cache-armhf", command)
             self.assertEqual(pull.call_args.args[1], repo / "target" / "firmware-sim-bundle.tar.gz")
             self.assertEqual(local_runs[-1][2], "install")
             self.assertEqual(out, repo / "target" / "firmware-sim-bundle.tar.gz")
 
     def test_builder_image_carries_the_native_sim_toolchain_and_keeps_the_station_one(self) -> None:
-        for need in ("gcc-multilib", "gcc-arm-none-eabi", "ninja-build", "i686-unknown-linux-gnu",
+        for need in ("gcc-multilib", "gcc-arm-none-eabi", "ninja-build", "i686-unknown-linux-gnu", "gcc-arm-linux-gnueabihf",
+                     "armv7-unknown-linux-gnueabihf",
                      "gcc-aarch64-linux-gnu", "aarch64-unknown-linux-gnu", "wasm32-unknown-unknown"):
             self.assertIn(need, remote_build.DOCKERFILE)
 

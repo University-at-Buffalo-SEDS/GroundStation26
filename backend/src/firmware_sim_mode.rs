@@ -73,10 +73,13 @@ pub(crate) fn unavailable_reason(rrls: bool) -> Option<String> {
     if rrls {
         return Some("Firmware simulation runs on the primary station only.".into());
     }
-    if cfg!(feature = "raspberry_pi") {
-        return Some("Firmware simulation runs on a development machine, not on the Raspberry Pi station.".into());
+    let manifest = manifest();
+    if cfg!(feature = "raspberry_pi")
+        && manifest.as_ref().and_then(|m| m.get("host_abi")).and_then(Value::as_str) != Some("armhf")
+    {
+        return Some("This Raspberry Pi station needs an armhf firmware-sim bundle (docs/firmware-sim.md, Raspberry Pi).".into());
     }
-    match manifest() {
+    match manifest {
         Some(m)
             if m.get("boards").and_then(Value::as_object).is_some_and(|b| {
                 ["flight", "rf", "power", "gateway", "actuator", "valve", "daq"].iter().all(|n| b.contains_key(*n))
@@ -170,6 +173,7 @@ pub(crate) fn status_json() -> Value {
         "control": dir.as_ref().and_then(|d| read_json(d.join("control.json"))).unwrap_or_else(|| json!({})),
         "igt_datasets": igt_datasets(),
         "sd_card": dir.as_ref().and_then(|d| read_json(d.join("sdcard.json"))),
+        "bay_refused": dir.as_ref().and_then(|d| std::fs::read_to_string(d.join("refused.txt")).ok()),
         "run_dir": dir.map(|d| d.display().to_string()),
     })
 }

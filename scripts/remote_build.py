@@ -61,10 +61,12 @@ RUN sed -i 's/^Types: deb$/Types: deb\nArchitectures: amd64/' /etc/apt/sources.l
       clang lld cmake nasm perl pkg-config python3 python3-venv curl ca-certificates git \
       libssl-dev libudev-dev:arm64 \
       gcc-multilib g++-multilib gcc-arm-none-eabi libnewlib-arm-none-eabi ninja-build binutils \
+      gcc-arm-linux-gnueabihf libc6-dev-armhf-cross binutils-arm-linux-gnueabihf \
  && rm -rf /var/lib/apt/lists/*
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal \
       --default-toolchain "$RUST_VERSION" --target aarch64-unknown-linux-gnu --target wasm32-unknown-unknown \
-      --target i686-unknown-linux-gnu --target thumbv7em-none-eabihf --target thumbv8m.main-none-eabihf
+      --target i686-unknown-linux-gnu --target armv7-unknown-linux-gnueabihf \
+      --target thumbv7em-none-eabihf --target thumbv8m.main-none-eabihf
 RUN curl -sSL "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/binaryen-version_${BINARYEN_VERSION}-x86_64-linux.tar.gz" \
       | tar xz -C /opt \
  && ln -s "/opt/binaryen-version_${BINARYEN_VERSION}/bin/wasm-opt" /usr/local/bin/wasm-opt
@@ -419,7 +421,7 @@ def build_backend(repo_root: Path, features: list[str], debug: bool) -> None:
 SIM_BUNDLE = "firmware-sim-bundle.tar.gz"
 
 
-def build_sim_bundle(repo_root: Path, stage_args: list[str] | None = None, install: bool = True) -> Path:
+def build_sim_bundle(repo_root: Path, stage_args: list[str] | None = None, install: bool = True, abi: str | None = None) -> Path:
     """Build the firmware-simulation bundle (docs/firmware-sim.md) on the remote host.
 
     The board, FirmwareSimulator, SEDSnet, SEDSLaunchCore and FileX sources are staged locally at their resolved
@@ -427,7 +429,10 @@ def build_sim_bundle(repo_root: Path, stage_args: list[str] | None = None, insta
     SEDSnet's prepare step rewrites its tree), sent with the station checkout, built inside the station builder
     image into a cache on the remote (kept between runs, so unchanged boards are not rebuilt), packed as a bundle
     with its manifest of revisions, copied back and, unless `install` is off, installed into the local cache.
-    The bundle holds x86_64 executables (the remote's architecture)."""
+    `abi` "i686" (x86_64 stations and dev machines) or "armhf" (statically linked board executables and an aarch64
+    coordinator for a 64-bit Raspberry Pi with 32-bit compat); by default the local machine's."""
+    if abi is None:
+        abi = "armhf" if platform.machine().lower() in {"aarch64", "arm64"} else "i686"
     remote = Remote(requested() or "")
     repo_root = repo_root.resolve()
     staging = Path(tempfile.mkdtemp(prefix="gs-sim-sources-"))
@@ -444,7 +449,11 @@ def build_sim_bundle(repo_root: Path, stage_args: list[str] | None = None, insta
             f"--fs-dir /build/{sources}/FirmwareSimulator --jobs $(nproc)",
             f"python3 tools/firmware_sim.py --cache /build/sim-cache bundle --out /build/{SIM_BUNDLE}",
         ])
-        _container(remote, tag, {workspace: repo_root}, repo_root, command, {})
+        env = {"FIRMWARE_SIM_HOST": abi}
+        if abi == "armhf":
+            env.update(CROSS_ENV, FIRMWARE_SIM_COORDINATOR_TARGET=TARGET)
+        command = command.replace("/build/sim-cache", f"/build/sim-cache-{abi}")
+        _container(remote, tag, {workspace: repo_root}, repo_root, command, env)
         local = repo_root / "target" / SIM_BUNDLE
         local.parent.mkdir(parents=True, exist_ok=True)
         remote.pull(f"{REMOTE_ROOT}/{SIM_BUNDLE}", local)

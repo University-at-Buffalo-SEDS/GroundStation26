@@ -180,8 +180,13 @@ def build_firmware_simulator(cache: Path, fs_src: Path, jobs: int) -> Path:
     """The firmware-sim coordinator binary, built from fs_src into <cache>/bin."""
     target = cache / "work" / "fs-target"
     env = {**os.environ, "CARGO_TARGET_DIR": str(target), "CARGO_BUILD_JOBS": str(jobs)}
-    log("building the firmware-sim coordinator")
-    subprocess.run(["cargo", "build", "--release", "--quiet", "--bin", "firmware-sim"], cwd=fs_src, env=env, check=True)
+    # the coordinator runs on the station: aarch64 for an armhf bundle (FIRMWARE_SIM_COORDINATOR_TARGET)
+    triple = os.environ.get("FIRMWARE_SIM_COORDINATOR_TARGET")
+    log("building the firmware-sim coordinator" + (f" for {triple}" if triple else ""))
+    cmd = ["cargo", "build", "--release", "--quiet", "--bin", "firmware-sim"] + (["--target", triple] if triple else [])
+    subprocess.run(cmd, cwd=fs_src, env=env, check=True)
+    if triple:
+        target = target / triple
     out = cache / "bin" / "firmware-sim"
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(".tmp")
@@ -294,6 +299,8 @@ def cmd_build(a) -> int:
             shutil.rmtree(built, ignore_errors=True)
             shutil.rmtree(src, ignore_errors=True)
     manifest["built"] = _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
+    # board executable ABI: i686 (x86_64 hosts) or armhf (aarch64 stations with 32-bit compat), FIRMWARE_SIM_HOST
+    manifest["host_abi"] = os.environ.get("FIRMWARE_SIM_HOST", "i686")
     manifest["engine_dir"] = str(fs_src)
     manifest["coordinator"] = str(cache / "bin" / "firmware-sim")
     write_manifest(cache, manifest)
