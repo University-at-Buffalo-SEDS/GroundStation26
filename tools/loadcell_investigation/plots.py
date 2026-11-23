@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""Figures for docs/loadcell-investigation-2026-11.md. Usage: plots.py NPZ_DIR OUT_DIR"""
+import sys, os
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+K = 16000.0 / 921.0
+BLUE, ORANGE, AQUA, YELLOW, RED, INK, MUTED = '#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e34948', '#0b0b0b', '#52514e'
+plt.rcParams.update({'font.size': 9, 'axes.edgecolor': MUTED, 'axes.labelcolor': INK, 'xtick.color': MUTED,
+                     'ytick.color': MUTED, 'axes.grid': True, 'grid.color': '#e6e5e1', 'grid.linewidth': 0.6,
+                     'axes.spines.top': False, 'axes.spines.right': False, 'lines.linewidth': 1.2,
+                     'figure.facecolor': '#fcfcfb', 'axes.facecolor': '#fcfcfb'})
+
+def load(d, name):
+    return np.load(os.path.join(d, f'groundstation_recording_{name}.npz'))
+
+def s(z, k, col=0):
+    return z[k + '__t'], z[k + '__v'][:, col]
+
+def panels(n, title, h=1.6):
+    fig, ax = plt.subplots(n, 1, sharex=True, figsize=(8, h * n + 0.6))
+    fig.suptitle(title, x=0.01, ha='left', fontsize=10, color=INK)
+    return fig, ax
+
+def fire_ignition(d, out):
+    z = load(d, '2026-11-17_00-59-46_065')
+    t1, k1 = s(z, 'DAQ|KG1000'); t0 = t1[0]
+    sel = lambda t: (t - t0) / 1000.0
+    fig, ax = panels(4, '2026-11-16 test fire (recording 2026-11-17 00:59:46 UTC), first 25 s')
+    m = sel(t1) < 25
+    ax[0].plot(sel(t1)[m], k1[m] * K, color=BLUE); ax[0].axhline(2.4, color=RED, lw=0.8, ls='--')
+    ax[0].set_ylabel('KG1000\nADC-pin V'); ax[0].text(0.3, 2.55, 'ADC full scale 2.4 V', color=RED, fontsize=8)
+    t5, k5 = s(z, 'DAQ|KG50'); m = sel(t5) < 25
+    ax[1].plot(sel(t5)[m], k5[m] * 1000, color=ORANGE); ax[1].set_ylabel('KG50 (P6)\ninput mV')
+    tp, vm = s(z, 'DAQ|DAQ_POWER_MONITOR', 2); m = sel(tp) < 25
+    ax[2].plot(sel(tp)[m], vm[m], color=AQUA, marker='.', ms=2, lw=0.8); ax[2].set_ylabel('DAQ VMAIN V')
+    tf, fp = s(z, 'VB|FUEL_TANK_PRESSURE'); m = sel(tf) < 25
+    ax[3].plot(sel(tf)[m], fp[m], color=YELLOW); ax[3].set_ylabel('Tank psi'); ax[3].set_xlabel('seconds from recording start')
+    for a in ax: a.axvline(9.2, color=MUTED, lw=0.8, ls=':')
+    ax[3].text(9.4, 300, 'supply restored /\nburn starts', fontsize=8, color=MUTED)
+    fig.tight_layout(); fig.savefig(os.path.join(out, 'fire-20261116-ignition.png'), dpi=110); plt.close(fig)
+
+def fire_overview(d, out):
+    z = load(d, '2026-11-17_00-59-46_065')
+    t1, k1 = s(z, 'DAQ|KG1000'); t0 = t1[0]
+    mins = lambda t: (t - t0) / 60000.0
+    fig, ax = panels(4, '2026-11-16 test fire, whole recording (28 min)')
+    ax[0].plot(mins(t1), k1 * K, color=BLUE, lw=0.6); ax[0].set_ylabel('KG1000 V'); ax[0].set_yscale('log')
+    ax[0].axhline(0.2126, color=MUTED, lw=0.8, ls='--'); ax[0].text(20, 0.3, 'calibrated zero 0.213 V', fontsize=8, color=MUTED)
+    tp, vm = s(z, 'DAQ|DAQ_POWER_MONITOR', 2)
+    ax[1].plot(mins(tp), vm, color=AQUA, lw=0.6); ax[1].set_ylabel('VMAIN V')
+    t5, k5 = s(z, 'DAQ|KG50'); g = mins(t5) > 0.4
+    ax[2].plot(mins(t5)[g], k5[g] * 1000, color=ORANGE, lw=0.6); ax[2].set_ylabel('KG50 input mV'); ax[2].set_ylim(3.6, 3.95)
+    tt, tc = s(z, 'DAQ|DAQ_ADC_TEMPERATURE')
+    ax[3].plot(mins(tt), tc, color=YELLOW, lw=0.8); ax[3].set_ylabel('ADC die °C'); ax[3].set_xlabel('minutes')
+    fig.tight_layout(); fig.savefig(os.path.join(out, 'fire-20261116-overview.png'), dpi=110); plt.close(fig)
+
+def rail_1106(d, out):
+    z = load(d, '2026-11-06_22-51-01_544')
+    t1, k1 = s(z, 'DAQ|KG1000'); t0 = t1[0]
+    mins = lambda t: (t - t0) / 60000.0
+    fig, ax = panels(2, '2026-11-06 17:51 local: KG1000 rails with supply dips and keeps a +16 kg zero shift')
+    ax[0].plot(mins(t1), k1 * K, color=BLUE, lw=0.6); ax[0].set_ylabel('KG1000 V'); ax[0].set_yscale('log')
+    tp, vm = s(z, 'DAQ|DAQ_POWER_MONITOR', 2)
+    ax[1].plot(mins(tp), vm, color=AQUA, lw=0.6); ax[1].set_ylabel('VMAIN V'); ax[1].set_xlabel('minutes')
+    fig.tight_layout(); fig.savefig(os.path.join(out, 'rail-20261106.png'), dpi=110); plt.close(fig)
+
+def calibration_steps(out):
+    # Points from the live GroundStation calibration (GET /api/loadcell_calibration, 2026-11-22), ADC-pin / input volts.
+    kg1000 = [(20.4, 0.24977598), (40.8, 0.28683203), (61.2, 0.32496646), (81.6, 0.36300135), (102.0, 0.398651)]
+    kg50 = [(5.0, 0.004191), (10.0, 0.004523), (15.0, 0.004628), (20.0, 0.004947)]  # temperature_captures (unshifted)
+    fig, ax = plt.subplots(1, 2, figsize=(8, 2.8))
+    fig.suptitle('Sensitivity of each calibration step relative to the whole-fit slope', x=0.01, ha='left', fontsize=10)
+    for a, pts, name, color in ((ax[0], kg1000, 'KG1000 (20.4 kg steps)', BLUE), (ax[1], kg50, 'KG50 on P6 (5 kg steps)', ORANGE)):
+        x = np.array([p[1] for p in pts]); y = np.array([p[0] for p in pts])
+        m, b = np.polyfit(x, y, 1)
+        r2 = 1 - np.sum((y - (m * x + b)) ** 2) / np.sum((y - y.mean()) ** 2)
+        ratio = (np.diff(x) * m) / np.diff(y)
+        labels = [f'{y[i]:g}→{y[i+1]:g}' for i in range(len(y) - 1)]
+        a.bar(labels, ratio, color=color, width=0.5); a.axhline(1, color=MUTED, lw=0.8, ls='--')
+        a.set_ylim(0, 1.8); a.set_title(f'{name}, R² = {r2:.4f}', fontsize=9)
+        for i, v in enumerate(ratio): a.text(i, v + 0.04, f'{v:.2f}', ha='center', fontsize=8)
+    ax[0].set_ylabel('step sensitivity / fit slope')
+    fig.tight_layout(); fig.savefig(os.path.join(out, 'calibration-steps.png'), dpi=110); plt.close(fig)
+
+def kg50_cross_check(d, out):
+    fig, ax = plt.subplots(1, 2, figsize=(8, 2.8))
+    fig.suptitle('KG50 telemetry vs the same P6 bridge scanned single-ended (CH2-CH3, 10 Hz)', x=0.01, ha='left', fontsize=10)
+    for a, name, title in ((ax[0], '2026-10-30_23-23-48_776', '2026-10-30 site, N2 fill (bridge CM 1.138 V)'),
+                           (ax[1], '2026-11-09_13-12-38_375', '2026-11-09 bench (bridge CM 0.169 V)')):
+        z = load(d, name)
+        t5, k5 = s(z, 'DAQ|KG50'); t0 = t5[0]
+        ts = z['DAQ|DAQ_SDADC_VOLTAGES__t']; sv = z['DAQ|DAQ_SDADC_VOLTAGES__v']
+        a.plot((t5 - t0) / 60000, k5 * 1000, color=ORANGE, lw=0.7, label='KG50 telemetry (P6, PGA 16)')
+        a.plot((ts - t0) / 60000, (sv[:, 0] - sv[:, 1]) * 1000 * 0.88, color=BLUE, lw=0.9, label='0.88 × (CH2 − CH3) single-ended')
+        a.set_title(title, fontsize=9); a.set_xlabel('minutes'); a.set_ylabel('mV')
+    ax[0].legend(fontsize=7, loc='upper right', frameon=False)
+    fig.tight_layout(); fig.savefig(os.path.join(out, 'kg50-p6-cross-check.png'), dpi=110); plt.close(fig)
+
+if __name__ == '__main__':
+    d, out = sys.argv[1], sys.argv[2]
+    os.makedirs(out, exist_ok=True)
+    fire_ignition(d, out); fire_overview(d, out); rail_1106(d, out); calibration_steps(out); kg50_cross_check(d, out)
