@@ -683,4 +683,4 @@ pub(crate) fn routes() -> axum::Router<Arc<AppState>> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

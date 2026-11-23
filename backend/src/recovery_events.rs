@@ -219,6 +219,7 @@ pub fn notify(
         notification_text(kind, evidence, event_ms, t_plus_ms(state, event_ms))
     };
     log::info!("{text}");
+    crate::flight_review::note(event_ms, crate::flight_review::LiveEntry::Message(text.clone()));
     state.add_notification_with_persistence(text.clone(), true);
     crate::web::persist_message_db_only(state, text.clone());
     Some(text)

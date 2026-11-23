@@ -31,7 +31,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 pub(crate) mod merge;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 pub(crate) mod thrust;
 
 use merge::{Channel, Sample, Source};
@@ -94,6 +94,21 @@ pub struct BurnReport {
     pub fill_at_ignition_kg: Option<f64>,
     pub fill_after_kg: Option<f64>,
     pub tank_psi_at_ignition: Option<f64>,
+    /// Tank PT just after the burn (median over burn end .. +1 s).
+    #[serde(default)]
+    pub tank_psi_end: Option<f64>,
+    /// End of the burn (5 % of peak) from the ignition reference, s.
+    #[serde(default)]
+    pub burn_end_s: f64,
+    /// N2O loaded (the KG50 fill reading at ignition, taken as all
+    /// expelled), the fuel burnt (propellant consumed minus that) and their
+    /// ratio. Estimates: absent when the masses do not support them.
+    #[serde(default)]
+    pub oxidizer_kg: Option<f64>,
+    #[serde(default)]
+    pub fuel_kg: Option<f64>,
+    #[serde(default)]
+    pub of_ratio: Option<f64>,
     pub chamber: Option<Chamber>,
     pub coverage: Coverage,
     pub quality_flags: Vec<Flag>,
@@ -321,6 +336,13 @@ pub(crate) fn compute(inputs: &Inputs, meta: Meta) -> Result<BurnReport, String>
     let consumed = thrust.kg50_pre_kg - thrust.kg50_post_kg;
     let consumed = (consumed > 0.05).then_some((consumed * 1000.0).round() / 1000.0);
     let isp = consumed.map(|m| (thrust.total_impulse_ns / (m * thrust::G) * 10.0).round() / 10.0);
+    let tank_end = median(
+        tank.iter()
+            .filter(|(t, _)| *t >= thrust.burn_end_s && *t <= thrust.burn_end_s + 1.0)
+            .map(|p| p.1)
+            .collect(),
+    );
+    let (oxidizer, fuel, of_ratio) = split_propellant(thrust.kg50_pre_kg, consumed);
     let count = |source: Source| {
         inputs
             .channels
@@ -376,6 +398,11 @@ pub(crate) fn compute(inputs: &Inputs, meta: Meta) -> Result<BurnReport, String>
         fill_at_ignition_kg: Some((thrust.kg50_pre_kg * 1000.0).round() / 1000.0),
         fill_after_kg: Some((thrust.kg50_post_kg * 1000.0).round() / 1000.0),
         tank_psi_at_ignition: tank_at.map(|p| (p * 10.0).round() / 10.0),
+        tank_psi_end: tank_end.map(|p| (p * 10.0).round() / 10.0),
+        burn_end_s: (thrust.burn_end_s * 1000.0).round() / 1000.0,
+        oxidizer_kg: oxidizer,
+        fuel_kg: fuel,
+        of_ratio,
         chamber,
         coverage,
         quality_flags: flags,
@@ -384,6 +411,23 @@ pub(crate) fn compute(inputs: &Inputs, meta: Meta) -> Result<BurnReport, String>
         startup_fill_impulse_ns: thrust.startup_fill_impulse_ns,
         archive_id: None,
     })
+}
+
+/// (N2O, fuel, O/F) from the fill reading at ignition and the propellant
+/// consumed: all the loaded N2O is taken as expelled, the rest of the mass
+/// lost is fuel. Only a plausible split (fuel > 50 g, O/F 1..20) is given.
+pub(crate) fn split_propellant(fill_kg: f64, consumed_kg: Option<f64>) -> (Option<f64>, Option<f64>, Option<f64>) {
+    let round = |v: f64| (v * 1000.0).round() / 1000.0;
+    let oxidizer = (fill_kg.is_finite() && fill_kg > 0.1).then_some(round(fill_kg));
+    let Some((ox, consumed)) = oxidizer.zip(consumed_kg) else {
+        return (oxidizer, None, None);
+    };
+    let fuel = consumed - ox;
+    if fuel > 0.05 && (1.0..=20.0).contains(&(ox / fuel)) {
+        (Some(ox), Some(round(fuel)), Some((ox / fuel * 100.0).round() / 100.0))
+    } else {
+        (Some(ox), None, None)
+    }
 }
 
 fn mode_is_simulated(mode_id: &str) -> bool {
@@ -597,7 +641,7 @@ async fn read_capture_telemetry(db_path: &Path, inputs: &mut Inputs) -> anyhow::
     Ok(())
 }
 
-fn daq_rows(folder: &Path, manifest: &Manifest) -> Vec<(Channel, Sample)> {
+pub(crate) fn daq_rows(folder: &Path, manifest: &Manifest) -> Vec<(Channel, Sample)> {
     let mut rows = Vec::new();
     for entry in manifest.board_sd.iter().filter(|e| e.board == "DAQ") {
         let dir = folder

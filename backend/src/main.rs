@@ -62,6 +62,7 @@ mod firmware_sim_mode;
 mod flight_sim_runtime;
 mod flight_maxima;
 mod burn_report;
+mod flight_review;
 mod gpio;
 mod gpio_panel;
 mod gse;

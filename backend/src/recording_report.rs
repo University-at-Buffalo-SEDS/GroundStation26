@@ -51,6 +51,23 @@ fn channel_metadata(layout:&serde_json::Value)->serde_json::Value {
     let mut out=Vec::new();walk(layout,&mut out);serde_json::Value::Array(out)
 }
 
+/// The report worker's Python: `GS_REPORT_PYTHON`, else the backend's
+/// `.venv-reports`, else `python3`.
+pub(crate) fn report_python() -> String {
+    std::env::var("GS_REPORT_PYTHON").unwrap_or_else(|_| {
+        let local = if cfg!(windows) {
+            ".venv-reports/Scripts/python.exe"
+        } else {
+            ".venv-reports/bin/python"
+        };
+        if std::path::Path::new(local).is_file() {
+            local.into()
+        } else {
+            "python3".into()
+        }
+    })
+}
+
 pub async fn report(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -111,19 +128,7 @@ pub async fn report(
             .into_response();
     };
     let output = tokio::time::timeout(Duration::from_secs(120), async {
-        let python = std::env::var("GS_REPORT_PYTHON").unwrap_or_else(|_| {
-            let local = if cfg!(windows) {
-                ".venv-reports/Scripts/python.exe"
-            } else {
-                ".venv-reports/bin/python"
-            };
-            if std::path::Path::new(local).is_file() {
-                local.into()
-            } else {
-                "python3".into()
-            }
-        });
-        let mut child = tokio::process::Command::new(python)
+        let mut child = tokio::process::Command::new(report_python())
             .args(["-c", include_str!("recording_report.py")])
             .env("MPLBACKEND", "Agg")
             .stdin(Stdio::piped())

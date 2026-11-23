@@ -266,7 +266,7 @@ fn records_round_trip_on_disk_and_serve_in_fit() {
     let _ = std::fs::remove_dir_all(&data);
 }
 
-async fn http_state() -> Arc<AppState> {
+pub(crate) async fn http_state() -> Arc<AppState> {
     let mut state = crate::state::tests::test_app_state().await;
     let users = std::path::Path::new(&state.placeholder_db_path)
         .parent()
@@ -300,7 +300,7 @@ async fn http_state() -> Arc<AppState> {
     state
 }
 
-async fn call(
+pub(crate) async fn call(
     state: &Arc<AppState>,
     method: &str,
     uri: &str,

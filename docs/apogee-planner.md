@@ -413,6 +413,9 @@ report was saved; ambient temperature and weather come from the launch capture's
 | `GET /api/fire_archive` | view | archived fires |
 | `PATCH /api/fire_archive/{id}` | send commands | review: status, exclude_from_fit, notes, metadata |
 | `POST /api/fire_archive/import` | admin | import a past fire record |
+| `GET /api/flight_review/live` | view | the dashboard's Motor & flight tab: the open launch capture's motor values and flight summary from the live cache, and the newest saved launch capture |
+| `GET /api/flight_review/recording/{id}` | view | the same for any replay source (capture, rolling segment or range, `merge-sd.*`, `sd-only.*`, `fire.*`), `?from_ms&to_ms` optional |
+| `GET /api/flight_review/recording/{id}/motor_export`, `.../flight_export` | view | ZIP bundles (CSVs, SVG/PNG charts, JSON + text values, HTML/PDF report, provenance); without a range, the burn window / Launch to touchdown. Contents: `backend/src/flight_review/export.rs` |
 
 ## Notes for the sim
 

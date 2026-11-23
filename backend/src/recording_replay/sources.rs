@@ -472,6 +472,15 @@ async fn build_fire(root: &Path, id: &str) -> anyhow::Result<SqlitePool> {
     Ok(db)
 }
 
+/// Opens a replay source without a station (tests).
+#[cfg(test)]
+pub(crate) async fn tests_open(root: &Path, id: &str) -> SqlitePool {
+    match Source::parse(id).expect("a replay id") {
+        Source::File(id) => open_file(root, &id).await.expect("the file"),
+        other => build(root, &other).await.expect("the source"),
+    }
+}
+
 #[cfg(test)]
 pub(crate) async fn clear_cache() {
     CACHE.lock().await.clear();

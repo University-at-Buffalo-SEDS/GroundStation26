@@ -2924,6 +2924,7 @@ async fn handle_packet_inner(
         if sender_id == Board::FlightComputer.sender_id() {
             crate::recovery_events::observe_fc_message(state, &message, pkt.timestamp() as i64);
             crate::flight_maxima::observe_fc_message(state, &message, pkt.timestamp() as i64);
+            crate::flight_review::note(pkt.timestamp() as i64, crate::flight_review::LiveEntry::Message(format!("FC: {message}")));
         }
         let message = format!("{sender_id}: {message}");
         let (message_id, inserted) = state.add_backend_message(message.clone());

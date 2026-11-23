@@ -946,6 +946,9 @@ const FLIGHT_KEY: &str = "flight";
 /// Every FLIGHT_STATE row the DB actor writes.
 pub(crate) fn observe_flight_state(state: &AppState, code: i64) {
     use crate::types::FlightState as F;
+    if let Ok(code) = u8::try_from(code) {
+        crate::flight_review::note(crate::telemetry_task::get_current_timestamp_ms() as i64, crate::flight_review::LiveEntry::Station(code));
+    }
     if !state.recording_store.rolling_enabled() {
         return;
     }

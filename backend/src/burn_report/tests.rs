@@ -287,9 +287,9 @@ fn daq_rows_need_network_time_and_a_known_sensor() {
 
 // ---------------------------------------------------------------- folders
 
-const T0: i64 = 1_800_000_000_000;
+pub(crate) const T0: i64 = 1_800_000_000_000;
 
-fn temp_root(tag: &str) -> PathBuf {
+pub(crate) fn temp_root(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "seds-burn-{tag}-{}-{}",
         std::process::id(),
@@ -302,7 +302,7 @@ fn temp_root(tag: &str) -> PathBuf {
     dir
 }
 
-fn manifest(folder: &str, mode: &str, details: serde_json::Value) -> Manifest {
+pub(crate) fn manifest(folder: &str, mode: &str, details: serde_json::Value) -> Manifest {
     Manifest {
         format: "seds-gs-event-capture".into(),
         version: 1,
@@ -335,7 +335,7 @@ fn manifest(folder: &str, mode: &str, details: serde_json::Value) -> Manifest {
 
 /// A capture folder holding a synthetic stand burn in its telemetry (40 Hz)
 /// and, optionally, a DAQ launch file (200 Hz).
-async fn capture_folder(root: &Path, name: &str, mode: &str, with_daq: bool) -> PathBuf {
+pub(crate) async fn capture_folder(root: &Path, name: &str, mode: &str, with_daq: bool) -> PathBuf {
     let folder = crate::recording_store::events_dir(root)
         .join("launch")
         .join(name);
