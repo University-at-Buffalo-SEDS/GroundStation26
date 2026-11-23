@@ -32,6 +32,7 @@ import sys
 import tarfile
 import time
 from pathlib import Path
+from typing import Optional
 
 HERE = Path(__file__).resolve().parent
 GS_ROOT = HERE.parent
@@ -45,6 +46,9 @@ NODE_REPO = {
     "daq": "DAQ-Board",
 }
 NODES = list(NODE_REPO)
+# Build variants run in place of a node in some station modes: the FC ground-test image (INTEGRATED_GROUND_TEST,
+# never a flight image) for the integrated ground test.
+VARIANTS = {"flight_igt": ("flight", ["INTEGRATED_GROUND_TEST=ON"])}
 REMOTES = {
     "FirmwareSimulator": "git@github.com:University-at-Buffalo-SEDS/FirmwareSimulator.git",
     "FlightComputer26": "git@github.com:University-at-Buffalo-SEDS/FlightComputer26.git",
@@ -85,8 +89,18 @@ def git(repo: Path, *args: str, capture: bool = True) -> str:
     return (result.stdout or "").strip()
 
 
+# Staged sources (a remote or container build, `stage`): DIR/<Repo>/ trees with .source-commit and DIR/sources.json.
+STAGED: dict = {}
+
+
+def staged(name: str) -> Optional[dict]:
+    return (STAGED.get("repos") or {}).get(name)
+
+
 def resolve_repo(name: str, workspace: Path, cache: Path, fetch: bool) -> Path:
     """A git repository holding `name`: the local clone in the workspace, else a blobless mirror in the cache."""
+    if staged(name):
+        return Path(STAGED["dir"]) / name
     local = workspace / name
     if (local / ".git").exists():
         if fetch:
@@ -105,6 +119,8 @@ def resolve_repo(name: str, workspace: Path, cache: Path, fetch: bool) -> Path:
 
 def resolve_ref(repo: Path, ref: str) -> str:
     """A branch name means the remote's branch (origin/<ref>); tags and SHAs are used as given."""
+    if staged(repo.name):
+        return staged(repo.name)["commit"]
     for candidate in (f"origin/{ref}", ref):
         result = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "-q", f"{candidate}^{{commit}}"],
                                 capture_output=True, text=True)
@@ -114,6 +130,8 @@ def resolve_ref(repo: Path, ref: str) -> str:
 
 
 def describe(repo: Path, sha: str) -> dict:
+    if staged(repo.name):
+        return {k: v for k, v in staged(repo.name).items() if k != "ref"}
     subject = git(repo, "log", "-1", "--format=%s", sha)
     when = git(repo, "log", "-1", "--format=%cI", sha)
     tag = subprocess.run(["git", "-C", str(repo), "describe", "--tags", "--always", sha], capture_output=True, text=True)
@@ -124,6 +142,9 @@ def describe(repo: Path, sha: str) -> dict:
 def archive(repo: Path, sha: str, dest: Path) -> None:
     if dest.exists():
         shutil.rmtree(dest)
+    if staged(repo.name):
+        shutil.copytree(repo, dest, symlinks=True)  # a per-build copy (SEDSnet's prepare rewrites its tree)
+        return
     dest.mkdir(parents=True)
     data = subprocess.check_output(["git", "-C", str(repo), "archive", sha])
     with tarfile.open(fileobj=io.BytesIO(data)) as tar:
@@ -171,6 +192,9 @@ def build_firmware_simulator(cache: Path, fs_src: Path, jobs: int) -> Path:
 
 
 def cmd_build(a) -> int:
+    if a.sources:
+        STAGED.update(json.loads((Path(a.sources) / "sources.json").read_text()), dir=str(Path(a.sources).resolve()))
+        a.no_fetch = True
     cache = cache_dir(a.cache)
     cache.mkdir(parents=True, exist_ok=True)
     workspace = Path(a.workspace).resolve()
@@ -214,10 +238,12 @@ def cmd_build(a) -> int:
     manifest["sedsnet"] = {"ref": a.sedsnet_ref, **describe(sdk_repo, sdk_sha)}
 
     work = cache / "work"
-    for node in nodes:
-        repo_name = NODE_REPO[node]
+    build_list = nodes + [v for v, (base, _) in VARIANTS.items() if base in nodes and not a.no_variants]
+    for node in build_list:
+        base, defines = VARIANTS.get(node, (node, []))
+        repo_name = NODE_REPO[base]
         repo = resolve_repo(repo_name, workspace, cache, not a.no_fetch)
-        sha = resolve_ref(repo, refs[node])
+        sha = resolve_ref(repo, refs[base])
         have = manifest["boards"].get(node) or {}
         exe = cache / "boards" / node / f"{node}.native"
         if (not a.force and have.get("commit") == sha and have.get("sedsnet") == sdk_sha
@@ -225,18 +251,26 @@ def cmd_build(a) -> int:
             log(node, "up to date at", sha[:7])
             continue
         src = work / "src" / repo_name  # build_board.py keys board options on the directory name
-        log(node, f"{repo_name} {refs[node]} -> {sha[:7]}")
+        log(node, f"{repo_name} {refs[base]} -> {sha[:7]}" + (f" ({', '.join(defines)})" if defines else ""))
         archive(repo, sha, src)
         started = time.monotonic()
         cmd = [sys.executable, str(fs_src / "native" / "build_board.py"), str(src), "--out", str(work / "boards"),
-               "--jobs", str(a.jobs), "--sdk", f"{sdk_repo}@{sdk_sha}"]
+               "--jobs", str(a.jobs), "--sdk", f"{sdk_repo}@{sdk_sha}", "--node", node]
+        for d in defines:
+            cmd += ["--define", d]
         lc_pin = a.launchcore_ref
-        if lc_pin:
+        if staged("SEDSLaunchCore"):
+            cmd += ["--launchcore", f"{Path(STAGED['dir']) / 'SEDSLaunchCore'}@HEAD"]
+        elif lc_pin:
             cmd += ["--launchcore", f"{lc_repo}@{resolve_ref(lc_repo, lc_pin)}"]
         elif (workspace / "SEDSLaunchCore").exists() is False:
             cmd += ["--launchcore", f"{lc_repo}@e2eea7d94245168dc63d31e160f4cb7bdc7688c3"]
         if a.factory:
             cmd.append("--factory")
+        if a.filex:
+            cmd += ["--filex", a.filex]
+        elif staged("filex"):
+            cmd += ["--filex", f"{Path(STAGED['dir']) / 'filex'}@HEAD"]
         subprocess.run(cmd, check=True)
         built = work / "boards" / node
         dest = cache / "boards" / node
@@ -249,7 +283,7 @@ def cmd_build(a) -> int:
         shutil.copyfile(src / "sim" / "board.json", dest / "board.json")
         native = json.loads((built / f"{node}.native.json").read_text())
         manifest["boards"][node] = {
-            "repo": repo_name, "ref": refs[node], **describe(repo, sha), "sedsnet": sdk_sha,
+            "repo": repo_name, "ref": refs[base], **describe(repo, sha), "sedsnet": sdk_sha, "defines": defines,
             "engine": fs_info.get("commit"), "exe": str(dest / f"{node}.native"),
             "factory_bin": str(dest / "factory.bin") if (dest / "factory.bin").exists() else None,
             "family": native.get("family"), "flash_size": (native.get("memory") or {}).get("flash_size", 524288),
@@ -289,6 +323,101 @@ def cmd_status(a) -> int:
     return 0
 
 
+STAGE_REPOS = ["FirmwareSimulator", "SEDSnet", "SEDSLaunchCore", *NODE_REPO.values()]
+LAUNCHCORE_PIN = "e2eea7d94245168dc63d31e160f4cb7bdc7688c3"
+FILEX_PIN = ("firmware-public439-qualification-20261103/deps/DAQ-Board/filex-src", "b93ac4ae77ee12196f15f341cffb0a9810d2484f")
+
+
+def cmd_stage(a) -> int:
+    """Source trees at their resolved refs, without git, for a remote or container build (`build --sources`)."""
+    out = Path(a.out).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    workspace = Path(a.workspace).resolve()
+    cache = cache_dir(a.cache)
+    refs = {repo: a.ref for repo in NODE_REPO.values()}
+    refs.update(FirmwareSimulator=a.fs_ref, SEDSnet=a.sedsnet_ref, SEDSLaunchCore=a.launchcore_ref or LAUNCHCORE_PIN)
+    for item in a.board:
+        node, _, ref = item.partition("=")
+        refs[NODE_REPO[node]] = ref
+    repos = {}
+    for name in STAGE_REPOS:
+        repo = resolve_repo(name, workspace, cache, not a.no_fetch)
+        sha = resolve_ref(repo, refs[name])
+        archive(repo, sha, out / name)
+        (out / name / ".source-commit").write_text(sha + "\n")
+        repos[name] = {"ref": refs[name], **describe(repo, sha)}
+        log("staged", name, refs[name], sha[:7])
+    filex = workspace / ".workspace-progress" / FILEX_PIN[0]
+    if (filex / ".git").exists():
+        archive(filex, FILEX_PIN[1], out / "filex")
+        (out / "filex" / ".source-commit").write_text(FILEX_PIN[1] + "\n")
+        repos["filex"] = {"ref": FILEX_PIN[1], "commit": FILEX_PIN[1], "short": FILEX_PIN[1][:7]}
+    (out / "sources.json").write_text(json.dumps({"repos": repos}, indent=2) + "\n")
+    log(f"staged {len(repos)} source trees in {out} ({dir_size(out) / 1e6:.0f} MB)")
+    return 0
+
+
+def cmd_bundle(a) -> int:
+    """The built cache as a relocatable bundle: board executables (debug info stripped), layouts, symbols, the
+    coordinator, the launcher scripts and the manifest of revisions."""
+    cache = cache_dir(a.cache)
+    manifest = read_manifest(cache)
+    if manifest is None:
+        raise SystemExit("not built")
+    import tarfile as _tar
+    staging = cache / "bundle-staging"
+    if staging.exists():
+        shutil.rmtree(staging)
+    (staging / "engine" / "scripts").mkdir(parents=True)
+    shutil.copytree(cache / "boards", staging / "boards")
+    for exe in staging.glob("boards/*/*.native"):
+        if shutil.which("strip"):
+            subprocess.run(["strip", "--strip-debug", str(exe)], check=False)
+    (staging / "bin").mkdir()
+    shutil.copy2(cache / "bin" / "firmware-sim", staging / "bin" / "firmware-sim")
+    engine = Path(manifest["engine_dir"])
+    for name in ("gs_bay.py", "native_engine.py", "fat32_image.py"):
+        shutil.copy2(engine / "scripts" / name, staging / "engine" / "scripts" / name)
+    rel = json.loads(json.dumps(manifest))
+    for node, b in rel["boards"].items():
+        b["exe"] = f"boards/{node}/{node}.native"
+        if b.get("factory_bin"):
+            b["factory_bin"] = f"boards/{node}/factory.bin"
+    rel.update(engine_dir="engine", coordinator="bin/firmware-sim", bundle={"host": os.uname().machine, "created": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")})
+    (staging / MANIFEST).write_text(json.dumps(rel, indent=2) + "\n")
+    out = Path(a.out).resolve()
+    with _tar.open(out, "w:gz") as tar:
+        for item in sorted(staging.iterdir()):
+            tar.add(item, arcname=item.name)
+    shutil.rmtree(staging)
+    log(f"bundle {out} ({out.stat().st_size / 1e6:.0f} MB)")
+    return 0
+
+
+def cmd_install(a) -> int:
+    """Unpack a bundle into the cache with absolute paths in its manifest."""
+    import tarfile as _tar
+    cache = cache_dir(a.cache)
+    for sub in ("boards", "bin", "engine"):
+        if (cache / sub).exists():
+            shutil.rmtree(cache / sub)
+    cache.mkdir(parents=True, exist_ok=True)
+    with _tar.open(a.bundle) as tar:
+        tar.extractall(cache, filter="data")
+    manifest = json.loads((cache / MANIFEST).read_text())
+    for b in manifest["boards"].values():
+        b["exe"] = str(cache / b["exe"])
+        if b.get("factory_bin"):
+            b["factory_bin"] = str(cache / b["factory_bin"])
+    manifest["engine_dir"] = str(cache / manifest["engine_dir"])
+    manifest["coordinator"] = str(cache / manifest["coordinator"])
+    for exe in [*cache.glob("boards/*/*.native"), cache / "bin" / "firmware-sim"]:
+        exe.chmod(0o755)
+    write_manifest(cache, manifest)
+    log(f"installed into {cache}")
+    return cmd_status(argparse.Namespace(cache=a.cache, json=False))
+
+
 def cmd_clean(a) -> int:
     cache = cache_dir(a.cache)
     targets = [cache] if a.all else [cache / "work", cache / "mirrors"]
@@ -306,7 +435,8 @@ def cmd_run(a) -> int:
     if manifest is None:
         raise SystemExit("not built: python3 tools/firmware_sim.py build")
     launcher = Path(manifest["engine_dir"]) / "scripts" / "gs_bay.py"
-    cmd = [sys.executable, str(launcher), "--manifest", str(cache / MANIFEST), "--out", a.out, "--mode", a.mode]
+    cmd = [sys.executable, str(launcher), "--manifest", str(cache / MANIFEST), "--out", a.out, "--mode", a.mode,
+           "--igt-dir", str(GS_ROOT / "test-data" / "igt"), "--flight-profile-dir", str(GS_ROOT / "tools" / "flight_profile")]
     cmd += a.extra
     # exec: the launcher replaces this process, so it is the supervisor's child and dies with it
     os.execv(sys.executable, cmd)
@@ -328,6 +458,22 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 4) // 2))
     b.add_argument("--factory", action="store_true", help="also build ARM factory images for first boot (slow)")
     b.add_argument("--force", action="store_true")
+    b.add_argument("--no-variants", action="store_true", help="skip the FC ground-test variant")
+    b.add_argument("--sources", help="staged source trees (tools/firmware_sim.py stage) instead of git")
+    b.add_argument("--filex", help="FileX source DIR@REF (default: build_board.py's)")
+    st = sub.add_parser("stage", help="source trees at their refs, without git, for a remote build")
+    st.add_argument("--out", required=True)
+    st.add_argument("--ref", default="dev")
+    st.add_argument("--board", action="append", default=[], metavar="NODE=REF")
+    st.add_argument("--fs-ref", default="dev")
+    st.add_argument("--sedsnet-ref", default="main")
+    st.add_argument("--launchcore-ref")
+    st.add_argument("--workspace", default=str(default_workspace()))
+    st.add_argument("--no-fetch", action="store_true")
+    bu = sub.add_parser("bundle", help="pack the built cache as a relocatable bundle with its manifest")
+    bu.add_argument("--out", required=True)
+    ins = sub.add_parser("install", help="install a bundle into the cache")
+    ins.add_argument("bundle")
     b.add_argument("--no-fetch", action="store_true")
     b.add_argument("--no-coordinator", action="store_true", help="skip building the firmware-sim coordinator")
     b.add_argument("--keep-work", action="store_true", help="keep sources and intermediates under <cache>/work")
@@ -340,7 +486,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--mode", default="normal", help="station mode the plant follows (test_fire: stand, hitl: no igniter)")
     r.add_argument("extra", nargs=argparse.REMAINDER)
     a = p.parse_args(argv)
-    return {"build": cmd_build, "status": cmd_status, "clean": cmd_clean, "run": cmd_run}[a.cmd](a)
+    return {"build": cmd_build, "status": cmd_status, "clean": cmd_clean, "run": cmd_run, "stage": cmd_stage,
+            "bundle": cmd_bundle, "install": cmd_install}[a.cmd](a)
 
 
 if __name__ == "__main__":

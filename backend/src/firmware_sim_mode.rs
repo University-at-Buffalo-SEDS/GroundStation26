@@ -77,7 +77,13 @@ pub(crate) fn unavailable_reason(rrls: bool) -> Option<String> {
         return Some("Firmware simulation runs on a development machine, not on the Raspberry Pi station.".into());
     }
     match manifest() {
-        Some(m) if m.get("boards").and_then(Value::as_object).is_some_and(|b| b.len() == 7) => None,
+        Some(m)
+            if m.get("boards").and_then(Value::as_object).is_some_and(|b| {
+                ["flight", "rf", "power", "gateway", "actuator", "valve", "daq"].iter().all(|n| b.contains_key(*n))
+            }) =>
+        {
+            None
+        }
         Some(_) => Some("The firmware simulation cache is incomplete. Run: python3 tools/firmware_sim.py build".into()),
         None => Some("No firmware simulation build on this machine. Run: python3 tools/firmware_sim.py build".into()),
     }
@@ -122,6 +128,22 @@ fn read_json(path: PathBuf) -> Option<Value> {
     serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
 
+/// IGT replay datasets (`test-data/igt/<set>/IGT/*.CSV`) the simulated FC SD card can carry.
+pub(crate) fn igt_datasets() -> Vec<String> {
+    let dir = std::env::var_os("GS_IGT_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../test-data/igt"));
+    let mut sets: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().join("IGT").is_dir())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    sets.sort();
+    sets
+}
+
 /// The current plant control (conditions, loads, faults) for recording metadata.
 pub(crate) fn current_control() -> Option<Value> {
     run_dir().and_then(|d| read_json(d.join("control.json")))
@@ -146,6 +168,8 @@ pub(crate) fn status_json() -> Value {
         "bay_status_age_ms": age_ms,
         "bay_running": age_ms.is_some_and(|age| age < 5_000),
         "control": dir.as_ref().and_then(|d| read_json(d.join("control.json"))).unwrap_or_else(|| json!({})),
+        "igt_datasets": igt_datasets(),
+        "sd_card": dir.as_ref().and_then(|d| read_json(d.join("sdcard.json"))),
         "run_dir": dir.map(|d| d.display().to_string()),
     })
 }
@@ -170,7 +194,7 @@ pub(crate) fn validate_control(body: &Value) -> Result<Value, String> {
                 for (k, v) in faults {
                     match k.as_str() {
                         "dead_tank_pt" | "dead_chamber_pt" | "radio_drop" | "kg1000_supply_dip" | "kg1000_open_lead"
-                        | "kg50_open_lead" | "p10_inputs_swapped"
+                        | "kg50_open_lead" | "p10_inputs_swapped" | "fc_sd_missing" | "gps_no_fix"
                             if v.is_boolean() => {}
                         "kg50_bypass" | "kg1000_bypass" if v.as_f64().is_some_and(|x| (0.0..=1.0).contains(&x)) => {}
                         "kg50_drift_kg_per_c" | "kg1000_drift_kg_per_c" if v.as_f64().is_some_and(|x| x.abs() <= 5.0) => {}
@@ -192,6 +216,20 @@ pub(crate) fn validate_control(body: &Value) -> Result<Value, String> {
             "conditions" => {
                 let c = value.as_object().ok_or("conditions must be an object")?;
                 for (k, v) in c {
+                    if k == "wind_levels" {
+                        // winds aloft (the apogee planner's weather snapshot)
+                        let levels = v.as_array().ok_or("wind_levels must be a list")?;
+                        if levels.len() > 64
+                            || !levels.iter().all(|l| {
+                                l.get("alt_m").and_then(Value::as_f64).is_some_and(|x| (-500.0..=30_000.0).contains(&x))
+                                    && l.get("speed_mps").and_then(Value::as_f64).is_some_and(|x| (0.0..=80.0).contains(&x))
+                                    && l.get("from_deg").and_then(Value::as_f64).is_some_and(|x| (0.0..=360.0).contains(&x))
+                            })
+                        {
+                            return Err("wind_levels: up to 64 of {alt_m, speed_mps 0-80, from_deg 0-360}".into());
+                        }
+                        continue;
+                    }
                     let x = v.as_f64().ok_or_else(|| format!("condition {k} must be a number"))?;
                     let ok = match k.as_str() {
                         "ambient_c" => (-30.0..=50.0).contains(&x),
@@ -202,6 +240,18 @@ pub(crate) fn validate_control(body: &Value) -> Result<Value, String> {
                     };
                     if !ok {
                         return Err(format!("condition {k} out of range"));
+                    }
+                }
+                out.insert(key.clone(), value.clone());
+            }
+            "igt" => {
+                let i = value.as_object().ok_or("igt must be an object")?;
+                for (k, v) in i {
+                    match (k.as_str(), v) {
+                        ("dataset", Value::Null) => {}
+                        ("dataset", Value::String(name)) if igt_datasets().iter().any(|d| d == name) => {}
+                        ("dataset", _) => return Err(format!("unknown IGT dataset (have: {})", igt_datasets().join(", "))),
+                        _ => return Err(format!("unknown igt key {k}")),
                     }
                 }
                 out.insert(key.clone(), value.clone());
@@ -357,8 +407,10 @@ mod tests {
     fn control_validation_accepts_plant_inputs_and_faults_only() {
         let ok = json!({"plant": {"qd_connected": false}, "faults": {"stuck_valves": {"vent": "closed"}, "dead_tank_pt": true,
                         "kg50_bypass": 0.2, "kg1000_supply_dip": true},
-                        "conditions": {"ambient_c": 35.0, "wind_mps": 9.0, "wind_from_deg": 300.0}, "loads": {"kg50_kg": 10.0},
-                        "patch": {"dac1": "hvain1", "dac2": null, "dac1_attenuation": 0.5}});
+                        "conditions": {"ambient_c": 35.0, "wind_mps": 9.0, "wind_from_deg": 300.0,
+                                       "wind_levels": [{"alt_m": 0.0, "speed_mps": 4.0, "from_deg": 300.0}, {"alt_m": 3000.0, "speed_mps": 15.0, "from_deg": 270.0}]},
+                        "loads": {"kg50_kg": 10.0},
+                        "patch": {"dac1": "hvain1", "dac2": null, "dac1_attenuation": 0.5}, "igt": {"dataset": "nominal_10k"}});
         assert_eq!(validate_control(&ok).unwrap(), ok);
         for bad in [
             json!({"plant": {"qd_connected": "no"}}),
@@ -371,6 +423,7 @@ mod tests {
             json!({"loads": {"kg50_kg": 500.0}}),
             json!({"faults": {"kg50_bypass": 2.0}}),
             json!({"patch": {"dac1": "sar1"}}),
+            json!({"igt": {"dataset": "../../etc"}}),
             json!({"patch": {"dac1_attenuation": 0.0}}),
             json!([1]),
         ] {
