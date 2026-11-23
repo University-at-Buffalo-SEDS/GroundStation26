@@ -91,7 +91,7 @@ The DAQ, VB, AB and gateway never use the radio. The FC, PB and RF never use the
 
 | Stage | Size / period | Behaviour when full | Source |
 | --- | --- | --- | --- |
-| Router to ingress ring | 65,536 packets (`GS_RING_BUFFER_CAPACITY`, 1,024 to 1,000,000) | drops the oldest packet, no counter | `main.rs:1536`, `ring_buffer.rs` `RingBuffer::push` |
+| Router to ingress ring | 65,536 packets (`GS_RING_BUFFER_CAPACITY`, 1,024 to 1,000,000) | drops the oldest packet and counts it; warns (at once, then at most every 30 s); counts in `/api/network_diagnostics` `ingress_ring` and every `REC_NETWORK_STATE` row | `main.rs:1536`, `ring_buffer.rs` `RingBuffer::push`, `DropWarning` |
 | Ring to packet work queue | 256 packets per 1 ms tick (`GS_PACKET_ENQUEUE_BURST`); queue 8,192 (`GS_PACKET_WORK_QUEUE_SIZE`) | stops moving packets; logs "Telemetry ingest backpressured" | `telemetry_task.rs:49-50`, `:1026`, `:1820` |
 | Packet worker to DB queue | 8,192 items (`GS_DB_WORK_QUEUE_SIZE`) | telemetry rows wait (`send().await`); health rows are dropped (`try_send`) | `main.rs:1499`, `telemetry_task.rs` `queue_db_write`, `telemetry_task/recording_diagnostics.rs` `raw_health` |
 | DB batch | up to 256 rows or 8 ms (`GS_DB_BATCH_MAX`, `GS_DB_BATCH_WAIT_MS`) | n/a | `telemetry_task.rs:52-53`, `telemetry_task/recording_owner.rs` |
@@ -392,7 +392,7 @@ sequenceDiagram
 **Steps.** One worker per station, `fc::run`:
 
 1. LIST the FC card root (P2P 4511, dir 0, `irec*.csv`).
-2. `choose_launch_file`: the newest `irec_LAUNCH*` whose UTC name lies between 15 min before the flight capture began and 1 min after the trigger; otherwise the newest dated launch file; otherwise the last one listed. A file still open is waited for, up to 2 min (`sd_conclude` closes it about 5 s after Landed).
+2. `choose_launch_file`: the newest `irec_LAUNCH*` whose UTC name lies between 15 min before the flight capture began and 1 min after the trigger; otherwise the newest dated launch file; otherwise the last one listed. A file still open is waited for, up to 2 min (the FC closes it 20 s after Landed and keeps logging into a new ordinary file).
 3. Download it to `sd-downloads/FC/ROOT/<name>.part`. Each READ answer's CRC-32 is checked; a mismatch is requested again and counted (`crc_errors`).
 4. Attach it with `offer_file_with`, notify the operator (persistent notification), and queue the burn-report recompute. Without a capture it waits for one; it gives up after 2 min if no flight capture is pending. A later save attaches it through `rescan_downloads`.
 5. Optionally cut the 60 s lead-up from the same boot's ordinary file (window reads only, §3.4).
@@ -697,12 +697,13 @@ the UI are not dropped for the feed, which has its own per-client caps.
 
 ## 6. Known gaps / bugs found
 
-These are described, not fixed.
+Items marked **Fixed** were fixed after the audit; the rest are described, not fixed.
 
-1. **Ingress overflow loses packets silently.**
-   - `RingBuffer::push` drops the oldest packet when the 65,536-entry ring is full, with no counter or alert (`ring_buffer.rs:30-35`).
-   - Upstream of it, the DB queue makes the packet worker wait (`telemetry_task.rs` `queue_db_write`).
-   - So a stalled SQLite writer becomes loss of the oldest packets, not a reported error.
+1. **Fixed: ingress overflow lost packets silently.**
+   - `RingBuffer::push` still drops the oldest packet when the 65,536-entry ring is full, but now counts it (`ring_buffer.rs` `RingStats`: capacity, length, high-water mark, drops; cumulative for the process).
+   - The telemetry pump warns the operator on the first drop and then at most every 30 s, naming the packets lost since the last warning (`DropWarning`, `telemetry_task.rs`).
+   - `/api/network_diagnostics` reports `ingress_ring`, and each recording's `REC_NETWORK_STATE` context carries `ingress_ring_drops_decimal`, `ingress_ring_capacity`, `ingress_ring_len` and `ingress_ring_high_water`.
+   - Size: the ring empties at up to 256 packets per 1 ms tick and fills at a few hundred packets/s (§5), so 65,536 entries hold more than 2 min of traffic. It only fills when the packet worker is blocked behind the DB queue (`queue_db_write`) for that long; a larger ring would only delay the loss, so the size is unchanged.
 2. **The receive timestamp is the processing time.** `timestamp_ms` is taken when the worker handles the packet (`telemetry_task.rs:3130`), not when it arrived. A backlog shifts `received_timestamp_ms` and the capture windows built on it. The load-cell filter `dt` (`loadcell_zero.rs` `Filter::add`) also comes from this time.
 3. **KG50 packets for the unselected input are not recorded.** `telemetry_rows_from_packet_values` returns no rows for `KG50` or `DAQ_KG50_SELECTED` packets that do not match the station's `kg50_input`, and for those types from any sender other than `DAQ` (`telemetry_task/derived.rs:1264-1274`). The packet path records only the returned rows (`telemetry_task.rs:3243`), so these packets leave no trace in the recording, for example during an input switch. The same applies to a `DAQ_LOADCELL_CHAMBER` with ≠3 values or from another sender (`telemetry_task/derived.rs:1093`).
 4. **Health rows are dropped under load.** `raw_health` uses `try_send`, so `BOARD_HEALTH`, `DAQ_SD_HEALTH`, `DAQ_INPUT_HEALTH` and `DAQ_LAUNCH_LOG_STATUS` rows are discarded when the DB queue is full (`telemetry_task/recording_diagnostics.rs:137`). There is only an internal counter.
@@ -721,3 +722,4 @@ These are described, not fixed.
 10. **Thermal correction depends on a fresh temperature.** If a thermal entry with a nonzero slope is configured, `temperature_corrected_raw` returns `None` without a `DAQ_ADC_TEMPERATURE` from the last 2 s (`loadcell.rs` `recent_adc_temperature`, `temperature_corrected_raw`). The weight then becomes unavailable.
 11. **Documentation mismatch.** [backend/rolling-recording.md](backend/rolling-recording.md) gives the HITL capture 10 min / 5 min. The code default is 300 s / 120 s (`recording_store.rs:131`).
 12. **No burn report on `dev`.** No impulse, thrust or merge code exists on `dev` (§3.6). Until it lands, the merged DAQ SD data is reachable only through the SD import (§3.5) and the attached raw files.
+13. **Fixed: the BATTERY_CURRENT alarm never fired.** `safety_task.rs` read element 1 of the one-element value. It now reads element 0. The floor moved from 0 A to -1 A because the VB sense reads -0.14 to 0.55 A at rest (Nov 2026 Pi recordings; GB 0.41-1.54 A, PB 4.05-4.37 A); 0 A would have warned on VB noise. The ceiling stays 50 A. Non-finite or undecodable values do not warn.
