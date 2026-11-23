@@ -143,6 +143,29 @@ class RecordingTests(unittest.TestCase):
             _, gps = read_rows(out / 'IGT/GPS0.CSV')
             self.assertEqual([g[0] for g in gps], [500, 600])
 
+    def test_fc_sd_log_with_the_format_block(self):
+        # FC SD files now carry '# seds-sd' metadata lines after the header.
+        header = ('timestamp_ms,monotonic_ms,sensor,value,raw_adc_code,raw_value,calibrated_value,'
+                  'time_source,adc_temperature_c,adc_temperature_code,uptime_ticks,uptime_frequency_hz,record_sequence')
+        lines = [header,
+                 '# seds-sd,format=fc,version=2,board=FC,firmware=unknown,tick_hz=1000,schema=e59ae8a7',
+                 '# seds-sd-columns,u64:ms,u64:ms,label,vec,vec,vec,vec,clock,f32:degC,i32:code,u64:tick,u32:Hz,u64:seq',
+                 '# seds-sd-records,IMU:v=m/s2*3;deg/s*3,BARO:v=m;Pa;degC',
+                 '1000,1000,launch_accepted,"Launch","","","",local,,,1000,1000,1']
+        seq = 2
+        for t in range(0, 7000, 20):
+            lines.append(f'{1000 + t},{1000 + t},IMU,"0 0 9.8 0 0 0","","","",local,,,{1000 + t},1000,{seq}')
+            lines.append(f'{1000 + t},{1000 + t},BARO,"{t / 1000} 101000 20","","","",local,,,{1000 + t},1000,{seq + 1}')
+            seq += 2
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / 'irec_LAUNCH-1-000.csv'
+            src.write_text('\r\n'.join(lines) + '\r\n', newline='')
+            out = Path(tmp) / 'set'
+            igt_csv.main(['recording', str(src), '--out', str(out)])
+            _, baro = read_rows(out / 'IGT/BARO0.CSV')
+            self.assertEqual(baro[0][0], 0)
+            self.assertEqual(baro[1][:2], [20, 0.02])
+
 
 if __name__ == '__main__':
     unittest.main()

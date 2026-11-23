@@ -350,11 +350,19 @@ def from_recording(path: Path, t0: str, imu_sender: str, gps_sender: str) -> dic
         sd_log = 'sensor' in fields
         for row in reader:
             if sd_log:
+                # '#' lines (the SEDS-SD format block, DAQ calibration lines)
+                # are metadata, not records.
+                if (row.get('timestamp_ms') or '').startswith('#'):
+                    continue
                 stamp = float(row['monotonic_ms'])
-                sensor, value = row['sensor'], floats(row['value'])
+                sensor = row['sensor']
                 if sensor == 'launch_accepted' and launch is None:
                     launch = stamp
-                elif sensor == 'IMU' and len(value) == 6:
+                    continue
+                if sensor not in ('IMU', 'BARO', 'SIM'):
+                    continue  # text rows (events, messages) and raw samples
+                value = floats(row['value'])
+                if sensor == 'IMU' and len(value) == 6:
                     samples['IMU'].append((stamp, value))
                 elif sensor == 'BARO' and len(value) == 3:
                     samples['BARO'].append((stamp, value))
