@@ -105,7 +105,7 @@ class Station:
         return ((self.sim().get("bay") or {}).get("plant")) or {}
 
     def recent(self):
-        code, rows = self.api("/api/recent")
+        code, rows = self.api("/api/recent?display=true&max_rows=6000")
         return rows if code == 200 and isinstance(rows, list) else []
 
     def latest(self, data_type: str, sender: str | None = None):
@@ -172,6 +172,7 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
     proc, key = start_station(out, a.mode, a.port)
     st = Station(f"http://127.0.0.1:{a.port}", key, out)
+    st.mode = a.mode
     result = {"checks": [], "mode": a.mode}
 
     def check(name, ok, **extra):
@@ -192,7 +193,7 @@ def main() -> int:
             st.log("interactive: station running", origin=st.origin, token_file=str(out / "token"))
             proc.wait()
             return 0
-        run_scenario(st, check, result)
+        SCENARIOS[a.mode](st, check, result)
         return 0 if all(c["pass"] for c in result["checks"]) else 1
     finally:
         if a.keep:
@@ -227,19 +228,20 @@ def fc_phase(st: Station):
     return (f.get("fc_phase") or {}).get("label") or f.get("state")
 
 
-def run_scenario(st: Station, check, result):
-    # 1. every board on the simulated links
+def boards_up(st: Station, check, boards=BOARDS):
     def all_seen():
         code, b = st.api("/api/boards")
         seen = {x["sender_id"] for x in (b or {}).get("boards", []) if x.get("seen") and x.get("packet_count")}
-        return set(BOARDS) <= seen and seen
+        return set(boards) <= seen and seen
     seen = st.wait(all_seen, 180, "all boards heard", poll=2)
-    check("all seven boards heard over the simulated radio and umbilical", seen, seen=sorted(seen or []))
+    check(f"boards heard over the simulated links ({', '.join(boards)})", seen, seen=sorted(seen or []))
+    # pace since the bay started (start-up costs settle within a minute)
+    st.wait(lambda: (st.sim().get("bay") or {}).get("pace_actual", 0) > 0.9, 90, "pace")
     sim = st.sim()
     check("bay running at real time", (sim.get("bay") or {}).get("pace_actual", 0) > 0.9 and sim.get("bay_running"),
           pace=(sim.get("bay") or {}).get("pace_actual"), firmware={k: (v or {}).get("short") for k, v in ((sim.get("bay") or {}).get("firmware") or {}).items()})
 
-    # 2. fill rules through the real VB/AB firmware
+def fill(st: Station, check, nitrous_kg=5.0):
     check("vent and dump closed by the VB firmware", set_valve(st, "vent", False, "NormallyOpen") and set_valve(st, "dump", False, "Dump"),
           valves=st.plant().get("valves"))
     p0 = st.wait(lambda: vb_psi(st) is not None and vb_psi(st) + 0.001, 10, "VB pressure") or 0
@@ -269,7 +271,7 @@ def run_scenario(st: Station, check, result):
     # a same-temperature nitrous transfer needs the vent open: evaporation cools the tank below the bottle
     set_valve(st, "vent", True, "NormallyOpen")
     st.command("Nitrous")
-    filled = st.wait(lambda: st.plant().get("tank", {}).get("liquid_kg", 0) >= 5.0, 240, "nitrous fill", poll=2)
+    filled = st.wait(lambda: st.plant().get("tank", {}).get("liquid_kg", 0) >= nitrous_kg, 240, "nitrous fill", poll=2)
     st.command("NitrousClose")
     set_valve(st, "vent", False, "NormallyOpen")
     st.wait(lambda: not st.plant().get("valves", {}).get("nitrous"), 10, "AB nitrous valve closed")
@@ -278,16 +280,17 @@ def run_scenario(st: Station, check, result):
     check("nitrous fill: DAQ load cell and VB tank PT follow the fill", filled and m1 > m0 + 1 and (vb_psi(st) or 0) > 300,
           load_cell_before=m0, load_cell_after=m1, tank_psi=vb_psi(st), plant=st.plant().get("tank"))
 
-    # 3. Armed, Launch, flight through the real FC
-    for _ in range(12):
-        phase = fc_phase(st)
+def arm_and_launch(st: Station, check):
+    state = None
+    for _ in range(20):
         code, f = st.api("/flightstate")
         state = (f or {}).get("state") if isinstance(f, dict) else None
         if state == "Armed":
             break
-        st.command("AdvanceFlightState")
+        # HITL steps the flight state; other modes reach Armed from the fill itself
+        code, _ = st.command("AdvanceFlightState") if st.mode == "hitl" else (0, None)
         time.sleep(3)
-    check("station and boards reach Armed (HITL steps)", state == "Armed", state=state, fc=fc_phase(st))
+    check("station and boards reach Armed", state == "Armed", state=state, fc=fc_phase(st))
     launched = False
     for _ in range(8):
         st.api("/api/board_abort/refresh", {})
@@ -300,6 +303,10 @@ def run_scenario(st: Station, check, result):
             st.command("RetractPlumbing")
             time.sleep(6)
     check("Launch accepted by the station", launched)
+    return launched
+
+
+def flight(st: Station, check, result):
     lift = st.wait(lambda: st.plant().get("flight", {}).get("phase") not in (None, "pad"), 90, "liftoff (igniter + pilot from the boards)")
     plant = st.plant()
     check("boards fire the igniter and open the pilot: liftoff", lift, events=[e["event"] for e in plant.get("events", [])][-8:])
@@ -325,6 +332,117 @@ def run_scenario(st: Station, check, result):
     check("FC fires its main output", flight.get("main_at_s") is not None, main_at_s=flight.get("main_at_s"))
     check("descent follows the deployments to landing", landed is not None, phase=flight.get("phase"))
     check("FC reports Landed or Recovery", any(p in ("Landed", "Recovery") for p in phases), phases=phases)
+
+
+
+def scenario_hitl(st, check, result):
+    boards_up(st, check)
+    fill(st, check)
+    arm_and_launch(st, check)
+    flight(st, check, result)
+
+
+def scenario_testing(st, check, result):
+    # testing mode's own logic against the simulated boards: the links and the fill rules (its launch flow is not
+    # driven here)
+    boards_up(st, check)
+    fill(st, check)
+
+
+def peak(st: Station, data_type: str, seconds: float, index=0):
+    best = None
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        for r in st.recent():
+            if r.get("data_type") == data_type and r.get("values") and r["values"][index] is not None:
+                v = r["values"][index]
+                best = v if best is None else max(best, v)
+        time.sleep(1)
+    return best
+
+
+def scenario_test_fire(st, check, result):
+    # test fire uses the fill-side boards on the umbilical (the AV bay is not on the stand's radio)
+    boards_up(st, check, ["GB", "AB", "VB", "DAQ"])
+    fill(st, check)
+    kg1000_rest = (st.latest("KG1000", "DAQ") or {}).get("values", [None])[0]
+    arm_and_launch(st, check)
+    lit = st.wait(lambda: st.plant().get("motor", {}).get("burning") or st.plant().get("motor", {}).get("burned_out"), 90, "ignition on the stand")
+    check("igniter and pilot light the motor on the stand", lit, events=[e["event"] for e in st.plant().get("events", [])][-6:])
+    chamber = peak(st, "COMBUSTION_CHAMBER_PRESSURE", 12)
+    kg1000 = peak(st, "KG1000", 1)
+    plant = st.plant()
+    result["test_fire"] = {"chamber_psi_peak": chamber, "kg1000_v_peak": kg1000, "kg1000_v_rest": kg1000_rest, "motor": plant.get("motor")}
+    check("DAQ reports the chamber pressure of the burn", (chamber or 0) > 100, chamber_psi_peak=chamber)
+    check("the KG1000 sees the thrust once the gap closes", kg1000 is not None and kg1000_rest is not None and kg1000 > kg1000_rest + 0.5,
+          rest_v=kg1000_rest, peak_v=kg1000)
+    check("the rocket stays on the stand", plant.get("flight", {}).get("phase") == "pad", phase=plant.get("flight", {}).get("phase"))
+    check("the motor burns out", st.wait(lambda: st.plant().get("motor", {}).get("burned_out"), 30, "burnout"))
+
+
+def scenario_normal(st, check, result):
+    boards_up(st, check)
+    def fix():
+        code, a = st.api("/api/antenna/status")
+        rocket = (a or {}).get("rocket") if code == 200 and isinstance(a, dict) else None
+        return rocket if rocket and not rocket.get("stale") and rocket.get("latitude") is not None else None
+    rocket = st.wait(fix, 120, "RF GPS fix at the GS", poll=2)
+    check("RF NEO-M9N fix reaches the station (GPS gates)", rocket, fix=rocket)
+    gps = st.latest("GPS_STATUS", "RF")
+    result["normal"] = {"rocket_fix": rocket, "gps_status": gps}
+    fill(st, check)
+    code, pol = st.api("/api/action_policy")
+    reason = ""
+    if code == 200 and isinstance(pol, dict):
+        launch = next((c for c in pol.get("controls", []) if c.get("cmd") == "Launch"), {})
+        reason = launch.get("disabled_reason") or ""
+    result["normal"]["launch_gate"] = reason
+    check("Launch is not held by the GPS gate", "gps" not in reason.lower(), launch_gate=reason)
+
+
+def scenario_igt(st, check, result):
+    boards_up(st, check)
+    datasets = st.sim().get("igt_datasets") or []
+    check("IGT datasets offered", "nominal_10k" in datasets, datasets=datasets)
+    # swap the card: out, choose the dataset, in, Retry SD
+    st.api("/api/firmware-sim/control", {"faults": {"fc_sd_missing": True}})
+    time.sleep(2)
+    st.api("/api/firmware-sim/control", {"igt": {"dataset": "nominal_10k"}})
+    loaded = st.wait(lambda: (st.sim().get("sd_card") or {}).get("dataset") == "nominal_10k" and st.sim()["sd_card"], 20, "card rewritten")
+    check("the simulated card carries the dataset", loaded, sd_card=st.sim().get("sd_card"))
+    st.api("/api/firmware-sim/control", {"faults": {}})
+    time.sleep(2)
+    st.command("FcSdRetry")
+    def igt(k=None):
+        code, g = st.api("/api/igt")
+        return g if code == 200 and isinstance(g, dict) else {}
+    ready = st.wait(lambda: igt().get("sd_ready") is True and igt(), 60, "FC SD ready", poll=2)
+    check("the FC mounts the simulated SD card", ready, igt=igt())
+    check("the FC runs the ground-test image", igt().get("fc_image") == "ground_test", fc_image=igt().get("fc_image"))
+    code, challenge = st.api("/api/igt/prepare", {"action": "enter"})
+    ticket = challenge.get("ticket") if isinstance(challenge, dict) else None
+    code, body = st.api("/api/igt/confirm", {"ticket": ticket}) if ticket else (code, challenge)
+    st.log("IGT enter", http=code, body=body)
+    fc_ready = st.wait(lambda: str(igt().get("fc_mode", "")).lower() == "ready" and igt(), 60, "FC IGT Ready", poll=2)
+    check("FC IGT reaches Ready (CSV replay loaded)", fc_ready, igt=igt())
+    result["igt"] = igt()
+    fill(st, check)
+    if arm_and_launch(st, check):
+        phases = []
+        def track():
+            ph = fc_phase(st)
+            if ph and (not phases or phases[-1] != ph):
+                phases.append(ph)
+                st.log("FC phase", phase=ph)
+            return any(p in ("Landed", "Recovery") for p in phases)
+        st.wait(track, 400, "replayed flight landed", poll=1)
+        result["igt_phases"] = phases
+        check("the FC replays the flight from the CSV (Ascent, Apogee, Landed)",
+              any("Ascent" in p or "Coast" in p for p in phases) and any(p in ("Landed", "Recovery") for p in phases), phases=phases)
+
+
+SCENARIOS = {"hitl": scenario_hitl, "testing": scenario_testing, "test_fire": scenario_test_fire, "normal": scenario_normal,
+             "integrated_ground_test": scenario_igt}
 
 
 if __name__ == "__main__":

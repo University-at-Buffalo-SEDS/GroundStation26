@@ -1,7 +1,13 @@
 # Integrated ground test
 
 An integrated ground test (IGT) is a real fill and a real motor fire on the
-stand with the whole rocket powered as for flight. After Launch the flight
+stand with the whole rocket powered as for flight. Two bodies take part: the
+motor with its tank and plumbing is on the test stand (VB, AB, GB, DAQ, the
+load cells, the chamber PT and the umbilical/QD behave as in a test fire), and
+the rocket's avionics (FC, RF, PB) lie separately on the ground, without the
+motor, linked to the station over the radio. No thrust or vibration reaches
+the FC's real sensors: they read a vehicle at rest (often lying horizontally),
+the ambient pressure and the real GPS at the site. After Launch the flight
 computer (FC) stops using its real flight sensors and replays a recorded or
 generated flight from CSV files on its SD card. Its real Kalman filter, state
 machine and deployment logic run on that replayed data, and the drogue and
@@ -10,6 +16,18 @@ channels are dry-run (logged, not fired). With LIVE PYRO armed they fire.
 
 The test shows that the fill, the fire, the flight software and the recovery
 hardware work together, without a launch.
+
+Consequences of the separate avionics:
+
+- The FC's barometer drift tracker keeps tracking through the fire (its real
+  IMU is quiet) and freezes only at the FC's Launch, as in flight.
+- The rest checks at Launch see a vehicle at rest and pass.
+- FC, RF and PB reach the station over the radio, never the umbilical; nothing
+  in IGT depends on the FC being on the umbilical or the continuity loop. The VB
+  vent countdown keys off the station link and the stand's continuity wire,
+  which stays intact.
+- The pyro outputs fire into the separate rocket's recovery hardware (or are
+  logged in DRY-RUN).
 
 | Piece | Where |
 | --- | --- |

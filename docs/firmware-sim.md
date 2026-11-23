@@ -207,6 +207,39 @@ discharge (LTC2990 monitors read static values), RF link quality versus range (o
 NEO-M9N GPS, an SD card missing, weathercocking/3-DOF attitude, weather-shifted pad pressure, the DAQ DAC to ADC
 patch (section 7).
 
+Additions since the MVP:
+
+* **Vehicle and motor from `tools/flight_profile`** (read at every bay start, so the apogee planner's and the fire
+  archive's updates flow through): dry mass, diameter, drogue/main rates, launch site from `vehicle.json`; the
+  motor's delivered Isp from the motor summary (impulse per kg of N2O, e.g. 9.19 kN s / 5.6 kg gives about 140 s);
+  `motor.total_impulse_ns` in `vehicle.json` rescales it. The injector flow and the chamber pressure are solved
+  together. The provenance (files, impulse, Isp) is in the status `firmware._flight_profile`.
+* **Stand behaviour**: the KG50 carries the hanging rocket minus thrust until lift-off and sits at its zero-load
+  reading while lifted; the KG1000 sees thrust minus the current mass after an 80 ms gap with a contact spike; the
+  rocket drops back onto the KG50 at tail-off, so the vapour tail shows only there.
+* **Winds aloft**: `conditions.wind_levels` (`[{alt_m, speed_mps, from_deg}]`, the apogee planner's weather
+  snapshot) or the `vehicle.json` power law (exponent 0.14, cap 1.4) drift the vehicle.
+* **RF NEO-M9N GPS** (`sim_gps.c`, SPI): GGA and RMC once a second from the flight model's position (launch site plus
+  drift, altitude), UBX ACK for configuration; fault `gps_no_fix`. Normal mode's GPS gate passes and the rocket fix
+  reaches the map.
+* **FC SD card**: a FAT32 image written by the launcher (`scripts/fat32_image.py`, no mkfs) carrying the selected
+  `test-data/igt/<set>/IGT/*.CSV`; fault `fc_sd_missing` pulls the card at run time; a dataset chosen while the card
+  is out is written then (swap: card out, dataset, card in, `FcSdRetry`). IGT mode runs the FC ground-test variant
+  (`INTEGRATED_GROUND_TEST=ON`, built alongside) as two bodies: the motor, tank and plumbing burn on the stand as in a
+  test fire, while the avionics bay lies still on the ground apart from it (FC sensors at rest, horizontal by default:
+  plant `fc_attitude`, ambient pressure, GPS at the site; no thrust or vibration coupling). The FC's flight comes
+  only from the CSV replay.
+* **DAQ DAC to ADC patch** (simulated loopback cable): the plant reads the DAQ's own DAC1 registers, trigger timers,
+  GPDMA source table and SystemCoreClock, so any waveform or table the firmware plays reaches the patched input
+  through the real acquisition path (MCP CH2-5, HVAIN1/2, P6 differential, KG1000/KG50 amplifiers with an
+  attenuator; SAR inputs are not modelled). Control `patch: {dac1, dac2, dac1_attenuation, dac2_attenuation}`;
+  fault `p10_inputs_swapped` latches the buffer to a rail (the unreworked board). The table is sampled every 10 ms of
+  plant time, so waveforms up to about 25 Hz come through faithfully.
+* **AB current sense**: the N2O/N2 solenoid and igniter channels (ADC1) read current while energized; fault
+  `igniter_open` reads no igniter current.
+* **RF link quality**: packet loss grows with the slant range (none to 3 km, about 30 % at 12 km).
+* Control sections merge: a POST replaces only the sections it sends.
+
 ## 4. FC simulated flight
 
 The FC runs its real estimator and recovery logic. The coordinator's flight model drives the FC's BMP390/BMI088
@@ -215,59 +248,59 @@ before liftoff, then the flight. Pyro outputs are observed and change the descen
 mirror `tools/flight_profile/vehicle.json` (15 ft x 6 in, 31.6 kg dry) and the 11-16 motor; with the measured
 motor the vehicle reaches about 1.4 km, `motor.impulse_scale` about 1.8 gives the 10 kft profile.
 
-## 5. Raspberry Pi 5 (aarch64), bundles and the remote build
+## 5. Raspberry Pi 5, bundles and the remote build
 
-Status: **analysed, not ported or verified on aarch64.** What the port needs, from reading the engine:
+### Pi 5 setup
 
-* The board executables are deliberately **32-bit** (`gcc -m32`, SEDSnet for `i686-unknown-linux-gnu`): the firmware
-  keeps pointers in 32-bit fields (ThreadX `ULONG`, DMA and register addresses) and the shim maps the MCU address map
-  at its real addresses (flash 0x08000000, SRAM 0x20000000, peripherals 0x40000000-0x5FFFFFFF, PPB 0xE0000000), so the
-  ARM counterpart is **AArch32 (armhf) user space**, not 64-bit aarch64. A 64-bit port would touch every
-  pointer-in-uint32 site of seven boards and lose the 32-bit layout that makes native faithful.
-* **Pi 5 page size**: the Cortex-A76 runs AArch32 at EL0, but the Pi 5's default kernel (`kernel_2712.img`) uses
-  16 KB pages and arm64 Linux offers 32-bit compat only with 4 KB pages. A Pi 5 that runs the board executables
-  must boot the 4 KB kernel (`kernel=kernel8.img` in `config.txt`, a supported Raspberry Pi OS option; Docker then
-  runs armhf binaries natively). The fixed MCU mappings are 16 KB-aligned and their sizes are page multiples, so
-  they would also be fine under 16 KB pages; the compat requirement is the blocker.
-* x86-specific pieces: `native/build_board.py` (`-m32`, the i686 SEDSnet target, `-Ttext-segment=0x70000000`,
-  `nm`); `sim_stubs.c`'s `.set _estack` (portable GAS); the CMSIS layer in `sim_preinclude.h` (only a compiler
-  barrier, portable); ThreadX coroutines on `makecontext/swapcontext` (present in glibc armhf, absent in musl). The
-  simclock LD_PRELOAD (`native/simclock`) is x86_64-only, and so is the thread-level lockstep, but **the
-  station-managed mode uses neither**: the bay runs at pace 1 and the station on its own wall clock. The
-  coordinator talks to the boards over Unix sockets with blocking messages (no shared-memory lock-free protocol on
-  this path), so there is no x86 memory-ordering assumption here. The coordinator and the plant are portable Rust.
-* Toolchain: jupiter has the Rust `armv7-unknown-linux-gnueabihf` and `aarch64-unknown-linux-gnu` targets and
-  `qemu-arm`/`qemu-aarch64`, but no armhf/aarch64 C cross compiler and no binfmt registration (registering it is a
-  system change this work did not make), so nothing ran under emulation yet.
-* Resources measured on jupiter (x86, 1x, seven boards + plant, during the end-to-end run): the coordinator (lockstep,
-  radio medium, Pico-Fi model, plant) about 13 % of one core, the seven board processes about 14 % together, about
-  47 MB RSS in total. A Pi 5 core is roughly a third to a half of a jupiter core, so the bay should need about one
-  Pi core at 1x (estimate, not measured on a Pi), next to the station.
-  Board processes run at nice 10 (`FIRMWARE_SIM_NODE_NICE`); on a Pi the bay should additionally run in its own
-  cgroup (`docker run --cpus=1.5` or a systemd `CPUQuota=150%` slice) and stay at pace 1 (the station-managed mode
-  never runs faster than real time).
-* Safety on a Pi: the backend refuses to enter firmware simulation while any board was heard in the last 30 s; in
-  the mode the comms config names no device; the supervisor stops the bay whenever the backend exits (SIGTERM is
-  forwarded and the bay is a child that also dies with its parent), and a bay crash leaves the backend running with
-  the bay shown as not running. The Pi build currently does **not** offer the mode (`raspberry_pi` feature).
+The board executables are 32-bit (the firmware keeps pointers in 32-bit fields and the shim maps the MCU address
+map at its real addresses), so on an aarch64 station they are **armhf, statically linked** (no armhf libraries on the
+host or in the station image), next to an aarch64 coordinator. They need the kernel's 32-bit compat, which arm64
+Linux offers only with 4 KB pages:
 
-Bundles: the cache layout is the bundle (`manifest.json` with every board's repo/ref/commit, `boards/<node>/`
-executable + `board.json` + symbols, `bin/firmware-sim`, `firmware-simulator/` scripts and shim sources). On x86 it
-is about 140 MB of board executables (unstripped, debug info) plus 3 MB coordinator; stripped it is a fraction of
-that. A station container would take it as a volume (`-v <bundle>:/opt/firmware-sim`, `GS_FIRMWARE_SIM_CACHE`).
+* **Ubuntu (raspi kernel, as the station runs: 6.8.0-*-raspi, `CONFIG_ARM64_4K_PAGES=y`, `CONFIG_COMPAT=y`)**: no
+  kernel change; armhf binaries run as they are.
+* **Raspberry Pi OS** with its default 16 KB-page Pi 5 kernel: set `kernel=kernel8.img` in
+  `/boot/firmware/config.txt` (4 KB pages, 32-bit compat) and reboot.
 
-Remote build (`build.py --remote HOST`, `scripts/remote_build.py`): **not implemented.** The plan: a `sim-bundle`
-target that rsyncs the board checkouts at their resolved refs (per-build copies, since SEDSnet's prepare step rewrites
-its source directory; no credentials), adds an armhf C cross compiler, cmake/ninja and the Rust
-`armv7-unknown-linux-gnueabihf` target to the `gs-station-builder` image, parametrises `build_board.py` for
-`--host-cc arm-linux-gnueabihf-gcc --host-target armv7-unknown-linux-gnueabihf`, builds the coordinator for
-aarch64, and brings back the bundle; `build.py --remote HOST --sim` would add it to the station build.
+The launcher checks at start and refuses with that message (`run/refused.txt`, shown in `GET /api/firmware-sim`
+`bay_refused`) when the page size is not 4 KB or the kernel cannot execute a 32-bit binary. A `raspberry_pi` build
+offers the mode only when an armhf bundle is installed (manifest `host_abi: "armhf"`). The bay processes run at nice
+10; in Docker give the station container the bundle as a volume and leave the bay inside the station's container
+(`-v ~/.cache/seds-firmware-sim:/root/.cache/seds-firmware-sim`, or set `GS_FIRMWARE_SIM_CACHE`); a `--cpus` quota
+on that container bounds the station and the bay together (one core is enough for the bay at 1x by the jupiter
+measurement below). A bay crash never takes the backend down; stopping the backend stops the bay.
 
-DAQ DAC to ADC patching (requested): **not implemented.** Design: the plant reads the DAQ's DAC data-holding
-register from the DAQ node's mapped peripheral page each step (so whatever waveform the real firmware generates,
-from the shared waveform spec or any table, is what appears), applies the DAC resolution/range and the P10 buffer
-(with the swapped-inputs fault as an option), and substitutes that voltage on the patched ADC channel(s); the patch
-is a control section, and the UI patch diagram is gated on `/api/firmware-sim` `active`.
+### Bundles
+
+`python3 tools/firmware_sim.py bundle --out FILE` packs the built cache as a relocatable bundle (board executables
+with debug info stripped, board layouts, symbols, the coordinator, the launcher scripts and `manifest.json` with every
+board's repo/ref/commit/subject, SEDSnet, the engine and `host_abi`): 15 MB compressed, 38 MB installed for x86_64.
+`python3 tools/firmware_sim.py install FILE` unpacks one into the cache. `stage --out DIR` writes the sources at
+their resolved refs as plain trees (no git, a copy per build because SEDSnet's prepare step rewrites its tree) and
+`build --sources DIR` builds from them, which is what container and remote builds use.
+
+### Remote build
+
+`./build.py --remote HOST sim-bundle` stages the sources locally, sends them with the station checkout, builds in the
+station builder image on HOST (now also carrying `gcc-multilib`, `gcc-arm-none-eabi`, `gcc-arm-linux-gnueabihf`
+with the armhf libc, ninja and the Rust `i686`, `armv7-unknown-linux-gnueabihf` and thumb targets) into a cache kept
+on HOST, and copies the bundle back to `target/firmware-sim-bundle.tar.gz` and installs it. Run from the Pi it builds
+an armhf bundle (`FIRMWARE_SIM_HOST=armhf`, aarch64 coordinator); from an x86_64 machine an i686 one.
+`./build.py --remote HOST --sim ...` adds the bundle to an ordinary station build. No credentials leave the local
+side (the password stays in SSH_ASKPASS). Without `--remote`, `./build.py sim-bundle` builds locally.
+
+Verified: the x86_64 bundle/install round trip and a git-free staged build of a board on jupiter; the remote command
+sequence by mocked tests (`tests/test_remote_build.py`). **Not verified**: an actual remote run, the armhf cross build
+(jupiter has no armhf cross compiler; the builder image has one) and running on a Pi.
+
+### Appendix: a 64-bit port (not planned)
+
+Running the boards as aarch64 processes would mean auditing every place the firmware or its libraries keep a pointer
+in a 32-bit field: ThreadX (`ULONG` thread entry inputs, timer and queue message words, `tx_byte_pool` block links),
+DMA descriptors and peripheral registers written with `(uint32_t)(uintptr_t)` addresses (GPDMA linked lists, SDMMC,
+the DAQ DAC table), FileX media/driver words, SEDSnet's embedded-target allocator interface and any packed structs
+with pointers, plus the shim's own MMIO and ThreadX port. Estimated at weeks per board family and it would lose the
+32-bit memory layout that makes native runs faithful. The armhf route above needs none of it.
 
 ## 6. Running it
 
@@ -299,12 +332,23 @@ python3 tools/firmware_sim_e2e.py --out /tmp/fsim-e2e
 python3 tools/firmware_sim.py clean --all                 # remove the cache
 ```
 
-Per mode: **HITL** - fill by hand (Nitrogen/Nitrous/NormallyOpen/Dump), step to Armed, Launch: the VB opens the pilot
-at T+10 s, the plant lights the motor (no igniter in HITL) and flies; the FC runs its estimator and fires its pyro
-outputs. **Normal** - the full procedure; RF GPS is not modelled yet, so GPS-gated admission blocks Launch.
-**Test fire** - the rocket stays on the stand; the igniter and pilot light the motor and the KG50/KG1000/chamber PT
-show the burn. **Testing** and **IGT** - the mode's own logic against the simulated boards; loading the IGT CSV
-datasets onto the simulated FC SD card is a follow-up (the native FC reports its SD card as not mounted).
+Per mode (the e2e: `python3 tools/firmware_sim_e2e.py --out DIR --mode <mode>`):
+
+* **HITL**: fill by hand (Nitrogen/Nitrous/NormallyOpen/Dump), AdvanceFlightState to Armed, Launch: the VB opens the
+  pilot at T+10 s, the plant lights the motor (no igniter in HITL) and flies; the FC runs its estimator and fires its
+  pyro outputs.
+* **Test fire**: the fill-side boards on the umbilical; the fill takes the station to Armed, Launch fires the igniter
+  and the pilot, the motor burns on the stand (chamber PT, KG50 unloading, KG1000 after the gap).
+* **Normal**: the RF NEO-M9N fix reaches the station, so the GPS gate passes; the full procedure (self-test, nitrogen
+  test, fill, QD retract, Launch) is the station's own and was not driven end to end yet.
+* **IGT**: the FC ground-test variant; pick a dataset in the sim panel (card out, dataset, card in, Retry SD), Ground
+  test > Enter ground test, fill, Launch: the FC (lying apart on the ground) replays the CSV flight while the motor
+  burns on the stand.
+* **Testing**: the mode's own logic against the simulated boards (the e2e checks the links and the fill rules).
+
+Sim panel: Settings shows it while the station runs simulated firmware (revisions, pace, plant for everyone; plant
+inputs, conditions, calibration masses, faults and the IGT dataset for administrators). The DAQ DAC page shows the
+simulated loopback cable for patching the DAC outputs onto DAQ inputs.
 
 Logs: `<station-mode dir>/firmware-sim/run/diagnostics/` (`native-<board>.log`, `native-gpio.log` with plant
 events and control changes, `bay.log`, `native-report.json`), live `run/status.json`; isolated station state under
@@ -332,17 +376,22 @@ the supplies and opens dump and vent through the real boards.
 Not verified: Normal (RF GPS not modelled), Test fire, Testing and IGT end to end (the modes are offered and the plant
 follows them, but only HITL was driven through), aarch64, the remote build, the DAC patch.
 
+### DAQ 99db2e6 and later (not supported natively yet)
+
+DAQ-Board 99db2e6 moved the MCP3564R to a TIM2 1 ms frame engine: TIM2 compare interrupts (CC1 frame tick, CC2 slot
+start) programmed at register level, a free-running µs counter, one-shot SCAN cycles started per frame and DMA SPI
+reads on DRDY. The native shim emulates timers only through the HAL (update interrupts) and the MCP3564R model
+converts continuously, so a native DAQ at 99db2e6 builds and runs but produces no load-cell or chamber samples (the
+fill load cell reads 0, and test fire never reaches Armed). Until the shim gains register-level TIM compare
+emulation (CNT, CCRx/DIER/EGR, the TIM2 vector the replaced `stm32u5xx_it.c` routes) and a one-shot SCAN model,
+build the DAQ at 6f29611: `python3 tools/firmware_sim.py build --board daq=6f29611`.
+
 ## 7. Follow-ups
 
-* Frontend (the separate frontend repo, untouched here): a SIMULATED FIRMWARE banner on every view from
-  `current.banner` (station modes) and `/api/firmware-sim` `banner`, a sim panel (firmware revisions, pace, plant,
-  conditions, calibration masses) and the admin fault and patch controls. The backend API is in place.
-* Raspberry Pi 5: the armhf board build (`build_board.py` host-compiler/target options), the aarch64 coordinator,
-  a qemu/arm64-container smoke test, prebuilt bundles from jupiter or CI, the `build.py --remote --sim` target, a
-  cgroup quota for the bay, then enabling the mode in Pi builds (section 5).
-* IGT: put the `test-data/igt` datasets on the simulated FC SD card (the native FC's SD image) for the CSV replay.
-* RF NEO-M9N GPS model (the launch site is in the plant config) so Normal-mode GPS gates pass.
-* DAQ DAC to ADC patch (section 5), thermocouples and tank wall temperature telemetry, igniter current and continuity
-  sensing, power rails and battery discharge, RF link quality versus range, SD-missing fault, weather-shifted pad
-  pressure, weathercocking/3-DOF (reuse `tools/flight_profile/flightsim.py`'s atmosphere and wind directly).
-* Read `tools/flight_profile/vehicle.json` and the motor curve at bay start instead of the mirrored defaults.
+* The DAQ 99db2e6 frame engine in the native shim (above); IGT reaching FC `Ready` (the e2e mounts the card, sees the
+  ground-test image and enters ground test, but the FC mode stays `off`; not diagnosed yet).
+* Thermocouples and tank wall temperature telemetry, power rails and battery discharge (the LTC2990 monitors still
+  read static values), weathercocking/3-DOF attitude, SAR inputs in the DAC patch.
+* An actual remote bundle run, the armhf cross build and a run on the Pi station.
+* Normal mode end to end through the full procedure (self-test, nitrogen test, fill, retract, Launch) and the
+  flight track on the map; the e2e covers the GPS gate and the fill rules.
