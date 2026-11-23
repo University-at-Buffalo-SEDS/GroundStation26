@@ -145,7 +145,7 @@ operators see exactly which firmware revisions are being simulated.
 in its header), stepped every 10 ms of virtual time by the native coordinator. Inputs are the boards' outputs, never
 their internal state:
 
-* AB `N2_SIG` (PB13), `N20_SIG` (PB14), `IGNITER_SIG` (PB12) and VB `Solenoid` (PB11, pilot) from the boards' GPIO
+* AB drive enables `N2_Valve_EN` (PB3), `N20_Valve_EN` (PB4), `Igniter_EN` (PB7) (PB12-14, the `*_Sig` lines, are ribbon inputs) and VB `Solenoid` (PB11, pilot) from the boards' GPIO
   reports; VB vent (normally-open servo, TIM2 CH2) and dump (TIM2 CH1) from the timer compare registers in the VB's
   mapped peripheral page, open below 860 us (open ~530 us, closed ~1200 us on the VB's 500-2500 us/270 degree
   mapping); FC `CO2` (PB5, drogue) and `REEF` (PB6, main) pyro outputs.
@@ -338,15 +338,24 @@ Per mode (the e2e: `python3 tools/firmware_sim_e2e.py --out DIR --mode <mode>`):
   pilot at T+10 s, the plant lights the motor (no igniter in HITL) and flies; the FC runs its estimator and fires its
   pyro outputs.
 * **Test fire**: the fill-side boards on the umbilical. Armed comes from the station's own GSE procedure (valve
-  self-test, nitrogen test, fill to target), not from manual valve commands; the e2e drives that procedure. In the
-  sim the valve self-test currently pauses on "Valve acknowledgement timed out ... no fresh report" after the pilot
-  open/close steps (the station does not accept the VB/AB valve-state reports as fresh in time); open.
-* **Normal**: the RF NEO-M9N fix reaches the station, so the GPS gate passes; the full procedure (self-test, nitrogen
-  test, fill, QD retract, Launch) is the station's own and was not driven end to end yet.
+  self-test, nitrogen test, fill to target), not from manual valve commands; the e2e drives that procedure: a dry
+  valve self-test (the e2e closes both supply bottles first, as the self-test confirmation asks), the nitrogen test
+  (dump at the hold), Start fill (the automatic KG50 zero, then the fill to its mass target), Launch, ignition on
+  the stand (AB igniter, VB pilot), the burn, burnout and the station's burn report.
+* **Normal**: the RF NEO-M9N fix reaches the station, so the GPS gate passes; the e2e then drives the full
+  procedure (self-test, nitrogen test, fill, QD retract, Launch) and follows the flight on the map
+  (`/api/antenna/status` rocket positions from the RF GPS).
 * **IGT**: the FC ground-test variant; pick a dataset in the sim panel (card out, dataset, card in, Retry SD), Ground
   test > Enter ground test, fill, Launch: the FC (lying apart on the ground) replays the CSV flight while the motor
-  burns on the stand.
-* **Testing**: the mode's own logic against the simulated boards (the e2e checks the links and the fill rules).
+  burns on the stand. The FC refuses Enter (reason 11, "refused (wrong state)") while it still counts the station as
+  lost, e.g. a few seconds after the radio path came back at boot; press it again. Swapping the card's contents while
+  the FC runs (card out, another dataset, card in, Retry SD) currently ends in an FC fault "CSV parse error" (code 4)
+  although the same files pass when the card holds them from power-on: the FC reads the new card through what it
+  cached of the old one (FileX media not reopened on Retry SD; to confirm on hardware with a real card swap). The
+  e2e therefore powers on with the dataset on the card (`FIRMWARE_SIM_CONTROL={"igt":{"dataset":...}}`).
+* **Testing**: the mode's own logic against the simulated boards (the e2e checks the links, the DAC waveform engine
+  through the simulated loopback cable (a 20 Hz sine on DAC1 patched onto MCP3564R CH2, judged by the station's DAC
+  validation) and the fill rules).
 
 Sim panel: Settings shows it while the station runs simulated firmware (revisions, pace, plant for everyone; plant
 inputs, conditions, calibration masses, faults and the IGT dataset for administrators). The DAQ DAC page shows the
@@ -375,28 +384,67 @@ DAQ 6f29611 (all dev), SEDSnet main ebdb444, FirmwareSimulator dev + this work; 
 Also seen: an N2-pressurised tank topped up with nitrous trips the station's 850 psi overpressure relief, which closes
 the supplies and opens dump and vent through the real boards.
 
-Not verified: Normal (RF GPS not modelled), Test fire, Testing and IGT end to end (the modes are offered and the plant
-follows them, but only HITL was driven through), aarch64, the remote build, the DAC patch.
+Verified 2026-11-23 (r5, single bay): test fire through the valve self-test (dry), the nitrogen test, the automatic
+KG50 zero and the fill to its 5 kg target; IGT to FC `Ready` with the dataset on the card from power-on. Not verified
+end to end yet (host overloaded by other builds while these ran; see the next section): test-fire ignition and burn
+report with the igniter on PB7, Normal through Launch and the map track, IGT Launch and replay, the DAC patch
+validation, aarch64, the remote build.
+
+### Valve-report time stamps and the bay's pace (2026-11-23)
+
+Test-fire runs showed the VB/AB valve-state reports refused as clock-skewed (+100 ms to -5 s window around station
+network time), VB/AB valve state STALE and the valve self-test pausing on "Valve acknowledgement timed out ... no
+fresh report", together with "requesting RRLS relay" and "rocket_comms send_data failed: operation would block" on
+the radio PTY. Traced with every received stamp `(epoch, timestamp)` against the station clock:
+
+* the station's network clock never stepped (epoch changes were only "renamed", delta 0); the boards' clocks moved;
+* the bay had fallen behind its pace (the first virtual second took 12 s while every board booted; later a slow
+  FC boot or host load) and then ran 3-4x real time to catch up. Every board's clock follows the station's on
+  virtual time, so during the catch-up the boards ran ahead of the station's wall clock (up to +3.7 s), named
+  diverged epochs (the station adopted them, delta 0) and kept small offsets (+100 to +300 ms) for minutes; the
+  valve reports were then refused as ahead;
+* while the bay lagged, its radio PTY was read at most 8 KiB per (slow) step: the station's writes failed with
+  "operation would block" and the AV-bay frames came late, hence the RRLS relay requests;
+* the GPS model plays no part (the same with no fix).
+
+**Mostly a sim artifact, plus one real station bug.** No hardware oscillator runs 3-4x fast: that part is fixed in
+FirmwareSimulator (the station-managed bay drops lag beyond 20 ms instead of racing, `slipped_ms` and `slip_events`
+in `run/status.json`; the radio PTY is drained every step and fed to the modem at the UART baud; the shim keeps the
+DAQ frame engine on time). The real bug: the station's periodic network-time refresh read the host clock before the
+step policy and its locks and applied the reading as "now"; a refresh that waited 1.5 s (here a host under memory
+pressure) stepped the station's network clock back 1485 ms (new epoch) and a second later forward again (another
+epoch), and every board re-anchored twice. Steps are allowed in Startup/Idle, i.e. during the whole GSE procedure of
+a test fire, so on hardware any stall of the router worker longer than 1 s (a blocked radio write, a busy Pi) does the
+same. Fixed in the station (`system_clock::refresh_network_source_now`, the wait added back on the router's
+monotonic clock); the -7.6 s then +1.0 s jumps reported earlier fit this pattern. The SEDSnet epoch rules (stamps
+translated across steps, `network_stamp_is_fresh`) behaved as designed and were not changed.
+
+A single bay on an otherwise quiet host holds pace with a few hundred ms slipped per run and no refused valve report.
+The limit stays the host: with three bays and builds at once (or heavy swap) the bay slipped 12-65 s in a few minutes
+and the boards' disciplined clocks wandered (+100 to +270 ms ahead, or seconds behind), so valve reports were refused
+again. Run one bay at a time and watch `slipped_ms`; making the station follow the bay's virtual clock would remove
+this limit (follow-up).
 
 ### DAQ frame engine (DAQ-Board 99db2e6 and later)
 
 The DAQ's MCP3564R frame engine runs natively: the shim emulates TIM2 at register level (a live CNT from virtual
 time, CCRx compare matches and EGR events setting SR.CCxIF with rc_w0 clears, calling `mcp3564r_timer_irq`, the body
 of the DAQ's replaced TIM2 vector), and the MCP3564R model converts the SCAN list once per START in one-shot mode
-(CONFIG3 0xB0) and returns to standby. Verified: about 1 kHz frame ticks, and the fill load cell, KG1000 and chamber
-PT values reach the station through the new engine (the test-fire e2e fill check). The engine's own counters still
-show scans timing out in about a third of the frames in the sim (`g_mcp3564r_diag.scans_timed_out`), so some
-samples are dropped; the cause (SPI DMA timing against DRDY in the model) is open.
+(CONFIG3 0xB0) and returns to standby. A third of the frames used to time out: the slot compare (CCR2/DIER written
+from the SPI DMA completion) was only scheduled once virtual time moved, and the idle skip jumped past it to the next
+frame tick. FirmwareSimulator now refreshes the live registers before every idle skip: 0 timed-out scans, 0 skipped
+frames and slots in 5000 frames (`g_mcp3564r_diag`, before 1742/1577/1576), so the KG50 and slow items arrive at
+their full rates (KG50 20 Hz, KG1000 50 Hz).
 
 DAC patch sampling: while a DAC output is patched the plant steps every 1 ms (else every 10 ms), so with the 1 kHz
 frame engine waveforms up to about 250 Hz come through faithfully (500 Hz Nyquist).
 
 ## 7. Follow-ups
 
-* The frame engine's dropped scans in the sim (above); IGT reaching FC `Ready` (the e2e mounts the card, sees the
-  ground-test image and enters ground test, but the FC mode stays `off`; not diagnosed yet).
+* Run the remaining e2e scenarios on a quiet host (test-fire burn and burn report, Normal launch and map track, IGT
+  Launch and replay, Testing DAC patch); the station on the bay's virtual clock, so host load slows the whole sim
+  instead of skewing its clocks.
+* FC: a card swapped while running (Retry SD) is read through FileX's cache of the old card (IGT CSV parse fault).
 * Thermocouples and tank wall temperature telemetry, power rails and battery discharge (the LTC2990 monitors still
   read static values), weathercocking/3-DOF attitude, SAR inputs in the DAC patch.
 * An actual remote bundle run, the armhf cross build and a run on the Pi station.
-* Normal mode end to end through the full procedure (self-test, nitrogen test, fill, retract, Launch) and the
-  flight track on the map; the e2e covers the GPS gate and the fill rules.
