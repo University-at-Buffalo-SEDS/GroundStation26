@@ -118,8 +118,6 @@ pub(crate) fn hitl_flight_command_id(cmd: &TelemetryCommand) -> Option<u8> {
     Some(match cmd {
         TelemetryCommand::DeployParachute => FlightComputerCommands::DeployParachute as u8,
         TelemetryCommand::ExpandParachute => FlightComputerCommands::ExpandParachute as u8,
-        TelemetryCommand::EvaluationRelax => FlightComputerCommands::EvaluationRelax as u8,
-        TelemetryCommand::EvaluationFocus => FlightComputerCommands::EvaluationFocus as u8,
         TelemetryCommand::EvaluationAbort => FlightComputerCommands::EvaluationAbort as u8,
         TelemetryCommand::ReinitSensors => FlightComputerCommands::ReinitSensors as u8,
         TelemetryCommand::ReinitBarometer => FlightComputerCommands::ReinitBarometer as u8,
@@ -1740,8 +1738,6 @@ pub async fn telemetry_task(
                         }
                         TelemetryCommand::DeployParachute
                         | TelemetryCommand::ExpandParachute
-                        | TelemetryCommand::EvaluationRelax
-                        | TelemetryCommand::EvaluationFocus
                         | TelemetryCommand::EvaluationAbort
                         | TelemetryCommand::ReinitSensors
                         | TelemetryCommand::ReinitBarometer
@@ -4176,14 +4172,6 @@ mod tests {
                 FlightComputerCommands::ExpandParachute as u8,
             ),
             (
-                TelemetryCommand::EvaluationRelax,
-                FlightComputerCommands::EvaluationRelax as u8,
-            ),
-            (
-                TelemetryCommand::EvaluationFocus,
-                FlightComputerCommands::EvaluationFocus as u8,
-            ),
-            (
                 TelemetryCommand::EvaluationAbort,
                 FlightComputerCommands::EvaluationAbort as u8,
             ),
@@ -4298,8 +4286,6 @@ mod tests {
             FlightComputerCommands::RevokeValidateMeasms,
             FlightComputerCommands::DeployParachute,
             FlightComputerCommands::ExpandParachute,
-            FlightComputerCommands::EvaluationRelax,
-            FlightComputerCommands::EvaluationFocus,
             FlightComputerCommands::EvaluationAbort,
             FlightComputerCommands::ReinitSensors,
             FlightComputerCommands::ReinitBarometer,

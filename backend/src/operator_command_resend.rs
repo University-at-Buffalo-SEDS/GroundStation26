@@ -469,7 +469,7 @@ pub(crate) fn verdict(c: &Context) -> Verdict {
 fn command_for(byte: u8) -> Option<TelemetryCommand> {
     use TelemetryCommand::*;
     [
-        DeployParachute, ExpandParachute, EvaluationRelax, EvaluationFocus, EvaluationAbort, ReinitSensors,
+        DeployParachute, ExpandParachute, EvaluationAbort, ReinitSensors,
         ReinitBarometer, EnableIMU, DisableIMU, AbortAfter40, AbortAfter100, AbortAfter250, ReinitAfter15,
         ReinitAfter30, ReinitAfter50,
     ]
@@ -659,12 +659,12 @@ mod unconfirmed_tests {
     #[tokio::test]
     async fn the_unconfirmed_notice_names_the_fcs_refusal_reason() {
         let state = crate::state::tests::test_app_state().await;
-        let relax = Fc::EvaluationRelax as u8;
+        let reinit = Fc::ReinitBarometer as u8;
         crate::fc_command_gate::forget(&state);
         crate::fc_command_gate::observe_at(&state, 9 << 24, Instant::now());
         assert_eq!(
-            unconfirmed_message(&state, relax),
-            "EvaluationRelax: no confirmation from FC. The FC reports it refuses flight commands because its persistent store is not ready and its recovery floor failed."
+            unconfirmed_message(&state, reinit),
+            "ReinitBarometer: no confirmation from FC. The FC reports it refuses flight commands because its persistent store is not ready and its recovery floor failed."
         );
         crate::fc_command_gate::forget(&state);
     }

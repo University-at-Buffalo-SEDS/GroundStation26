@@ -29,10 +29,10 @@ const REASONS: [(u32, &str); 5] = [
 const WATCHDOG_INHIBIT: u32 = 16;
 /// Flight commands the FC refuses while it holds its sequence. Deploy, Expand and
 /// EvaluationAbort pass that hold (FC recovery.c fc_recovery_command_admissible).
-const HELD_COMMANDS: [&str; 25] = [
+const HELD_COMMANDS: [&str; 23] = [
     "Postinit", "Launch", "GroundStationLaunch", "MonitorAltitude", "RevokeMonitorAltitude", "ConsecutiveSamples",
     "RevokeConsecutiveSamples", "ResetFailures", "RevokeResetFailures", "ValidateMeasms", "RevokeValidateMeasms",
-    "EvaluationRelax", "EvaluationFocus", "ReinitSensors", "ReinitBarometer", "EnableIMU", "DisableIMU",
+    "ReinitSensors", "ReinitBarometer", "EnableIMU", "DisableIMU",
     "AdvanceFlightState", "RewindFlightState", "AbortAfter40", "AbortAfter100", "AbortAfter250", "ReinitAfter15",
     "ReinitAfter30", "ReinitAfter50",
 ];
@@ -273,11 +273,11 @@ mod tests {
         }
         let t = Instant::now();
         observe_at(&state, BENCH, t);
-        let relax = Fc::EvaluationRelax as u8;
+        let reinit = Fc::ReinitBarometer as u8;
         assert_eq!(
-            note_press_at(&state, relax, "EvaluationRelax", t + Duration::from_secs(2)).as_deref(),
+            note_press_at(&state, reinit, "ReinitBarometer", t + Duration::from_secs(2)).as_deref(),
             Some(
-                "EvaluationRelax: refused by FC because its persistent store is not ready and its recovery floor failed. Pressing again will not help until this clears."
+                "ReinitBarometer: refused by FC because its persistent store is not ready and its recovery floor failed. Pressing again will not help until this clears."
             )
         );
         assert_eq!(
@@ -306,7 +306,7 @@ mod tests {
         // An accepting FC raises nothing for a press.
         observe_at(&state, 0, t + Duration::from_secs(5));
         assert_eq!(
-            note_press_at(&state, relax, "EvaluationRelax", t + Duration::from_secs(6)),
+            note_press_at(&state, reinit, "ReinitBarometer", t + Duration::from_secs(6)),
             None
         );
         forget(&state);
@@ -322,18 +322,18 @@ mod tests {
             return;
         }
         let t = Instant::now();
-        let relax = Fc::EvaluationRelax as u8;
+        let reinit = Fc::ReinitBarometer as u8;
         assert_eq!(
-            note_press_at(&state, relax, "EvaluationRelax", t),
+            note_press_at(&state, reinit, "ReinitBarometer", t),
             None,
             "nothing known yet"
         );
         let notices = observe_at(&state, BENCH, t + Duration::from_secs(4));
         assert_eq!(notices.len(), 2);
-        assert!(notices[1].starts_with("EvaluationRelax: refused by FC because its persistent store is not ready"));
+        assert!(notices[1].starts_with("ReinitBarometer: refused by FC because its persistent store is not ready"));
         // A stale press is not attributed to a later refusal.
         observe_at(&state, 0, t + Duration::from_secs(5));
-        note_press_at(&state, relax, "EvaluationRelax", t + Duration::from_secs(30));
+        note_press_at(&state, reinit, "ReinitBarometer", t + Duration::from_secs(30));
         let notices = observe_at(&state, BENCH, t + Duration::from_secs(60));
         assert_eq!(notices.len(), 1, "{notices:?}");
         assert_eq!(

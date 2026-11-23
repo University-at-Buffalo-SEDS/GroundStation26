@@ -120,7 +120,7 @@ fn flight_command_bay(outage_ms: u64, writes: &[(u64, u8)], run_ms: u64) -> Vec<
 #[test]
 fn deploy_behind_an_unacknowledged_fc_command_waits_at_most_one_retry_span() {
     let span = reliable_retry_span_ms();
-    let delivered = flight_command_bay(span * 2 / 3, &[(0, 14), (500, 12)], span + 3_000);
+    let delivered = flight_command_bay(span * 2 / 3, &[(0, FIRST), (500, 12)], span + 3_000);
     eprintln!("DEPLOY_BEHIND_SLOW_LINK span={span} delivered={delivered:?}");
     let deploy = delivered[1].unwrap_or_else(|| panic!("Deploy never reached the FC: {delivered:?}"));
     assert!(deploy <= span, "Deploy reached the FC {deploy} ms after it was pressed (span {span} ms)");
@@ -135,7 +135,7 @@ fn deploy_behind_an_unacknowledged_fc_command_waits_at_most_one_retry_span() {
 #[ignore = "the raw SDK strand without the station's re-send: kept to show the SDK behaviour"]
 fn sdk_drops_a_command_queued_behind_an_exhausted_one() {
     let span = reliable_retry_span_ms();
-    let delivered = flight_command_bay(span + 1_000, &[(0, 14), (2_000, 12)], span + 6_000);
+    let delivered = flight_command_bay(span + 1_000, &[(0, FIRST), (2_000, 12)], span + 6_000);
     eprintln!("SDK_DROPS_BEHIND_EXHAUSTED span={span} delivered={delivered:?}");
     assert_eq!(delivered, vec![None, None], "the SDK alone drops the queued command");
 }
@@ -162,13 +162,15 @@ enum Between {
 }
 
 const DEPLOY: u8 = 12;
-const FOCUS: u8 = 15;
+/// Harmless non-pyro FC commands used as generic examples.
+const FIRST: u8 = 18; // ReinitBarometer
+const SECOND: u8 = 17; // ReinitSensors
 
 /// The station (real AppState, HITL, flight state `flight`) and the FC on
 /// real SDK routers. The FC is unreachable for span + 1 s. The operator
-/// presses EvaluationRelax at 0 and `second` at 2 s, so `second` waits behind
+/// presses ReinitBarometer at 0 and `second` at 2 s, so `second` waits behind
 /// it. A non-pyro `second` is queued in the SDK and dropped when
-/// EvaluationRelax exhausts; a Deploy is held by the station instead. Returns
+/// ReinitBarometer exhausts; a Deploy is held by the station instead. Returns
 /// when the FC got `second` after its press (ms) and the notifications.
 async fn operator_bay(flight: crate::types::FlightState, between: Between, second: u8) -> (Option<u64>, Vec<String>) {
     let (delivered, notes, _) = operator_bay_timed(flight, between, second).await;
@@ -246,12 +248,12 @@ async fn operator_bay_timed(flight: crate::types::FlightState, between: Between,
     };
     let start = std::time::Instant::now();
     let ms = || start.elapsed().as_millis() as u64;
-    let (mut relax, mut deploy_at, mut disturbed) = (false, None, false);
+    let (mut first, mut deploy_at, mut disturbed) = (false, None, false);
     let mut undelivered_at = None;
     while ms() < span + 2_500 {
-        if !relax {
-            press(14, true);
-            relax = true;
+        if !first {
+            press(FIRST, true);
+            first = true;
         }
         if deploy_at.is_none() && ms() >= 2_000 {
             press(second, between != Between::Automatic);
@@ -296,16 +298,16 @@ async fn operator_bay_timed(flight: crate::types::FlightState, between: Between,
 /// lost before the RRLS; the station retired it after its retry span and
 /// nothing told the operator. A press whose own packet runs out of retries
 /// is reported, once and in one line naming that press, by the end of its
-/// retry span, and is never re-sent (R1). Here the press is EvaluationRelax
+/// retry span, and is never re-sent (R1). Here the press is ReinitBarometer
 /// (the harness's first press, its own packet the head that runs out).
 #[tokio::test]
 async fn a_press_whose_every_copy_was_lost_is_reported_unconfirmed() {
     let span = reliable_retry_span_ms();
-    let (_, notes, at) = operator_bay_timed(crate::types::FlightState::Ascent, Between::Nothing, FOCUS).await;
+    let (_, notes, at) = operator_bay_timed(crate::types::FlightState::Ascent, Between::Nothing, SECOND).await;
     eprintln!("UNCONFIRMED span={span} at={at:?} notes={notes:?}");
     let lost: Vec<_> = notes.iter().filter(|n| n.contains("no confirmation from FC")).collect();
     assert_eq!(lost.len(), 1, "one line: {notes:?}");
-    assert_eq!(lost[0].as_str(), "EvaluationRelax: no confirmation from FC. Check FC state before pressing again.");
+    assert_eq!(lost[0].as_str(), "ReinitBarometer: no confirmation from FC. Check FC state before pressing again.");
     let at = at.expect("reported");
     assert!(at <= span + 500, "reported {at} ms after the press (span {span})");
 }
@@ -317,9 +319,9 @@ async fn a_press_whose_every_copy_was_lost_is_reported_unconfirmed() {
 /// command is the risk).
 #[tokio::test]
 async fn a_press_whose_acknowledgements_were_lost_is_never_called_undelivered() {
-    let (_, notes, _) = operator_bay_timed(crate::types::FlightState::Ascent, Between::AcksLost, FOCUS).await;
+    let (_, notes, _) = operator_bay_timed(crate::types::FlightState::Ascent, Between::AcksLost, SECOND).await;
     eprintln!("ACKS_LOST notes={notes:?}");
-    let line = notes.iter().find(|n| n.starts_with("EvaluationRelax")).unwrap_or_else(|| panic!("reported: {notes:?}"));
+    let line = notes.iter().find(|n| n.starts_with("ReinitBarometer")).unwrap_or_else(|| panic!("reported: {notes:?}"));
     assert!(!line.contains("not delivered") && !line.contains("press again"), "{line}");
     assert!(line.contains("Check FC state before pressing again"), "{line}");
 }
@@ -329,40 +331,40 @@ fn noted(notes: &[String], label: &str, words: &str) -> bool {
 }
 
 /// R1, R5, R8: a non-pyro command dropped behind the exhausted
-/// EvaluationRelax is re-sent once and reaches the FC as soon as the link
+/// ReinitBarometer is re-sent once and reaches the FC as soon as the link
 /// returns, inside the press's own retry span, with its own notification.
 #[tokio::test]
 async fn command_dropped_behind_an_exhausted_fc_command_is_resent() {
     let span = reliable_retry_span_ms();
-    let (delivered, notes) = operator_bay(crate::types::FlightState::Ascent, Between::Nothing, FOCUS).await;
-    eprintln!("FOCUS_RESENT span={span} delivered={delivered:?} notes={notes:?}");
-    let ms = delivered.unwrap_or_else(|| panic!("EvaluationFocus never reached the FC: {notes:?}"));
-    assert!(ms <= span + 750, "EvaluationFocus reached the FC {ms} ms after the press (span {span})");
-    assert!(noted(&notes, "EvaluationFocus", "re-sent after the link recovered"), "{notes:?}");
+    let (delivered, notes) = operator_bay(crate::types::FlightState::Ascent, Between::Nothing, SECOND).await;
+    eprintln!("SECOND_RESENT span={span} delivered={delivered:?} notes={notes:?}");
+    let ms = delivered.unwrap_or_else(|| panic!("ReinitSensors never reached the FC: {notes:?}"));
+    assert!(ms <= span + 750, "ReinitSensors reached the FC {ms} ms after the press (span {span})");
+    assert!(noted(&notes, "ReinitSensors", "re-sent after the link recovered"), "{notes:?}");
 }
 
 /// R3: an Abort after the press means no re-send, and the operator is told.
 #[tokio::test]
 async fn command_is_not_resent_after_an_abort() {
-    let (delivered, notes) = operator_bay(crate::types::FlightState::Ascent, Between::AbortLatched, FOCUS).await;
+    let (delivered, notes) = operator_bay(crate::types::FlightState::Ascent, Between::AbortLatched, SECOND).await;
     assert_eq!(delivered, None, "{notes:?}");
-    assert!(noted(&notes, "EvaluationFocus", "not re-sent: an Abort"), "{notes:?}");
+    assert!(noted(&notes, "ReinitSensors", "not re-sent: an Abort"), "{notes:?}");
 }
 
 /// R3: a newer operator command means no re-send.
 #[tokio::test]
 async fn command_is_not_resent_after_a_newer_operator_command() {
-    let (delivered, notes) = operator_bay(crate::types::FlightState::Ascent, Between::NewerCommand, FOCUS).await;
+    let (delivered, notes) = operator_bay(crate::types::FlightState::Ascent, Between::NewerCommand, SECOND).await;
     assert_eq!(delivered, None, "{notes:?}");
-    assert!(noted(&notes, "EvaluationFocus", "a newer operator command"), "{notes:?}");
+    assert!(noted(&notes, "ReinitSensors", "a newer operator command"), "{notes:?}");
 }
 
 /// R2: a press older than its retry span is not re-sent; the operator is told.
 #[tokio::test]
 async fn command_older_than_its_retry_span_is_not_resent_and_is_reported() {
-    let (delivered, notes) = operator_bay(crate::types::FlightState::Ascent, Between::PressAged, FOCUS).await;
+    let (delivered, notes) = operator_bay(crate::types::FlightState::Ascent, Between::PressAged, SECOND).await;
     assert_eq!(delivered, None, "{notes:?}");
-    assert!(noted(&notes, "EvaluationFocus", "beyond its"), "{notes:?}");
+    assert!(noted(&notes, "ReinitSensors", "beyond its"), "{notes:?}");
 }
 
 /// R9: a command the station queued itself is never re-sent.

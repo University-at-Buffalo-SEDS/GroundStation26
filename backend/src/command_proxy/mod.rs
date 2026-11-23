@@ -1339,7 +1339,7 @@ pub(crate) fn takeover_operation(name: &str) -> bool {
             | "ConsecutiveSamples" | "RevokeConsecutiveSamples"
             | "ResetFailures" | "RevokeResetFailures"
             | "ValidateMeasms" | "RevokeValidateMeasms"
-            | "EvaluationRelax" | "EvaluationFocus" | "EvaluationAbort"
+            | "EvaluationAbort"
             | "ReinitSensors" | "ReinitBarometer" | "EnableIMU" | "DisableIMU"
             | "AbortAfter40" | "AbortAfter100" | "AbortAfter250"
             | "ReinitAfter15" | "ReinitAfter30" | "ReinitAfter50"
@@ -2701,8 +2701,6 @@ pub(crate) fn command_catalog() -> &'static [&'static str] {
         "ResetFlightState",
         "DeployParachute",
         "ExpandParachute",
-        "EvaluationRelax",
-        "EvaluationFocus",
         "EvaluationAbort",
         "ReinitSensors",
         "ReinitBarometer",

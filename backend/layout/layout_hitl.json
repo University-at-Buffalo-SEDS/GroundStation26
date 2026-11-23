@@ -260,22 +260,6 @@
         "group": "Flight controls"
       },
       {
-        "label": "Evaluation Relax",
-        "cmd": "EvaluationRelax",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe",
-        "group": "Flight controls"
-      },
-      {
-        "label": "Evaluation Focus",
-        "cmd": "EvaluationFocus",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe",
-        "group": "Flight controls"
-      },
-      {
         "label": "Evaluation Abort",
         "cmd": "EvaluationAbort",
         "border": "#38bdf8",

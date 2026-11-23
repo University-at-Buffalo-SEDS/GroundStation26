@@ -828,8 +828,6 @@ impl FlightSimState {
             | TelemetryCommand::DeployParachute
             | TelemetryCommand::ExpandParachute
             | TelemetryCommand::ReinitSensors
-            | TelemetryCommand::EvaluationRelax
-            | TelemetryCommand::EvaluationFocus
             | TelemetryCommand::EvaluationAbort
             | TelemetryCommand::ReinitBarometer
             | TelemetryCommand::EnableIMU
@@ -2037,8 +2035,6 @@ mod tests {
             RewindFlightState,
             DeployParachute,
             ExpandParachute,
-            EvaluationRelax,
-            EvaluationFocus,
             EvaluationAbort,
             MonitorAltitude,
             Postinit,

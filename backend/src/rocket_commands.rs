@@ -14,8 +14,9 @@ pub enum FlightComputerCommands {
     RevokeValidateMeasms = 9,
     DeployParachute = 12,
     ExpandParachute = 13,
-    EvaluationRelax = 14,
-    EvaluationFocus = 15,
+    // Bytes 14 and 15 (EvaluationRelax, EvaluationFocus) are retired: the
+    // FC's estimator guard made them meaningless and the FC refuses them.
+    // Never reuse them for another command.
     EvaluationAbort = 16,
     ReinitSensors = 17,
     ReinitBarometer = 18,
@@ -92,8 +93,6 @@ mod flight_command_wire_tests {
             (RevokeValidateMeasms, "Revoke_Measm_Reports"),
             (DeployParachute, "Compat_Deploy_Parachute"),
             (ExpandParachute, "Compat_Expand_Parachute"),
-            (EvaluationRelax, "Compat_Evaluation_Relax"),
-            (EvaluationFocus, "Compat_Evaluation_Focus"),
             (EvaluationAbort, "Compat_Evaluation_Abort"),
             (ReinitSensors, "Compat_Reinit_Sensors"),
             (ReinitBarometer, "Compat_Reinit_Barometer"),
@@ -126,5 +125,8 @@ mod flight_command_wire_tests {
         // Bytes 10 and 11 are intentionally not reused by another GS command.
         assert_eq!(contract["remote_commands_compat"][10], "Compat_Velocity_Checks");
         assert_eq!(contract["remote_commands_compat"][11], "Revoke_Velocity_Checks");
+        // Bytes 14 and 15 are retired (EvaluationRelax/Focus) and stay unused.
+        assert_eq!(contract["remote_commands_compat"][14], "Compat_Retired_Evaluation_Relax");
+        assert_eq!(contract["remote_commands_compat"][15], "Compat_Retired_Evaluation_Focus");
     }
 }

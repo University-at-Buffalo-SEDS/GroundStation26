@@ -1130,8 +1130,6 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         TelemetryCommand::ResetTClock => "ResetTClock",
         TelemetryCommand::DeployParachute => "DeployParachute",
         TelemetryCommand::ExpandParachute => "ExpandParachute",
-        TelemetryCommand::EvaluationRelax => "EvaluationRelax",
-        TelemetryCommand::EvaluationFocus => "EvaluationFocus",
         TelemetryCommand::EvaluationAbort => "EvaluationAbort",
         TelemetryCommand::ReinitSensors => "ReinitSensors",
         TelemetryCommand::ReinitBarometer => "ReinitBarometer",
@@ -1250,8 +1248,6 @@ fn all_command_names_hitl() -> Vec<&'static str> {
         "ResetTClock",
         "DeployParachute",
         "ExpandParachute",
-        "EvaluationRelax",
-        "EvaluationFocus",
         "EvaluationAbort",
         "ReinitSensors",
         "ReinitBarometer",
@@ -1352,7 +1348,7 @@ pub(crate) fn control_section(cmd: &str) -> Option<ControlSection> {
             Sequences
         }
         "Postinit" | "AdvanceFlightState" | "RewindFlightState" | "DeployParachute"
-        | "ExpandParachute" | "EvaluationRelax" | "EvaluationFocus" | "EvaluationAbort"
+        | "ExpandParachute" | "EvaluationAbort"
         | "ReinitSensors" | "ReinitBarometer" | "EnableIMU" | "DisableIMU" | "MonitorAltitude"
         | "RevokeMonitorAltitude" | "ConsecutiveSamples" | "RevokeConsecutiveSamples"
         | "ResetFailures" | "RevokeResetFailures" | "ValidateMeasms" | "RevokeValidateMeasms"

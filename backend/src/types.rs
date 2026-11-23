@@ -49,8 +49,6 @@ pub enum TelemetryCommand {
     ResetTClock,
     DeployParachute,
     ExpandParachute,
-    EvaluationRelax,
-    EvaluationFocus,
     EvaluationAbort,
     ReinitSensors,
     ReinitBarometer,
@@ -181,7 +179,7 @@ const HITL_CLIENT_COMMANDS: &[&str] = &[
     "TogglePlumbingDelayInterlock", "ToggleChecklistInterlock", "ToggleSupplyInterlock",
     "ToggleBoardStateProofInterlock", "TogglePhysicalLaunchMode", "ToggleAvBayUnderglow",
     "ToggleFlightBuzzer", "ResetLaunchLatch", "ResetFlightState", "ResetTClock",
-    "DeployParachute", "ExpandParachute", "EvaluationRelax", "EvaluationFocus",
+    "DeployParachute", "ExpandParachute",
     "EvaluationAbort", "ReinitSensors", "ReinitBarometer", "EnableIMU", "DisableIMU",
     "AdvanceFlightState", "RewindFlightState", "AbortAfter100", "AbortAfter40",
     "AbortAfter250", "ReinitAfter15", "ReinitAfter30", "ReinitAfter50", "StartFill",
@@ -226,8 +224,6 @@ impl TelemetryCommand {
             | TelemetryCommand::ResetFlightState
             | TelemetryCommand::DeployParachute
             | TelemetryCommand::ExpandParachute
-            | TelemetryCommand::EvaluationRelax
-            | TelemetryCommand::EvaluationFocus
             | TelemetryCommand::EvaluationAbort
             | TelemetryCommand::ReinitSensors
             | TelemetryCommand::ReinitBarometer

@@ -2730,7 +2730,11 @@ async fn main() -> anyhow::Result<()> {
                         else {
                             return;
                         };
-                        let command = FlightComputerCommands::EvaluationRelax as u8;
+                        // A non-actuating FC command the FC must accept and
+                        // process: ValidateMeasms sets Measm_Reports, which is
+                        // already on by default (FC USER_OPTIONS), so nothing
+                        // changes. (EvaluationRelax, used before, is retired.)
+                        let command = FlightComputerCommands::ValidateMeasms as u8;
                         match queue_locally_routed_flight_command(
                             &validation_state,
                             &validation_router,
@@ -3310,7 +3314,9 @@ async fn main() -> anyhow::Result<()> {
                     else {
                         return;
                     };
-                    let command = FlightComputerCommands::EvaluationRelax as u8;
+                    // Non-actuating: ValidateMeasms re-sets the default-on
+                    // Measm_Reports option (EvaluationRelax is retired).
+                    let command = FlightComputerCommands::ValidateMeasms as u8;
                     if let Err(error) = network_variables::set_underglow(&soak_router, open)
                         .and_then(|_| {
                             queue_locally_routed_flight_command(

@@ -48,7 +48,7 @@ const SAFING: &[&str] = &[
     "RetractPlumbing", "ResetSim", "ResetTClock", "MonitorAltitude", "RevokeMonitorAltitude", "ConsecutiveSamples",
     "RevokeConsecutiveSamples", "ResetFailures", "RevokeResetFailures", "ValidateMeasms",
     "RevokeValidateMeasms", "ToggleAvBayUnderglow", "ToggleFlightBuzzer", "FcSdRetry", "RewindFlightState",
-    "ResetFlightState", "ResetLaunchLatch", "EvaluationAbort", "EvaluationRelax", "EvaluationFocus",
+    "ResetFlightState", "ResetLaunchLatch", "EvaluationAbort",
     "AbortAfter40", "AbortAfter100", "AbortAfter250", "DeployParachute", "ExpandParachute", "IgtExit",
     "IgtDryRun", "IgtEnter", "ReinitSensors", "ReinitBarometer", "EnableIMU", "DisableIMU",
     "ToggleButtonInterlock", "ToggleLaunchInterlock", "ToggleSupplyInterlock",
