@@ -50,11 +50,11 @@
     "GPS": 2349
   },
   "bytes": {
-    "BARO0.CSV": 340962,
+    "BARO0.CSV": 340831,
     "GPS0.CSV": 89186,
     "IMU0.CSV": 543091
   },
-  "total_bytes": 973239,
+  "total_bytes": 973108,
   "seed": 2,
   "noise": true,
   "site": [

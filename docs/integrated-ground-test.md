@@ -528,11 +528,13 @@ about 10 s after Launch. The drogue is near apogee (about 36.8 s), the main
 at 457 m (about 140 s), and the vehicle lands about 215 s after Launch. After
 landing there are 30 s at rest, so the FC reaches Landed and ends the replay.
 
-The FC computes baro altitude with the sea-level constant 44330 against the
-pad pressure. At the 890 m site this reads about 2% high: the FC sees
-`nominal_10k` peak at about 3,108 m when the truth is 3,048 m. The main is
-then commanded at about 448 m true. The replayed `alt_m` column carries this
-deliberately, because it is what the board computes.
+The replayed `alt_m` column is what the board computes from the replayed
+pressure: the FC's `baro_agl()` (the ISA pressure altitude of the sample minus
+that of the pad, i.e. the hypsometric equation with the ISA pad temperature).
+At the 890 m site it matches the model's height above the pad to about 0.1%
+(the ISA altitude is geopotential, about 2 m short of the geometric height at
+3 km). Datasets made before 2026-11-22 used the old sea-level form
+`44330 * (1 - (p/p0)^0.1903)`, which read about 2% high at this site.
 
 ### 11.2 Generating new mock flights
 

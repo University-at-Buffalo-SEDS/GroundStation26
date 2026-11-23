@@ -261,12 +261,21 @@ fn shows_the_barometer_ground_reference() {
     assert_eq!((report.start_tick, report.since_start()), (Some(40_000), Some(Duration::from_millis(251))));
     assert_eq!(decode(&with_baro(0, 0, 0)).unwrap().baro, None, "no reference yet");
 
-    // The FC's altitude is measured from the pressure that maps it to 0 m.
+    // The FC's altitude is measured from the pressure that maps it to 0 m:
+    // ISA pressure altitude of the sample minus that of the reference.
+    let isa_alt = |p: f64| 44_330.77 * (1.0 - (p / 101_325.0).powf(0.190_263));
+    let isa_prs = |h: f64| 101_325.0 * (1.0 - h / 44_330.77).powf(1.0 / 0.190_263);
     let reference = 100_320.0f64;
-    let pressure = |alt: f64| reference * (1.0 - alt / 44_330.0).powf(1.0 / 0.1903);
+    let pressure = |alt: f64| isa_prs(isa_alt(reference) + alt);
     for alt in [0.0, 12.5, -3.0, 2_900.0] {
         let got = reference_pressure(&[alt as f32, pressure(alt) as f32, 21.0]).unwrap();
         assert!((got - reference).abs() < 2.0, "{alt} m: {got}");
+    }
+    // A high pad (the 890 m site): the old sea-level form would be about 2% off.
+    let high = isa_prs(890.0);
+    for alt in [0.0, 457.2, 3_047.5] {
+        let got = reference_pressure(&[alt as f32, isa_prs(890.0 + alt) as f32, 21.0]).unwrap();
+        assert!((got - high).abs() < 2.0, "890 m pad, {alt} m: {got} vs {high}");
     }
     assert_eq!(reference_pressure(&[0.0, 20.0, 100_000.0]), None, "not (alt, prs, tmp)");
     assert_eq!(reference_pressure(&[1.0]), None);

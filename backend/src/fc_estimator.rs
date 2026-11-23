@@ -51,9 +51,10 @@ const PUBLISH_EVERY: Duration = Duration::from_secs(1);
 const CYCLE_MASK: u32 = 0xF_FFFF;
 const START_MASK: u32 = 0x3_FFFF;
 const START_SHIFT: u32 = 4;
-/// FC barometer.h ALT_PRES_CONST and BARO_HYPSOMETRIC_EXPONENT.
-const ALT_PRES_CONST: f64 = 44_330.0;
-const HYPSOMETRIC_EXPONENT: f64 = 0.1903;
+/// FC baro_reference.h BARO_ISA_T0_L, BARO_ISA_EXP and BARO_ISA_P0.
+const ISA_T0_L: f64 = 44_330.77;
+const ISA_EXP: f64 = 0.190_263;
+const ISA_P0: f64 = 101_325.0;
 
 /// Word 15 as the FC builds it (`FC_EST_WORD15`): the start tick in 16-tick
 /// units and the barometer reference bits (mode, shift << 2).
@@ -111,7 +112,13 @@ pub fn reference_pressure(values: &[f32]) -> Option<f64> {
     if !(30_000.0..=125_000.0).contains(&pressure) || !(-1_000.0..=10_000.0).contains(&alt) {
         return None;
     }
-    let reference = pressure / (1.0 - alt / ALT_PRES_CONST).powf(1.0 / HYPSOMETRIC_EXPONENT);
+    // The FC's alt is the ISA pressure altitude of `pressure` minus that of the
+    // reference (baro_agl), so the reference's is the sample's minus alt.
+    let base = (pressure / ISA_P0).powf(ISA_EXP) + alt / ISA_T0_L;
+    if base <= 0.0 {
+        return None;
+    }
+    let reference = ISA_P0 * base.powf(1.0 / ISA_EXP);
     (60_000.0..=125_000.0).contains(&reference).then_some(reference)
 }
 

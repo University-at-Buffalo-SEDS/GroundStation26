@@ -67,8 +67,18 @@ def schedule(cfg: dict, ev: dict, end_s: float) -> dict[str, list[int]]:
     return {'IMU': imu, 'BARO': baro, 'GPS': gps}
 
 
+# FC baro_reference.h: ISA T0/L, R*L/g0 and sea-level pressure.
+FC_ISA_T0_L = 44330.77
+FC_ISA_EXP = 0.190263
+FC_ISA_P0 = 101325.0
+
+
 def fc_altitude(p, p0):
-    return 44330.0 * (1.0 - np.power(p / p0, 0.1903))
+    """The FC's height above the pad reference p0 (baro_agl): the ISA pressure
+    altitude of p minus that of p0, i.e. the hypsometric equation with the ISA
+    temperature at the pad."""
+    scale = FC_ISA_T0_L * np.power(p0 / FC_ISA_P0, FC_ISA_EXP)
+    return scale * (1.0 - np.power(p / p0, FC_ISA_EXP))
 
 
 def imu_rows(cfg, truth: fs.Truth, times, rng, noise: bool, glitches):
