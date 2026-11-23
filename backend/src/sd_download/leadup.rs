@@ -7,10 +7,10 @@
 //!
 //! A DAQ launch file attached to a launch capture gets the minute before its
 //! first row from the DAQ's regular session file of the same boot. Only that
-//! window is read (the block protocol reads any byte range): the file's last
-//! block identifies the session that ended at the launch, a binary search over
-//! single blocks finds the window start, and blocks are then read in order
-//! until the window is covered. A small file is downloaded whole instead.
+//! window is read (protocol v2 OPENs any byte range): the file's last
+//! kilobyte identifies the session that ended at the launch, a binary search
+//! over 1 KiB probes finds the window start, and the window is then streamed
+//! until it is covered. A small file is downloaded whole instead.
 //!
 //! The fetch never competes with live work: it runs only in the SD download
 //! states (Idle, Landed, Recovery, no fill/launch sequence), pauses for any
@@ -231,30 +231,36 @@ struct Source<'a> {
 }
 
 impl Source<'_> {
-    async fn block(&mut self, offset: u64, gate: &Gate) -> Result<(Vec<u8>, u64, bool), StreamError> {
-        let never = AtomicBool::new(false);
-        read_block(self.stream, &self.req, offset, gate, &never).await
+    /// `[offset, offset + length)` of the file (shorter at its end).
+    async fn range(&mut self, offset: u64, length: u64, gate: &Gate) -> Result<Vec<u8>, StreamError> {
+        read_range(self.stream, &self.req, offset, length, gate).await.map(|(bytes, _)| bytes)
     }
 }
 
-fn request(root: &FsPath, board: Board, dir_name: &str, name: &str, max_bps: u64) -> Option<TransferRequest> {
-    Some(TransferRequest::new(0, board, dir_index(board, dir_name)?, name, root.join("sd-downloads"), max_bps))
+fn request(root: &FsPath, board: Board, dir_name: &str, name: &str, params: &Params) -> Option<TransferRequest> {
+    let mut req = TransferRequest::new(0, board, dir_index(board, dir_name)?, name, root.join("sd-downloads"), params.rate);
+    req.profile = params.profile;
+    Some(req)
 }
+
+/// Bytes read by one binary-search probe (a few whole rows).
+const PROBE_BYTES: u64 = 2 * BLOCK_BYTES;
 
 /// Per-board fetch parameters.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Params {
-    /// Window reads are paced to this many payload bytes per second.
+    /// Reads are paced to this many DATA bytes per second.
     pub rate: u64,
     /// A whole ordinary file at or below this size is downloaded instead.
     pub whole_file_bytes: u64,
     /// Row bytes per millisecond at full rate (progress estimate only).
     pub bytes_per_ms: u64,
+    pub profile: Profile,
 }
 
 impl Params {
     fn daq() -> Self {
-        Self { rate: rate(), whole_file_bytes: small_file_bytes(), bytes_per_ms: 110 }
+        Self { rate: rate(), whole_file_bytes: small_file_bytes(), bytes_per_ms: 110, profile: Profile::WIRED }
     }
 }
 
@@ -375,20 +381,11 @@ pub(crate) async fn step_with(
         let mut stream = BoardStream::open(manager, router.clone(), board, gate, &AtomicBool::new(false)).await?;
         let mut best: Option<(i64, RemoteFile)> = None;
         for file in lead_up_candidates(board, &listing.files, job.to_ms).iter() {
-            let Some(req) = request(root, board, &file.dir, &file.name, params.rate) else { continue };
+            let Some(req) = request(root, board, &file.dir, &file.name, &params) else { continue };
             let mut source = Source { stream: &mut stream, req };
-            // The last two whole blocks (block reads stop at 512-byte boundaries).
-            let tail = (file.size.saturating_sub(1) / BLOCK_BYTES).saturating_sub(1) * BLOCK_BYTES;
-            let mut bytes = Vec::new();
-            let mut offset = tail;
-            while offset < file.size {
-                let (chunk, _, end) = source.block(offset, gate).await?;
-                offset += chunk.len() as u64;
-                bytes.extend_from_slice(&chunk);
-                if end || chunk.is_empty() {
-                    break;
-                }
-            }
+            // The last kilobyte (to the end of the file as it is now).
+            let tail = file.size.saturating_sub(2 * BLOCK_BYTES);
+            let bytes = source.range(tail, 0, gate).await?;
             let (_, last) = block_times(&bytes, tail == 0);
             if let Some(last) = last
                 && last >= job.from_ms
@@ -460,30 +457,23 @@ async fn fetch_window(
     let board_name = job.board.as_str();
     let board = board_of(board_name);
     let mut stream = BoardStream::open(manager, router, board, gate, &AtomicBool::new(false)).await?;
-    let req = request(root, board, dir_name, name, params.rate).ok_or_else(|| StreamError::Other("bad SD folder".into()))?;
+    let req = request(root, board, dir_name, name, &params).ok_or_else(|| StreamError::Other("bad SD folder".into()))?;
     let mut source = Source { stream: &mut stream, req };
     let (header_path, part_path) = part_paths(root, board_name, &job.launch_file);
     std::fs::create_dir_all(dir(root, board_name)).map_err(|e| e.to_string())?;
     // The CSV header and calibration lines that precede the first row.
     if !header_path.exists() {
         let mut header = String::new();
-        let mut offset = 0u64;
-        'blocks: for _ in 0..16 {
-            let (bytes, _, end) = source.block(offset, gate).await?;
-            offset += bytes.len() as u64;
-            let text = String::from_utf8_lossy(&bytes).into_owned();
-            for line in text.split_inclusive('\n') {
-                if !line.ends_with('\n') {
-                    break;
-                }
-                if board_sd::network_time(line.trim_end()).is_some() || (!line.starts_with('#') && !line.starts_with("timestamp_ms") && !line.trim().is_empty()) {
-                    break 'blocks;
-                }
-                header.push_str(line);
-            }
-            if end {
+        let bytes = source.range(0, 16 * BLOCK_BYTES, gate).await?;
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        for line in text.split_inclusive('\n') {
+            if !line.ends_with('\n') {
                 break;
             }
+            if board_sd::network_time(line.trim_end()).is_some() || (!line.starts_with('#') && !line.starts_with("timestamp_ms") && !line.trim().is_empty()) {
+                break;
+            }
+            header.push_str(line);
         }
         std::fs::write(&header_path, header).map_err(|e| e.to_string())?;
     }
@@ -499,7 +489,7 @@ async fn fetch_window(
             let (mut lo, mut hi) = (0u64, job.source_size);
             while hi - lo > BLOCK_BYTES * 4 {
                 let mid = (lo + (hi - lo) / 2) / BLOCK_BYTES * BLOCK_BYTES;
-                let (bytes, _, _) = source.block(mid, gate).await?;
+                let bytes = source.range(mid, PROBE_BYTES, gate).await?;
                 match block_times(&bytes, mid == 0).0 {
                     Some(ts) if ts < target => lo = mid,
                     Some(_) => hi = mid,
@@ -524,34 +514,35 @@ async fn fetch_window(
         .open(&part_path)
         .await
         .map_err(|e| e.to_string())?;
-    let started = Instant::now();
-    let mut sent = 0u64;
     let estimate = (job.to_ms - job.from_ms).max(1) as u64 * params.bytes_per_ms;
-    let rate = params.rate.max(1);
-    loop {
-        let due = started + Duration::from_secs_f64(sent as f64 / rate as f64);
-        if let Some(wait) = due.checked_duration_since(Instant::now()) {
-            tokio::time::sleep(wait).await;
+    // Stream from the kept offset until a row at or after the window end.
+    let never = AtomicBool::new(false);
+    let req = &source.req;
+    if let Some(mut fetch) = Fetch::open(&mut *source.stream, req, start + have, 0, gate, &never).await? {
+        loop {
+            let bytes = match fetch.next().await {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => break,
+                Err(error) => {
+                    out.flush().await.map_err(|e| e.to_string())?;
+                    update(root, board_name, &job.launch_file, |j| j.fetched = have);
+                    return Err(error);
+                }
+            };
+            out.write_all(&bytes).await.map_err(|e| e.to_string())?;
+            have += bytes.len() as u64;
+            let (_, last) = block_times(&bytes, false);
+            let covered = last.is_some_and(|ts| ts >= job.to_ms);
+            update(root, board_name, &job.launch_file, |j| {
+                j.fetched = have;
+                j.phase = "fetching".into();
+                j.message = format!("{have} of about {estimate} bytes of the lead-up window");
+            });
+            if covered {
+                break;
+            }
         }
-        if let Some(reason) = gate() {
-            out.flush().await.map_err(|e| e.to_string())?;
-            return Err(StreamError::Gate(reason));
-        }
-        let offset = start + have;
-        let (bytes, _, end) = source.block(offset, gate).await?;
-        out.write_all(&bytes).await.map_err(|e| e.to_string())?;
-        have += bytes.len() as u64;
-        sent += bytes.len() as u64;
-        let (_, last) = block_times(&bytes, false);
-        let covered = last.is_some_and(|ts| ts >= job.to_ms);
-        update(root, board_name, &job.launch_file, |j| {
-            j.fetched = have;
-            j.phase = "fetching".into();
-            j.message = format!("{have} of about {estimate} bytes of the lead-up window");
-        });
-        if covered || end || bytes.is_empty() || offset + bytes.len() as u64 >= job.source_size {
-            break;
-        }
+        fetch.close();
     }
     out.flush().await.map_err(|e| e.to_string())?;
     out.sync_all().await.map_err(|e| e.to_string())?;

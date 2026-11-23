@@ -1,9 +1,9 @@
 use super::*;
 use crate::recording_export::tests::{TestDirectory, export_state};
 use crate::recording_store::EventKind;
-use crate::sd_download::tests::{pattern, pump};
-use sedsnet::router::{P2pStreamEvent, RouterConfig};
-use std::sync::atomic::AtomicUsize;
+use crate::sd_download::tests::{MockCard, pump, serve_card};
+use crate::sd_download::{sdx, xfer};
+use sedsnet::router::RouterConfig;
 
 const T0: i64 = 1_800_000_000_000;
 const HEADER: &str = "timestamp_ms,monotonic_ms,sensor,value,raw_adc_code,raw_value,calibrated_value,time_source,adc_temperature_c,adc_temperature_code,uptime_ticks,uptime_frequency_hz,record_sequence\r\n";
@@ -29,20 +29,12 @@ fn launch_name() -> String {
 
 // ------------------------------------------------------------- mock FC
 
-struct MockFc {
-    files: Vec<(String, Vec<u8>, bool)>,
-    reads: AtomicUsize,
-    /// Corrupt the CRC of this many READ answers (from the first).
-    corrupt: AtomicUsize,
-    /// Run `on_read` at this READ.
-    trigger_after: usize,
-    on_read: Box<dyn Fn() + Send + Sync>,
-}
-
-impl MockFc {
-    fn new(files: Vec<(String, Vec<u8>, bool)>) -> Self {
-        Self { files, reads: AtomicUsize::new(0), corrupt: AtomicUsize::new(0), trigger_after: usize::MAX, on_read: Box::new(|| {}) }
-    }
+/// The FC's card: root only (dir 0), protocol v2 with 512-byte messages at
+/// most, as the firmware serves it.
+fn mock_fc(files: Vec<CardFile>) -> MockCard {
+    let card = MockCard::new(Vec::new());
+    *card.files.lock().unwrap() = files.into_iter().map(|(n, b, open)| (0, n, b, open)).collect();
+    card
 }
 
 fn routers() -> (Arc<Router>, Arc<Router>) {
@@ -68,74 +60,12 @@ fn link() -> (Arc<Router>, Arc<Router>) {
     (gs, fc)
 }
 
-/// The FC side of protocol v1 + CRC: card root only, CRC on the last frame.
-fn serve(fc: &Arc<Router>, board: Arc<MockFc>) {
-    let reply = fc.clone();
-    fc.bind_p2p_stream_port(SD_FILE_STREAM_PORT, move |event: P2pStreamEvent<'_>| {
-        if event.kind != P2pStreamEventKind::Data || event.payload.is_empty() {
-            return Ok(());
-        }
-        let p = event.payload;
-        let mut frames: Vec<Vec<u8>> = Vec::new();
-        match p[0] {
-            OP_LIST => {
-                let index = u16::from_le_bytes([p[2], p[3]]) as usize;
-                let entry = (p[1] == 0).then(|| board.files.get(index)).flatten();
-                let mut f = vec![0xa1, if entry.is_some() { 0 } else { STATUS_END }, p[1], p[2], p[3]];
-                let (size, name, open) = entry.map_or((0, "", false), |e| (e.1.len() as u32, e.0.as_str(), e.2));
-                f.extend_from_slice(&size.to_le_bytes());
-                f.extend_from_slice(&[u8::from(open), name.len() as u8, 0]);
-                f.extend_from_slice(name.as_bytes());
-                frames.push(f);
-            }
-            OP_READ => {
-                let n = board.reads.fetch_add(1, Ordering::SeqCst) + 1;
-                if n == board.trigger_after {
-                    (board.on_read)();
-                }
-                let offset = u32::from_le_bytes(p[1..5].try_into().unwrap()) as usize;
-                let name = std::str::from_utf8(&p[7..]).unwrap();
-                let data = &board.files.iter().find(|f| f.0 == name).unwrap().1;
-                let header = |status: u8, flags: u8, off: usize| {
-                    let mut f = vec![0xa2, status, flags];
-                    f.extend_from_slice(&(off as u32).to_le_bytes());
-                    f.extend_from_slice(&(data.len() as u32).to_le_bytes());
-                    f
-                };
-                if offset >= data.len() {
-                    frames.push(header(STATUS_END, FLAG_LAST, offset));
-                } else {
-                    let end = ((offset / 512 + 1) * 512).min(data.len());
-                    let mut crc = crc32(&data[offset..end]);
-                    if board.corrupt.load(Ordering::SeqCst) > 0 {
-                        board.corrupt.fetch_sub(1, Ordering::SeqCst);
-                        crc ^= 1;
-                    }
-                    let mut at = offset;
-                    while at < end {
-                        let to = (at + 100).min(end);
-                        let last = to == end;
-                        let mut f = header(0, if last { FLAG_LAST | FLAG_CRC } else { 0 }, at);
-                        f.extend_from_slice(&data[at..to]);
-                        if last {
-                            f.extend_from_slice(&crc.to_le_bytes());
-                        }
-                        assert!(f.len() <= 115);
-                        frames.push(f);
-                        at = to;
-                    }
-                }
-            }
-            OP_CANCEL => frames.push(vec![0xa3, 0]),
-            _ => {}
-        }
-        for f in frames {
-            reply.send_p2p_stream(event.stream_id, &f)?;
-        }
-        Ok(())
-    })
-    .unwrap();
+fn serve(fc: &Arc<Router>, board: Arc<MockCard>) {
+    serve_card(fc, board, FC_MAX_MSG);
 }
+
+/// The FC's DATA message limit.
+const FC_MAX_MSG: u16 = 512;
 
 async fn capture(root: &FsPath, kind: EventKind) -> PathBuf {
     let capture = crate::recording_store::Capture {
@@ -321,19 +251,28 @@ fn launch_file_choice_names_and_signals() {
 
 #[test]
 fn the_adaptive_rate_rises_while_calm_and_drops_at_once() {
-    let mut rate = AdaptiveRate::new(512, 768);
-    assert_eq!(rate.update(0, true), 512, "starts at the base");
-    assert_eq!(rate.update(4_999, true), 512);
-    assert_eq!(rate.update(5_000, true), 576);
-    assert_eq!(rate.update(6_000, true), 576, "one step per 5 s");
-    let mut now = 5_000;
+    let mut rate = AdaptiveRate::new(768, 1536);
+    assert_eq!(rate.update(0, true, 0), 768, "starts at the base");
+    assert_eq!(rate.update(1_999, true, 0), 768);
+    assert_eq!(rate.update(2_000, true, 0), 896, "+128 B/s after 2 s calm");
+    assert_eq!(rate.update(3_000, true, 0), 896, "one step per 2 s");
+    let mut now = 2_000;
     for _ in 0..10 {
-        now += 5_000;
-        rate.update(now, true);
+        now += 2_000;
+        rate.update(now, true, 0);
     }
-    assert_eq!(rate.update(now, true), 768, "capped at the ceiling");
-    assert_eq!(rate.update(now + 1, false), 512, "any yield trigger: back to the base at once");
-    assert_eq!(rate.update(now + 2, true), 512, "and the climb starts over");
+    assert_eq!(rate.update(now, true, 0), 1536, "capped at the ceiling");
+    assert_eq!(rate.update(now + 1, true, 2), 768, "a gap halves it");
+    assert_eq!(rate.update(now + 2, true, 1), 384);
+    assert_eq!(rate.update(now + 3, true, 1), 256, "not below the floor");
+    assert_eq!(rate.update(now + 2_003, true, 0), 384, "and climbs again while calm");
+    assert_eq!(rate.update(now + 2_004, false, 0), 384, "a yield trigger never raises it");
+    let mut fast = AdaptiveRate::new(768, 1536);
+    for t in 1..=10 {
+        fast.update(t * 2_000, true, 0);
+    }
+    assert_eq!(fast.update(30_000, false, 0), 768, "any yield trigger: back to the base at once");
+    assert_eq!(fast.update(30_001, true, 0), 768, "and the climb starts over");
     let s = Signals::new(10_000);
     assert!(s.calm(1_000));
     s.note_command(1_000);
@@ -347,8 +286,8 @@ fn the_adaptive_rate_rises_while_calm_and_drops_at_once() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn crc_mismatch_is_requested_again_and_counted() {
     let (gs, fc) = link();
-    let data = pattern(5 * 512 + 33, 7);
-    let board = Arc::new(MockFc::new(vec![("irec_LAUNCH-1-000.csv".into(), data.clone(), false)]));
+    let data = fc_csv(T0, T0 + 120_000, 100);
+    let board = Arc::new(mock_fc(vec![("irec_LAUNCH-1-000.csv".into(), data.clone(), false)]));
     board.corrupt.store(2, Ordering::SeqCst);
     serve(&fc, board.clone());
     let (running, task) = pump(gs.clone(), fc.clone());
@@ -365,7 +304,7 @@ async fn crc_mismatch_is_requested_again_and_counted() {
     assert_eq!(std::fs::read(final_path).unwrap(), data, "corrupt answers never reach the file");
     assert_eq!(req.crc_errors.load(Ordering::Relaxed), 2);
     assert_eq!(manager.get(id).unwrap().crc_errors, 2);
-    assert_eq!(board.reads.load(Ordering::SeqCst), 6 + 2, "each corrupt block read once more");
+    assert_eq!(board.opens.load(Ordering::SeqCst), 1 + 2, "each corrupt block opened again from it");
     assert!(completed_file(&root.0, "FC", "ROOT", "irec_LAUNCH-1-000.csv").is_some());
     assert!(completed_file(&root.0, "FC", "LAUNCH", "irec_LAUNCH-1-000.csv").is_none());
     running.store(false, Ordering::Relaxed);
@@ -394,7 +333,7 @@ async fn the_worker_collects_attaches_with_provenance_and_cuts_the_lead_up() {
     let folder = capture(&root.0, EventKind::Launch).await;
     let (launch, ordinary, files) = flight_files();
     let (gs, fc) = link();
-    let board = Arc::new(MockFc::new(files));
+    let board = Arc::new(mock_fc(files));
     serve(&fc, board.clone());
     let (running, task) = pump(gs.clone(), fc.clone());
     let manager: &'static Manager = Box::leak(Box::new(Manager::default()));
@@ -415,7 +354,7 @@ async fn the_worker_collects_attaches_with_provenance_and_cuts_the_lead_up() {
     assert_eq!(entry.lead_up_rows, 600, "{entry:?}");
     let lead = folder.join("board_sd/FC").join(format!("{}.leadup.csv", launch_name().trim_end_matches(".csv")));
     assert!(std::fs::read_to_string(lead).unwrap().contains("# seds-sd,format=fc"));
-    let read_bytes = board.reads.load(Ordering::SeqCst) as u64 * BLOCK_BYTES;
+    let read_bytes = board.served.load(Ordering::SeqCst);
     assert!(read_bytes < launch.len() as u64 + ordinary.len() as u64 / 2, "window only: {read_bytes}");
     let notes = fakes.notes.lock().unwrap().join("\n");
     assert!(notes.contains("attached to the Launch capture") && notes.contains("collection complete"), "{notes}");
@@ -429,7 +368,7 @@ async fn an_rrls_keeps_verified_files_in_its_outbox_and_reports_power_off_ready(
     capture(&root.0, EventKind::Launch).await;
     let (launch, _, files) = flight_files();
     let (gs, fc) = link();
-    serve(&fc, Arc::new(MockFc::new(files)));
+    serve(&fc, Arc::new(mock_fc(files)));
     let (running, task) = pump(gs.clone(), fc.clone());
     let manager: &'static Manager = Box::leak(Box::new(Manager::default()));
     let (mut env, fakes) = env(manager, gs.clone(), &root.0, 10_000_000, true);
@@ -485,12 +424,12 @@ async fn pauses_for_commands_gps_and_operator_stop_then_resumes() {
     capture(&root.0, EventKind::Launch).await;
     let launch = fc_csv(T0 - 10_000, T0 + 50_000, 100);
     let (gs, fc) = link();
-    let board = Arc::new(MockFc::new(vec![(launch_name(), launch.clone(), false)]));
+    let board = Arc::new(mock_fc(vec![(launch_name(), launch.clone(), false)]));
     serve(&fc, board.clone());
     let (running, task) = pump(gs.clone(), fc.clone());
     let manager: &'static Manager = Box::leak(Box::new(Manager::default()));
-    // 20 KiB/s: a few seconds for the file, time to pause it in the middle.
-    let (env, fakes) = env(manager, gs.clone(), &root.0, 20_000, false);
+    // 600 B/s of DATA: several seconds for the file, time to pause it in the middle.
+    let (env, fakes) = env(manager, gs.clone(), &root.0, 600, false);
     let job = new_job(&root.0);
     let worker = tokio::spawn(run(env));
     let part = root.0.join("sd-downloads/FC/ROOT").join(format!("{}.part", launch_name()));
@@ -530,7 +469,13 @@ async fn pauses_for_commands_gps_and_operator_stop_then_resumes() {
     set_stopped(&root.0, false, None);
     assert!(wait_for(Duration::from_secs(3), paused_with("congested")).await);
     *fakes.blocked.lock().unwrap() = None;
-    let done = wait_done(&root.0, Duration::from_secs(20)).await;
+    // GPS keeps arriving while the rest of the file streams.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !load(&root.0).jobs[0].done && Instant::now() < deadline {
+        fakes.signals.note_gps(now_ms());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let done = wait_done(&root.0, Duration::from_secs(1)).await;
     assert!(done.done, "{done:?}");
     assert_eq!(done.id, job.id);
     tokio::time::timeout(Duration::from_secs(5), worker).await.unwrap().unwrap();
@@ -542,19 +487,16 @@ async fn pauses_for_commands_gps_and_operator_stop_then_resumes() {
 async fn a_link_drop_and_a_restart_resume_from_the_persisted_offset() {
     let root = TestDirectory::new();
     capture(&root.0, EventKind::Hitl).await;
-    let launch = fc_csv(T0 - 10_000, T0 + 4_000, 100);
+    let launch = fc_csv(T0 - 10_000, T0 + 60_000, 100);
     let (gs, fc) = link();
     let link_up = Arc::new(AtomicBool::new(true));
     let drop_link = link_up.clone();
-    let mut mock = MockFc::new(vec![(launch_name(), launch.clone(), true)]);
-    mock.files[0].2 = false;
-    mock.trigger_after = 6;
-    mock.on_read = Box::new(move || drop_link.store(false, Ordering::SeqCst));
-    let board = Arc::new(mock);
+    let board = Arc::new(mock_fc(vec![(launch_name(), launch.clone(), false)]));
+    board.trigger(20 * 1024, move || drop_link.store(false, Ordering::SeqCst));
     serve(&fc, board.clone());
     let (running, task) = pump(gs.clone(), fc.clone());
     let manager: &'static Manager = Box::leak(Box::new(Manager::default()));
-    let (mut first, _) = env(manager, gs.clone(), &root.0, 10_000_000, false);
+    let (mut first, _) = env(manager, gs.clone(), &root.0, 1_500, false);
     let up = link_up.clone();
     let inner = first.pause.clone();
     first.pause = Arc::new(move |stage| (!up.load(Ordering::SeqCst)).then(|| "FC unreachable".to_string()).or_else(|| inner(stage)));
@@ -563,13 +505,13 @@ async fn a_link_drop_and_a_restart_resume_from_the_persisted_offset() {
     let part = root.0.join("sd-downloads/FC/ROOT").join(format!("{}.part", launch_name()));
     assert!(wait_for(Duration::from_secs(10), || load(&root.0).jobs[0].paused_reason.as_deref() == Some("FC unreachable")).await);
     let kept = std::fs::metadata(&part).unwrap().len();
-    assert!(kept > 0 && kept < launch.len() as u64 && kept.is_multiple_of(512), "kept {kept}");
+    assert!(kept > 0 && kept < launch.len() as u64, "kept {kept}");
     // The station restarts: the worker is gone, a new one (fresh manager)
     // picks the persisted job up and resumes after the kept bytes.
     worker.abort();
     let _ = worker.await;
     assert!(!worker_running(&root.0));
-    let reads_before = board.reads.load(Ordering::SeqCst);
+    let served_before = board.served.load(Ordering::SeqCst);
     link_up.store(true, Ordering::SeqCst);
     let manager2: &'static Manager = Box::leak(Box::new(Manager::default()));
     let (second, _) = env(manager2, gs.clone(), &root.0, 10_000_000, false);
@@ -578,8 +520,8 @@ async fn a_link_drop_and_a_restart_resume_from_the_persisted_offset() {
     assert!(job.done, "{job:?}");
     let resumed = manager2.list().into_iter().next().unwrap();
     assert_eq!(resumed.resumed_from, kept, "resumed from the persisted offset");
-    let blocks_after = (board.reads.load(Ordering::SeqCst) - reads_before) as u64;
-    assert_eq!(blocks_after, (launch.len() as u64 - kept).div_ceil(512) + 1, "only the rest, plus the tail check");
+    let served_after = board.served.load(Ordering::SeqCst) - served_before;
+    assert_eq!(served_after, launch.len() as u64 - kept + 512, "only the rest, plus the 512-byte resume check");
     assert!(job.capture.as_deref().unwrap().contains("hitl"), "{job:?}");
     running.store(false, Ordering::Relaxed);
     task.await.unwrap();
@@ -612,11 +554,11 @@ async fn switching_to_the_rrls_path_and_back_resumes_the_direct_copy_from_its_of
     capture(&root.0, EventKind::Launch).await;
     let launch = fc_csv(T0 - 10_000, T0 + 50_000, 100);
     let (gs, fc) = link();
-    let board = Arc::new(MockFc::new(vec![(launch_name(), launch.clone(), false)]));
+    let board = Arc::new(mock_fc(vec![(launch_name(), launch.clone(), false)]));
     serve(&fc, board.clone());
     let (running, task) = pump(gs.clone(), fc.clone());
     let manager: &'static Manager = Box::leak(Box::new(Manager::default()));
-    let (mut env, _) = env(manager, gs.clone(), &root.0, 20_000, false);
+    let (mut env, _) = env(manager, gs.clone(), &root.0, 1_500, false);
     let good = PathMetrics { gs_direct_age_ms: Some(100), gs_good: 500, rrls_online: true, rrls_hears_av_bay: true, rrls_good: 500, rrls_can_transmit: true, ..Default::default() };
     let metrics = Arc::new(Mutex::new(good));
     let m = metrics.clone();
@@ -639,8 +581,11 @@ async fn switching_to_the_rrls_path_and_back_resumes_the_direct_copy_from_its_of
     metrics.lock().unwrap().gs_direct_age_ms = Some(100);
     let done = wait_done(&root.0, Duration::from_secs(20)).await;
     assert!(done.done, "{done:?}");
+    // Held open (rate 0) or reopened: either way never from zero.
     let resumed = manager.list().into_iter().map(|j| j.resumed_from).max().unwrap();
-    assert_eq!(resumed, kept, "resumed from the kept offset, not from zero");
+    assert!(resumed == 0 || resumed == kept, "resumed from {resumed}");
+    let served = board.served.load(Ordering::SeqCst);
+    assert!(served < launch.len() as u64 + 32 * 1024, "the copy continued from its offset ({served} B read)");
     tokio::time::timeout(Duration::from_secs(5), worker).await.unwrap().unwrap();
     running.store(false, Ordering::Relaxed);
     task.await.unwrap();
@@ -690,12 +635,19 @@ async fn status_and_stop_routes_follow_the_sd_download_permissions() {
 
 // ------------------------------------------------- shared radio link safety
 
+/// The AV-bay radio side as production configures it (`main.rs`): no hop
+/// reliability, 192-byte small-packet frames.
+fn radio_side() -> sedsnet::router::RouterSideOptions {
+    sedsnet::router::RouterSideOptions { reliable_enabled: false, ..Default::default() }.with_small_packet_transport(192)
+}
+
 /// A frame on the simulated AV-bay UART: router bytes, or a stand-in for
 /// recovery GPS (FC/RF -> GS) or a command (GS -> FC).
 enum Frame {
     Router(Vec<u8>),
-    Gps(Instant),
-    Command(Instant),
+    /// The turn it was queued in.
+    Gps(u64),
+    Command(u64),
 }
 
 impl Frame {
@@ -716,31 +668,52 @@ struct Air {
     up: Mutex<VecDeque<Frame>>,
     stream_down_bytes: AtomicU64,
     stream_up_bytes: AtomicU64,
+    /// When the FC router handed each frame to the radio, and its size.
+    fc_tx_log: Mutex<Vec<(Instant, usize)>>,
     gps_latency_ms: Mutex<Vec<u64>>,
     command_latency_ms: Mutex<Vec<u64>>,
+    /// Turns so far, and when each began (latency is counted in turns, so a
+    /// loaded test machine does not stretch it).
+    turn: AtomicU64,
+    turn_starts: Mutex<Vec<Instant>>,
 }
 
 const TURN_BYTES: usize = 691;
 const TURN: Duration = Duration::from_millis(200);
 
+/// FC-shaped launch file (firmware float text and record mix) of this many
+/// milliseconds.
+fn realistic_launch(ms: u64) -> Vec<u8> {
+    crate::sd_download::test_data::fc_launch_csv(ms, 5)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn on_a_shared_radio_budget_gps_and_commands_keep_rate_and_latency() {
     let root = TestDirectory::new();
     capture(&root.0, EventKind::Launch).await;
-    let launch = fc_csv(T0 - 10_000, T0 + 1_500, 100);
-    assert!(launch.len() > 3 * 512);
+    let launch = realistic_launch(4_000);
+    assert!(launch.len() > 40_000, "{}", launch.len());
     let (gs, fc) = routers();
     let air = Arc::new(Air::default());
     let a = air.clone();
-    let gs_side = gs.add_side_packed("radio", move |bytes| {
-        a.up.lock().unwrap().push_back(Frame::Router(bytes.to_vec()));
-        Ok(())
-    });
+    let gs_side = gs.add_side_packed_with_options(
+        "radio",
+        move |bytes| {
+            a.up.lock().unwrap().push_back(Frame::Router(bytes.to_vec()));
+            Ok(())
+        },
+        radio_side(),
+    );
     let a = air.clone();
-    let fc_side = fc.add_side_packed("radio", move |bytes| {
-        a.down.lock().unwrap().push_back(Frame::Router(bytes.to_vec()));
-        Ok(())
-    });
+    let fc_side = fc.add_side_packed_with_options(
+        "radio",
+        move |bytes| {
+            a.fc_tx_log.lock().unwrap().push((Instant::now(), bytes.len() + 4));
+            a.down.lock().unwrap().push_back(Frame::Router(bytes.to_vec()));
+            Ok(())
+        },
+        radio_side(),
+    );
     let alive = Arc::new(AtomicBool::new(true));
     // Routers run continuously; the air delivers once per turn.
     let (g, f, live) = (gs.clone(), fc.clone(), alive.clone());
@@ -754,6 +727,8 @@ async fn on_a_shared_radio_budget_gps_and_commands_keep_rate_and_latency() {
     let (a, g, f, live) = (air.clone(), gs.clone(), fc.clone(), alive.clone());
     let air_task = tokio::spawn(async move {
         while live.load(Ordering::Relaxed) {
+            let turn = a.turn.fetch_add(1, Ordering::SeqCst) + 1;
+            a.turn_starts.lock().unwrap().push(Instant::now());
             for down in [true, false] {
                 let queue = if down { &a.down } else { &a.up };
                 let mut budget = TURN_BYTES;
@@ -777,9 +752,10 @@ async fn on_a_shared_radio_budget_gps_and_commands_keep_rate_and_latency() {
                                 let _ = f.rx_packed_from_side(&bytes, fc_side);
                             }
                         }
-                        // Delivered at the end of the burst of this turn.
-                        Frame::Gps(at) => a.gps_latency_ms.lock().unwrap().push(at.elapsed().as_millis() as u64 + 60),
-                        Frame::Command(at) => a.command_latency_ms.lock().unwrap().push(at.elapsed().as_millis() as u64 + 60),
+                        // Queued during turn `at`: the next turn begins at most
+                        // one turn later; delivered at the end of the burst.
+                        Frame::Gps(at) => a.gps_latency_ms.lock().unwrap().push((turn - at) * TURN.as_millis() as u64 + 60),
+                        Frame::Command(at) => a.command_latency_ms.lock().unwrap().push((turn - at) * TURN.as_millis() as u64 + 60),
                     }
                 }
             }
@@ -789,48 +765,37 @@ async fn on_a_shared_radio_budget_gps_and_commands_keep_rate_and_latency() {
     gs.announce_discovery().unwrap();
     fc.announce_discovery().unwrap();
     assert!(wait_for(Duration::from_secs(5), || gs.resolve_hostname("FC").is_some()).await, "discovery over the air");
-    let board = Arc::new(MockFc::new(vec![(launch_name(), launch.clone(), false)]));
+    // Let the discovery exchange drain off the air before measuring.
+    for _ in 0..3 {
+        assert!(wait_for(Duration::from_secs(20), || air.down.lock().unwrap().is_empty() && air.up.lock().unwrap().is_empty()).await);
+        tokio::time::sleep(2 * TURN).await;
+    }
+    let board = Arc::new(mock_fc(vec![(launch_name(), launch.clone(), false)]));
     serve(&fc, board.clone());
     let manager: &'static Manager = Box::leak(Box::new(Manager::default()));
     let (env, fakes) = env(manager, gs.clone(), &root.0, RADIO_DEFAULT_BPS, false);
     let signals = fakes.signals.clone();
+    let wire_before = (air.stream_down_bytes.load(Ordering::Relaxed), air.stream_up_bytes.load(Ordering::Relaxed));
     new_job(&root.0);
     let worker = tokio::spawn(run(env));
     // Recovery GPS at 1 Hz from the vehicle, a command every 3 s from the GS.
     let started = Instant::now();
     let mut gps_sent = 0;
-    let mut commands_sent = 0;
     let mut last_gps = Instant::now() - Duration::from_secs(1);
     let mut last_command = Instant::now();
-    let mut quiet_checks = Vec::new();
-    let part = root.0.join("sd-downloads/FC/ROOT").join(format!("{}.part", launch_name()));
-    let size = || std::fs::metadata(&part).map_or(0, |m| m.len());
-    while !load(&root.0).jobs[0].done && started.elapsed() < Duration::from_secs(40) {
+    let mut commands = Vec::new();
+    while !load(&root.0).jobs[0].done && started.elapsed() < Duration::from_secs(90) {
         if last_gps.elapsed() >= Duration::from_secs(1) {
             last_gps = Instant::now();
-            air.down.lock().unwrap().push_back(Frame::Gps(last_gps));
+            air.down.lock().unwrap().push_back(Frame::Gps(air.turn.load(Ordering::SeqCst)));
             signals.note_gps(now_ms());
             gps_sent += 1;
         }
-        if last_command.elapsed() >= Duration::from_secs(3) && commands_sent < 3 {
+        if last_command.elapsed() >= Duration::from_secs(3) && commands.len() < 3 {
             last_command = Instant::now();
-            air.up.lock().unwrap().push_back(Frame::Command(last_command));
+            air.up.lock().unwrap().push_back(Frame::Command(air.turn.load(Ordering::SeqCst)));
             signals.note_command(now_ms());
-            commands_sent += 1;
-            quiet_checks.push((Instant::now(), None::<u64>));
-        }
-        // The fetch yields: the partial file stays frozen 0.4..1.4 s after a command.
-        for check in quiet_checks.iter_mut() {
-            let age = check.0.elapsed();
-            if check.1.is_none() && age >= Duration::from_millis(400) {
-                check.1 = Some(size());
-            }
-            if let Some(at) = check.1
-                && age >= Duration::from_millis(1_400)
-                && age < Duration::from_millis(1_450)
-            {
-                assert_eq!(size(), at, "the fetch yields for the command quiet time");
-            }
+            commands.push(last_command);
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -841,85 +806,248 @@ async fn on_a_shared_radio_budget_gps_and_commands_keep_rate_and_latency() {
     let _ = routers_task.await;
     let _ = air_task.await;
     assert!(job.done, "{job:?}");
+    assert_eq!(std::fs::read(root.0.join("sd-downloads/FC/ROOT").join(launch_name())).unwrap(), launch);
     let gps = air.gps_latency_ms.lock().unwrap().clone();
-    let commands = air.command_latency_ms.lock().unwrap().clone();
+    let command_latency = air.command_latency_ms.lock().unwrap().clone();
     // Every GPS fix and command got through, each within two turns.
     assert!(gps.len() + 1 >= gps_sent, "{} of {gps_sent} GPS fixes", gps.len());
-    assert_eq!(commands.len(), commands_sent);
+    assert_eq!(command_latency.len(), commands.len());
     let worst_gps = gps.iter().max().copied().unwrap_or(0);
-    let worst_command = commands.iter().max().copied().unwrap_or(0);
+    let worst_command = command_latency.iter().max().copied().unwrap_or(0);
     assert!(worst_gps <= 2 * TURN.as_millis() as u64 + 80, "GPS latency {gps:?}");
-    assert!(worst_command <= 2 * TURN.as_millis() as u64 + 80, "command latency {commands:?}");
-    // The fetch kept well inside the budget (payload <= 512 B/s on average).
-    let down = air.stream_down_bytes.load(Ordering::Relaxed);
-    let up = air.stream_up_bytes.load(Ordering::Relaxed);
-    let blocks = launch.len().div_ceil(512) as u64;
+    assert!(worst_command <= 2 * TURN.as_millis() as u64 + 80, "command latency {command_latency:?}");
+    // The fetch yields for each command's quiet time (1.5 s here): the GS
+    // sends rate 0 at once, the board has it within three turns, and from
+    // then until the quiet time ends the FC hands the radio nothing new but
+    // control traffic: less than one DATA message (a 460-byte message is
+    // three frames, ~590 B) in total. DATA already queued for the air before
+    // the pause took effect still drains, as it would on the real radio.
+    let pauses = board.pause_acks.lock().unwrap().clone();
+    let log = air.fc_tx_log.lock().unwrap().clone();
+    let mut pause_delays = Vec::new();
+    for tc in &commands {
+        let Some(pa) = pauses.iter().find(|p| *p >= tc) else { panic!("no pause after the command at {tc:?}: {pauses:?}") };
+        let delay = pa.duration_since(*tc);
+        pause_delays.push(delay.as_millis());
+        let turns = air.turn_starts.lock().unwrap().iter().filter(|t| *t > tc && *t <= pa).count();
+        assert!(turns <= 3, "pause took {turns} turns ({delay:?})");
+        let quiet_end = *tc + Duration::from_millis(1_450);
+        let after: usize = log.iter().filter(|(t, _)| *t > *pa + Duration::from_millis(20) && *t < quiet_end).map(|(_, n)| n).sum();
+        assert!(after < 400, "{after} B handed to the radio after the pause took effect");
+    }
+    let down = air.stream_down_bytes.load(Ordering::Relaxed) - wire_before.0;
+    let up = air.stream_up_bytes.load(Ordering::Relaxed) - wire_before.1;
+    let payload_rate = launch.len() as f64 / elapsed;
     println!(
-        "FC SD over the simulated radio: {} B payload in {elapsed:.1} s; wire {down} B down + {up} B up ({} + {} B per 512 B block incl. discovery); GPS worst {worst_gps} ms, commands worst {worst_command} ms",
+        "FC SD v2 over the simulated radio (691 B / 200 ms turns, {} B FC launch file, 768 B/s DATA): {payload_rate:.0} B/s of CSV in {elapsed:.1} s; wire {down} B down + {up} B up = {:.3} down + {:.3} up per payload byte; downlink share {:.0} B/s of 3455; GPS worst {worst_gps} ms, commands worst {worst_command} ms; pause took effect after {pause_delays:?} ms",
         launch.len(),
-        down / blocks,
-        up / blocks
+        down as f64 / launch.len() as f64,
+        up as f64 / launch.len() as f64,
+        down as f64 / elapsed
     );
-    assert!((launch.len() as f64 / elapsed) <= RADIO_DEFAULT_BPS as f64 * 1.1);
-    assert!((down as f64 / elapsed) < 0.35 * (TURN_BYTES as f64 * 5.0), "{down} B down in {elapsed:.1} s");
+    // The fetch's downlink stays inside what telemetry leaves (~1.5 KB/s of
+    // AV-bay telemetry on a 3.4 KB/s turn).
+    assert!((down as f64 / elapsed) < 0.55 * (TURN_BYTES as f64 * 5.0), "{down} B down in {elapsed:.1} s");
+    // DATA at <= 768 B/s, so the CSV rate stays near 768 x the SDX ratio.
+    assert!(payload_rate > 2_000.0, "{payload_rate}");
 }
 
-/// Wire cost of the protocol itself (no radio losses or retransmissions):
-/// SEDSnet packed bytes per 512-byte block each way, plus the 4-byte radio
-/// frame header per packet. Printed for the docs' transfer-time estimate.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn wire_bytes_per_block_on_an_instant_link() {
+/// Two routers on radio-configured sides, delivered at once but each frame
+/// dropped with the given probability per direction (and all of them while
+/// `cut` is set). Counts wire bytes (plus the 4-byte radio header) each way.
+struct LossyLink {
+    gs: Arc<Router>,
+    fc: Arc<Router>,
+    cut: Arc<AtomicBool>,
+    down: Arc<AtomicU64>,
+    up: Arc<AtomicU64>,
+}
+
+fn lossy_link(drop_down: f64, drop_up: f64, seed: u64) -> LossyLink {
+    use crate::sd_download::test_data::Noise;
     let (gs, fc) = routers();
-    let down = Arc::new((AtomicU64::new(0), AtomicU64::new(0)));
-    let up = Arc::new((AtomicU64::new(0), AtomicU64::new(0)));
-    let fc_side_slot = Arc::new(std::sync::OnceLock::new());
-    let gs_side_slot = Arc::new(std::sync::OnceLock::new());
-    let (f, u, slot) = (fc.clone(), up.clone(), fc_side_slot.clone());
-    let gs_side = gs.add_side_packed("wire", move |b| {
-        u.0.fetch_add(b.len() as u64 + 4, Ordering::Relaxed);
-        u.1.fetch_add(1, Ordering::Relaxed);
-        f.rx_packed_from_side(b, *slot.get().unwrap())
-    });
-    let (g, d, slot) = (gs.clone(), down.clone(), gs_side_slot.clone());
-    let fc_side = fc.add_side_packed("wire", move |b| {
-        d.0.fetch_add(b.len() as u64 + 4, Ordering::Relaxed);
-        d.1.fetch_add(1, Ordering::Relaxed);
-        g.rx_packed_from_side(b, *slot.get().unwrap())
-    });
-    fc_side_slot.set(fc_side).unwrap();
-    gs_side_slot.set(gs_side).unwrap();
-    gs.announce_discovery().unwrap();
-    fc.announce_discovery().unwrap();
-    for _ in 0..5 {
-        gs.process_all_queues().unwrap();
-        fc.process_all_queues().unwrap();
+    let cut = Arc::new(AtomicBool::new(false));
+    let (down, up) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+    let gs_slot = Arc::new(std::sync::OnceLock::new());
+    let fc_slot = Arc::new(std::sync::OnceLock::new());
+    let rnd = Arc::new(Mutex::new(Noise::new(seed)));
+    let lose = move |p: f64, rnd: &Mutex<Noise>| (rnd.lock().unwrap().next_u64() % 1_000_000) as f64 / 1e6 < p;
+    let (f, slot, c, counter, r) = (fc.clone(), fc_slot.clone(), cut.clone(), up.clone(), rnd.clone());
+    let gs_side = gs.add_side_packed_with_options(
+        "radio",
+        move |b| {
+            counter.fetch_add(b.len() as u64 + 4, Ordering::Relaxed);
+            if c.load(Ordering::Relaxed) || lose(drop_up, &r) {
+                return Ok(());
+            }
+            f.rx_packed_from_side(b, *slot.get().unwrap())
+        },
+        radio_side(),
+    );
+    let (g, slot, c, counter, r) = (gs.clone(), gs_slot.clone(), cut.clone(), down.clone(), rnd);
+    let fc_side = fc.add_side_packed_with_options(
+        "radio",
+        move |b| {
+            counter.fetch_add(b.len() as u64 + 4, Ordering::Relaxed);
+            if c.load(Ordering::Relaxed) || lose(drop_down, &r) {
+                return Ok(());
+            }
+            g.rx_packed_from_side(b, *slot.get().unwrap())
+        },
+        radio_side(),
+    );
+    fc_slot.set(fc_side).unwrap();
+    gs_slot.set(gs_side).unwrap();
+    LossyLink { gs, fc, cut, down, up }
+}
+
+async fn discover(gs: &Arc<Router>, fc: &Arc<Router>) {
+    for _ in 0..200 {
+        let _ = gs.announce_discovery();
+        let _ = fc.announce_discovery();
+        for _ in 0..5 {
+            let _ = gs.process_all_queues();
+            let _ = fc.process_all_queues();
+        }
+        if gs.resolve_hostname("FC").is_some() && fc.resolve_hostname("GS").is_some() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(gs.resolve_hostname("FC").is_some());
-    let data = pattern(64 * 512, 3);
-    let board = Arc::new(MockFc::new(vec![(launch_name(), data.clone(), false)]));
-    serve(&fc, board);
-    let (running, task) = pump(gs.clone(), fc.clone());
+    panic!("no discovery");
+}
+
+/// Wire cost of the protocol itself (no losses): bytes on the radio per raw
+/// CSV byte each way, for an FC-shaped launch file, including SEDSnet frame
+/// headers and the 4-byte radio frame header. Printed for the docs'
+/// transfer-time table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wire_bytes_per_payload_byte_on_an_instant_link() {
+    let link = lossy_link(0.0, 0.0, 1);
+    discover(&link.gs, &link.fc).await;
+    let data = realistic_launch(12_000);
+    let board = Arc::new(mock_fc(vec![(launch_name(), data.clone(), false)]));
+    serve(&link.fc, board);
+    let (running, task) = pump(link.gs.clone(), link.fc.clone());
     let manager: &'static Manager = Box::leak(Box::new(Manager::default()));
     let root = TestDirectory::new();
     let open: Gate = Arc::new(|| None);
     let (id, cancel) = manager.create_job(Board::FlightComputer, "ROOT", &launch_name()).unwrap();
-    let req = TransferRequest::new(id, Board::FlightComputer, 0, &launch_name(), root.0.clone(), 10_000_000);
-    // Count only the transfer (after connect).
-    let mut stream = BoardStream::open(manager, gs.clone(), Board::FlightComputer, &open, &cancel).await.unwrap();
-    let (d0, dn0, u0, un0) = (down.0.load(Ordering::Relaxed), down.1.load(Ordering::Relaxed), up.0.load(Ordering::Relaxed), up.1.load(Ordering::Relaxed));
-    for block in 0..64u64 {
-        read_block(&mut stream, &req, block * 512, &open, &cancel).await.unwrap();
+    let mut req = TransferRequest::new(id, Board::FlightComputer, 0, &launch_name(), root.0.clone(), 10_000_000);
+    req.profile = Profile::RADIO;
+    let (d0, u0) = (link.down.load(Ordering::Relaxed), link.up.load(Ordering::Relaxed));
+    transfer(manager, link.gs.clone(), &req, &open, &cancel).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (down, up) = (link.down.load(Ordering::Relaxed) - d0, link.up.load(Ordering::Relaxed) - u0);
+    let n = data.len() as f64;
+    // DATA bytes for the same file (SDX + DATA headers), for the ratio.
+    let mut sdx = 0usize;
+    let mut messages = 0usize;
+    let mut at = 0;
+    while at < data.len() {
+        let (used, body) = sdx::Encoder::encode_block(&data[at..], 16 * 1024);
+        messages += body.len().div_ceil(usize::from(RADIO_MSG_BYTES) - 17);
+        sdx += body.len() + 17 * body.len().div_ceil(usize::from(RADIO_MSG_BYTES) - 17);
+        at += used;
     }
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let per = |a: u64, b: u64| (a - b) as f64 / 64.0;
-    let (down_b, down_n) = (per(down.0.load(Ordering::Relaxed), d0), per(down.1.load(Ordering::Relaxed), dn0));
-    let (up_b, up_n) = (per(up.0.load(Ordering::Relaxed), u0), per(up.1.load(Ordering::Relaxed), un0));
-    println!("FC SD wire per 512 B block: down {down_b:.0} B in {down_n:.1} packets, up {up_b:.0} B in {up_n:.1} packets");
-    // 6 DATA frames (11 B header each + CRC) plus SEDSnet packet headers and
-    // the stream ACK; the docs' radio estimate uses these numbers.
-    assert!(down_b > 512.0 + 6.0 * 11.0 && down_b < 1400.0, "{down_b}");
-    assert!(up_b < 600.0, "{up_b}");
-    stream.finish(false);
+    println!(
+        "FC SD v2 wire per payload byte ({} B FC launch file, 460 B messages): down {:.3} ({down} B), up {:.3} ({up} B); DATA {sdx} B in {messages} messages ({:.2}x CSV/DATA); down wire per DATA byte {:.3}",
+        data.len(),
+        down as f64 / n,
+        up as f64 / n,
+        n / sdx as f64,
+        down as f64 / sdx as f64
+    );
+    assert!(down as f64 / n < 0.25, "{down}");
+    assert!(up as f64 / n < 0.05, "{up}");
     running.store(false, Ordering::Relaxed);
     task.await.unwrap();
+}
+
+/// Retries a whole transfer like the worker does, each try with a fresh
+/// manager (a station restart); `before_try` runs before each.
+async fn transfer_until_done(link: &LossyLink, root: &FsPath, name: &str, attempts: usize, mut stop: impl FnMut(&FsPath) -> bool) -> (usize, u64) {
+    let part = root.join("FC/ROOT").join(format!("{name}.part"));
+    let fin = root.join("FC/ROOT").join(name);
+    let mut tries = 0;
+    let mut crc_errors = 0;
+    while !fin.exists() && tries < attempts {
+        tries += 1;
+        let manager: &'static Manager = Box::leak(Box::new(Manager::default()));
+        let (id, cancel) = manager.create_job(Board::FlightComputer, "ROOT", name).unwrap();
+        let mut req = TransferRequest::new(id, Board::FlightComputer, 0, name, root.to_path_buf(), 64 * 1024);
+        req.profile = Profile::RADIO;
+        let req = Arc::new(req);
+        let cancel = Arc::new(AtomicBool::new(cancel.load(Ordering::Relaxed)));
+        let (r, g, c) = (req.clone(), link.gs.clone(), cancel.clone());
+        let open: Gate = Arc::new(|| None);
+        let task = tokio::spawn(async move { transfer(manager, g, &r, &open, &c).await });
+        // A restart: abort the station mid-transfer when `stop` says so.
+        while !task.is_finished() {
+            if stop(&part) {
+                task.abort();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = task.await;
+        crc_errors += req.crc_errors.load(Ordering::Relaxed);
+    }
+    (tries, crc_errors)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn a_lossy_radio_with_a_link_drop_and_a_restart_still_yields_the_identical_file() {
+    let data = realistic_launch(6_000);
+    let want = xfer::sha256(&data);
+    for (i, loss) in [0.05, 0.15, 0.30].into_iter().enumerate() {
+        let link = lossy_link(loss, loss, 100 + i as u64);
+        discover(&link.gs, &link.fc).await;
+        let board = Arc::new(mock_fc(vec![(launch_name(), data.clone(), false)]));
+        serve(&link.fc, board.clone());
+        let (running, task) = pump(link.gs.clone(), link.fc.clone());
+        let root = TestDirectory::new();
+        let started = Instant::now();
+        // Cut the link for 3 s once a third has arrived; restart the station
+        // once two thirds have.
+        let len = data.len() as u64;
+        let (cut, mut dropped, mut restarted) = (link.cut.clone(), false, false);
+        let mut kept_at_restart = 0;
+        let (tries, crc) = transfer_until_done(&link, &root.0, &launch_name(), 20, |part| {
+            let have = std::fs::metadata(part).map_or(0, |m| m.len());
+            if !dropped && have >= len / 3 {
+                dropped = true;
+                cut.store(true, Ordering::SeqCst);
+                let cut = cut.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    cut.store(false, Ordering::SeqCst);
+                });
+            }
+            if !restarted && have >= 2 * len / 3 {
+                restarted = true;
+                kept_at_restart = have;
+                return true;
+            }
+            false
+        })
+        .await;
+        let got = std::fs::read(root.0.join("FC/ROOT").join(launch_name())).unwrap_or_default();
+        let (down, up) = (link.down.load(Ordering::Relaxed), link.up.load(Ordering::Relaxed));
+        println!(
+            "lossy radio {:.0} % each way: {} B in {:.1} s over {tries} station runs, link cut 3 s, restart at {kept_at_restart} B; {} B served by the board ({:.2}x the file); wire {:.3} down / {:.3} up per payload byte; bad blocks {crc}",
+            loss * 100.0,
+            data.len(),
+            started.elapsed().as_secs_f64(),
+            board.served.load(Ordering::SeqCst),
+            board.served.load(Ordering::SeqCst) as f64 / data.len() as f64,
+            down as f64 / data.len() as f64,
+            up as f64 / data.len() as f64
+        );
+        assert!(dropped && restarted, "the drop and the restart happened");
+        assert_eq!(xfer::sha256(&got), want, "byte-identical at {loss}");
+        assert!(kept_at_restart > 0);
+        running.store(false, Ordering::Relaxed);
+        task.await.unwrap();
+    }
 }

@@ -1,18 +1,22 @@
 //! Network download of board SD files into the offline SD recovery pipeline.
 //!
-//! Boards serve their SD card on SEDSnet P2P stream port 4511 (protocol v1, see
-//! DAQ-Board `Core/Inc/sd_file_wire.h`). The station asks for one 512-byte block
-//! at a time and appends it to a `.part` file, so a transfer can be paused,
-//! cancelled and resumed at any byte. Transfers are bandwidth-bounded here and
-//! paced again on the board, run one at a time, and are only admitted (and only
-//! continue) in Idle, Landed or Recovery with no fill/launch sequence active.
-//! Completed files are handed to `recording_sd::upload` unchanged, so the
-//! existing import, provenance and "SD rows win" merge rules apply.
+//! Boards serve their SD card on SEDSnet P2P stream port 4511 with the SD
+//! transfer protocol v2 (`docs/backend/sd-transfer.md`, [`xfer`]): the station
+//! OPENs a byte range, the board streams it as independent 16 KiB blocks in
+//! SDX ([`sdx`], lossless binary rows, about 5-6x smaller than the CSV) paced
+//! to the rate and window the station sets, and the station acknowledges
+//! selectively, verifies each block's length and CRC-32, appends the verified
+//! prefix to a `.part` file and finally compares the board's SHA-256 of the
+//! file with its own copy's. A transfer can be paused (rate 0), cancelled and
+//! resumed at any committed byte. Transfers run one at a time and are only
+//! admitted (and only continue) in Idle, Landed or Recovery with no
+//! fill/launch sequence active. Completed files are handed to
+//! `recording_sd::upload` unchanged, so the existing import, provenance and
+//! "SD rows win" merge rules apply.
 //!
 //! The DAQ serves `/LAUNCH`, `/UTC` and `/NO_UTC` (directories 0..2); the
 //! Flight Computer serves only its card root (directory 0, `ROOT` here,
-//! listing `irec*.csv`) and closes every READ answer with a CRC-32 of the
-//! block (`FLAG_CRC`). The FC is collected automatically after landing by
+//! listing `irec*.csv`). The FC is collected automatically after landing by
 //! [`fc`].
 use crate::{
     auth::Permission,
@@ -29,32 +33,19 @@ use sedsnet::router::{P2pStreamEventKind, P2pStreamId, Router};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
 pub const SD_FILE_STREAM_PORT: u16 = 4511;
-const OP_LIST: u8 = 0x21;
-const OP_READ: u8 = 0x22;
-const OP_CANCEL: u8 = 0x23;
-/// RRLS relay outbox only: the GS confirms a forwarded file by its SHA-256.
-const OP_CONFIRM: u8 = 0x24;
-const RESPONSE_FLAG: u8 = 0x80;
-const STATUS_OK: u8 = 0;
+use xfer::{OP_CANCEL, OP_CONFIRM, OP_LIST, RESPONSE as RESPONSE_FLAG, STATUS_BUSY, STATUS_END, STATUS_OK};
 const STATUS_BAD_STATE: u8 = 2;
-const STATUS_BUSY: u8 = 3;
-const STATUS_NOT_FOUND: u8 = 4;
-const STATUS_END: u8 = 6;
-const DATA_HEADER: usize = 11;
 const LIST_HEADER: usize = 12;
-const FLAG_LAST: u8 = 0x01;
-/// The frame ends a READ answer and carries 4 trailing bytes: the zlib CRC-32
-/// (little-endian) of every data byte of that answer (FC firmware).
-const FLAG_CRC: u8 = 0x02;
 const ENTRY_OPEN: u8 = 0x01;
 const NAME_MAX: usize = 63;
+/// Unit of the lead-up's tail reads and binary-search probes.
 pub const BLOCK_BYTES: u64 = 512;
 pub const DIRECTORIES: [&str; 3] = ["LAUNCH", "UTC", "NO_UTC"];
 /// The FC serves its card root only (directory 0).
@@ -69,6 +60,9 @@ const SOURCE_PORT_FIRST: u16 = 60_000;
 const SOURCE_PORT_LAST: u16 = 64_999;
 
 static MANAGER: LazyLock<Manager> = LazyLock::new(Manager::default);
+/// Transfer ids differ between streams too (a stale DATA of an earlier
+/// stream can never match).
+static NEXT_XFER: AtomicU8 = AtomicU8::new(1);
 
 /// Boards whose current firmware serves the SD download stream.
 pub fn supports_sd_download(board: Board) -> bool {
@@ -130,16 +124,6 @@ fn encode_list(dir: u8, index: u16) -> [u8; 4] {
     [OP_LIST, dir, i[0], i[1]]
 }
 
-fn encode_read(offset: u32, dir: u8, name: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(7 + name.len());
-    out.push(OP_READ);
-    out.extend_from_slice(&offset.to_le_bytes());
-    out.push(dir);
-    out.push(name.len() as u8);
-    out.extend_from_slice(name.as_bytes());
-    out
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ListFrame {
     status: u8,
@@ -151,18 +135,10 @@ struct ListFrame {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DataFrame {
-    status: u8,
-    flags: u8,
-    offset: u32,
-    file_size: u32,
-    data: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 enum Frame {
     List(ListFrame),
-    Data(DataFrame),
+    Open(xfer::OpenAnswer),
+    Hash(xfer::HashAnswer),
     Cancel(u8),
     Confirm(u8),
 }
@@ -171,6 +147,7 @@ fn u32_at(p: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(p[at..at + 4].try_into().expect("four bytes"))
 }
 
+/// Answers other than DATA (which [`Fetch`] reads itself).
 fn decode_frame(p: &[u8]) -> Option<Frame> {
     match *p.first()? {
         b if b == OP_LIST | RESPONSE_FLAG => {
@@ -191,18 +168,8 @@ fn decode_frame(p: &[u8]) -> Option<Frame> {
                 name,
             }))
         }
-        b if b == OP_READ | RESPONSE_FLAG => {
-            if p.len() < DATA_HEADER {
-                return None;
-            }
-            Some(Frame::Data(DataFrame {
-                status: p[1],
-                flags: p[2],
-                offset: u32_at(p, 3),
-                file_size: u32_at(p, 7),
-                data: p[DATA_HEADER..].to_vec(),
-            }))
-        }
+        b if b == xfer::OP_OPEN | RESPONSE_FLAG => xfer::OpenAnswer::decode(p).map(Frame::Open),
+        b if b == xfer::OP_HASH | RESPONSE_FLAG => xfer::HashAnswer::decode(p).map(Frame::Hash),
         b if b == OP_CANCEL | RESPONSE_FLAG && p.len() == 2 => Some(Frame::Cancel(p[1])),
         b if b == OP_CONFIRM | RESPONSE_FLAG && p.len() == 2 => Some(Frame::Confirm(p[1])),
         _ => None,
@@ -455,6 +422,8 @@ pub(crate) struct BoardStream {
     stream: P2pStreamId,
     rx: mpsc::UnboundedReceiver<OwnedEvent>,
     open: bool,
+    /// The last transfer id used on this stream.
+    xfer: u8,
 }
 
 impl BoardStream {
@@ -523,6 +492,7 @@ impl BoardStream {
             stream,
             rx,
             open: true,
+            xfer: NEXT_XFER.fetch_add(97, Ordering::Relaxed),
         };
         let deadline = Instant::now() + CONNECT_TIMEOUT;
         loop {
@@ -595,6 +565,37 @@ impl BoardStream {
                     )));
                 }
                 _ => {}
+            }
+        }
+    }
+
+    /// A new transfer id (1..255), never the previous one on this stream.
+    fn next_xfer(&mut self) -> u8 {
+        self.xfer = self.xfer.wrapping_add(1).max(1);
+        self.xfer
+    }
+
+    /// The next DATA payload within `wait`; `None` when nothing arrived.
+    /// A closed or reset stream is an error.
+    async fn recv(&mut self, wait: Duration) -> Result<Option<Vec<u8>>, StreamError> {
+        let deadline = Instant::now() + wait;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            match tokio::time::timeout(deadline - now, self.rx.recv()).await {
+                Ok(Some(event)) if event.stream_id == self.stream && event.peer == self.board => match event.kind {
+                    P2pStreamEventKind::Data => return Ok(Some(event.payload)),
+                    P2pStreamEventKind::Closed | P2pStreamEventKind::Reset => {
+                        self.open = false;
+                        return Err(StreamError::Other(format!("{} closed the SD stream (state change or reboot)", self.board)));
+                    }
+                    _ => {}
+                },
+                Ok(Some(_)) => {}
+                Err(_) => return Ok(None),
+                Ok(None) => return Err(StreamError::Other("SD stream channel closed".into())),
             }
         }
     }
@@ -792,31 +793,67 @@ fn disk_ok(path: &FsPath, needed: u64) -> Result<(), String> {
 
 // --------------------------------------------------------------- transfer
 
+/// DATA message size on the AV-bay radio. SEDSnet carries a DATA message in
+/// one P2P packet split into 192-byte radio frames; with the P2P stream and
+/// packet headers a 460-byte message fills three frames (measured by
+/// `wire_bytes_per_payload_byte_on_an_instant_link`), so no frame is sent
+/// half empty and one lost frame costs at most 460 bytes.
+pub(crate) const RADIO_MSG_BYTES: u16 = 460;
+/// Wired links (bench, umbilical, CAN, DAQ fill link): the board clamps it
+/// to what it serves (FC 512, DAQ 1024).
+pub(crate) const WIRED_MSG_BYTES: u16 = 1024;
+/// Raw block size the GS asks for (KiB).
+pub(crate) const BLOCK_KIB: u8 = 16;
+
+/// DATA message size, window and compression for one link.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Profile {
+    pub msg: u16,
+    pub window: u8,
+    /// Ask for zstd (only the RRLS outbox has it).
+    pub zstd: bool,
+}
+
+impl Profile {
+    /// Radio: 6 messages in flight. P2P stream messages are ordered and
+    /// reliable in SEDSnet, so each unacknowledged DATA message (~520 B with
+    /// its SEDSnet overhead) stays in the FC router's 8 KiB queue budget
+    /// until acknowledged; 6 keep the transfer near 3 KB of it.
+    pub(crate) const RADIO: Self = Self { msg: RADIO_MSG_BYTES, window: 6, zstd: false };
+    /// FC on a wire: the FC answers at most 512-byte messages; 8 of them
+    /// stay within the same queue budget.
+    pub(crate) const FC_WIRED: Self = Self { msg: WIRED_MSG_BYTES, window: 8, zstd: false };
+    /// DAQ (fill link): 1 KiB messages, 16 in flight.
+    pub(crate) const WIRED: Self = Self { msg: WIRED_MSG_BYTES, window: 16, zstd: false };
+}
+
+/// A pacing rate that may change during the transfer (FC adaptive rate).
+/// Called about every 500 ms with the gaps and bad blocks seen since the
+/// last call; returns DATA bytes per second.
+pub(crate) type RateFn = Arc<dyn Fn(u32) -> u64 + Send + Sync>;
+/// Told when an open transfer pauses (`Some(reason)`) and resumes (`None`).
+pub(crate) type PauseHook = Arc<dyn Fn(Option<&str>) + Send + Sync>;
+
 pub(crate) struct TransferRequest {
     id: u64,
     board: Board,
     dir: u8,
     name: String,
     root: PathBuf,
+    /// DATA bytes per second (whole messages, headers included).
     max_bps: u64,
+    profile: Profile,
     /// Offer the finished file to the launch captures (operator and DAQ
     /// launch downloads). The FC collection attaches it itself.
     attach: bool,
-    /// READ answers re-requested after a CRC-32 mismatch.
+    /// Blocks that failed their length or CRC-32 and were requested again.
     crc_errors: AtomicU64,
     /// Another SD file service than the board itself (host, P2P port).
     peer: Option<(&'static str, u16)>,
     /// Local folder under `<root>/<board>/` instead of the wire directory.
     local_dir: Option<&'static str>,
-    /// A rate that may change during the transfer (FC adaptive rate); read
-    /// before every block. `max_bps` otherwise.
-    rate_fn: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
-}
-
-impl TransferRequest {
-    fn current_rate(&self) -> u64 {
-        self.rate_fn.as_ref().map_or(self.max_bps, |f| f()).max(1)
-    }
+    rate_fn: Option<RateFn>,
+    on_pause: Option<PauseHook>,
 }
 
 impl TransferRequest {
@@ -827,117 +864,396 @@ impl TransferRequest {
             dir,
             name: name.into(),
             root,
-            max_bps: max_bps.max(1),
+            max_bps: max_bps.max(xfer::RATE_UNIT),
+            profile: Profile::WIRED,
             attach: true,
             crc_errors: AtomicU64::new(0),
             peer: None,
             local_dir: None,
             rate_fn: None,
+            on_pause: None,
         }
+    }
+
+    fn rate(&self, losses: u32) -> u64 {
+        self.rate_fn.as_ref().map_or(self.max_bps, |f| f(losses)).max(xfer::RATE_UNIT)
     }
 }
 
-/// zlib CRC-32 (IEEE, reflected, init/xorout 0xFFFFFFFF), as the FC computes it.
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(bytes);
-    hasher.finalize()
+#[cfg(not(test))]
+mod timing {
+    use std::time::Duration;
+    /// An OPEN or HASH whose answer did not come is sent again after this.
+    pub const OPEN_RETRY: Duration = Duration::from_secs(3);
+    pub const HASH_RETRY: Duration = Duration::from_secs(10);
+    /// No new DATA for this long while not paused: OPEN again from the
+    /// committed offset (the board may have dropped the transfer).
+    pub const STALL: Duration = Duration::from_secs(8);
+    /// A pause holds the open transfer (rate 0, ACK every 5 s) this long; a
+    /// longer one closes the stream and resumes later by a new OPEN.
+    pub const PAUSE_HOLD: Duration = Duration::from_secs(15);
 }
+#[cfg(test)]
+mod timing {
+    use std::time::Duration;
+    pub const OPEN_RETRY: Duration = Duration::from_millis(1500);
+    pub const HASH_RETRY: Duration = Duration::from_secs(2);
+    pub const STALL: Duration = Duration::from_secs(4);
+    pub const PAUSE_HOLD: Duration = Duration::from_secs(3);
+}
+use timing::PAUSE_HOLD;
+const KEEPALIVE: Duration = Duration::from_secs(5);
+const ACK_EVERY: Duration = Duration::from_secs(1);
+const ACK_GAP_EVERY: Duration = Duration::from_millis(500);
+const RATE_CHECK: Duration = Duration::from_millis(500);
+const HASH_TIMEOUT: Duration = Duration::from_secs(180);
 
-/// Reads one block answer starting at `offset`. Returns (bytes, file_size, end).
-async fn read_block(
+/// Sends OPEN until the board answers it (retrying lost requests, waiting
+/// while it is busy). `END` comes back as an answer, other refusals as errors.
+async fn send_open(
     stream: &mut BoardStream,
     req: &TransferRequest,
     offset: u64,
+    length: u64,
+    rate: u64,
     gate: &Gate,
     cancel: &AtomicBool,
-) -> Result<(Vec<u8>, u64, bool), StreamError> {
-    let offset32 =
-        u32::try_from(offset).map_err(|_| "file offset exceeds protocol limit".to_string())?;
-    let mut attempts = 0_u32;
-    'retry: loop {
-        stream.send(&encode_read(offset32, req.dir, &req.name))?;
-        let deadline = Instant::now() + RESPONSE_TIMEOUT;
-        let mut data = Vec::with_capacity(BLOCK_BYTES as usize);
-        loop {
-            let frame = match stream.next_frame(deadline, gate, cancel).await {
-                Ok(Frame::Data(frame)) => frame,
-                Ok(_) => continue,
-                Err(StreamError::Other(e)) if e.starts_with("timed out") => {
-                    attempts += 1;
-                    if attempts > MAX_RETRIES {
-                        return Err(StreamError::Other(e));
-                    }
-                    continue 'retry;
-                }
+) -> Result<xfer::OpenAnswer, StreamError> {
+    let offset32 = u32::try_from(offset).map_err(|_| "file offset exceeds protocol limit".to_string())?;
+    let length32 = u32::try_from(length).map_err(|_| "range exceeds protocol limit".to_string())?;
+    let mut attempts = 0u32;
+    let mut busy = 0u32;
+    loop {
+        let open = xfer::Open {
+            xfer: stream.next_xfer(),
+            dir: req.dir,
+            flags: xfer::OPEN_SDX | if req.profile.zstd { xfer::OPEN_ZSTD } else { 0 },
+            offset: offset32,
+            length: length32,
+            rate: xfer::rate_units(rate),
+            msg: req.profile.msg,
+            window: req.profile.window,
+            block_kib: BLOCK_KIB,
+            name: req.name.clone(),
+        };
+        stream.send(&open.encode())?;
+        let deadline = Instant::now() + timing::OPEN_RETRY;
+        let answer = loop {
+            match stream.next_frame(deadline, gate, cancel).await {
+                Ok(Frame::Open(a)) if a.xfer == open.xfer || a.status != STATUS_OK => break Some(a),
+                Ok(_) => {}
+                Err(StreamError::Other(e)) if e.starts_with("timed out") => break None,
                 Err(e) => return Err(e),
-            };
-            match frame.status {
-                STATUS_OK => {
-                    // Accept only the contiguous continuation; stale frames
-                    // from an earlier retried request are ignored.
-                    if u64::from(frame.offset) != offset + data.len() as u64 {
-                        continue;
-                    }
-                    if frame.flags & FLAG_CRC != 0 {
-                        // FC: the last frame of the answer carries the CRC-32
-                        // of the whole answered block after its data.
-                        let Some(split) = frame.data.len().checked_sub(4) else {
-                            attempts += 1;
-                            if attempts > MAX_RETRIES {
-                                return Err(StreamError::Other("malformed CRC frame".into()));
-                            }
-                            continue 'retry;
-                        };
-                        data.extend_from_slice(&frame.data[..split]);
-                        let sent = u32::from_le_bytes(frame.data[split..].try_into().expect("four bytes"));
-                        if crc32(&data) != sent {
-                            req.crc_errors.fetch_add(1, Ordering::Relaxed);
-                            attempts += 1;
-                            log::warn!(
-                                "{} SD block {} of {} failed its CRC-32; requesting it again",
-                                req.board.sender_id(),
-                                offset,
-                                req.name
-                            );
-                            if attempts > MAX_RETRIES {
-                                return Err(StreamError::Other("SD block failed its CRC-32 repeatedly".into()));
-                            }
-                            continue 'retry;
-                        }
-                        return Ok((data, u64::from(frame.file_size), false));
-                    }
-                    data.extend_from_slice(&frame.data);
-                    if frame.flags & FLAG_LAST != 0 || data.len() as u64 >= BLOCK_BYTES {
-                        return Ok((data, u64::from(frame.file_size), false));
-                    }
-                }
-                STATUS_END => return Ok((data, u64::from(frame.file_size), true)),
-                STATUS_BUSY => {
-                    attempts += 1;
-                    if attempts > 400 {
-                        return Err(StreamError::Other("board stayed busy".into()));
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                    continue 'retry;
-                }
-                STATUS_BAD_STATE => {
-                    return Err(StreamError::Gate(status_text(STATUS_BAD_STATE).into()));
-                }
-                STATUS_NOT_FOUND => {
-                    return Err(StreamError::Other(status_text(STATUS_NOT_FOUND).into()));
-                }
-                other => {
-                    attempts += 1;
-                    if attempts > MAX_RETRIES {
-                        return Err(StreamError::Other(status_text(other).into()));
-                    }
-                    continue 'retry;
-                }
             }
+        };
+        let Some(answer) = answer else {
+            attempts += 1;
+            if attempts > MAX_RETRIES {
+                return Err(StreamError::Other(format!("timed out waiting for {} to open {}", stream.board, req.name)));
+            }
+            continue;
+        };
+        match answer.status {
+            STATUS_OK | STATUS_END => return Ok(answer),
+            STATUS_BUSY => {
+                busy += 1;
+                if busy > 400 {
+                    return Err(StreamError::Other("board stayed busy".into()));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            STATUS_BAD_STATE => return Err(StreamError::Gate(status_text(STATUS_BAD_STATE).into())),
+            other => return Err(StreamError::Other(status_text(other).into())),
         }
     }
 }
+
+/// One streamed range read: OPEN, then verified raw bytes in file order.
+/// Pauses (the gate) send rate 0 and hold the transfer for up to
+/// [`PAUSE_HOLD`]; nothing is handed out while paused. Gaps are acknowledged
+/// selectively, stalls and bad blocks re-OPEN from the committed offset.
+pub(crate) struct Fetch<'a> {
+    stream: &'a mut BoardStream,
+    req: &'a TransferRequest,
+    gate: &'a Gate,
+    cancel: &'a AtomicBool,
+    rx: xfer::Receiver,
+    /// The file size at the latest OPEN.
+    pub size: u64,
+    rate: u64,
+    window: u8,
+    losses: u32,
+    new_since_ack: u32,
+    dup_since_ack: bool,
+    last_ack: Instant,
+    last_rate_check: Instant,
+    last_fresh: Instant,
+    stalls: u32,
+    paused: Option<(Instant, String)>,
+    failed: Option<StreamError>,
+    final_acked: bool,
+    /// The gate is polled every [`GATE_POLL`] (it may read files).
+    gate_at: Option<Instant>,
+    gate_reason: Option<String>,
+}
+
+impl<'a> Fetch<'a> {
+    /// Opens `[offset, offset + length)` (`length` 0: to the end of the
+    /// file). `None` when `offset` is the end of the file.
+    pub(crate) async fn open(
+        stream: &'a mut BoardStream,
+        req: &'a TransferRequest,
+        offset: u64,
+        length: u64,
+        gate: &'a Gate,
+        cancel: &'a AtomicBool,
+    ) -> Result<Option<Fetch<'a>>, StreamError> {
+        let rate = req.rate(0);
+        let answer = send_open(stream, req, offset, length, rate, gate, cancel).await?;
+        if answer.status == STATUS_END {
+            return Ok(None);
+        }
+        let start = u64::from(answer.offset);
+        let now = Instant::now();
+        Ok(Some(Self {
+            rx: xfer::Receiver::new(answer.xfer, start, start + u64::from(answer.length)),
+            stream,
+            req,
+            gate,
+            cancel,
+            size: u64::from(answer.size),
+            rate,
+            window: req.profile.window,
+            losses: 0,
+            new_since_ack: 0,
+            dup_since_ack: false,
+            last_ack: now,
+            last_rate_check: now,
+            last_fresh: now,
+            stalls: 0,
+            paused: None,
+            failed: None,
+            final_acked: false,
+            gate_at: None,
+            gate_reason: None,
+        }))
+    }
+
+    fn send_ack(&mut self) -> Result<(), StreamError> {
+        let rate = if self.paused.is_some() { 0 } else { xfer::rate_units(self.rate) };
+        let ack = self.rx.ack(rate, self.window);
+        self.stream.send(&ack.encode())?;
+        self.last_ack = Instant::now();
+        self.new_since_ack = 0;
+        self.dup_since_ack = false;
+        Ok(())
+    }
+
+    /// OPEN again at the committed offset (same range end); verified blocks
+    /// already held are kept.
+    async fn reopen(&mut self) -> Result<(), StreamError> {
+        let at = self.rx.committed;
+        let length = self.rx.range_end - at;
+        let answer = send_open(self.stream, self.req, at, length, self.rate, self.gate, self.cancel).await?;
+        let end = if answer.status == STATUS_END { at } else { u64::from(answer.offset) + u64::from(answer.length) };
+        self.rx.restart(answer.xfer, end.min(self.rx.range_end));
+        self.size = u64::from(answer.size);
+        self.last_fresh = Instant::now();
+        self.last_ack = Instant::now();
+        Ok(())
+    }
+
+    /// The next verified bytes, in order; `None` at the end of the range.
+    pub(crate) async fn next(&mut self) -> Result<Option<Vec<u8>>, StreamError> {
+        loop {
+            if self.failed.is_some() {
+                // Hand out what is verified before reporting the stop.
+                if let Some(bytes) = self.rx.take_ready() {
+                    return Ok(Some(bytes));
+                }
+                return Err(self.failed.take().expect("failure"));
+            }
+            if self.cancel.load(Ordering::Acquire) {
+                let _ = self.stream.send(&[OP_CANCEL]);
+                self.failed = Some(StreamError::Cancelled);
+                continue;
+            }
+            let now = Instant::now();
+            if self.gate_at.is_none_or(|at| now.duration_since(at) >= GATE_POLL) {
+                self.gate_at = Some(now);
+                self.gate_reason = (self.gate)();
+            }
+            match (self.gate_reason.clone(), self.paused.as_ref()) {
+                (Some(reason), None) => {
+                    self.paused = Some((now, reason.clone()));
+                    self.send_ack()?;
+                    if let Some(hook) = &self.req.on_pause {
+                        hook(Some(&reason));
+                    }
+                }
+                (Some(reason), Some((since, _))) => {
+                    if now.duration_since(*since) >= PAUSE_HOLD {
+                        let _ = self.stream.send(&[OP_CANCEL]);
+                        self.failed = Some(StreamError::Gate(reason));
+                        continue;
+                    }
+                }
+                (None, Some(_)) => {
+                    self.paused = None;
+                    self.rate = self.req.rate(0);
+                    self.last_rate_check = now;
+                    self.last_fresh = now;
+                    self.send_ack()?;
+                    if let Some(hook) = &self.req.on_pause {
+                        hook(None);
+                    }
+                }
+                (None, None) => {}
+            }
+            if self.paused.is_none() {
+                if let Some(bytes) = self.rx.take_ready() {
+                    return Ok(Some(bytes));
+                }
+                if self.rx.done() {
+                    if !self.final_acked {
+                        self.final_acked = true;
+                        self.send_ack()?;
+                    }
+                    return Ok(None);
+                }
+                if now.duration_since(self.last_rate_check) >= RATE_CHECK {
+                    self.last_rate_check = now;
+                    let rate = self.req.rate(std::mem::take(&mut self.losses));
+                    if xfer::rate_units(rate) != xfer::rate_units(self.rate) {
+                        self.rate = rate;
+                        self.send_ack()?;
+                    }
+                }
+                if now.duration_since(self.last_fresh) >= timing::STALL {
+                    self.stalls += 1;
+                    if self.stalls > MAX_RETRIES {
+                        return Err(StreamError::Other(format!("timed out waiting for {}", self.stream.board)));
+                    }
+                    self.reopen().await?;
+                    continue;
+                }
+            }
+            let since_ack = now.duration_since(self.last_ack);
+            let due = since_ack >= KEEPALIVE
+                || (self.paused.is_none()
+                    && (u64::from(self.new_since_ack) >= u64::from(self.window / 2).max(1)
+                        || (self.rx.has_gap() && since_ack >= ACK_GAP_EVERY)
+                        || (self.new_since_ack > 0 && since_ack >= ACK_EVERY)
+                        || (self.dup_since_ack && since_ack >= Duration::from_millis(200))));
+            if due {
+                self.send_ack()?;
+            }
+            let event = match self.stream.recv(Duration::from_millis(25)).await? {
+                Some(event) => event,
+                None => continue,
+            };
+            let Some(data) = xfer::Data::decode(&event) else { continue };
+            let arrival = self.rx.on_data(&data);
+            if arrival.fresh {
+                self.new_since_ack += 1;
+                self.last_fresh = Instant::now();
+                self.stalls = 0;
+            }
+            if arrival.duplicate {
+                self.dup_since_ack = true;
+            }
+            if arrival.gap {
+                self.losses += 1;
+            }
+            if let Some(offset) = arrival.bad_block {
+                self.req.crc_errors.fetch_add(1, Ordering::Relaxed);
+                self.losses += 1;
+                log::warn!(
+                    "{} SD block at {offset} of {} failed its length or CRC-32; requesting it again",
+                    self.req.board.sender_id(),
+                    self.req.name
+                );
+                self.reopen().await?;
+            }
+        }
+    }
+
+    /// Ends the transfer on the board (CANCEL; harmless if it already ended).
+    pub(crate) fn close(self) {
+        let _ = self.stream.send(&[OP_CANCEL]);
+    }
+}
+
+/// Reads `[offset, offset + length)` whole (tails, probes, small files).
+/// Returns the bytes (shorter at the end of the file) and the file size.
+pub(crate) async fn read_range(
+    stream: &mut BoardStream,
+    req: &TransferRequest,
+    offset: u64,
+    length: u64,
+    gate: &Gate,
+) -> Result<(Vec<u8>, u64), StreamError> {
+    let never = AtomicBool::new(false);
+    let Some(mut fetch) = Fetch::open(stream, req, offset, length, gate, &never).await? else {
+        return Ok((Vec::new(), offset));
+    };
+    let mut out = Vec::new();
+    while let Some(bytes) = fetch.next().await? {
+        out.extend_from_slice(&bytes);
+    }
+    let size = fetch.size;
+    fetch.close();
+    Ok((out, size))
+}
+
+/// The board's size and SHA-256 of the file as it is now.
+async fn board_hash(stream: &mut BoardStream, req: &TransferRequest, gate: &Gate, cancel: &AtomicBool) -> Result<xfer::HashAnswer, StreamError> {
+    let deadline = Instant::now() + HASH_TIMEOUT;
+    let mut busy = 0u32;
+    loop {
+        // CANCEL first: a transfer the board still holds would make it BUSY.
+        stream.send(&[OP_CANCEL])?;
+        stream.send(&xfer::encode_hash(req.dir, &req.name))?;
+        let retry = (Instant::now() + timing::HASH_RETRY).min(deadline);
+        let answer = loop {
+            match stream.next_frame(retry, gate, cancel).await {
+                Ok(Frame::Hash(answer)) => break Some(answer),
+                Ok(_) => {}
+                Err(StreamError::Other(e)) if e.starts_with("timed out") => break None,
+                Err(e) => return Err(e),
+            }
+        };
+        match answer {
+            Some(a) if a.status == STATUS_OK => return Ok(a),
+            Some(a) if a.status == STATUS_BUSY && busy < 100 => {
+                busy += 1;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Some(a) if a.status == STATUS_BAD_STATE => return Err(StreamError::Gate(status_text(a.status).into())),
+            Some(a) => return Err(StreamError::Other(format!("SHA-256 of {} refused: {}", req.name, status_text(a.status)))),
+            None if Instant::now() >= deadline => return Err(StreamError::Other(format!("timed out waiting for the SHA-256 of {}", req.name))),
+            None => {}
+        }
+    }
+}
+
+fn sha256_file(path: &FsPath) -> std::io::Result<[u8; 32]> {
+    use std::io::Read;
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut file = std::fs::File::open(path)?;
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        context.update(&buffer[..n]);
+    }
+    Ok(context.finish().as_ref().try_into().expect("32 bytes"))
+}
+
+/// Bytes of the local copy compared with the card when resuming.
+const RESUME_CHECK_BYTES: u64 = 512;
 
 async fn transfer(
     manager: &Manager,
@@ -975,99 +1291,114 @@ async fn transfer(
     let (host, service_port) = req.peer.unwrap_or((req.board.sender_id(), SD_FILE_STREAM_PORT));
     let mut stream = BoardStream::open_peer(manager, router, host, service_port, gate, cancel).await?;
 
-    // Resume check: the block holding our last byte must still match, else
-    // the card was replaced or rewritten and we restart from zero.
+    // Resume check: our last bytes must still match the card, else the card
+    // was replaced or rewritten and we restart from zero.
     if have > 0 {
-        let check = (have - 1) / BLOCK_BYTES * BLOCK_BYTES;
-        let (remote, _, _) = read_block(&mut stream, req, check, gate, cancel).await?;
-        let local_len = (have - check) as usize;
-        let mut local = vec![0_u8; local_len];
+        let check = have.saturating_sub(RESUME_CHECK_BYTES);
+        let (remote, _) = read_range(&mut stream, req, check, have - check, gate).await?;
+        let mut local = vec![0_u8; (have - check) as usize];
         {
             use tokio::io::{AsyncReadExt, AsyncSeekExt};
             let mut file = tokio::fs::File::open(&part_path)
                 .await
                 .map_err(|e| format!("cannot reopen partial file: {e}"))?;
-            file.seek(std::io::SeekFrom::Start(check))
-                .await
-                .map_err(|e| e.to_string())?;
-            file.read_exact(&mut local)
-                .await
-                .map_err(|e| e.to_string())?;
+            file.seek(std::io::SeekFrom::Start(check)).await.map_err(|e| e.to_string())?;
+            file.read_exact(&mut local).await.map_err(|e| e.to_string())?;
         }
-        if remote.len() < local_len || remote[..local_len] != local[..] {
+        if remote != local {
             have = 0;
             let _ = tokio::fs::remove_file(&part_path).await;
         }
     }
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&part_path)
-        .await
-        .map_err(|e| format!("cannot open partial file: {e}"))?;
     let resumed_from = have;
     manager.update(req.id, |s| {
         s.phase = Phase::Transferring;
         s.resumed_from = resumed_from;
         s.bytes_done = resumed_from;
-        s.message = if resumed_from > 0 {
-            format!("resuming at {resumed_from} bytes")
-        } else {
-            "transferring".into()
-        };
+        s.message = if resumed_from > 0 { format!("resuming at {resumed_from} bytes") } else { "transferring".into() };
     });
-
     let started = Instant::now();
-    let mut sent_this_run = 0_u64;
-    let mut last_disk_check = 0_u64;
-    let mut offset = have;
-    // Bandwidth bound: the next request waits until the bytes already asked
-    // for fit the (possibly changing) rate; no catch-up burst after a stall.
-    let mut due = Instant::now();
+    let mut received = 0_u64;
+    let mut last_disk_check = have;
+    let mut hash_mismatches = 0;
     loop {
-        if let Some(wait) = due.checked_duration_since(Instant::now()) {
-            tokio::time::sleep(wait).await;
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&part_path)
+            .await
+            .map_err(|e| format!("cannot open partial file: {e}"))?;
+        let mut fetch = Fetch::open(&mut stream, req, have, 0, gate, cancel).await?;
+        if let Some(fetch) = fetch.as_mut() {
+            let total = fetch.size;
+            loop {
+                let next = fetch.next().await;
+                let bytes = match next {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => break,
+                    Err(error) => {
+                        file.flush().await.map_err(|e| e.to_string())?;
+                        return Err(error);
+                    }
+                };
+                file.write_all(&bytes).await.map_err(|e| format!("cannot write download: {e}"))?;
+                have += bytes.len() as u64;
+                received += bytes.len() as u64;
+                let elapsed = started.elapsed().as_secs_f64().max(0.001);
+                let crc_errors = req.crc_errors.load(Ordering::Relaxed);
+                manager.update(req.id, |s| {
+                    s.bytes_done = have;
+                    s.total_bytes = total.max(have);
+                    s.bytes_per_second = (received as f64 / elapsed) as u64;
+                    s.crc_errors = crc_errors;
+                    if s.message.starts_with("paused") || s.message.starts_with("resuming") {
+                        s.message = "transferring".into();
+                    }
+                });
+                if have - last_disk_check >= 4 * 1024 * 1024 {
+                    last_disk_check = have;
+                    disk_ok(&req.root, 64 * 1024 * 1024)?;
+                }
+            }
         }
-        let (data, file_size, end) = read_block(&mut stream, req, offset, gate, cancel).await?;
-        let now = Instant::now();
-        due = due.max(now.checked_sub(Duration::from_millis(250)).unwrap_or(now))
-            + Duration::from_secs_f64(data.len() as f64 / req.current_rate() as f64);
-        if !data.is_empty() {
-            file.write_all(&data)
-                .await
-                .map_err(|e| format!("cannot write download: {e}"))?;
-            offset += data.len() as u64;
-            sent_this_run += data.len() as u64;
+        if let Some(fetch) = fetch {
+            fetch.close();
         }
-        let elapsed = started.elapsed().as_secs_f64().max(0.001);
-        let crc_errors = req.crc_errors.load(Ordering::Relaxed);
-        manager.update(req.id, |s| {
-            s.bytes_done = offset;
-            s.total_bytes = file_size.max(offset);
-            s.bytes_per_second = (sent_this_run as f64 / elapsed) as u64;
-            s.crc_errors = crc_errors;
-        });
-        if offset - last_disk_check >= 4 * 1024 * 1024 {
-            last_disk_check = offset;
-            disk_ok(&req.root, 64 * 1024 * 1024)?;
+        file.flush().await.map_err(|e| e.to_string())?;
+        file.sync_all().await.map_err(|e| e.to_string())?;
+        drop(file);
+        // End to end: the board's SHA-256 of the file against our copy's.
+        let hash = board_hash(&mut stream, req, gate, cancel).await?;
+        let size = u64::from(hash.size);
+        if size > have {
+            // Still being written: fetch what was added.
+            continue;
         }
-        if end || offset >= file_size {
+        let path = part_path.clone();
+        let local = tokio::task::spawn_blocking(move || sha256_file(&path))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        if size == have && local == hash.sha256 {
             break;
         }
-        if data.is_empty() {
-            return Err(StreamError::Other("board returned an empty block".into()));
+        hash_mismatches += 1;
+        log::warn!("{} SD {}: SHA-256 differs from the card ({have} of {size} bytes); fetching it again", req.board.sender_id(), req.name);
+        let _ = tokio::fs::remove_file(&part_path).await;
+        have = 0;
+        if hash_mismatches >= 2 {
+            return Err(StreamError::Other(format!("{}: the copy's SHA-256 differs from the card's", req.name)));
         }
     }
-    file.flush().await.map_err(|e| e.to_string())?;
-    file.sync_all().await.map_err(|e| e.to_string())?;
-    drop(file);
     stream.finish(false);
     tokio::fs::rename(&part_path, &final_path)
         .await
         .map_err(|e| format!("cannot finalize download: {e}"))?;
     manager.update(req.id, |s| {
         s.phase = Phase::Complete;
-        s.message = "downloaded; ready to import".into();
+        s.bytes_done = have;
+        s.total_bytes = have;
+        s.message = "downloaded and SHA-256 verified; ready to import".into();
     });
     // A board launch file follows its GS launch capture; an ordinary file can
     // supply the lead-up of one already attached.
@@ -1509,6 +1840,16 @@ pub(crate) mod fc;
 
 #[path = "sd_download/relay.rs"]
 pub(crate) mod relay;
+
+#[path = "sd_download/sdx.rs"]
+pub(crate) mod sdx;
+
+#[path = "sd_download/xfer.rs"]
+pub(crate) mod xfer;
+
+#[cfg(test)]
+#[path = "sd_download/test_data.rs"]
+pub(crate) mod test_data;
 
 #[cfg(test)]
 mod tests;

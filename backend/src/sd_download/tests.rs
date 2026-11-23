@@ -1,6 +1,6 @@
 use super::*;
 use crate::recording_export::tests::{TestDirectory, export_state};
-use sedsnet::router::{P2pStreamEvent, RouterConfig};
+use sedsnet::router::RouterConfig;
 use std::sync::atomic::AtomicUsize;
 
 #[test]
@@ -33,42 +33,39 @@ fn only_idle_landed_and_recovery_admit_downloads() {
 }
 
 #[test]
-fn wire_codec_matches_firmware_layout() {
+fn wire_codec_matches_the_protocol_layout() {
     assert_eq!(encode_list(2, 0x0105), [0x21, 2, 5, 1]);
-    let read = encode_read(0x0102_0304, 0, "A.CSV");
-    assert_eq!(&read[..7], &[0x22, 4, 3, 2, 1, 0, 5]);
-    assert_eq!(&read[7..], b"A.CSV");
-    let mut data = vec![0xa2, 0, 1, 0, 2, 0, 0, 0x10, 0, 0, 0];
-    data.extend_from_slice(b"xyz");
-    assert_eq!(
-        decode_frame(&data),
-        Some(Frame::Data(DataFrame {
-            status: 0,
-            flags: 1,
-            offset: 512,
-            file_size: 16,
-            data: b"xyz".to_vec()
-        }))
-    );
+    let open = xfer::Open { xfer: 9, dir: 1, flags: xfer::OPEN_SDX, offset: 0x0102_0304, length: 0, rate: 48, msg: 460, window: 6, block_kib: 16, name: "A.CSV".into() };
+    let bytes = open.encode();
+    assert_eq!(&bytes[..19], &[0x25, 9, 1, 1, 4, 3, 2, 1, 0, 0, 0, 0, 48, 0, 0xcc, 1, 6, 16, 5]);
+    assert_eq!(xfer::Open::decode(&bytes), Some(open));
+    let answer = xfer::OpenAnswer { status: 0, xfer: 9, flags: 5, size: 1000, offset: 10, length: 990, msg: 460, block_kib: 16 };
+    let bytes = answer.encode();
+    assert_eq!(bytes.len(), 19);
+    assert_eq!((bytes[0], u32::from_le_bytes(bytes[4..8].try_into().unwrap()), bytes[18]), (0xa5, 1000, 16));
+    assert_eq!(decode_frame(&bytes), Some(Frame::Open(answer)));
+    let ack = xfer::Ack { xfer: 9, una: 0x0201, bitmap: 0x8000_0001, rate: 96, window: 6 };
+    assert_eq!(ack.encode(), vec![0x26, 9, 1, 2, 1, 0, 0, 0x80, 96, 0, 6]);
+    let body = b"xyz";
+    let data = xfer::Data { xfer: 9, flags: xfer::DATA_FIRST | xfer::DATA_LAST | xfer::DATA_SDX, seq: 7, block: 512, raw_len: 3, crc: 0xdead_beef, body };
+    let bytes = data.encode();
+    assert_eq!(bytes.len(), 17 + 3);
+    assert_eq!(&bytes[..9], &[0xa6, 9, 7, 7, 0, 0, 2, 0, 0]);
+    assert_eq!(xfer::Data::decode(&bytes), Some(data));
+    let mid = xfer::Data { flags: 0, raw_len: 0, crc: 0, ..xfer::Data::decode(&bytes).unwrap() }.encode();
+    assert_eq!(mid.len(), 9 + 3, "no trailer without LAST");
+    assert_eq!(xfer::encode_hash(0, "A.CSV"), [&[0x27, 0, 5][..], b"A.CSV"].concat());
+    let hash = xfer::HashAnswer { status: 0, flags: 4, size: 77, sha256: [3; 32] };
+    assert_eq!(hash.encode().len(), 39);
+    assert_eq!(decode_frame(&hash.encode()), Some(Frame::Hash(hash)));
     let mut list = vec![0xa1, 0, 1, 3, 0, 42, 0, 0, 0, 1, 5, 0];
     list.extend_from_slice(b"L.CSV");
     assert_eq!(
         decode_frame(&list),
-        Some(Frame::List(ListFrame {
-            status: 0,
-            dir: 1,
-            index: 3,
-            size: 42,
-            flags: 1,
-            name: "L.CSV".into()
-        }))
+        Some(Frame::List(ListFrame { status: 0, dir: 1, index: 3, size: 42, flags: 1, name: "L.CSV".into() }))
     );
     list.push(0);
-    assert_eq!(
-        decode_frame(&list),
-        None,
-        "name length must match the frame"
-    );
+    assert_eq!(decode_frame(&list), None, "name length must match the frame");
     for name in ["..", "a/b", "a\\b", "", ".", "x y", &"A".repeat(64)] {
         assert!(!valid_name(name), "{name:?}");
     }
@@ -77,25 +74,82 @@ fn wire_codec_matches_firmware_layout() {
 
 // ------------------------------------------------------------ mock board
 
-struct MockBoard {
-    files: Vec<(u8, String, Vec<u8>)>,
-    reads: AtomicUsize,
-    /// After this many READs, run `on_read` (cancel or state flip).
-    trigger_after: usize,
-    on_read: Box<dyn Fn() + Send + Sync>,
+/// A board's SD card served with protocol v2 by the shared engine
+/// (`xfer::serve`), as the FC and DAQ firmware serve it.
+pub(super) struct MockCard {
+    /// (dir, name, bytes, still open)
+    pub files: Mutex<Vec<(u8, String, Vec<u8>, bool)>>,
+    pub opens: AtomicUsize,
+    /// Raw bytes cut into blocks (what the board read for the GS).
+    pub served: AtomicU64,
+    /// Corrupt the CRC-32 of this many blocks.
+    pub corrupt: AtomicUsize,
+    /// Run `on_trigger` once `served` reaches this.
+    pub trigger_at: AtomicU64,
+    pub on_trigger: Mutex<Box<dyn FnMut() + Send>>,
+    /// When ACKs with rate 0 (pauses) arrived, and the last ACK's rate.
+    pub pause_acks: Mutex<Vec<Instant>>,
+    last_rate: AtomicU64,
+}
+
+impl MockCard {
+    pub(super) fn new(files: Vec<(u8, &str, Vec<u8>)>) -> Self {
+        Self {
+            files: Mutex::new(files.into_iter().map(|(d, n, b)| (d, n.to_string(), b, false)).collect()),
+            opens: AtomicUsize::new(0),
+            served: AtomicU64::new(0),
+            corrupt: AtomicUsize::new(0),
+            trigger_at: AtomicU64::new(u64::MAX),
+            on_trigger: Mutex::new(Box::new(|| {})),
+            pause_acks: Mutex::new(Vec::new()),
+            last_rate: AtomicU64::new(1),
+        }
+    }
+    pub(super) fn trigger(&self, at: u64, f: impl FnMut() + Send + 'static) {
+        *self.on_trigger.lock().unwrap() = Box::new(f);
+        self.trigger_at.store(at, Ordering::SeqCst);
+    }
+}
+
+impl xfer::Catalog for MockCard {
+    fn list(&self, dir: u8, index: u16) -> Option<(String, u64, bool)> {
+        let files = self.files.lock().unwrap();
+        files.iter().filter(|f| f.0 == dir).nth(usize::from(index)).map(|f| (f.1.clone(), f.2.len() as u64, f.3))
+    }
+    fn file(&self, dir: u8, name: &str) -> Result<xfer::Snapshot, u8> {
+        let files = self.files.lock().unwrap();
+        let f = files.iter().find(|f| f.0 == dir && f.1 == name).ok_or(xfer::STATUS_NOT_FOUND)?;
+        Ok(xfer::Snapshot { bytes: Arc::new(f.2.clone()), growing: f.3 })
+    }
+    fn on_open(&self, _open: &xfer::Open) {
+        self.opens.fetch_add(1, Ordering::SeqCst);
+    }
+    fn corrupt_next_block(&self) -> bool {
+        self.corrupt.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok()
+    }
+    fn on_ack(&self, ack: &xfer::Ack) {
+        if self.last_rate.swap(u64::from(ack.rate), Ordering::SeqCst) != 0 && ack.rate == 0 {
+            self.pause_acks.lock().unwrap().push(Instant::now());
+        }
+    }
+    fn on_served(&self, raw: usize) {
+        let total = self.served.fetch_add(raw as u64, Ordering::SeqCst) + raw as u64;
+        if total >= self.trigger_at.load(Ordering::SeqCst) {
+            self.trigger_at.store(u64::MAX, Ordering::SeqCst);
+            (self.on_trigger.lock().unwrap())();
+        }
+    }
+}
+
+/// Serves `card` on port 4511 with the given DATA message limit.
+pub(super) fn serve_card(router: &Arc<Router>, card: Arc<MockCard>, max_msg: u16) {
+    let opts = xfer::ServeOptions { max_msg, zstd: false, min_gap: Duration::ZERO, tick: Duration::from_millis(2) };
+    xfer::serve(router, SD_FILE_STREAM_PORT, card, opts, None).unwrap();
 }
 
 fn link() -> (Arc<Router>, Arc<Router>) {
-    let gs = Arc::new(Router::new(
-        RouterConfig::default()
-            .with_hostname("GS")
-            .with_static_address(0x2001),
-    ));
-    let daq = Arc::new(Router::new(
-        RouterConfig::default()
-            .with_hostname("DAQ")
-            .with_static_address(0x2002),
-    ));
+    let gs = Arc::new(Router::new(RouterConfig::default().with_hostname("GS").with_static_address(0x2001)));
+    let daq = Arc::new(Router::new(RouterConfig::default().with_hostname("DAQ").with_static_address(0x2002)));
     let daq_rx = daq.clone();
     gs.add_side_packet("to-daq", move |packet| daq_rx.rx_from_side(packet, 0));
     let gs_rx = gs.clone();
@@ -110,73 +164,8 @@ fn link() -> (Arc<Router>, Arc<Router>) {
     (gs, daq)
 }
 
-fn serve(daq: &Arc<Router>, board: Arc<MockBoard>) {
-    let reply_router = daq.clone();
-    daq.bind_p2p_stream_port(SD_FILE_STREAM_PORT, move |event: P2pStreamEvent<'_>| {
-        if event.kind != P2pStreamEventKind::Data || event.payload.is_empty() {
-            return Ok(());
-        }
-        let p = event.payload;
-        let mut frames: Vec<Vec<u8>> = Vec::new();
-        match p[0] {
-            OP_LIST => {
-                let (dir, index) = (p[1], u16::from_le_bytes([p[2], p[3]]) as usize);
-                let entry = board.files.iter().filter(|f| f.0 == dir).nth(index);
-                let mut f = vec![
-                    0xa1,
-                    if entry.is_some() { 0 } else { STATUS_END },
-                    dir,
-                    p[2],
-                    p[3],
-                ];
-                let (size, name) = entry.map_or((0, ""), |e| (e.2.len() as u32, e.1.as_str()));
-                f.extend_from_slice(&size.to_le_bytes());
-                f.extend_from_slice(&[0, name.len() as u8, 0]);
-                f.extend_from_slice(name.as_bytes());
-                frames.push(f);
-            }
-            OP_READ => {
-                let n = board.reads.fetch_add(1, Ordering::SeqCst) + 1;
-                if n == board.trigger_after {
-                    (board.on_read)();
-                }
-                let offset = u32::from_le_bytes(p[1..5].try_into().unwrap()) as usize;
-                let name = std::str::from_utf8(&p[7..]).unwrap();
-                let data = &board
-                    .files
-                    .iter()
-                    .find(|f| f.0 == p[5] && f.1 == name)
-                    .unwrap()
-                    .2;
-                let header = |status: u8, flags: u8, off: usize| {
-                    let mut f = vec![0xa2, status, flags];
-                    f.extend_from_slice(&(off as u32).to_le_bytes());
-                    f.extend_from_slice(&(data.len() as u32).to_le_bytes());
-                    f
-                };
-                if offset >= data.len() {
-                    frames.push(header(STATUS_END, FLAG_LAST, offset));
-                } else {
-                    let end = ((offset / 512 + 1) * 512).min(data.len());
-                    let mut at = offset;
-                    while at < end {
-                        let to = (at + 100).min(end);
-                        let mut f = header(0, if to == end { FLAG_LAST } else { 0 }, at);
-                        f.extend_from_slice(&data[at..to]);
-                        frames.push(f);
-                        at = to;
-                    }
-                }
-            }
-            OP_CANCEL => frames.push(vec![0xa3, 0]),
-            _ => {}
-        }
-        for f in frames {
-            reply_router.send_p2p_stream(event.stream_id, &f)?;
-        }
-        Ok(())
-    })
-    .unwrap();
+fn serve(daq: &Arc<Router>, board: Arc<MockCard>) {
+    serve_card(daq, board, 1024);
 }
 
 pub(super) fn pump(gs: Arc<Router>, daq: Arc<Router>) -> (Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
@@ -187,6 +176,23 @@ pub(super) fn pump(gs: Arc<Router>, daq: Arc<Router>) -> (Arc<AtomicBool>, tokio
             gs.process_all_queues().unwrap();
             daq.process_all_queues().unwrap();
             tokio::task::yield_now().await;
+        }
+    });
+    (running, task)
+}
+
+/// As [`pump`], but nothing moves between the routers while `up` is false
+/// (a lost link: both sides keep queueing).
+pub(super) fn pump_link(gs: Arc<Router>, board: Arc<Router>, up: Arc<AtomicBool>) -> (Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
+    let running = Arc::new(AtomicBool::new(true));
+    let flag = running.clone();
+    let task = tokio::spawn(async move {
+        while flag.load(Ordering::Relaxed) {
+            if up.load(Ordering::SeqCst) {
+                gs.process_all_queues().unwrap();
+                board.process_all_queues().unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
     });
     (running, task)
@@ -211,15 +217,7 @@ async fn lists_downloads_resumes_and_verifies_partial_tail() {
     let (gs, daq) = link();
     let launch = pattern(3 * 512 + 77, 1);
     let utc = pattern(900, 9);
-    let board = Arc::new(MockBoard {
-        files: vec![
-            (0, "DAQ_LAUNCH_1_000.CSV".into(), launch.clone()),
-            (1, "DAQ_1_000.CSV".into(), utc),
-        ],
-        reads: AtomicUsize::new(0),
-        trigger_after: usize::MAX,
-        on_read: Box::new(|| {}),
-    });
+    let board = Arc::new(MockCard::new(vec![(0, "DAQ_LAUNCH_1_000.CSV", launch.clone()), (1, "DAQ_1_000.CSV", utc)]));
     serve(&daq, board.clone());
     let (running, task) = pump(gs.clone(), daq.clone());
     let manager: &'static Manager = Box::leak(Box::new(Manager::default()));
@@ -302,15 +300,11 @@ async fn lists_downloads_resumes_and_verifies_partial_tail() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_keeps_partial_and_a_later_start_resumes_it() {
     let (gs, daq) = link();
-    let data = pattern(8 * 512, 3);
+    let data = pattern(400 * 1024, 3);
     let cancel = Arc::new(AtomicBool::new(false));
     let trip = cancel.clone();
-    let board = Arc::new(MockBoard {
-        files: vec![(0, "F.CSV".into(), data.clone())],
-        reads: AtomicUsize::new(0),
-        trigger_after: 3,
-        on_read: Box::new(move || trip.store(true, Ordering::SeqCst)),
-    });
+    let board = Arc::new(MockCard::new(vec![(0, "F.CSV", data.clone())]));
+    board.trigger(64 * 1024, move || trip.store(true, Ordering::SeqCst));
     serve(&daq, board.clone());
     let (running, task) = pump(gs.clone(), daq.clone());
     let manager: &'static Manager = Box::leak(Box::new(Manager::default()));
@@ -330,10 +324,7 @@ async fn cancel_keeps_partial_and_a_later_start_resumes_it() {
     assert!(matches!(error, StreamError::Cancelled), "{error:?}");
     let (final_path, part_path) = local_paths(&root.0, Board::DaqBoard, "LAUNCH", "F.CSV");
     let kept = std::fs::metadata(&part_path).unwrap().len();
-    assert!(
-        kept > 0 && kept < data.len() as u64 && kept % 512 == 0,
-        "kept {kept}"
-    );
+    assert!(kept > 0 && kept < data.len() as u64, "kept {kept}: whole verified blocks only");
     assert!(!final_path.exists());
     // Only one job may be active; a finished one does not block the next.
     manager.update(id, |s| s.phase = Phase::Cancelled);
@@ -368,15 +359,11 @@ async fn cancel_keeps_partial_and_a_later_start_resumes_it() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn leaving_idle_pauses_the_transfer_and_refuses_new_work() {
     let (gs, daq) = link();
-    let data = pattern(6 * 512, 5);
+    let data = pattern(400 * 1024, 5);
     let blocked = Arc::new(AtomicBool::new(false));
     let trip = blocked.clone();
-    let board = Arc::new(MockBoard {
-        files: vec![(0, "F.CSV".into(), data.clone())],
-        reads: AtomicUsize::new(0),
-        trigger_after: 2,
-        on_read: Box::new(move || trip.store(true, Ordering::SeqCst)),
-    });
+    let board = Arc::new(MockCard::new(vec![(0, "F.CSV", data.clone())]));
+    board.trigger(32 * 1024, move || trip.store(true, Ordering::SeqCst));
     serve(&daq, board);
     let (running, task) = pump(gs.clone(), daq.clone());
     let manager: &'static Manager = Box::leak(Box::new(Manager::default()));
@@ -703,7 +690,8 @@ fn block_times_skip_partial_lines_and_command_traffic_quiets_the_link() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn large_session_file_yields_only_the_lead_up_window_and_resumes_after_a_drop() {
-    leadup::TEST_RATE.store(10_000_000, Ordering::Relaxed);
+    // Slow enough (DATA B/s) that the link drop lands between blocks.
+    leadup::TEST_RATE.store(2_000, Ordering::Relaxed);
     leadup::TEST_SMALL_FILE_BYTES.store(64 * 1024, Ordering::Relaxed);
     let root = TestDirectory::new();
     let launch_name = "DAQ_LAUNCH_1800000000000_000.CSV";
@@ -719,19 +707,16 @@ async fn large_session_file_yields_only_the_lead_up_window_and_resumes_after_a_d
     let (gs, daq) = link();
     let gate_open = Arc::new(AtomicBool::new(true));
     let flip = gate_open.clone();
-    let board = Arc::new(MockBoard {
-        files: vec![
-            (0, launch_name.into(), daq_csv(T0 - 10_000, T0 + 20_000, 100)),
-            (1, "DAQ_1799999390000_000.CSV".into(), session.clone()),
-            (2, "DAQ_0_000.CSV".into(), old),
-        ],
-        reads: AtomicUsize::new(0),
-        // Drop the link part-way through the window fetch.
-        trigger_after: 40,
-        on_read: Box::new(move || flip.store(false, Ordering::SeqCst)),
-    });
+    let board = Arc::new(MockCard::new(vec![
+        (0, launch_name, daq_csv(T0 - 10_000, T0 + 20_000, 100)),
+        (1, "DAQ_1799999390000_000.CSV", session.clone()),
+        (2, "DAQ_0_000.CSV", old),
+    ]));
+    // Drop the link part-way through the window fetch (after the tails, the
+    // header and the search, a few KB into the window).
+    board.trigger(40 * 1024, move || flip.store(false, Ordering::SeqCst));
     serve(&daq, board.clone());
-    let (running, task) = pump(gs.clone(), daq.clone());
+    let (running, task) = pump_link(gs.clone(), daq.clone(), gate_open.clone());
     let manager: &'static Manager = Box::leak(Box::new(Manager::default()));
     let gate_flag = gate_open.clone();
     let gate: Gate = Arc::new(move || (!gate_flag.load(Ordering::SeqCst)).then(|| "link busy".to_owned()));
@@ -741,7 +726,7 @@ async fn large_session_file_yields_only_the_lead_up_window_and_resumes_after_a_d
     let paused = leadup::load(&root.0).remove(0);
     assert_eq!(paused.source.as_deref(), Some("DAQ_1799999390000_000.CSV"));
     assert!(paused.start_offset.is_some() && !paused.done);
-    let reads_before = board.reads.load(Ordering::SeqCst);
+    let reads_before = board.served.load(Ordering::SeqCst);
     // Link back: the job resumes from what it already has.
     gate_open.store(true, Ordering::SeqCst);
     leadup::step(manager, &root.0, gs.clone(), &paused, &gate).await.unwrap();
@@ -749,7 +734,7 @@ async fn large_session_file_yields_only_the_lead_up_window_and_resumes_after_a_d
     assert!(done.done, "{done:?}");
     assert_eq!(done.phase, "complete");
     // Only the window was read, never the whole session file.
-    let read_bytes = (board.reads.load(Ordering::SeqCst) as u64) * BLOCK_BYTES;
+    let read_bytes = board.served.load(Ordering::SeqCst);
     assert!(read_bytes < session.len() as u64 / 3, "read {read_bytes} of {}", session.len());
     let _ = reads_before;
     // Exactly the minute before the launch file, no overlap, no duplicates.
@@ -773,19 +758,15 @@ async fn large_session_file_yields_only_the_lead_up_window_and_resumes_after_a_d
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_small_session_file_is_downloaded_whole_and_kept() {
-    leadup::TEST_RATE.store(10_000_000, Ordering::Relaxed);
+    // Slow enough (DATA B/s) that the link drop lands between blocks.
+    leadup::TEST_RATE.store(2_000, Ordering::Relaxed);
     let root = TestDirectory::new();
     let launch_name = "DAQ_LAUNCH_1800000000000_001.CSV";
     let folder = capture_with_daq_launch(&root.0, launch_name).await;
     // A short session (two minutes at 1 Hz) is far under the small-file limit.
     let session = daq_csv(T0 - 120_000, T0 - 10_000, 1_000);
     let (gs, daq) = link();
-    let board = Arc::new(MockBoard {
-        files: vec![(1, "DAQ_1799999880000_000.CSV".into(), session.clone())],
-        reads: AtomicUsize::new(0),
-        trigger_after: usize::MAX,
-        on_read: Box::new(|| {}),
-    });
+    let board = Arc::new(MockCard::new(vec![(1, "DAQ_1799999880000_000.CSV", session.clone())]));
     serve(&daq, board);
     let (running, task) = pump(gs.clone(), daq.clone());
     let manager: &'static Manager = Box::leak(Box::new(Manager::default()));

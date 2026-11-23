@@ -2,7 +2,7 @@ use super::*;
 use crate::recording_export::tests::TestDirectory;
 use crate::recording_store::EventKind;
 use crate::sd_download::fc::{Signals, Stage};
-use crate::sd_download::tests::pump;
+use crate::sd_download::tests::{pump, pump_link};
 use sedsnet::router::RouterConfig;
 
 const T0: i64 = 1_800_000_000_000;
@@ -178,13 +178,22 @@ async fn the_forward_resumes_across_a_link_drop_and_a_restart() {
     rrls_outbox(&rrls_root.0, &launch, false);
     let (gs, rrls) = link();
     serve(&rrls, rrls_root.0.clone(), None).unwrap();
-    let (running, task) = pump(gs.clone(), rrls.clone());
+    let up = Arc::new(AtomicBool::new(true));
+    let (running, task) = pump_link(gs.clone(), rrls.clone(), up.clone());
     let part = gs_root.0.join("sd-downloads/FC/RRLS").join(format!("{}.part", launch_name()));
     let p = part.clone();
     // The link drops once 8 KiB have arrived.
-    let gate: Gate = Arc::new(move || (std::fs::metadata(&p).map_or(0, |m| m.len()) >= 8192).then(|| "RRLS link lost".to_string()));
+    let lost = up.clone();
+    let gate: Gate = Arc::new(move || {
+        if std::fs::metadata(&p).map_or(0, |m| m.len()) >= 8192 {
+            lost.store(false, Ordering::SeqCst);
+        }
+        (!lost.load(Ordering::SeqCst)).then(|| "RRLS link lost".to_string())
+    });
     let manager: &'static Manager = Box::leak(Box::new(Manager::default()));
-    let (env, _) = pull_env(manager, gs.clone(), &gs_root.0, gate);
+    let (mut env, _) = pull_env(manager, gs.clone(), &gs_root.0, gate);
+    // Slow enough that the link drop lands between blocks.
+    env.rate = 300;
     assert!(matches!(pull(&env).await, Err(StreamError::Gate(_))));
     let kept = std::fs::metadata(&part).unwrap().len();
     assert!(kept >= 8192 && kept < launch.len() as u64);
@@ -194,6 +203,7 @@ async fn the_forward_resumes_across_a_link_drop_and_a_restart() {
     let (env2, _) = pull_env(manager2, gs.clone(), &gs_root.0, Arc::new(|| None));
     rrls.clear_p2p_stream_port(RELAY_STREAM_PORT);
     serve(&rrls, rrls_root.0.clone(), None).unwrap();
+    up.store(true, Ordering::SeqCst);
     assert_eq!(pull(&env2).await.unwrap(), 1);
     let job = manager2.list().into_iter().find(|j| j.name == launch_name()).unwrap();
     assert_eq!(job.resumed_from, kept, "resumed by offset");
@@ -223,7 +233,8 @@ async fn a_corrupt_hop_is_refused_by_sha256_and_the_forward_yields_to_commands()
     assert!(matches!(pull(&held).await, Err(StreamError::Gate(r)) if r.contains("commands")));
     let (env, notes) = pull_env(manager, gs.clone(), &gs_root.0, Arc::new(|| None));
     for _ in 0..2 {
-        assert!(matches!(pull(&env).await, Err(StreamError::Other(e)) if e.contains("SHA-256")));
+        let result = pull(&env).await;
+        assert!(matches!(&result, Err(StreamError::Other(e)) if e.contains("SHA-256")), "{result:?}");
     }
     assert_eq!(pull(&env).await.unwrap(), 1, "third mismatch: refused");
     let state = load_state(&gs_root.0);

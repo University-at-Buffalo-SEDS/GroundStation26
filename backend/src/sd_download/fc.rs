@@ -4,8 +4,7 @@
 //! it for [`LANDED_CONFIRM_MS`] (a transient Landed that reverts does not
 //! count), or the FC reports Recovery, a job is queued in
 //! `data/sd-downloads/FC/jobs.json`. The worker then, over SEDSnet P2P port
-//! 4511 (same wire as the DAQ, FC directory 0 = card root, CRC-32 per READ
-//! answer):
+//! 4511 (SD transfer protocol v2 as the DAQ, FC directory 0 = card root):
 //!
 //! 1. lists the card root and picks the newest `irec_LAUNCH*` file of this
 //!    flight ([`choose_launch_file`]);
@@ -17,8 +16,11 @@
 //! 4. optionally (admin setting `fc_sd_leadup`, default on) reads the 60 s
 //!    lead-up window from the same boot's ordinary file (`leadup.rs`).
 //!
-//! It is the lowest-priority user of the link: one 512-byte READ in flight,
-//! paced to [`rate`] (radio 512 B/s, wired 16 KiB/s), paused while commands
+//! It is the lowest-priority user of the link: a streamed transfer whose
+//! window and rate the station sets ([`profile`], [`rate`]: radio 460-byte
+//! DATA messages, window 6, 768 B/s of DATA rising to 1536 B/s while the
+//! link is calm; wired 512-byte messages, window 8, 64 KiB/s), paused (rate 0)
+//! while commands
 //! were sent in the last 10 s, while recovery GPS stalls, while the radio is
 //! congested or poor, while another SD transfer or the DAQ launch fetch runs,
 //! and while an operator stop is in force (persisted). Failures back off up
@@ -41,8 +43,10 @@ const GPS_GONE_MS: u64 = 60_000;
 const OPEN_FILE_WAIT_MS: u64 = 120_000;
 const MAX_BACKOFF_MS: u64 = 60_000;
 const JOBS_FILE: &str = "jobs.json";
-const RADIO_DEFAULT_BPS: u64 = 512;
-const WIRED_DEFAULT_BPS: u64 = 16 * 1024;
+/// DATA bytes per second (SDX-encoded, headers included; about 6x as many
+/// CSV bytes on an FC launch file).
+const RADIO_DEFAULT_BPS: u64 = 768;
+const WIRED_DEFAULT_BPS: u64 = 64 * 1024;
 /// FC rows per millisecond on the pad (FC docs section 7.5: ~65 KB/s).
 const FC_PAD_BYTES_PER_MS: u64 = 65;
 
@@ -93,7 +97,16 @@ fn env_rate(name: &str, default: u64, range: std::ops::RangeInclusive<u64>) -> u
         .unwrap_or(default)
 }
 
-/// Payload bytes per second for the link.
+/// DATA message size and window for the link.
+pub(crate) fn profile(link: Link) -> Profile {
+    match link {
+        Link::Radio => Profile::RADIO,
+        Link::Wired => Profile::FC_WIRED,
+    }
+}
+
+/// Starting DATA bytes per second for the link (the env names are kept from
+/// protocol v1, where they counted CSV bytes).
 pub(crate) fn rate(link: Link) -> u64 {
     match link {
         Link::Radio => env_rate("GS_FC_SD_RADIO_MAX_BYTES_PER_SEC", RADIO_DEFAULT_BPS, 64..=65_536),
@@ -101,19 +114,22 @@ pub(crate) fn rate(link: Link) -> u64 {
     }
 }
 
-/// Radio ceiling for the adaptive rate (payload B/s). The RF board's radio
+/// Radio ceiling for the adaptive rate (DATA B/s). The RF board's radio
 /// turn (691 B per 200 ms of UART bytes, ~3.4 KB/s for all AV-bay egress)
-/// carries ~1.5 KB/s of telemetry; one 512-byte block costs ~1094 B down and
-/// ~414 B up on the wire (measured, `wire_bytes_per_block_on_an_instant_link`),
-/// so 640 B/s payload (~1.4 KB/s down, with telemetry ~83 % of the turn) is
-/// the default ceiling; ~900 B/s would use the whole turn.
+/// carries ~1.5 KB/s of telemetry. A 460-byte DATA message goes out as three
+/// 192-byte frames, about 1.35 wire bytes per DATA byte down (measured by
+/// `wire_bytes_per_payload_byte_on_an_instant_link`), so the 768 B/s start
+/// uses ~1.0 KB/s of the turn and the 1536 B/s ceiling ~2.1 KB/s: at the
+/// ceiling the turn is full with telemetry, which is why the rate rises only
+/// while the GS radio queue stays nearly empty and halves on any gap.
 pub(crate) fn radio_ceiling() -> u64 {
-    env_rate("GS_FC_SD_RADIO_CEILING_BYTES_PER_SEC", 640, 64..=4096).max(rate(Link::Radio))
+    env_rate("GS_FC_SD_RADIO_CEILING_BYTES_PER_SEC", 1536, 64..=4096).max(rate(Link::Radio))
 }
 
-/// Adaptive radio rate: starts at the base rate, rises by `STEP` every
-/// `STEP_MS` while recovery traffic is light (no yield reason and no command
-/// for [`CALM_AFTER_COMMAND_MS`]) up to the ceiling, and drops back to the
+/// Adaptive radio rate (AIMD): starts at the base rate, rises by `STEP`
+/// every `STEP_MS` while recovery traffic is light (no yield reason and no
+/// command for [`CALM_AFTER_COMMAND_MS`]) up to the ceiling, halves on a gap
+/// or a bad block (not below [`MIN_RATE`]), and drops back to at most the
 /// base at once on any yield trigger. The same rule serves the direct and
 /// the RRLS path.
 #[derive(Debug, Clone)]
@@ -126,18 +142,27 @@ pub(crate) struct AdaptiveRate {
 }
 
 pub(crate) const CALM_AFTER_COMMAND_MS: u64 = 30_000;
-const STEP: u64 = 64;
-const STEP_MS: u64 = 5_000;
+const STEP: u64 = 128;
+const STEP_MS: u64 = 2_000;
+/// The halving stops here (DATA B/s): one 460-byte message every ~2 s.
+pub(crate) const MIN_RATE: u64 = 256;
 
 impl AdaptiveRate {
     pub(crate) fn new(base: u64, ceiling: u64) -> Self {
         Self { base, ceiling: ceiling.max(base), current: base, calm_since: None, last_step: 0 }
     }
     /// `calm`: Landed/Recovery, no yield reason, no recent command, GPS
-    /// fresh, the radio queue (nearly) empty.
-    pub(crate) fn update(&mut self, now: u64, calm: bool) -> u64 {
+    /// fresh, the radio queue (nearly) empty. `losses`: gaps or bad blocks
+    /// seen since the last call.
+    pub(crate) fn update(&mut self, now: u64, calm: bool, losses: u32) -> u64 {
+        if losses > 0 {
+            self.current = (self.current / 2).max(MIN_RATE.min(self.base));
+            self.calm_since = Some(now);
+            self.last_step = now;
+            return self.current;
+        }
         if !calm {
-            self.current = self.base;
+            self.current = self.current.min(self.base);
             self.calm_since = None;
             return self.current;
         }
@@ -547,8 +572,8 @@ pub(crate) struct Env {
     pub capture_pending: Arc<dyn Fn() -> bool + Send + Sync>,
     pub notify: Arc<dyn Fn(String) + Send + Sync>,
     pub alive: Arc<dyn Fn() -> bool + Send + Sync>,
-    /// The pacing rate read before every block (adaptive on the radio).
-    pub rate_fn: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
+    /// The pacing rate, read about every 500 ms (adaptive on the radio).
+    pub rate_fn: Option<RateFn>,
     /// Worker poll period while waiting or paused.
     pub poll: Duration,
     /// Backoff unit: retry n waits min(5 * 2^(n-1) units, 60 s worth).
@@ -765,7 +790,9 @@ async fn launch_step(env: &Env, job: &FcJob) -> Step {
     });
     let mut req = TransferRequest::new(id, Board::FlightComputer, 0, &name, env.downloads(), env.rate);
     req.attach = false;
+    req.profile = profile(env.link);
     req.rate_fn = env.rate_fn.clone();
+    req.on_pause = Some(pause_hook(env, job.id));
     let result = transfer(env.manager, env.router.clone(), &req, &env.gate(Stage::Launch), &cancel).await;
     let crc = req.crc_errors.load(Ordering::Relaxed);
     if result.is_err() {
@@ -885,7 +912,7 @@ async fn leadup_step(env: &Env, job: &FcJob) -> Step {
             j.phase = "lead_up".into();
             j.message = format!("lead-up: {}", lead.message);
         });
-        let params = leadup::Params { rate: env.rate, whole_file_bytes: 0, bytes_per_ms: FC_PAD_BYTES_PER_MS };
+        let params = leadup::Params { rate: env.rate, whole_file_bytes: 0, bytes_per_ms: FC_PAD_BYTES_PER_MS, profile: profile(env.link) };
         if let Err(error) = leadup::step_with(env.manager, &env.root, env.router.clone(), &lead, &env.gate(Stage::LeadUp), params).await {
             return error.into();
         }
@@ -915,6 +942,29 @@ async fn leadup_step(env: &Env, job: &FcJob) -> Step {
     complete(env, job.id, "complete", &message);
     (env.notify)(format!("FC SD collection complete: {message}."));
     Step::Progress
+}
+
+/// Shows a pause of the open transfer in the job (the stream stays open).
+fn pause_hook(env: &Env, id: u64) -> PauseHook {
+    let root = env.root.clone();
+    let manager = env.manager;
+    Arc::new(move |reason: Option<&str>| {
+        update_job(&root, id, |j| match reason {
+            Some(reason) => {
+                j.phase = "paused".into();
+                j.message = format!("paused: {reason}");
+                j.paused_reason = Some(reason.into());
+            }
+            None => {
+                j.phase = "transferring".into();
+                j.message = "transferring".into();
+                j.paused_reason = None;
+            }
+        });
+        if let Some(job) = load(&root).jobs.iter().find(|j| j.id == id).and_then(|j| j.manager_job) {
+            manager.update(job, |s| s.message = reason.map_or_else(|| "transferring".into(), |r| format!("paused: {r}")));
+        }
+    })
 }
 
 fn complete(env: &Env, id: u64, phase: &str, message: &str) {
@@ -984,10 +1034,10 @@ fn production_env(state: &Arc<AppState>, root: &FsPath, router: Arc<Router>) -> 
         }
         None
     });
-    let rate_fn: Option<Arc<dyn Fn() -> u64 + Send + Sync>> = (link == Link::Radio).then(|| {
+    let rate_fn: Option<RateFn> = (link == Link::Radio).then(|| {
         let adaptive = Mutex::new(AdaptiveRate::new(rate(link), radio_ceiling()));
         let weak = Arc::downgrade(state);
-        Arc::new(move || {
+        Arc::new(move |losses: u32| {
             let now = now_ms();
             let landed = weak.upgrade().is_some_and(|s| {
                 s.fc_phase.snapshot().is_some_and(|o| matches!(o.phase, FlightState::Landed | FlightState::Recovery))
@@ -997,8 +1047,8 @@ fn production_env(state: &Arc<AppState>, root: &FsPath, router: Arc<Router>) -> 
                 b["pending_bytes"].as_u64().unwrap_or(0) < 512 && b["parked_frames"].as_u64().unwrap_or(0) == 0
             });
             let calm = landed && SIGNALS.calm(now) && radio_reason().is_none() && queue_quiet;
-            adaptive.lock().unwrap_or_else(|e| e.into_inner()).update(now, calm)
-        }) as Arc<dyn Fn() -> u64 + Send + Sync>
+            adaptive.lock().unwrap_or_else(|e| e.into_inner()).update(now, calm, losses)
+        }) as RateFn
     });
     let captures = Arc::downgrade(state);
     let notifier = Arc::downgrade(state);
@@ -1166,7 +1216,9 @@ pub(crate) fn status_at(root: &FsPath, manager: &Manager, enabled: bool, lead_up
             measured = live.bytes_per_second;
         }
         let paused = job.paused_reason.clone();
-        let eta = (paused.is_none() && total > done).then(|| (total - done) / if measured > 0 { measured.min(rate) } else { rate }.max(1));
+        // `rate` counts DATA bytes; SDX carries about 5 CSV bytes per DATA
+        // byte, so that is the estimate until a rate is measured.
+        let eta = (paused.is_none() && total > done).then(|| (total - done) / if measured > 0 { measured } else { rate * 5 }.max(1));
         ActiveStatus {
             id: job.id,
             state: job.phase.clone(),

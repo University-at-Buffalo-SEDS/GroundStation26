@@ -12,16 +12,21 @@ same as for a card read by hand.
 - Allowed only in Idle, Landed and Recovery, and never while a fill/launch
   sequence is active. A running transfer stops within 100 ms of a state
   change. The board resets the stream too.
-- One transfer runs at a time, one 512-byte block per request, capped at
-  `GS_SD_DOWNLOAD_MAX_BYTES_PER_SEC` (default 16384, range 512 to 262144).
-  FC downloads use the FC link rate: 512 B/s over the AV-bay radio
-  (`GS_FC_SD_RADIO_MAX_BYTES_PER_SEC`), 16 KiB/s wired
+- One transfer runs at a time, with the SD transfer protocol v2
+  ([sd-transfer.md](sd-transfer.md)): streamed 16 KiB blocks in SDX (lossless
+  binary rows, about 5-6x smaller than the CSV), selective ACKs, a window
+  and a rate the station sets. The rate counts DATA bytes (SDX plus message
+  headers): `GS_SD_DOWNLOAD_MAX_BYTES_PER_SEC` (default 16384, range 512 to
+  262144) for the DAQ. FC downloads use the FC link rate: 768 B/s over the
+  AV-bay radio (`GS_FC_SD_RADIO_MAX_BYTES_PER_SEC`), 64 KiB/s wired
   (`GS_FC_SD_WIRED_MAX_BYTES_PER_SEC`); see "Flight Computer" below.
 - Data is appended to `sd-downloads/<board>/<folder>/<name>.part` next to the
-  recordings. Cancel, pause, failure or restart keep the partial file. Starting
-  the same file again resumes after the last byte, once the board's copy of the
-  block holding that byte still matches. If it does not match, the download restarts.
-  A finished file is renamed without `.part`.
+  recordings: the verified bytes in file order. Cancel, pause, failure or
+  restart keep the partial file. Starting the same file again resumes after
+  the last byte, once the board's copy of the last 512 bytes still matches.
+  If it does not match, the download restarts. A finished copy's SHA-256 is
+  compared with the board's (HASH) before it is renamed without `.part`; a
+  mismatch discards it and fetches the file once more.
 - Each 4 MiB the free disk is checked against the SD import reserve.
 
 ## API
@@ -39,18 +44,15 @@ same as for a card read by hand.
 
 ## Boards and folders
 
-| Board | Wire directories | Local folder | Answer check |
+| Board | Wire directories | Local folder | DATA message, window |
 | --- | --- | --- | --- |
-| DAQ | 0 `LAUNCH`, 1 `UTC`, 2 `NO_UTC` (DAQ-Board `docs/sd-network-download.md`) | `sd-downloads/DAQ/<dir>/` | none |
-| FC | 0 = card root, shown as `ROOT`; LIST returns `irec*.csv` only | `sd-downloads/FC/ROOT/` | CRC-32 |
+| DAQ | 0 `LAUNCH`, 1 `UTC`, 2 `NO_UTC` (DAQ-Board `docs/sd-network-download.md`) | `sd-downloads/DAQ/<dir>/` | 1 KiB, 16 |
+| FC | 0 = card root, shown as `ROOT`; LIST returns `irec*.csv` only | `sd-downloads/FC/ROOT/` | radio 460 B, 6; wired 512 B, 8 |
 
-**The FC's CRC-32.** The last DATA frame of every OK READ answer from the FC
-has flags `0x03` (last + CRC). It carries 4 trailing bytes after the data:
-the zlib CRC-32 (LE) of all data bytes of that answer. The station checks it.
-On a mismatch it requests the block again and counts the error (`crc_errors`
-in the job). Frames without the flag (DAQ) are accepted as before. A READ at
-an unaligned offset returns the data up to the end of that 512-byte block,
-and the next read continues at offset + length.
+**Checks.** Every block carries its raw length and zlib CRC-32; a block that
+fails either is requested again (a new OPEN at the committed offset) and
+counted (`crc_errors` in the job). The whole file is then checked by SHA-256
+against the board's.
 
 **FC gating.** The FC serves only in local Landed or Recovery, or in Startup
 while the network FLIGHT_STATE is Startup or Idle. It accepts peers `GS` and
@@ -63,8 +65,8 @@ The FC's launch file is collected automatically after landing. No operator
 action is needed: the trigger is the FC's Landed held 5 s, or Recovery. The
 collection runs at the lowest priority:
 
-- one block in flight, radio rate 512 B/s (adaptive up to 640 B/s while
-  recovery traffic is light);
+- radio: 768 B/s of DATA (about 4.6 KB/s of CSV), rising by 128 B/s every
+  2 s up to 1536 B/s while recovery traffic is light, halved on losses;
 - it pauses for commands (10 s), stalled recovery GPS, radio congestion,
   another SD transfer, or an operator stop;
 - it resumes across link drops and restarts.
@@ -78,12 +80,12 @@ powered off" readiness.
 
 | Path | Time |
 | --- | --- |
-| AV-bay radio at 512 B/s | ≈88 min |
-| AV-bay radio at the 640 B/s adaptive ceiling | ≈70 min |
-| Via the RRLS (takeover) | no faster: the RF board's radio turn caps all AV-bay egress |
-| **Bench, 16 KiB/s** | **≈2.8 min** |
+| AV-bay radio at 768 B/s of DATA | ≈9.7 min (v1: 88 min) |
+| AV-bay radio at the 1536 B/s adaptive ceiling | ≈4.9 min (v1: 70 min) |
+| Via the RRLS (takeover) | no faster from the FC: the RF board's radio turn caps all AV-bay egress |
+| **Bench, 64 KiB/s of DATA** | **seconds; the FC's SD reads rule** |
 
 **Bench path.** To power the AV bay off early, reconnect the recovered rocket
-by umbilical, USB or CAN. The same service collects at 16 KiB/s. Set
+by umbilical, USB or CAN. The same service collects at up to 64 KiB/s of DATA. Set
 `GS_FC_SD_LINK=wired` if the station still sees an RFD modem on the AV-bay
 link.

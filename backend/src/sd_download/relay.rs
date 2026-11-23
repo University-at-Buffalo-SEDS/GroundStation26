@@ -17,16 +17,18 @@
 //! protected outbox `data/sd-downloads/FC/outbox/` with its SHA-256
 //! (`outbox.json`); nothing there is ever deleted automatically. The outbox
 //! is served on SEDSnet P2P port [`RELAY_STREAM_PORT`] with the board SD
-//! wire (LIST dir 0, READ 512-byte blocks with the CRC-32 frame flag), plus a
+//! transfer protocol v2 (LIST dir 0, OPEN/ACK/DATA with SDX and, as only the
+//! outbox offers, zstd; HASH answered from the stored SHA-256), plus a
 //! virtual `<name>.sha256` sidecar per file holding its metadata, and one more
 //! opcode: CONFIRM (`0x24`, SHA-256 + name) marks a file received by the GS.
 //!
 //! **GS side.** [`pull`] lists the RRLS outbox, reads each sidecar, downloads
 //! the file (resumable by offset in `sd-downloads/FC/RRLS/<name>.part`),
-//! verifies its SHA-256 end to end (a mismatch deletes the copy and fetches
-//! it again; three mismatches refuse it), confirms it to the RRLS and
-//! attaches it to the capture with `via=RRLS` provenance. Same pause rules
-//! and adaptive rate as the direct path, one request in flight.
+//! verifies its SHA-256 end to end (the HASH answer, then the sidecar; a
+//! mismatch deletes the copy and fetches it again; three mismatches refuse
+//! it), confirms it to the RRLS and attaches it to the capture with
+//! `via=RRLS` provenance. Same pause rules and adaptive rate as the direct
+//! path, radio-sized DATA messages.
 use super::*;
 use super::fc::{FcJob, Stage};
 use crate::recording_store::board_sd;
@@ -196,96 +198,65 @@ fn served(root: &FsPath, name: &str) -> Option<Vec<u8>> {
     std::fs::read(outbox_path(root, name)).ok()
 }
 
-/// RRLS: serve the outbox to the GS on [`RELAY_STREAM_PORT`]. `corrupt`
-/// (tests) flips the CRC of that many READ answers.
-pub(crate) fn serve(router: &Arc<Router>, root: PathBuf, corrupt: Option<Arc<AtomicU64>>) -> Result<(), String> {
-    let reply = router.clone();
-    router
-        .bind_p2p_stream_port(RELAY_STREAM_PORT, move |event| {
-            if event.kind != P2pStreamEventKind::Data || event.payload.is_empty() {
-                return Ok(());
-            }
-            // The primary is the only consumer.
-            if !event.peer_hostname.eq_ignore_ascii_case("GS") {
-                return reply.reset_p2p_stream(event.stream_id).map(|_| ());
-            }
-            for frame in answer(&root, event.payload, corrupt.as_deref()) {
-                reply.send_p2p_stream(event.stream_id, &frame)?;
-            }
-            Ok(())
-        })
-        .map_err(|e| e.to_string())
+/// The outbox as an SD file service (directory 0 only).
+struct Outbox {
+    root: PathBuf,
+    /// Tests: corrupt the CRC-32 of this many blocks.
+    corrupt: Option<Arc<AtomicU64>>,
 }
 
-fn answer(root: &FsPath, p: &[u8], corrupt: Option<&AtomicU64>) -> Vec<Vec<u8>> {
-    let mut frames = Vec::new();
-    match p[0] {
-        OP_LIST if p.len() == 4 => {
-            let index = u16::from_le_bytes([p[2], p[3]]) as usize;
-            let names: Vec<(String, u64)> = load_outbox(root)
-                .into_iter()
-                .flat_map(|e| {
-                    let meta = serde_json::to_vec(&e).map_or(0, |m| m.len() as u64);
-                    [(e.name.clone(), e.bytes), (format!("{}{SIDECAR}", e.name), meta)]
-                })
-                .collect();
-            let entry = (p[1] == 0).then(|| names.get(index)).flatten();
-            let mut f = vec![OP_LIST | RESPONSE_FLAG, if entry.is_some() { STATUS_OK } else { STATUS_END }, p[1], p[2], p[3]];
-            let (size, name) = entry.map_or((0, ""), |(n, s)| (*s as u32, n.as_str()));
-            f.extend_from_slice(&size.to_le_bytes());
-            f.extend_from_slice(&[0, name.len() as u8, 0]);
-            f.extend_from_slice(name.as_bytes());
-            frames.push(f);
+impl xfer::Catalog for Outbox {
+    fn list(&self, dir: u8, index: u16) -> Option<(String, u64, bool)> {
+        if dir != 0 {
+            return None;
         }
-        OP_READ if p.len() > 7 => {
-            let offset = u32::from_le_bytes(p[1..5].try_into().expect("four")) as usize;
-            let name = std::str::from_utf8(&p[7..]).unwrap_or("");
-            let Some(data) = served(root, name) else {
-                let mut f = vec![OP_READ | RESPONSE_FLAG, STATUS_NOT_FOUND, FLAG_LAST];
-                f.extend_from_slice(&[0; 8]);
-                return vec![f];
-            };
-            let header = |status: u8, flags: u8, off: usize| {
-                let mut f = vec![OP_READ | RESPONSE_FLAG, status, flags];
-                f.extend_from_slice(&(off as u32).to_le_bytes());
-                f.extend_from_slice(&(data.len() as u32).to_le_bytes());
-                f
-            };
-            if offset >= data.len() {
-                frames.push(header(STATUS_END, FLAG_LAST, offset));
-            } else {
-                let end = ((offset / 512 + 1) * 512).min(data.len());
-                let mut crc = crc32(&data[offset..end]);
-                if let Some(c) = corrupt
-                    && c.load(Ordering::SeqCst) > 0
-                {
-                    c.fetch_sub(1, Ordering::SeqCst);
-                    crc ^= 0x5a;
-                }
-                let mut at = offset;
-                while at < end {
-                    let to = (at + 100).min(end);
-                    let last = to == end;
-                    let mut f = header(STATUS_OK, if last { FLAG_LAST | FLAG_CRC } else { 0 }, at);
-                    f.extend_from_slice(&data[at..to]);
-                    if last {
-                        f.extend_from_slice(&crc.to_le_bytes());
-                    }
-                    frames.push(f);
-                    at = to;
-                }
-            }
+        load_outbox(&self.root)
+            .into_iter()
+            .flat_map(|e| {
+                let meta = serde_json::to_vec(&e).map_or(0, |m| m.len() as u64);
+                [(e.name.clone(), e.bytes, false), (format!("{}{SIDECAR}", e.name), meta, false)]
+            })
+            .nth(usize::from(index))
+    }
+    fn file(&self, dir: u8, name: &str) -> Result<xfer::Snapshot, u8> {
+        let bytes = (dir == 0).then(|| served(&self.root, name)).flatten().ok_or(xfer::STATUS_NOT_FOUND)?;
+        Ok(xfer::Snapshot { bytes: Arc::new(bytes), growing: false })
+    }
+    /// The SHA-256 recorded when the file entered the outbox: a copy damaged
+    /// since then is refused by the GS.
+    fn hash(&self, dir: u8, name: &str) -> Result<(u64, [u8; 32], bool), u8> {
+        let entry = load_outbox(&self.root).into_iter().find(|e| dir == 0 && e.name == name);
+        let Some(entry) = entry else {
+            let snap = self.file(dir, name)?;
+            return Ok((snap.bytes.len() as u64, xfer::sha256(&snap.bytes), false));
+        };
+        let mut sha = [0u8; 32];
+        for (i, byte) in sha.iter_mut().enumerate() {
+            *byte = entry.sha256.get(2 * i..2 * i + 2).and_then(|h| u8::from_str_radix(h, 16).ok()).unwrap_or(0);
         }
-        OP_CONFIRM if p.len() > 34 => {
+        Ok((entry.bytes, sha, false))
+    }
+    fn other(&self, p: &[u8]) -> Option<Vec<u8>> {
+        (p[0] == OP_CONFIRM && p.len() > 34).then(|| {
             let sha: String = p[1..33].iter().map(|b| format!("{b:02x}")).collect();
             let name = std::str::from_utf8(&p[34..]).unwrap_or("");
-            let ok = confirm_local(root, name, &sha);
-            frames.push(vec![OP_CONFIRM | RESPONSE_FLAG, if ok { CONFIRM_OK } else { CONFIRM_MISMATCH }]);
-        }
-        OP_CANCEL => frames.push(vec![OP_CANCEL | RESPONSE_FLAG, 0]),
-        _ => {}
+            let ok = confirm_local(&self.root, name, &sha);
+            vec![OP_CONFIRM | RESPONSE_FLAG, if ok { CONFIRM_OK } else { CONFIRM_MISMATCH }]
+        })
     }
-    frames
+    fn corrupt_next_block(&self) -> bool {
+        self.corrupt.as_ref().is_some_and(|c| c.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok())
+    }
+}
+
+/// The outbox's DATA message limit (the GS asks for radio-sized ones).
+const OUTBOX_MAX_MSG: u16 = 4096;
+
+/// RRLS: serve the outbox to the GS on [`RELAY_STREAM_PORT`]. `corrupt`
+/// (tests) flips the CRC of that many blocks.
+pub(crate) fn serve(router: &Arc<Router>, root: PathBuf, corrupt: Option<Arc<AtomicU64>>) -> Result<(), String> {
+    let opts = xfer::ServeOptions { max_msg: OUTBOX_MAX_MSG, zstd: true, min_gap: Duration::from_millis(25), tick: Duration::from_millis(5) };
+    xfer::serve(router, RELAY_STREAM_PORT, Arc::new(Outbox { root, corrupt }), opts, Some("GS"))
 }
 
 // ----------------------------------------------------------------- GS pull
@@ -345,7 +316,7 @@ pub(crate) struct PullEnv {
     pub router: Arc<Router>,
     pub root: PathBuf,
     pub rate: u64,
-    pub rate_fn: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
+    pub rate_fn: Option<RateFn>,
     /// Pause rules (commands, GPS, radio, operator stop...).
     pub gate: Gate,
     pub notify: Arc<dyn Fn(String) + Send + Sync>,
@@ -356,6 +327,7 @@ fn relay_request(env: &PullEnv, id: u64, name: &str) -> TransferRequest {
     req.peer = Some((RRLS_HOST, RELAY_STREAM_PORT));
     req.local_dir = Some("RRLS");
     req.attach = false;
+    req.profile = Profile { zstd: true, ..Profile::RADIO };
     req.rate_fn = env.rate_fn.clone();
     req
 }
@@ -365,15 +337,7 @@ fn received_path(root: &FsPath, name: &str) -> PathBuf {
 }
 
 async fn read_small(stream: &mut BoardStream, req: &TransferRequest, gate: &Gate) -> Result<Vec<u8>, StreamError> {
-    let never = AtomicBool::new(false);
-    let mut out = Vec::new();
-    loop {
-        let (chunk, size, end) = read_block(stream, req, out.len() as u64, gate, &never).await?;
-        out.extend_from_slice(&chunk);
-        if end || chunk.is_empty() || out.len() as u64 >= size || out.len() > 64 * 1024 {
-            return Ok(out);
-        }
-    }
+    read_range(stream, req, 0, 64 * 1024, gate).await.map(|(bytes, _)| bytes)
 }
 
 async fn send_confirm(env: &PullEnv, name: &str, sha: &str) -> Result<bool, StreamError> {
@@ -448,6 +412,16 @@ async fn forward_one(env: &PullEnv, meta: &OutboxEntry) -> Result<(), StreamErro
         s.message = format!("forwarding {} from the RRLS", meta.name);
     });
     let result = transfer(env.manager, env.router.clone(), &req, &env.gate, &cancel).await;
+    // The RRLS answers HASH with the SHA-256 it recorded: a copy that does
+    // not match it is a damaged hop, counted below like a sidecar mismatch.
+    let hash_mismatch = matches!(&result, Err(StreamError::Other(e)) if e.contains("SHA-256 differs"));
+    if hash_mismatch {
+        env.manager.update(id, |s| {
+            s.phase = Phase::Failed;
+            s.message = "SHA-256 differs from the RRLS record".into();
+        });
+    }
+    let result = if hash_mismatch { Ok(()) } else { result };
     if result.is_err() {
         env.manager.update(id, |s| {
             if s.phase.is_active() {
@@ -459,9 +433,9 @@ async fn forward_one(env: &PullEnv, meta: &OutboxEntry) -> Result<(), StreamErro
     }
     result?;
     let path = received_path(&env.root, &meta.name);
-    let sha = board_sd::sha256_hex(&path).map_err(|e| StreamError::Other(e.to_string()))?;
+    let sha = if hash_mismatch { String::new() } else { board_sd::sha256_hex(&path).map_err(|e| StreamError::Other(e.to_string()))? };
     let bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
-    if sha != meta.sha256 || bytes != meta.bytes {
+    if hash_mismatch || sha != meta.sha256 || bytes != meta.bytes {
         let _ = std::fs::remove_file(&path);
         let count = modify_state(&env.root, |s| {
             let n = s.mismatches.entry(meta.name.clone()).or_default();

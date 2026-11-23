@@ -62,7 +62,7 @@ flowchart LR
     DEC --> WS
     DBQ --> SEG["rolling SQLite segments<br/>64 MB, ring of 50 GB max"]
     SEG --> CAP["event captures<br/>recording.db + manifest.json"]
-    SDDL["board SD download<br/>port 4511, 512 B blocks"] --> CAP
+    SDDL["board SD download<br/>port 4511, protocol v2 (SDX)"] --> CAP
     SEG --> EXP["CSV / report / replay"]
     CAP --> EXP
   end
@@ -347,7 +347,7 @@ Every attachment, FC or DAQ, queues `burn_report::request_recompute`. The burn r
 - **DAQ by network.** `sd_download::fetch_launch_files`, after a `launch` capture is saved:
   - Waits until downloads are allowed (Idle, Landed or Recovery, no sequence, no other transfer), giving up after 1 h.
   - Lists `/LAUNCH` over SEDSnet port 4511 (`SD_FILE_STREAM_PORT`).
-  - Downloads in 512-byte blocks (`BLOCK_BYTES`) at most 16 KiB/s (`GS_SD_DOWNLOAD_MAX_BYTES_PER_SEC`), to `data/sd-downloads/DAQ/LAUNCH/`.
+  - Downloads with the SD transfer protocol v2 ([`docs/backend/sd-transfer.md`](backend/sd-transfer.md)): streamed 16 KiB blocks in SDX, 1 KiB DATA messages, window 16, at most 16 KiB/s of DATA (`GS_SD_DOWNLOAD_MAX_BYTES_PER_SEC`; DATA bytes since v2, about 5x as many CSV bytes), to `data/sd-downloads/DAQ/LAUNCH/`. Each block's length and CRC-32 are checked, and the finished copy's SHA-256 is compared with the board's (HASH).
   - A finished file is offered, and `rescan_downloads` re-offers earlier downloads when a capture is saved.
 - **FC by network.** The FC is collected automatically after landing (§3.4a), into `data/sd-downloads/FC/ROOT/`. `rescan_downloads` also re-offers FC launch files found there when a capture is saved.
 - **Any board by import.** `recording_sd::upload` offers an imported CSV to `offer_file`.
@@ -360,16 +360,16 @@ Every attachment, FC or DAQ, queues `burn_report::request_recompute`. The burn r
 
 **From the card.** Otherwise a job is queued in `data/sd-downloads/DAQ/leadup/jobs.json`. The job (`leadup::step`):
 
-1. Reads the last two 512 B blocks of each non-LAUNCH file.
+1. Reads the last kilobyte of each non-LAUNCH file (a ranged OPEN).
 2. Picks the file whose last network row lies in `[from, to + 5 s]`.
 3. Downloads the file whole if it is 16 MiB or smaller (`SMALL_FILE_BYTES`).
-4. Otherwise binary-searches single blocks for the window start, starting 2 s early (`SEARCH_MARGIN_MS`), and reads forward (`fetch_window`).
+4. Otherwise binary-searches 1 KiB probes for the window start, starting 2 s early (`SEARCH_MARGIN_MS`), and streams forward from there until a row at or after the window end (`fetch_window`), then CANCELs.
 
 **Limits.**
 
 - Runs only in the download states.
 - Pauses for any other transfer and for 10 s after any command transmission (`QUIET_AFTER_COMMAND`).
-- Rate: `GS_SD_LEADUP_MAX_BYTES_PER_SEC`, default 8 KiB/s.
+- Rate: `GS_SD_LEADUP_MAX_BYTES_PER_SEC`, default 8 KiB/s of DATA (about 40 KB/s of DAQ CSV).
 - Offsets are saved, so a job resumes after a link drop or a restart.
 
 ```mermaid
@@ -380,11 +380,11 @@ sequenceDiagram
   GS->>DL: launch capture saved, schedule_launch_fetch
   DL->>DAQ: LIST /LAUNCH (when Idle, Landed or Recovery)
   DAQ-->>DL: DAQ_LAUNCH_*.CSV
-  DL->>DAQ: READ 512 B blocks, at most 16 KiB/s
+  DL->>DAQ: OPEN, streamed SDX blocks, ACKs; at most 16 KiB/s of DATA; HASH
   DL->>GS: offer_file: attach to the capture by UTC overlap
   GS->>DL: leadup::enqueue (no local lead-up)
-  DL->>DAQ: tail blocks of /UTC, /NO_UTC files
-  DL->>DAQ: binary search, then window blocks, at most 8 KiB/s
+  DL->>DAQ: last kilobyte of /UTC, /NO_UTC files
+  DL->>DAQ: binary search (1 KiB probes), then the window, at most 8 KiB/s of DATA
   DL->>GS: cut_lead_up: file.leadup.csv, manifest updated
 ```
 
@@ -403,7 +403,7 @@ sequenceDiagram
 
 1. LIST the FC card root (P2P 4511, dir 0, `irec*.csv`).
 2. `choose_launch_file`: the newest `irec_LAUNCH*` whose UTC name lies between 15 min before the flight capture began and 1 min after the trigger; otherwise the newest dated launch file; otherwise the last one listed. A file still open is waited for, up to 2 min (the FC closes it 20 s after Landed and keeps logging into a new ordinary file).
-3. Download it to `sd-downloads/FC/ROOT/<name>.part`. Each READ answer's CRC-32 is checked; a mismatch is requested again and counted (`crc_errors`).
+3. Download it to `sd-downloads/FC/ROOT/<name>.part` with protocol v2 (below). Each block's length and CRC-32 are checked; a bad block is requested again (a new OPEN at the committed offset) and counted (`crc_errors`). The finished copy's SHA-256 is compared with the FC's (HASH); a mismatch discards it.
 4. Attach it with `offer_file_with`, notify the operator (persistent notification), and queue the burn-report recompute. Without a capture it waits for one; it gives up after 2 min if no flight capture is pending. A later save attaches it through `rescan_downloads`.
 5. Optionally cut the 60 s lead-up from the same boot's ordinary file (window reads only, §3.4).
 
@@ -411,20 +411,25 @@ sequenceDiagram
 
 **Ground-test image.** The FC's `--ground-test` (IGT) image has no SD read service (flash budget). In IGT mode a listing that is refused or silent for 30 s ends the job as `unavailable`, with one notice: "FC SD service not available in the ground-test image". Import that card by hand. Flight and HITL use the flight image. Firmware-sim: the same path works if the native FC serves port 4511. The native FC currently reports its SD card as not mounted, so the listing comes back empty, and after three listings the job ends `unavailable`.
 
+**Protocol v2** ([`docs/backend/sd-transfer.md`](backend/sd-transfer.md), `sd_download/xfer.rs`, `sd_download/sdx.rs`). The GS OPENs a byte range; the board cuts it into independent 16 KiB blocks, encodes each row in SDX (lossless binary: about 6.3x smaller on an FC launch file, 5.2x on a DAQ one) and streams the blocks in DATA messages that SEDSnet splits into 192-byte radio frames. The GS sets the message size, the window (unacknowledged messages) and the DATA rate in OPEN and in every ACK; ACKs are selective (`una` + 32-bit bitmap), the board resends only gaps. The GS writes the contiguous verified prefix to the `.part` file and holds later verified blocks in memory, so a restart resumes from the `.part` size.
+
 **Priority: lowest; it never competes.**
 
-- One 512-byte READ in flight.
-- Rate:
-  - radio: `GS_FC_SD_RADIO_MAX_BYTES_PER_SEC`, default 512 B/s of payload;
-  - wired: `GS_FC_SD_WIRED_MAX_BYTES_PER_SEC`, default 16 KiB/s.
-- Adaptive radio rate (`AdaptiveRate`): while the FC is Landed or in Recovery, no command was sent for 30 s, GPS is fresh and the GS radio queue is nearly empty, the rate rises by 64 B/s every 5 s up to `GS_FC_SD_RADIO_CEILING_BYTES_PER_SEC` (default 640). Any yield trigger returns it to the base at once.
+- Flow control (`Profile`, `fc::profile`):
+  - radio: 460-byte DATA messages (three full 192-byte frames, `RADIO_MSG_BYTES`), window 6 (P2P stream messages are reliable in SEDSnet, so unacknowledged ones sit in the FC router's 8 KiB queue budget: 6 keep it near 3 KB), ACK every 3 messages or 1 s;
+  - wired: 1 KiB requested (the FC answers at most 512), window 8;
+  - DAQ: 1 KiB, window 16.
+- Rate (DATA bytes per second, headers included; the env names are kept from v1, where they counted CSV bytes):
+  - radio: `GS_FC_SD_RADIO_MAX_BYTES_PER_SEC`, default 768 B/s;
+  - wired: `GS_FC_SD_WIRED_MAX_BYTES_PER_SEC`, default 64 KiB/s (the FC's SD reads and encoding are the real limit).
+- Adaptive radio rate (`AdaptiveRate`, AIMD): while the FC is Landed or in Recovery, no command was sent for 30 s, GPS is fresh, the GS radio queue is nearly empty and the link is good, the rate rises by 128 B/s every 2 s up to `GS_FC_SD_RADIO_CEILING_BYTES_PER_SEC` (default 1536). A gap or a bad block halves it (not below 256 B/s). Any yield trigger returns it to at most the base at once.
 - Link detection (`fc::link`):
   - `GS_FC_SD_LINK=radio|wired` overrides;
   - otherwise the link is radio whenever the AV-bay link is an RFD modem (raw-UART serial or a configured RFD profile), unless the FC has been heard only on the umbilical side;
   - without an RFD modem it is wired.
 - Operator FC downloads from the SD download panel use the same rate.
 
-**Pause rules.** The worker checks them before each block, and the transfer gate polls them every 100 ms. A pause aborts the block in flight; whole blocks are kept.
+**Pause rules.** The worker checks them before each step, and the open transfer polls them every 100 ms. A pause sends an ACK with rate 0 at once: the FC sends nothing new and resends nothing; DATA already queued for the radio drains. The GS hands no bytes to the `.part` file while paused and keeps ACKing every 5 s (the FC ends a transfer after 15 s without one). The pause holds the transfer for up to 15 s (`PAUSE_HOLD`, covering the 10 s command quiet time); a longer one CANCELs and the worker resumes later with a new OPEN from the `.part` size. Resuming is an ACK with the current rate.
 
 - an operator stop (`POST /api/sd_download/fc/stop`; persisted until `/resume`);
 - the setting turned off;
@@ -436,7 +441,7 @@ sequenceDiagram
   - a poor link: at least 10 CRC rejects in the last minute, making up at least 20 % of frames (`link_quality`);
   - congestion: 1.5 KB queued for the radio or 4 parked frames (radio TX budget).
 
-The RF board's own queue (BOARD_HEALTH RFT1 words) is not used. The GS paces its requests instead.
+The RF board's own queue (BOARD_HEALTH RFT1 words) is not used. The GS sets the FC's rate and window instead.
 
 **Ordering with the DAQ.**
 
@@ -447,11 +452,11 @@ The RF board's own queue (BOARD_HEALTH RFT1 words) is not used. The GS paces its
 
 `MANAGER` runs one transfer at a time.
 
-**Safety test** (`on_a_shared_radio_budget_gps_and_commands_keep_rate_and_latency`). The test models a turn-based link: 691 B per 200 ms each way, FIFO, carrying real SEDSnet routers. With the fetch running at 512 B/s it injects 1 Hz GPS and a command every 3 s. Results:
+**Safety test** (`on_a_shared_radio_budget_gps_and_commands_keep_rate_and_latency`). The test models a turn-based link: 691 B per 200 ms each way, FIFO, carrying real SEDSnet routers with the production radio side (192-byte frames, no hop reliability). With the fetch at the 768 B/s DATA default, on a 110 KB FC-shaped launch file, it injects 1 Hz GPS and a command every 3 s. Results:
 
-- every GPS fix and every command arrived within 2 turns (worst seen: GPS 464 ms, command 78 ms);
-- the partial file stayed frozen during each command quiet time;
-- fetch payload stayed at or below 512 B/s, and its down-link wire bytes below 35 % of the budget.
+- every GPS fix and every command arrived within 2 turns (counted in turns: worst GPS 260 ms, command 260 ms, i.e. the next turn);
+- each pause took effect on the FC within 194–224 ms of the command (asserted: within 3 turns), and from then to the end of the quiet time the FC handed the radio less than one DATA message's worth of bytes (asserted < 400 B: control traffic only);
+- 3.6 KB/s of CSV arrived (with three pauses); the fetch used 0.260 wire bytes down and 0.057 up per CSV byte, about 935 B/s of the 3,455 B/s down-link turn (asserted < 55 %).
 
 **Status and control.**
 
@@ -460,7 +465,7 @@ The RF board's own queue (BOARD_HEALTH RFT1 words) is not used. The GS paces its
 | GET | `/api/sd_download/fc` | view data |
 | POST | `/api/sd_download/fc/stop`, `/api/sd_download/fc/resume` | command (`SdDownload`), as the other SD download routes |
 
-The status (`fc::Status`) is also returned in `/api/sd_download` (`fc_collect`) and `/api/recordings/store` (`fc_sd_collect`, shown in the Recordings panel). It contains:
+A paused open transfer shows in the job (`paused_reason`) through the transfer's pause hook. The status (`fc::Status`) is also returned in `/api/sd_download` (`fc_collect`) and `/api/recordings/store` (`fc_sd_collect`, shown in the Recordings panel). It contains:
 
 - `active`: state, file, bytes done/total, rate, paused reason, ETA, link and CRC errors;
 - recent jobs;
@@ -469,8 +474,8 @@ The status (`fc::Status`) is also returned in `/api/sd_download` (`fc_collect`) 
 
 **Power-off readiness** (`relay::power_off_ready`). The AV bay can be powered off once the GS or the RRLS holds the launch file complete and verified, with the lead-up settled when it is wanted:
 
-- every block CRC-checked;
-- the file's SHA-256 computed.
+- every block length- and CRC-checked;
+- the file's SHA-256 computed and equal to the board's (HASH).
 
 Complete at the RRLS counts even before its forward to the GS finishes. The station notifies once: "FC SD fully received by GS|RRLS, checksums verified: AV bay can be powered off".
 
@@ -478,11 +483,11 @@ Complete at the RRLS counts even before its forward to the GS finishes. The stat
 
 - **The RF board, not the receiver, caps FC egress.** Every AV-bay byte leaves through the RF board's radio turn: 691 UART bytes per 200 ms, about 3.4 KB/s, shared with about 1.5 KB/s of AV-bay telemetry (RFBoard26 docs §4.3). A closer RRLS can't fetch much faster. It gains only a cleaner link (fewer CRC rejects and retransmissions) and the same adaptive ceiling. A faster post-landing path needs an RF-board firmware change, which is a follow-up not made here: a larger turn burst share after Landed that still leaves uplink time for recovery commands.
 - **A standby RRLS's radio stays silent.** Its router side has egress disabled so it never collides with the primary. It fetches from the FC (with the same client, CRC checks and pause rules) only while it owns the AV bay in takeover, and only when `relay::choose_path` says the RRLS path wins. That function is pure and decides on the direct link (lost for more than 3 s, or poor), whether the RRLS is in range, whether it hears the AV bay, how clean the RRLS's link is, and whether the RRLS may transmit.
-- **The RRLS outbox.** The RRLS copies each verified file, plus its lead-up, into the protected outbox `data/sd-downloads/FC/outbox/` with its SHA-256 (`outbox.json`). Nothing there is deleted automatically. The RRLS serves the outbox on P2P port 4512 (`RELAY_STREAM_PORT`, peer `GS` only) with the same LIST/READ/CRC wire, a virtual `<name>.sha256` metadata sidecar per file, and `CONFIRM` (`0x24`: SHA-256 + name).
+- **The RRLS outbox.** The RRLS copies each verified file, plus its lead-up, into the protected outbox `data/sd-downloads/FC/outbox/` with its SHA-256 (`outbox.json`). Nothing there is deleted automatically. The RRLS serves the outbox on P2P port 4512 (`RELAY_STREAM_PORT`, peer `GS` only) with the same protocol v2 (`xfer::serve`, the Rust SDX encoder, plus zstd level 5 on the SDX blocks when the GS allows it: 8.4x on an FC launch file), HASH answered from the recorded SHA-256, a virtual `<name>.sha256` metadata sidecar per file, and `CONFIRM` (`0x24`: SHA-256 + name).
 - **The GS pull** (`relay::pull`, every 10–60 s while the RRLS is in the address book):
   1. read the sidecars;
-  2. download each file resumably to `sd-downloads/FC/RRLS/`, CRC-checked per block;
-  3. verify the SHA-256 end to end. A mismatch deletes the copy and fetches it again; three mismatches refuse it with a notice.
+  2. download each file resumably to `sd-downloads/FC/RRLS/` (radio messages, SDX + zstd), length- and CRC-checked per block;
+  3. verify the SHA-256 end to end (HASH, then the sidecar). A mismatch deletes the copy and fetches it again; three mismatches refuse it with a notice.
   4. send CONFIRM;
   5. attach the file with `via=RRLS` provenance.
 
@@ -501,21 +506,25 @@ The file size is derived from FC docs §7.5 and §3. The launch file runs from L
 | Landed to Recovery | 5 s | sensors off | ≈0 |
 | **Total** | | | **≈2.7 MB** |
 
-Wire cost per 512-byte block was measured on real SEDSnet routers (`wire_bytes_per_block_on_an_instant_link`):
+Measured on real SEDSnet routers with the production radio side (`wire_bytes_per_payload_byte_on_an_instant_link`, a 328 KB FC-shaped file):
 
-- down: 1094 B in 7 packets (6 DATA frames, each ≤100 B of data + 11 B header, the CRC, SEDSnet headers, plus one stream ACK), including the 4-byte radio frame header;
-- up: 414 B (the READ and 6 ACKs).
+- a 460-byte DATA message is three 192-byte frames: 1.35 wire bytes down per DATA byte (SEDSnet chunk and P2P headers, 4-byte radio frame header);
+- per CSV byte: 0.235 B down and 0.036 B up (ACKs every 3 messages, OPEN, HASH). With the real FC SDX ratio (6.3x on `tools/gen_sd.py`'s launch file, 6.0x as DATA with headers) that is about 0.22 B down per CSV byte, against 2.1 in v1;
+- on the turn simulation, with three command pauses: 0.260 down, 0.057 up.
 
-On the turn-based simulation with 100 ms retransmission, down was about 1.5 KB per block.
+Lossy radio (`a_lossy_radio_with_a_link_drop_and_a_restart_still_yields_the_identical_file`, random frame loss each way, a 3 s link cut and a station restart, 164 KB file, rate uncapped): byte-identical every time; 5 % loss 31 s (1.20x the file read by the board), 15 % 55 s (1.11x), 30 % 106 s (1.71x).
 
-| Path | Payload rate | 2.7 MB launch file | 60 s lead-up (≈3.9 MB) | FC docs' 10 MB example |
-| --- | --- | --- | --- | --- |
-| Direct radio, default | 512 B/s; down ≈1.09 KB/s (32 % of the 3.4 KB/s turn) | 2.7e6 / 512 = 5,273 s ≈ **88 min** | 7,617 s ≈ 2.1 h | 5.4 h |
-| Direct radio, adaptive ceiling | 640 B/s; down ≈1.37 KB/s, with telemetry ≈83 % of the turn | 4,219 s ≈ **70 min** | 1.7 h | 4.3 h |
-| Via RRLS (takeover) | the same RF turn cap: ≤640 B/s; gains only from fewer retransmissions | ≈ **70 min** at best; the forward to the GS follows at the RRLS's airtime share (≈1.4–2 KB/s of wire ≈ 650–930 B/s of payload, ≈50–70 min). The AV bay may be off by then. | 1.7 h | 4.3 h |
-| **Bench (wired)** | 16 KiB/s (the FC paces at ≤ ~50 KB/s) | 2.7e6 / 16,384 = 165 s ≈ **2.8 min** | 238 s ≈ 4 min | 10.2 min |
+| Path | DATA rate | CSV rate | 2.7 MB launch file | 60 s lead-up (FC ≈3.9 MB) | DAQ launch file (12.6 MB, 30 s) |
+| --- | --- | --- | --- | --- | --- |
+| Direct radio, default | 768 B/s; down ≈1.0 KB/s (30 % of the 3.4 KB/s turn) | ≈4.6 KB/s | 2.7e6 / 4,640 = 582 s ≈ **9.7 min** (v1: 88 min) | ≈14 min | n/a (DAQ is on the fill link) |
+| Direct radio, adaptive ceiling | 1536 B/s; down ≈2.1 KB/s (with 1.5 KB/s telemetry the turn is full) | ≈9.3 KB/s | ≈ **4.9 min** (v1: 70 min) | ≈7 min | n/a |
+| Via RRLS (takeover) | the same RF turn cap from the FC; RRLS->GS SDX + zstd (8.4x) | FC->RRLS as direct; forward ≈6.5–11 KB/s | ≈ **4.9–9.7 min** to the RRLS; the forward follows at the same airtime | ≈7–14 min | n/a |
+| **Bench (wired)** | 64 KiB/s (512-byte messages, window 8; the FC's SD reads bound it) | ≤ ≈390 KB/s | ≈7 s at the DATA cap; the FC's SD read speed rules | ≈10 s | n/a |
+| DAQ fill link | 16 KiB/s (`GS_SD_DOWNLOAD_MAX_BYTES_PER_SEC`), 1 KiB messages, window 16 | ≈84 KB/s (5.1x) | n/a | DAQ lead-up (≈6.6 MB at 110 KB/s of rows) at 8 KiB/s: ≈160 s | 12.6e6 / 83,600 = 151 s ≈ **2.5 min** (v1: 12.8 min) |
 
-**The bench path is the fast way to power down early.** Reconnect the recovered rocket by umbilical, USB or CAN (no RFD radio in the path). The same service and collection run without operator action, at 16 KiB/s. If the station cannot tell the FC is wired (for example the AV-bay link is still an RFD modem), set `GS_FC_SD_LINK=wired`. The radio path suits a vehicle that stays powered until recovery. To power off sooner, use the bench.
+The CSV rates use the C encoder's measured ratios on `tools/gen_sd.py` files (FC 6.27x, DAQ 5.19x; as DATA with message headers 6.04x and 5.10x).
+
+**The bench path is the fast way to power down early.** Reconnect the recovered rocket by umbilical, USB or CAN (no RFD radio in the path). The same service and collection run without operator action, at up to 64 KiB/s of DATA. If the station cannot tell the FC is wired (for example the AV-bay link is still an RFD modem), set `GS_FC_SD_LINK=wired`. The radio path suits a vehicle that stays powered until recovery. To power off sooner, use the bench.
 
 ### 3.5 SD import into a recording (`recording_sd.rs`, `recording_sd_import.py`, `recording_sd_resolve.py`)
 
@@ -683,7 +692,7 @@ FC files are `irec-…csv` and `irec_LAUNCH-…csv` at the card root (`Core/Src/
 | Worker to SQLite | at most 256 rows or 8 ms per batch | `DB_BATCH_*` |
 | Worker to browser | 20 ms flush | `GS_WS_TELEMETRY_FLUSH_MS` |
 | Capture written | event end + post-roll + 2 s, on a 1 s tick | `FLUSH_GRACE_MS`, `capture_task` |
-| DAQ launch file at GS | after the vehicle is safe; 16 KiB/s | `sd_download.rs` |
+| DAQ launch file at GS | after the vehicle is safe; 16 KiB/s of SDX DATA (≈84 KB/s of CSV) | `sd_download.rs` |
 
 The latency from board to GS is not fixed. Each row records it as
 `received_timestamp_ms − source_timestamp_ms` when the board is on network UTC.
