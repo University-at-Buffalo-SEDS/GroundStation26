@@ -290,6 +290,16 @@ class LoadcellMedianBinTests(unittest.TestCase):
             'config':{'schema':schema},'sensor_types':{},'assignment':{'sender_id':'DAQ','boot_and_session_verified':True,
                 'units_axes_calibration_verified':True,'start_utc_ms':BASE_UTC-10000,'end_utc_ms':BASE_UTC+600000,'max_gap_ms':60}}
 
+    def test_profile_accepts_the_dac_generator_head_and_no_other(self):
+        # The DAC generator adds only dac_chN_* scalar rows on top of the 1 kHz
+        # raw-record format, so its DAQ head resolves under the same profile.
+        for head in (sd.DAQ_SD_HEAD_US, sd.DAQ_SD_HEAD_US_DAC):
+            manifest=self.median_manifest(); manifest['firmware_head']=head
+            sd._resolution_manifest(manifest)
+        manifest=self.median_manifest(); manifest['firmware_head']='0'*40
+        with self.assertRaises(ValueError):
+            sd._resolution_manifest(manifest)
+
     def test_resolver_matches_the_daq_median_bins_bit_for_bit(self):
         daq=_daq_median_checkout()
         if daq is None:

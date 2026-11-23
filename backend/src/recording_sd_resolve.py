@@ -18,6 +18,10 @@ DAQ_SD_HEAD_WITH_WINDOW_INPUT='55fe7a811b74001ea2e9db07de24f57b97feb176'
 # microsecond uptime_ticks (uptime_frequency_hz=1000000), and the network
 # KG1000/KG50 values are fixed-bin means of running medians (daq_median.h).
 DAQ_SD_HEAD_US='e5fad32e33f065771887770cc8a650bf9692aaf0'
+# The same raw-record format with the DAC waveform generator added (DAQ
+# 99db2e6 on top of e5fad32). It writes only extra dac_chN_* scalar rows, which
+# no mapping reads.
+DAQ_SD_HEAD_US_DAC='99db2e65c6310d6ed088831cde62ba683175eae6'
 # field, element reordering, target type, units. BARO existing summary is alt/prs/tmp;
 # raw barometer_sample is pressure/temperature/altitude. These must not be swapped.
 PROFILES={
@@ -44,7 +48,7 @@ PROFILES={
  # KG1000/KG50 are rebuilt from those records with the DAQ's own boxcar, so
  # SD backfill equals what the station would have received. Selections are
  # mapping names; 'sensors' lists the SD rows each one reads.
- 'daq-20261123': {'head':DAQ_SD_HEAD_US,'mappings':{
+ 'daq-20261123': {'head':DAQ_SD_HEAD_US,'heads':(DAQ_SD_HEAD_US,DAQ_SD_HEAD_US_DAC),'mappings':{
   # KG1000 network value: mean of each 20000 us bin of a 3-sample running median.
   'kg1000_v':('raw_value',[0],'KG1000',['V'],{'median_bin':(3,20000),'uptime_hz':1000000,'sensors':('kg1000_v',)}),
   # Selected KG50 (AMP2 or P6): 5-sample median, 50000 us bins; both restart
