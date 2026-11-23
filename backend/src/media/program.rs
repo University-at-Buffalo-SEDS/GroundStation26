@@ -47,6 +47,16 @@ pub(super) fn routes() -> Router<Arc<MediaState>> {
             "/assets/stream-sequence-visuals.js",
             get(|| async { ([(header::CONTENT_TYPE, "text/javascript")], gs_browser_assets::STREAM_SEQUENCE_VISUALS_JS) }),
         )
+        .route(
+            "/assets/program-diagram.js",
+            get(|| async {
+                // Optional asset: an older frontend checkout has no diagram script.
+                match gs_browser_assets::asset_bytes("PROGRAM_DIAGRAM_JS") {
+                    Some(bytes) => ([(header::CONTENT_TYPE, "text/javascript")], bytes).into_response(),
+                    None => StatusCode::NOT_FOUND.into_response(),
+                }
+            }),
+        )
         .route("/api/media-assets/program/state", get(program_state))
         .route("/api/media-assets/program/audio", get(program_audio))
         .route(
@@ -258,7 +268,12 @@ async fn program_state(
         let fallback=available.iter().find(|s|s.id==id).map(|s|s.name.as_str()).unwrap_or(logical);
         streams.push(serde_json::json!({"id":logical,"label":presentation.stream_labels.get(logical).map(String::as_str).unwrap_or(fallback),"url":url}));
     }
-    Ok(([(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"broadcast":presentation.broadcast,"streams":streams,"server_now_ms":now,"telemetry":telemetry}))).into_response())
+    // Live diagram scenes carry their (static) topology; the delayed inputs
+    // ride in the snapshot (`telemetry.diagram`).
+    let diagram_topology = crate::diagrams::is_scene(effective_scene)
+        .then(|| crate::diagrams::scene_topology(effective_scene))
+        .flatten();
+    Ok(([(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"broadcast":presentation.broadcast,"streams":streams,"server_now_ms":now,"telemetry":telemetry,"diagram_topology":diagram_topology}))).into_response())
 }
 
 #[derive(Deserialize)]
@@ -344,7 +359,11 @@ pub(super) fn telemetry_snapshot(
         sampled_timestamp_ms:sampled,anchor_timestamp_ms:clock.anchor_timestamp_ms,duration_ms:clock.duration_ms,remaining_ms:remaining,advancing:false,
     };
     let sequence_visuals=crate::sequence_stream::project(stream_clock,Some(crate::gse::progress::stream_observation(app)),app.umbilical_stream_outputs(),app.umbilical_stream_commands());
-    serde_json::json!({"phase":format!("{phase:?}"),"test_fire_mode":crate::runtime_mode::is_test_fire(),"stats":stats,"profile":profile_id,"cycle_seconds":profile.cycle_seconds,"stats_per_page":profile.stats_per_page,"scene":profile.scene,"positions":crate::antenna::snapshot(),"t_clock":program_t_clock(&clock,sampled),"sequence_visuals":sequence_visuals})
+    // Diagram inputs only while a diagram scene can be shown (no cost otherwise).
+    let diagram_wanted = crate::diagrams::is_scene(&presentation.broadcast.layout)
+        || presentation.broadcast.rundown.profiles.values().any(|p| crate::diagrams::is_scene(&p.scene));
+    let diagram = diagram_wanted.then(|| crate::diagrams::program_inputs(app, now));
+    serde_json::json!({"phase":format!("{phase:?}"),"test_fire_mode":crate::runtime_mode::is_test_fire(),"stats":stats,"profile":profile_id,"cycle_seconds":profile.cycle_seconds,"stats_per_page":profile.stats_per_page,"scene":profile.scene,"positions":crate::antenna::snapshot(),"t_clock":program_t_clock(&clock,sampled),"sequence_visuals":sequence_visuals,"diagram":diagram})
 }
 
 fn valid_hls_file(name: &str) -> bool {

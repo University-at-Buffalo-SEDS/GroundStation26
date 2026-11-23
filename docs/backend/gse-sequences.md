@@ -224,6 +224,14 @@ pressure limits, nitrogen-test completion before fill, and self-test confirmatio
 remain required. Enabled sequence buttons are illuminated as a readiness indicator;
 backend `actuated` still reports actual sequence status, not mere availability.
 
+**Commanded vs confirmed valves.** In the action policy, `actuated` on Pilot,
+NormallyOpen (vent), Dump, Nitrogen, Nitrous, Igniter and RetractPlumbing is
+the position last confirmed by the owner board's `UMBILICAL_STATUS`. While a
+command for one of them waits for that confirmation, `requested` carries the
+commanded position (`true` = open/on/retracted); it is absent otherwise
+(`state.rs`, action-policy decoration). A UI shows "pending" while `requested`
+is present and differs from `actuated`.
+
 The backend layout now includes all five GSE sequence action definitions and
 adds their command IDs to prelaunch state widgets that contain manual valves.
 They therefore appear both in Actions and in the embedded ground-station valve

@@ -342,6 +342,7 @@ fn wants_ndjson(headers: &HeaderMap) -> bool {
 
 /// Public router constructor
 pub fn router(state: Arc<AppState>, video_password: String) -> Router {
+    crate::raw_stream::start(&state);
     let voice = Arc::new(crate::voice::VoiceHub::default());
     let spa_index = ServeFile::new("./frontend/dist/public/index.html");
     let static_dir = ServeDir::new("./frontend/dist/public")
@@ -525,6 +526,8 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .merge(crate::checklists::routes())
         .merge(crate::client_settings::routes())
         .merge(crate::watch::routes())
+        .merge(crate::diagrams::routes())
+        .merge(crate::raw_stream::routes())
         .merge(crate::mission_sync::routes())
         .merge(crate::station_mode::routes())
         .merge(crate::station_mode_switch::routes())
@@ -541,6 +544,8 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .fallback_service(static_dir)
         // Watch tokens reach only the watch status, map tiles, /api/command and logout.
         .layer(axum::middleware::from_fn(crate::watch::scope_watch_tokens))
+        // Stream viewer tokens reach only the raw stream feed and their logout.
+        .layer(axum::middleware::from_fn(crate::raw_stream::scope_stream_tokens))
         .with_state(state)
 }
 

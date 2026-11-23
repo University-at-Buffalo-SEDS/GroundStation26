@@ -524,6 +524,14 @@ The latency from board to GS is not fixed. Each row records it as
 
 Each row repeats the packet's `payload_json`.
 
+**External raw feed.** Every row published to the live UI (the `ws_tx`
+fan-out, after the decoders and derived values above) is also available
+read-only, with field names, units, the receipt/source/network times and
+live/sim/replay provenance, on `GET /api/stream/raw/ws` and `GET /api/stream/raw`
+(NDJSON). See [backend/raw-stream-feed.md](backend/raw-stream-feed.md). It
+shares the WebSocket's rows, not the recording: rows dropped by §6 item 5 for
+the UI are not dropped for the feed, which has its own per-client caps.
+
 ## 6. Known gaps / bugs found
 
 These are described, not fixed.

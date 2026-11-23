@@ -829,6 +829,15 @@ impl AuthManager {
 
     pub async fn logout(&self, db: &SqlitePool, token: &str) -> Result<(), AuthFailure> {
         let token = token.trim();
+        if is_stream_token(token) {
+            // A stream viewer signing itself out removes only its own row.
+            sqlx::query("DELETE FROM auth_sessions WHERE token = ?")
+                .bind(stream_row_key(token))
+                .execute(db)
+                .await
+                .map_err(|e| AuthFailure::Internal(format!("failed to remove stream token: {e}")))?;
+            return Ok(());
+        }
         if is_watch_token(token) {
             // A watch signing itself out removes only its own row.
             sqlx::query("DELETE FROM auth_sessions WHERE token = ?")
@@ -940,6 +949,11 @@ impl AuthManager {
 
         if let Some(token) = token.filter(|token| !token.trim().is_empty()) {
             let token = token.trim();
+            if is_stream_token(token) {
+                // Stream viewer tokens are checked only by the raw stream feed
+                // (`authorize_stream`); every other endpoint refuses them.
+                return Err(AuthFailure::Forbidden(STREAM_TOKEN_SCOPE_MESSAGE.into()));
+            }
             if is_watch_token(token) {
                 return self.authorize_watch(db, token, required).await;
             }
@@ -1776,4 +1790,275 @@ fn default_session_ttl_seconds() -> u64 {
 
 fn default_password_algorithm() -> String {
     "pbkdf2_sha256".to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Stream viewer tokens (docs/backend/raw-stream-feed.md)
+
+/// Stream viewer tokens: `gss1.` + 32 random bytes. Only a SHA-256 digest is
+/// stored (`gss1h:<hex>`), so the sessions table never holds the credential.
+pub const STREAM_TOKEN_PREFIX: &str = "gss1.";
+const STREAM_ROW_PREFIX: &str = "gss1h:";
+/// `stream|<public id>`
+const STREAM_SESSION_PREFIX: &str = "stream|";
+pub const STREAM_TOKEN_SCOPE_MESSAGE: &str = "stream viewer tokens only read the raw stream feed";
+pub const STREAM_TOKEN_MIN_TTL_HOURS: u64 = 1;
+pub const STREAM_TOKEN_MAX_TTL_HOURS: u64 = 8760;
+pub const STREAM_TOKEN_DEFAULT_TTL_HOURS: u64 = 720;
+const STREAM_LABEL_MAX: usize = 80;
+const STREAM_SCOPE_MAX_ITEMS: usize = 64;
+
+pub fn is_stream_token(token: &str) -> bool {
+    token.trim().starts_with(STREAM_TOKEN_PREFIX)
+}
+
+fn stream_row_key(token: &str) -> String {
+    format!("{STREAM_ROW_PREFIX}{}", sha256_hex(token.trim()))
+}
+
+/// What a stream viewer token may read: filters the feed can only narrow.
+/// Empty lists mean every type / every sender.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct StreamScope {
+    pub label: String,
+    #[serde(default)]
+    pub types: Vec<String>,
+    #[serde(default)]
+    pub senders: Vec<String>,
+    /// Per-stream rate cap (Hz) the token can never exceed.
+    #[serde(default)]
+    pub max_hz: Option<f64>,
+}
+
+impl StreamScope {
+    /// Trims, deduplicates and bounds the scope; refuses malformed entries.
+    pub fn normalized(mut self) -> Result<Self, String> {
+        self.label = self.label.trim().to_string();
+        if self.label.is_empty() || self.label.chars().count() > STREAM_LABEL_MAX {
+            return Err(format!("label must be 1-{STREAM_LABEL_MAX} characters"));
+        }
+        if self.label.chars().any(char::is_control) {
+            return Err("label must not contain control characters".into());
+        }
+        for (name, list) in [("types", &mut self.types), ("senders", &mut self.senders)] {
+            let mut out: Vec<String> = Vec::new();
+            for item in list.iter() {
+                let item = item.trim();
+                if item.is_empty() {
+                    continue;
+                }
+                if !valid_stream_filter_item(item) {
+                    return Err(format!("invalid {name} entry {item:?}"));
+                }
+                if !out.iter().any(|seen| seen == item) {
+                    out.push(item.to_string());
+                }
+            }
+            if out.len() > STREAM_SCOPE_MAX_ITEMS {
+                return Err(format!("at most {STREAM_SCOPE_MAX_ITEMS} {name} entries"));
+            }
+            *list = out;
+        }
+        if let Some(hz) = self.max_hz
+            && !(hz.is_finite() && (0.1..=1000.0).contains(&hz))
+        {
+            return Err("max_hz must be 0.1-1000".into());
+        }
+        Ok(self)
+    }
+}
+
+/// `A-Z a-z 0-9 _ - . @ :` with an optional trailing `*` (prefix match).
+pub fn valid_stream_filter_item(item: &str) -> bool {
+    let body = item.strip_suffix('*').unwrap_or(item);
+    (1..=64).contains(&item.len())
+        && body
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'@' | b':'))
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct StreamTokenGrant {
+    pub id: String,
+    /// Shown once; only its digest is stored.
+    pub token: String,
+    pub label: String,
+    pub issuer: String,
+    pub created_ms: i64,
+    pub expires_at_ms: i64,
+    pub types: Vec<String>,
+    pub senders: Vec<String>,
+    pub max_hz: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct StreamTokenInfo {
+    pub id: String,
+    pub label: String,
+    pub issuer: String,
+    pub created_ms: i64,
+    pub expires_at_ms: i64,
+    pub types: Vec<String>,
+    pub senders: Vec<String>,
+    pub max_hz: Option<f64>,
+}
+
+/// A valid stream viewer token: its public id, scope and expiry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamGrant {
+    pub id: String,
+    pub issuer: String,
+    pub scope: StreamScope,
+    pub expires_at_ms: i64,
+}
+
+fn valid_stream_id(id: &str) -> bool {
+    id.len() == 16 && id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+impl AuthManager {
+    /// Issues a stream viewer token. Only a signed-in application
+    /// administrator (never a watch or stream token) may issue one.
+    pub async fn issue_stream_token(
+        &self,
+        db: &SqlitePool,
+        issuer: &AuthPrincipal,
+        scope: StreamScope,
+        ttl_hours: Option<u64>,
+    ) -> Result<StreamTokenGrant, AuthFailure> {
+        if !issuer.is_admin() {
+            return Err(AuthFailure::Forbidden("Application administrator required".into()));
+        }
+        let username = issuer
+            .username
+            .clone()
+            .ok_or_else(|| AuthFailure::Forbidden("Application administrator required".into()))?;
+        let scope = scope.normalized().map_err(AuthFailure::Forbidden)?;
+        let ttl = ttl_hours.unwrap_or(STREAM_TOKEN_DEFAULT_TTL_HOURS);
+        if !(STREAM_TOKEN_MIN_TTL_HOURS..=STREAM_TOKEN_MAX_TTL_HOURS).contains(&ttl) {
+            return Err(AuthFailure::Forbidden(format!(
+                "ttl_hours must be {STREAM_TOKEN_MIN_TTL_HOURS}-{STREAM_TOKEN_MAX_TTL_HOURS}"
+            )));
+        }
+        let now = now_ms();
+        let expires_at_ms = now.saturating_add(ttl as i64 * 3_600_000);
+        let id: String = generate_random_bytes(8).iter().map(|b| format!("{b:02x}")).collect();
+        let token = format!("{STREAM_TOKEN_PREFIX}{}", generate_token());
+        let scope_json = serde_json::to_string(&scope)
+            .map_err(|e| AuthFailure::Internal(format!("failed to serialize scope: {e}")))?;
+        sqlx::query(
+            r#"
+            INSERT INTO auth_sessions (
+                token, username, session_type, can_view_data, can_send_commands, allowed_commands_json, created_at_ms, expires_at_ms
+            )
+            VALUES (?, ?, ?, 1, 0, ?, ?, ?)
+            "#,
+        )
+        .bind(stream_row_key(&token))
+        .bind(&username)
+        .bind(format!("{STREAM_SESSION_PREFIX}{id}"))
+        .bind(scope_json)
+        .bind(now)
+        .bind(expires_at_ms)
+        .execute(db)
+        .await
+        .map_err(|e| AuthFailure::Internal(format!("failed to store stream token: {e}")))?;
+        Ok(StreamTokenGrant {
+            id,
+            token,
+            label: scope.label,
+            issuer: username,
+            created_ms: now,
+            expires_at_ms,
+            types: scope.types,
+            senders: scope.senders,
+            max_hz: scope.max_hz,
+        })
+    }
+
+    /// Every unexpired stream viewer token (never the token itself).
+    pub async fn list_stream_tokens(&self, db: &SqlitePool) -> Result<Vec<StreamTokenInfo>, AuthFailure> {
+        self.cleanup_expired_sessions(db).await?;
+        let rows = sqlx::query(
+            "SELECT username, session_type, allowed_commands_json, created_at_ms, expires_at_ms FROM auth_sessions WHERE substr(session_type, 1, ?) = ? ORDER BY created_at_ms",
+        )
+        .bind(STREAM_SESSION_PREFIX.len() as i64)
+        .bind(STREAM_SESSION_PREFIX)
+        .fetch_all(db)
+        .await
+        .map_err(|e| AuthFailure::Internal(format!("failed to list stream tokens: {e}")))?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let id = row
+                    .get::<String, _>("session_type")
+                    .strip_prefix(STREAM_SESSION_PREFIX)?
+                    .to_string();
+                let scope: StreamScope =
+                    serde_json::from_str(&row.get::<String, _>("allowed_commands_json")).ok()?;
+                Some(StreamTokenInfo {
+                    id,
+                    label: scope.label,
+                    issuer: row.get("username"),
+                    created_ms: row.get("created_at_ms"),
+                    expires_at_ms: row.get("expires_at_ms"),
+                    types: scope.types,
+                    senders: scope.senders,
+                    max_hz: scope.max_hz,
+                })
+            })
+            .collect())
+    }
+
+    /// Revokes one stream viewer token by its public id.
+    pub async fn revoke_stream_token(&self, db: &SqlitePool, id: &str) -> Result<u64, AuthFailure> {
+        if !valid_stream_id(id) {
+            return Err(AuthFailure::Forbidden("invalid stream token id".into()));
+        }
+        let result = sqlx::query("DELETE FROM auth_sessions WHERE session_type = ?")
+            .bind(format!("{STREAM_SESSION_PREFIX}{id}"))
+            .execute(db)
+            .await
+            .map_err(|e| AuthFailure::Internal(format!("failed to revoke stream token: {e}")))?;
+        Ok(result.rows_affected())
+    }
+
+    /// Resolves a stream viewer token. It is valid while its row exists, it
+    /// has not expired and its issuer is still an enabled administrator.
+    pub async fn authorize_stream(&self, db: &SqlitePool, token: &str) -> Result<StreamGrant, AuthFailure> {
+        let invalid = || AuthFailure::Unauthorized("invalid or revoked stream token".into());
+        if !is_stream_token(token) {
+            return Err(invalid());
+        }
+        let row = sqlx::query(
+            "SELECT username, session_type, allowed_commands_json, expires_at_ms FROM auth_sessions WHERE token = ? LIMIT 1",
+        )
+        .bind(stream_row_key(token))
+        .fetch_optional(db)
+        .await
+        .map_err(|e| AuthFailure::Internal(format!("failed to query session: {e}")))?
+        .ok_or_else(invalid)?;
+        let id = row
+            .get::<String, _>("session_type")
+            .strip_prefix(STREAM_SESSION_PREFIX)
+            .map(str::to_string)
+            .ok_or_else(invalid)?;
+        let expires_at_ms = row.get::<i64, _>("expires_at_ms");
+        if expires_at_ms <= now_ms() {
+            return Err(AuthFailure::Unauthorized("stream token expired".into()));
+        }
+        let config = self
+            .load_users_file()
+            .map_err(|e| AuthFailure::Internal(format!("failed to load users.json: {e}")))?;
+        let username = row.get::<String, _>("username");
+        let issuer = config
+            .users
+            .iter()
+            .find(|u| u.username.eq_ignore_ascii_case(&username) && !u.disabled)
+            .filter(|u| u.roles.contains(&StreamRole::Admin))
+            .ok_or_else(|| AuthFailure::Unauthorized("stream token issuer is no longer an administrator".into()))?;
+        let scope: StreamScope = serde_json::from_str(&row.get::<String, _>("allowed_commands_json"))
+            .map_err(|_| invalid())?;
+        Ok(StreamGrant { id, issuer: issuer.username.clone(), scope, expires_at_ms })
+    }
 }

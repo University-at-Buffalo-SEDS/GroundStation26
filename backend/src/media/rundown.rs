@@ -163,6 +163,7 @@ pub(super) fn valid_scene(scene: &str) -> bool {
         "recorded-replay",
     ]
     .contains(&scene)
+        || crate::diagrams::is_scene(scene)
 }
 impl Rundown {
     pub(super) fn normalize_flight_phases(&mut self) -> Result<(), &'static str> {

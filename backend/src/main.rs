@@ -40,6 +40,8 @@ mod ignition_pair;
 mod checklists;
 mod client_settings;
 mod watch;
+mod raw_stream;
+mod diagrams;
 mod command_probe;
 mod command_proxy;
 mod comms;

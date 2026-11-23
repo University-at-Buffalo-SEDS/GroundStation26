@@ -2385,6 +2385,31 @@ impl AppState {
                     control.blink = crate::sequences::BlinkMode::None;
                 }
         }
+        // Commanded vs confirmed: while a valve command awaits its owner
+        // board's report, `requested` carries the commanded position (open =
+        // true); `actuated` stays the last confirmed one. No pending command
+        // leaves `requested` as it was (None for valves).
+        for control in &mut policy.controls {
+            let key = match control.cmd.as_str() {
+                "Pilot" => Some(crate::rocket_commands::ValveBoardCommands::PilotOpen as u8),
+                "NormallyOpen" => {
+                    Some(crate::rocket_commands::ValveBoardCommands::NormallyOpenOpen as u8)
+                }
+                "Dump" => Some(crate::rocket_commands::ValveBoardCommands::DumpOpen as u8),
+                "Igniter" => Some(crate::rocket_commands::ActuatorBoardCommands::IgniterOn as u8),
+                "RetractPlumbing" => {
+                    Some(crate::rocket_commands::ActuatorBoardCommands::RetractPlumbing as u8)
+                }
+                "Nitrogen" => {
+                    Some(crate::rocket_commands::ActuatorBoardCommands::NitrogenOpen as u8)
+                }
+                "Nitrous" => Some(crate::rocket_commands::ActuatorBoardCommands::NitrousOpen as u8),
+                _ => None,
+            };
+            if let Some(pending) = key.and_then(|key| self.get_pending_umbilical_valve_state(key)) {
+                control.requested = Some(pending);
+            }
+        }
         for control in &mut policy.controls {
             if crate::sequences::is_station_utility_command(&control.cmd) {
                 control.enabled = true;

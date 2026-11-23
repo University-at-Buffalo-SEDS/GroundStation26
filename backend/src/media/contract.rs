@@ -650,7 +650,7 @@ async fn control_broadcast_inner(
         .map_err(|message| error(StatusCode::BAD_REQUEST, message))?;
     if broadcast.label.len() > 200
         || !(3..=60).contains(&broadcast.delay_seconds)
-        || ![
+        || (![
             "hero",
             "grid",
             "tiles",
@@ -661,6 +661,7 @@ async fn control_broadcast_inner(
             "recorded-replay",
         ]
         .contains(&broadcast.layout.as_str())
+            && !crate::diagrams::is_scene(&broadcast.layout))
         || !valid_tiles(&broadcast.tiles)
         || (broadcast.layout=="tiles" && broadcast.tiles.is_empty())
         || broadcast.hidden_stream_ids.len() > 1000
