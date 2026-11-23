@@ -2473,6 +2473,7 @@ async fn get_network_diagnostics(
         "discovery": {"interval_ms": stats.discovery.current_announce_interval_ms,
             "next_announce_ms": stats.discovery.next_announce_ms},
         "radio_tx_budget": crate::telemetry_task::radio_tx_budget_diagnostics(),
+        "ingress_ring": state.ring_buffer.lock().unwrap().stats(),
     })).into_response()
 }
 

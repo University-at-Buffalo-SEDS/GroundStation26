@@ -1050,6 +1050,7 @@ pub async fn telemetry_task(
     heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut heartbeat_failed = false;
     let mut last_backpressure_log_ms: u64 = 0;
+    let mut ingress_drop_warning = crate::ring_buffer::DropWarning::default();
     let mut packet_worker_failure_reported = false;
     let packet_work_queue_size = env_usize(
         "GS_PACKET_WORK_QUEUE_SIZE",
@@ -1825,6 +1826,13 @@ pub async fn telemetry_task(
                     if crate::network_variables::reconcile_network_outputs_for_state(&state, &router) {
                         sequences::refresh_action_policy_now(&state);
                         state.broadcast_action_policy_snapshot();
+                    }
+                    let ingress_dropped = state.ring_buffer.lock().unwrap().dropped();
+                    if let Some(warning) =
+                        ingress_drop_warning.observe(ingress_dropped, get_current_timestamp_ms())
+                    {
+                        eprintln!("{warning}");
+                        emit_warning(&state, warning);
                     }
                     for _ in 0..packet_enqueue_burst {
                         match packet_tx.try_reserve() {

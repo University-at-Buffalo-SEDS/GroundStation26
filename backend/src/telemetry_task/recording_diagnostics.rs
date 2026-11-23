@@ -523,11 +523,14 @@ fn capture(
     if let Ok(shape) = topology_shape {
         sampler.topology_shape = Some(shape);
     }
+    let ingress = state.ring_buffer.lock().unwrap().stats();
     let snapshot_id = format!("{process}:{generation}:{started}");
     let context = json!({"version":1,"process":process,"snapshot_id":snapshot_id,"prior_lost_batches_decimal":prior_lost.to_string(),"received_utc_ms":wall,
         "network_utc_ms":network,"capture_started_received_utc_ms":started_wall,"recording_generation_decimal":generation.to_string(),"capture_monotonic_ms_decimal":started.to_string(),
         "capture_duration_ms_decimal":origin.elapsed().as_millis().saturating_sub(u128::from(started)).to_string(),
         "raw_health_queue_drops_decimal":RAW_DROPS.load(std::sync::atomic::Ordering::Relaxed).to_string(),
+        "ingress_ring_drops_decimal":ingress.dropped.to_string(),"ingress_ring_capacity":ingress.capacity,
+        "ingress_ring_len":ingress.len,"ingress_ring_high_water":ingress.high_water,
         "simulated":mirrored.simulated,"expected_launch_journal_match":"unknown_not_sampled","quality":"observed_snapshot"});
     let mut health_json = serde_json::to_value(&health).map_err(|e| e.to_string())?;
     for entry in health_json.as_array_mut().into_iter().flatten() {

@@ -97,6 +97,42 @@ async fn actual_snapshot_without_ui_keeps_stale_temperature_unknown() {
     );
 }
 
+#[tokio::test]
+async fn recorded_network_state_carries_ingress_ring_drops() {
+    let state = crate::state::tests::test_app_state().await;
+    installed(&state);
+    let packet = sedsnet::packet::Packet::new(
+        crate::telemetry_schema::data_type("BATTERY_CURRENT"),
+        &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+        "PB",
+        1,
+        Arc::<[u8]>::from(1.0f32.to_le_bytes().to_vec()),
+    )
+    .unwrap();
+    {
+        let mut ring = state.ring_buffer.lock().unwrap();
+        let capacity = ring.stats().capacity;
+        for _ in 0..capacity + 3 {
+            ring.push(crate::ring_buffer::ReceivedPacket::Telemetry {
+                packet: packet.clone(),
+                ingress_generation: 0,
+            });
+        }
+        ring.pop_oldest();
+    }
+    let writes = capture(&state, "p", Instant::now(), &mut Default::default(), 1, 0).unwrap();
+    let network = writes
+        .iter()
+        .find(|w| matches!(w,DbWrite::Telemetry{data_type,..}if data_type==NETWORK))
+        .unwrap();
+    let context = &payload(network)["context"];
+    let capacity = state.ring_buffer.lock().unwrap().stats().capacity;
+    assert_eq!(context["ingress_ring_drops_decimal"], "3");
+    assert_eq!(context["ingress_ring_capacity"], capacity);
+    assert_eq!(context["ingress_ring_high_water"], capacity);
+    assert_eq!(context["ingress_ring_len"], capacity - 1);
+}
+
 struct Hold {
     entries: AtomicUsize,
     armed: AtomicBool,
