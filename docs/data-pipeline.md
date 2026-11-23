@@ -383,6 +383,31 @@ sequenceDiagram
   It stores rows in `sd_samples` and the original bytes in `sd_source_chunks`.
 - `resolve_recording` builds `sd_replay_telemetry`. SD rows replace network rows of the same sender and type wherever the SD gives continuous coverage (gap ≤ `max_gap_ms`).
 
+**Format selection.** The parser is chosen by the file's SEDS-SD format block, not by the firmware revision. Board files start, right after the 13-column header:
+
+```
+# seds-sd,format=<daq|fc>,version=<n>,board=<DAQ|FC>,firmware=<rev>,tick_hz=<hz>,schema=<8hex>
+# seds-sd-columns,u64:ms,u64:ms,label,vec,vec,vec,vec,clock,f32:degC,i32:code,u64:tick,u32:Hz,u64:seq
+# seds-sd-records,<label>(:<v|a|r|c>=<units>)+[@<tick_hz>],...      (one or more lines)
+```
+
+`schema` is the first 8 hex digits of SHA-256 over the columns line and every records line, each taken as its text plus `\r\n`, in file order (lines 1-2 are excluded, so the firmware revision does not change it). The worker peeks the block before copying the recording (`read_format_block`), and the resolver re-parses it from the stored `#` rows (`format_block_from_metadata`). Both use `parse_format_block(lines) -> dict | None` in `recording_sd_import.py`. It returns `None` for a headerless file. It raises for a damaged block. Otherwise it returns `{format, version, board, firmware, tick_hz, schema, columns, records: {label: {columns: {field: [units]}, tick_hz, prefix, entry}}, legacy: False}`, with `<u>*<n>` expanded and the default `tick_hz` filled in. `declared_record(block, label)` looks a label up (exact, else the longest `prefix*` pattern).
+
+| File | Result |
+| --- | --- |
+| Block with a registered (format, version): `daq` v3 (`daq-v3`), `fc` v2 (`fc-v2`) | Accepted whatever the `firmware` revision. `mapping_profile` and `firmware_head` are optional. A `mapping_profile` other than the format's own (`daq-v3`, `fc-v2`) is refused as a conflict. The block's `board` must match the format, and the columns line must be the 13-column layout above. |
+| Block with another format or version | Refused: `SD file declares format daq v4; this ground station reads daq v3, fc v2 (and legacy headerless daq v1/v2, fc v1). Update the ground station.` |
+| Block whose schema does not match its lines, or a misplaced or malformed block | Refused: `SD format header damaged: schema hash mismatch (declared …, computed …)` (or the malformation). `import_csv` refuses it too. |
+| No block | Legacy: exactly the pinned `mapping_profile` + `firmware_head` rules below. Labelled legacy `daq` v1 (`daq-20261101`), `daq` v2 (`daq-20261117`, `daq-20261123`) and `fc` v1 (`fc-20261101`). |
+
+For a header file, each selected mapping needs its source labels declared with the column units it reads, width included, and with the tick rate where it matters. Examples: `kg1000_v` needs `kg1000_v:r=V@1000000`; `kg1000_kg` needs `kg1000_v:c=kg`; `input_supply` needs `input_voltage_v:r=V:c=V` and `input_current_a:r=V:c=A`; FC `IMU` needs `IMU:v=m/s2*3;deg/s*3`. A selected mapping whose label is missing or declared differently is refused with both declarations named. Other declared labels (`dac_chN_*`, `Message`, …) and undeclared data labels are ignored. `kg50_p6_v` is an optional source of `kg50_v`: it is read only when declared. Each row's `uptime_frequency_hz` must equal its record's declared tick rate.
+
+The detected format is reported as `sd_format: {format, version, board, firmware, schema, tick_hz, legacy}`: in the import result, at the top of the worker result (with `profile`), per import in the resolution manifest `sd_formats`, and in each SD row's `provenance.mapping.sd_format`. For header files `provenance.mapping.source_evidence` is the declared firmware revision. A manifest `firmware_head` is kept as `sd_format.manifest_firmware_head`.
+
+`daq` v3 maps as `daq-20261123` below (µs `MedianBin` for `KG1000`/`KG50`, kg, `input_supply`). `fc` v2 maps as `fc-20261101` but reads `value` and labels accelerations `m/s2`, which is what the FC writes (FC `docs/data-pipeline.md` gap 8). `SD_FORMATS` in `recording_sd_resolve.py` registers both.
+
+**Version rule.** Any firmware change to the columns line or the record entries bumps `version` in that board's firmware. That covers adding, removing or changing a label, its columns, units or tick rate, and any change to the row layout. The new version must also be registered in `SD_FORMATS`. Until it is, the station refuses those files with the message above. A Rust reader that only needs to detect the format can apply the same rule: line 2 starts `# seds-sd,`, the `key=value` fields follow, and the schema is checked as described above.
+
 **DAQ mapping profile `daq-20261123`** (firmware head `DAQ_SD_HEAD_US` = DAQ-Board `e5fad32`, the 1 kHz frame schedule). MCP3564R rows carry microsecond `uptime_ticks` (`uptime_frequency_hz` 1000000):
 
 | Mapping | SD sensor(s) | GS type |
@@ -548,7 +573,7 @@ These are described, not fixed.
 7. **The test-fire CSV uses the current calibration, and its Thrust column is in kg.**
    - The CSV is computed with the calibration loaded when the export runs, not the recording's `calibration_history` (`recording_store.rs:1048`, `telemetry_task.rs:2314`).
    - `Weight` is always `0.0` and `Thrust` repeats `1000kg Calibrated` in kg (`test_fire_csv.rs:115`, `:260`).
-8. **The SD resolver rejects current DAQ firmware.** The resolver accepts only DAQ heads `44a9195` and `55fe7a8` (`recording_sd_resolve.py:12-16`, `:145`). DAQ `origin/dev` is `6f29611`, which changed `Core/Src/sd_card.c` after `44a9195`. A manifest with the current head is refused even though the 13-column format is unchanged. `kg50_kg` maps only `kg50_v`, so a P6 run has no SD weight (`recording_sd_resolve.py:49`).
+8. **SD resolver firmware pins (fixed for files with a format block).** Files with a SEDS-SD format block are selected by format and version, whatever their firmware revision (§3.5). Headerless files still need a pinned `mapping_profile` + `firmware_head`, so a headerless file from an unpinned DAQ revision is refused. `kg50_kg` maps only `kg50_v`, whose `calibrated_value` is kg; `kg50_p6_v` carries input volts, so a P6 run has no SD weight. The legacy `fc-20261101` profile still labels accelerations `g`; the FC writes m/s², and `fc` v2 labels them `m/s2`.
 9. **The DAQ launch-file fetch is fragile.** The request is an in-memory flag (`sd_download.rs:939-946`), lost on a restart. It is set only for `launch` captures, not `hitl` or `ground_test` (`recording_store.rs:1059`). It gives up after 1 h of unavailable downloads (`sd_download.rs:953`). The lead-up jobs, by contrast, persist.
 10. **Thermal correction depends on a fresh temperature.** If a thermal entry with a nonzero slope is configured, `temperature_corrected_raw` returns `None` without a `DAQ_ADC_TEMPERATURE` from the last 2 s (`loadcell.rs` `recent_adc_temperature`, `temperature_corrected_raw`). The weight then becomes unavailable.
 11. **Documentation mismatch.** [backend/rolling-recording.md](backend/rolling-recording.md) gives the HITL capture 10 min / 5 min. The code default is 300 s / 120 s (`recording_store.rs:131`).

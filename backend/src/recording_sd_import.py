@@ -29,6 +29,180 @@ def bounded_csv_lines(text):
         if len(line)>MAX_PHYSICAL_LINE_CHARS:raise ValueError("CSV physical line exceeds versioned format bounds")
         yield line
 
+# SEDS-SD format block (lines 2.. of a board SD CSV, before any other '#' line):
+#   # seds-sd,format=<id>,version=<n>,board=<BOARD>,firmware=<rev>,tick_hz=<hz>,schema=<8hex>
+#   # seds-sd-columns,<type[:unit]> x13
+#   # seds-sd-records,<entry>,...        (one or more lines)
+# schema = first 8 hex of SHA-256 over the columns line and every records line,
+# each as its text plus CRLF, in file order. Files without the block are legacy
+# (mapping_profile + pinned firmware_head).
+SD_FORMAT_LINE = '# seds-sd'
+SD_COLUMNS_LINE = '# seds-sd-columns'
+SD_RECORDS_LINE = '# seds-sd-records'
+SD_COLUMN_ALIASES = {'v': 'value', 'a': 'raw_adc_code', 'r': 'raw_value', 'c': 'calibrated_value'}
+SD_COLUMN_TYPES = ('u64:ms,u64:ms,label,vec,vec,vec,vec,clock,f32:degC,i32:code,'
+                   'u64:tick,u32:Hz,u64:seq').split(',')
+# Headerless files: the legacy format each pinned mapping profile reads.
+LEGACY_SD_FORMATS = {'daq-20261101': ('daq', 1), 'daq-20261117': ('daq', 2),
+                     'daq-20261123': ('daq', 2), 'fc-20261101': ('fc', 1)}
+
+
+def _format_line_text(line):
+    if isinstance(line, (list, tuple)):
+        return ','.join(line)
+    if isinstance(line, bytes):
+        line = line.decode('utf-8')
+    return line.rstrip('\r\n')
+
+
+def _sd_units(text, where):
+    units = []
+    for item in text.split(';'):
+        name, star, count = item.partition('*')
+        if not name or (star and (not count.isdigit() or not 1 <= int(count) <= 64)):
+            raise ValueError(f'SD format header damaged: bad units {text!r} in {where}')
+        units += [name] * (int(count) if star else 1)
+    return units
+
+
+def _sd_record_entry(entry):
+    body, at, tick = entry.partition('@')
+    if at and (not tick.isdigit() or not 0 < int(tick) < 2**32):
+        raise ValueError(f'SD format header damaged: bad tick rate in record entry {entry!r}')
+    label, *columns = body.split(':')
+    if not label or not columns or label == '*':
+        raise ValueError(f'SD format header damaged: bad record entry {entry!r}')
+    declared = {}
+    for column in columns:
+        alias, equals, units = column.partition('=')
+        field = SD_COLUMN_ALIASES.get(alias)
+        if not equals or field is None or field in declared:
+            raise ValueError(f'SD format header damaged: bad column {column!r} in record entry {entry!r}')
+        declared[field] = _sd_units(units, entry)
+    prefix = label.endswith('*')
+    return (label[:-1] if prefix else label), {'columns': declared, 'tick_hz': int(tick) if at else None,
+                                               'prefix': prefix, 'entry': entry}
+
+
+def parse_format_block(lines):
+    """Parse and verify the SEDS-SD format block.
+
+    `lines` are the CSV lines after the 13-column header, in file order (text or
+    bytes with or without line endings, or csv field lists). Only the leading
+    run matters; pass at least the lines up to the first data row. Returns None
+    for a headerless (legacy) file. Raises ValueError for a malformed block or a
+    schema hash that does not match. The result:
+      {format, version, board, firmware, tick_hz, schema, columns: [13 str],
+       records: {label: {columns: {field: [unit, ...]}, tick_hz: int (resolved),
+                         prefix: bool, entry: str}}, legacy: False}
+    """
+    texts = []
+    for line in lines:
+        text = _format_line_text(line)
+        if not text.startswith('#'):
+            break
+        texts.append(text)
+    if not texts or texts[0].split(',', 1)[0] != SD_FORMAT_LINE:
+        if any(text.startswith(SD_FORMAT_LINE) for text in texts):
+            raise ValueError('SD format header damaged: format lines are not right after the CSV header')
+        return None
+    fields = {}
+    for item in texts[0].split(',')[1:]:
+        key, equals, value = item.partition('=')
+        if not equals or not key or key in fields:
+            raise ValueError(f'SD format header damaged: bad field {item!r}')
+        fields[key] = value
+    missing = [k for k in ('format', 'version', 'board', 'firmware', 'tick_hz', 'schema') if k not in fields]
+    if missing:
+        raise ValueError('SD format header damaged: missing ' + ', '.join(missing))
+    if not fields['version'].isdigit() or not fields['tick_hz'].isdigit() or not 0 < int(fields['tick_hz']) < 2**32:
+        raise ValueError('SD format header damaged: version and tick_hz must be decimal integers')
+    schema = fields['schema']
+    if len(schema) != 8 or any(ch not in '0123456789abcdef' for ch in schema):
+        raise ValueError('SD format header damaged: schema must be 8 lowercase hex digits')
+    if len(texts) < 2 or texts[1].split(',', 1)[0] != SD_COLUMNS_LINE:
+        raise ValueError('SD format header damaged: missing # seds-sd-columns line')
+    count = 2
+    while count < len(texts) and texts[count].split(',', 1)[0] == SD_RECORDS_LINE:
+        count += 1
+    if count == 2:
+        raise ValueError('SD format header damaged: missing # seds-sd-records line')
+    if any(text.startswith(SD_FORMAT_LINE) for text in texts[count:]):
+        raise ValueError('SD format header damaged: stray # seds-sd line after the record entries')
+    digest = hashlib.sha256(''.join(text + '\r\n' for text in texts[1:count]).encode()).hexdigest()[:8]
+    if digest != schema:
+        raise ValueError(f'SD format header damaged: schema hash mismatch (declared {schema}, computed {digest})')
+    tick_hz = int(fields['tick_hz'])
+    records = {}
+    for text in texts[2:count]:
+        for entry in text.split(',')[1:]:
+            label, record = _sd_record_entry(entry)
+            key = label + ('*' if record['prefix'] else '')
+            if key in records:
+                raise ValueError(f'SD format header damaged: record {key} declared twice')
+            if record['tick_hz'] is None:
+                record['tick_hz'] = tick_hz
+            records[key] = record
+    return {'format': fields['format'], 'version': int(fields['version']), 'board': fields['board'],
+            'firmware': fields['firmware'], 'tick_hz': tick_hz, 'schema': schema,
+            'columns': texts[1].split(',')[1:], 'records': records, 'legacy': False}
+
+
+def declared_record(block, label):
+    """The record entry that declares `label` (exact, else longest prefix pattern)."""
+    record = block['records'].get(label)
+    if record is not None and not record['prefix']:
+        return record
+    best = None
+    for key, record in block['records'].items():
+        if record['prefix'] and label.startswith(key[:-1]) and (best is None or len(key) > len(best[0])):
+            best = (key, record)
+    return best[1] if best else None
+
+
+def format_block_from_metadata(metadata):
+    """parse_format_block over the '#' rows import_csv stored (leading run only)."""
+    items = sorted((item for item in metadata or [] if isinstance(item, dict) and 'fields' in item),
+                   key=lambda item: item['record_index'])
+    leading = []
+    for position, item in enumerate(items, 1):
+        if item['record_index'] != position:
+            if any(','.join(rest['fields']).startswith(SD_FORMAT_LINE) for rest in items[position-1:]):
+                raise ValueError('SD format header damaged: format lines are not right after the CSV header')
+            break
+        leading.append(item['fields'])
+    return parse_format_block(leading)
+
+
+def read_format_block(path, max_rows=1024):
+    """Peek a CSV's format block (None if headerless or not a 13-column SD CSV)."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    csv.field_size_limit(MAX_FIELD_BYTES)
+    with io.TextIOWrapper(os.fdopen(fd, 'rb'), encoding='utf-8-sig', newline='') as text:
+        reader = csv.reader(bounded_csv_lines(text), strict=True)
+        if next(reader, None) != FIELDS:
+            return None
+        rows = []
+        for row in reader:
+            if not row or not row[0].startswith('#') or len(rows) >= max_rows:
+                break
+            rows.append(row)
+    return parse_format_block(rows)
+
+
+def sd_format_summary(block, manifest):
+    """Detected format for results and provenance."""
+    if block is not None:
+        return {'format': block['format'], 'version': block['version'], 'board': block['board'],
+                'firmware': block['firmware'], 'schema': block['schema'], 'tick_hz': block['tick_hz'],
+                'legacy': False}
+    profile = manifest.get('mapping_profile') if isinstance(manifest, dict) else None
+    legacy = LEGACY_SD_FORMATS.get(profile) if isinstance(profile, str) else None
+    return {'format': legacy[0] if legacy else None, 'version': legacy[1] if legacy else None,
+            'firmware': manifest.get('firmware_head') if legacy else None, 'schema': None,
+            'profile': profile if legacy else None, 'legacy': True}
+
+
 MAX_ROWS = 50_000_000
 MAX_DATABASE_BYTES = 32 * 1024**3
 MINIMUM_FREE_BYTES = 0
@@ -209,14 +383,15 @@ def import_csv(db, source, manifest, *, max_bytes=MAX_FILE_BYTES, max_rows=MAX_R
         if next(reader, None) != FIELDS:
             raise ValueError('Unsupported SD CSV schema: exact current 13-column header required')
         db.execute('BEGIN IMMEDIATE')
-        prior = db.execute('SELECT id,manifest_json FROM sd_imports WHERE file_sha256=? '
+        prior = db.execute('SELECT id,manifest_json,metadata_json FROM sd_imports WHERE file_sha256=? '
                            'AND board_id=? AND boot_id=? AND stream_id=?',
                            (digest,manifest['board_id'],manifest['boot_id'],manifest['stream_id'])).fetchone()
         if prior:
             if prior[1] != encoded_manifest:
                 raise ValueError('Reimport manifest conflicts with retained provenance')
             db.rollback()
-            return {'import_id':prior[0], 'file_sha256':digest, 'already_imported':True}
+            return {'import_id':prior[0], 'file_sha256':digest, 'already_imported':True,
+                    'sd_format':sd_format_summary(format_block_from_metadata(json.loads(prior[2])),manifest)}
         cur = db.execute('INSERT INTO sd_imports(file_sha256,filename,board_id,boot_id,stream_id,'
             'launch_session,schema_version,config_json,metadata_json,manifest_json) VALUES(?,?,?,?,?,?,?,?,?,?)',
             (digest,Path(source).name,manifest['board_id'],manifest['boot_id'],manifest['stream_id'],
@@ -282,13 +457,14 @@ def import_csv(db, source, manifest, *, max_bytes=MAX_FILE_BYTES, max_rows=MAX_R
                 raise ValueError('Import exceeds row limit; no rows committed')
         if not count:
             raise ValueError('CSV contains no samples')
+        sd_format=sd_format_summary(format_block_from_metadata(metadata),manifest)
         check_disk_limit(db,max_database_bytes)
         after=os.fstat(binary.fileno())
         if (after.st_size,after.st_mtime_ns)!=(source_info.st_size,source_info.st_mtime_ns):
             raise ValueError('CSV changed while importing; retry a closed immutable file')
         db.execute('UPDATE sd_imports SET metadata_json=? WHERE id=?',(canonical(metadata),import_id))
         db.commit()
-        return {'import_id':import_id,'file_sha256':digest,'samples':count,'already_imported':False}
+        return {'import_id':import_id,'file_sha256':digest,'samples':count,'already_imported':False,'sd_format':sd_format}
     except Exception as error:
         db.rollback()
         raise ValueError(f'SD import rejected near physical line {reader.line_num}: {error}') from error

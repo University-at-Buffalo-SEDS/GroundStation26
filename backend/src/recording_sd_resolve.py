@@ -1,8 +1,12 @@
 """Explicit semantic coverage resolver for imported derived recordings.
 
-No receipt timestamps participate in matching. Profiles are pinned to inspected
-firmware source identities; callers provide the recorded schema and boot/session
-assignment. Unsupported formats remain in raw SD storage for explicit selection.
+No receipt timestamps participate in matching. A file with a SEDS-SD format
+block (`# seds-sd,format=..,version=..`, see parse_format_block) is read by the
+parser registered for its (format, version) in SD_FORMATS, keyed off the record
+entries it declares; its firmware revision is informational. Headerless files
+are legacy: their profile is pinned to inspected firmware source identities.
+Callers provide the recorded schema and boot/session assignment. Unsupported
+formats remain in raw SD storage for explicit selection.
 """
 import math
 import struct
@@ -72,6 +76,92 @@ PROFILES={
       'sensors':('input_voltage_v','input_current_a')}),
  }},
 }
+
+
+def _declare(field,units,labels):
+    return {label:{field:list(units)} for label in labels}
+
+
+# Formats declared by a SEDS-SD header, by (format, version). Mappings use the
+# legacy tuple layout; their options add 'declare' (labels the mapping needs,
+# each with the column units it reads, width included) and 'optional' (more
+# source labels, read only when declared, and then checked the same way).
+# Median bins also need the declared tick rate (uptime_hz). Other declared
+# labels and undeclared data labels are ignored. A firmware SD layout change
+# bumps the version; register the new version here (docs/data-pipeline.md 3.5).
+SD_FORMATS={
+ ('daq',3):{'name':'daq-v3','board':'DAQ','mappings':{
+  'kg1000_v':('raw_value',[0],'KG1000',['V'],{'median_bin':(3,20000),'uptime_hz':1000000,'sensors':('kg1000_v',),
+      'declare':_declare('raw_value',['V'],('kg1000_v',))}),
+  'kg50_v':('raw_value',[0],'KG50',['V'],{'median_bin':(5,50000),'uptime_hz':1000000,'sensors':('kg50_v','kg50_p6_v'),
+      'declare':_declare('raw_value',['V'],('kg50_v',)),'optional':_declare('raw_value',['V'],('kg50_p6_v',))}),
+  'kg1000_kg':('calibrated_value',[0],'LOADCELL_WEIGHT_KG',['kg'],{'sensors':('kg1000_v',),
+      'declare':_declare('calibrated_value',['kg'],('kg1000_v',))}),
+  'kg50_kg':('calibrated_value',[0],'LOADCELL_50_WEIGHT_KG',['kg'],{'sensors':('kg50_v',),
+      'declare':_declare('calibrated_value',['kg'],('kg50_v',))}),
+  'input_supply':(None,[0,1,2,3],'DAQ_POWER_MONITOR',['V','V','V','A'],{'pair':('input_voltage_v','input_current_a'),
+      'sensors':('input_voltage_v','input_current_a'),
+      'declare':{'input_voltage_v':{'raw_value':['V'],'calibrated_value':['V']},
+                 'input_current_a':{'raw_value':['V'],'calibrated_value':['A']}}}),
+ }},
+ # FC rows hold the converted vector in both value and calibrated_value; the
+ # header declares value. Accelerations are m/s^2 (FC docs gap 8).
+ ('fc',2):{'name':'fc-v2','board':'FC','mappings':{
+  'barometer_sample':('value',[2,0,1],'BAROMETER_DATA',['m','Pa','degC'],{'declare':_declare('value',['Pa','degC','m'],('barometer_sample',))}),
+  'BARO':('value',[0,1,2],'BAROMETER_DATA',['m','Pa','degC'],{'declare':_declare('value',['m','Pa','degC'],('BARO',))}),
+  'IMU':('value',[0,1,2,3,4,5],'IMU_DATA',['m/s2']*3+['deg/s']*3,{'declare':_declare('value',['m/s2']*3+['deg/s']*3,('IMU',))}),
+  'gyroscope_sample':('value',[0,1,2],'GYRO_DATA',['deg/s']*3,{'declare':_declare('value',['deg/s']*3,('gyroscope_sample',))}),
+  'accelerometer_sample':('value',[0,1,2],'ACCEL_DATA',['m/s2']*3,{'declare':_declare('value',['m/s2']*3,('accelerometer_sample',))}),
+  'EKF':('value',[0,1,2,3,4,5],'ASCENT_STATE',['1']*4+['m','m/s'],{'declare':_declare('value',['1']*4+['m','m/s'],('EKF',))}),
+  'DKF':('value',[0,1,2,3],'DESCENT_STATE',['deg','deg','m','m/s'],{'declare':_declare('value',['deg','deg','m','m/s'],('DKF',))}),
+ }},
+}
+
+
+def _supported_formats_text():
+    current=', '.join(f'{name} v{version}' for name,version in sorted(SD_FORMATS))
+    legacy={}
+    for name,version in sorted(set(LEGACY_SD_FORMATS.values())):legacy.setdefault(name,[]).append(f'v{version}')
+    return current+' (and legacy headerless '+', '.join(f'{n} {"/".join(v)}' for n,v in legacy.items())+')'
+
+
+def select_sd_format(block):
+    """The registered format for a parsed block, or ValueError naming what is supported."""
+    entry=SD_FORMATS.get((block['format'],block['version']))
+    if entry is None:
+        raise ValueError(f"SD file declares format {block['format']} v{block['version']}; this ground station reads "
+                         f'{_supported_formats_text()}. Update the ground station.')
+    if block['board']!=entry['board']:
+        raise ValueError(f"SD format header names board {block['board']} for format {block['format']}; expected {entry['board']}")
+    if block['columns']!=SD_COLUMN_TYPES:
+        raise ValueError(f"SD file declares {block['format']} v{block['version']} but its # seds-sd-columns line is not that version's row layout")
+    return entry
+
+
+def _declared_sources(block,name,mapping):
+    """Source labels a header-file mapping reads; ValueError if a needed label is
+    not declared or declared with other columns, units, width or tick rate."""
+    options=_options(mapping);sources=[];hz={}
+    def check(label,columns,required):
+        record=declared_record(block,label)
+        if record is None:
+            if required:
+                raise ValueError(f'Mapping {name} needs SD record {label} declared with '
+                    +', '.join(f'{field}={";".join(units)}' for field,units in columns.items())+'; the file does not declare it')
+            return
+        for field,units in columns.items():
+            got=record['columns'].get(field)
+            if got!=units:
+                raise ValueError(f"Mapping {name} needs {label} {field}={';'.join(units)}; the file declares "
+                                 +(f"{field}={';'.join(got)}" if got else f'no {field}')+f" ({record['entry']})")
+        if options.get('uptime_hz') and record['tick_hz']!=options['uptime_hz']:
+            raise ValueError(f"Mapping {name} needs {label} at {options['uptime_hz']} Hz ticks; the file declares {record['tick_hz']} Hz")
+        sources.append(label);hz[label]=record['tick_hz']
+    for label,columns in options.get('declare',{}).items():check(label,columns,True)
+    for label,columns in options.get('optional',{}).items():check(label,columns,False)
+    return tuple(label for label in options.get('sensors',(name,)) if label in sources),hz
+
+
 # Width of the DAQ KG1000/KG50 network boxcar bins (DAQ_BROADCAST_PERIOD_MS);
 # files that state loadcell_boxcar_ms on their # calibration line use theirs.
 DAQ_BOXCAR_MS=4
@@ -184,11 +274,29 @@ def canonical_utc(value):
     return type(value) is int and UTC_MIN<=value<UTC_MAX
 
 
-def _resolution_manifest(manifest):
+def _resolution_manifest(manifest,block=None):
+    """Validates the manifest against the file's format block (None: headerless).
+    Returns (assignment, profile, selected); profile carries the mappings, its
+    name, the source evidence, the detected sd_format and, for header files,
+    the declared source labels and tick rates of each mapping."""
     assignment=manifest.get('assignment',{})
-    profile=PROFILES.get(manifest.get('mapping_profile'))
-    if profile is None or manifest.get('firmware_head') not in profile.get('heads',(profile['head'],)):
-        raise ValueError('A supported versioned firmware mapping and exact source identity are required')
+    claimed=manifest.get('mapping_profile')
+    if block is not None:
+        entry=select_sd_format(block)
+        if claimed is not None and claimed!=entry['name']:
+            raise ValueError(f"Manifest mapping_profile {claimed} conflicts with the SD file's declared format "
+                             f"{block['format']} v{block['version']} (profile {entry['name']}); omit mapping_profile or use {entry['name']}")
+        sd_format={**sd_format_summary(block,manifest),'profile':entry['name']}
+        if manifest.get('firmware_head') is not None:sd_format['manifest_firmware_head']=manifest['firmware_head']
+        profile={'name':entry['name'],'mappings':entry['mappings'],'evidence':block['firmware'],'sd_format':sd_format,
+                 'sources':{},'hz':{},'block':block}
+    else:
+        pinned=PROFILES.get(claimed) if isinstance(claimed,str) else None
+        if pinned is None or manifest.get('firmware_head') not in pinned.get('heads',(pinned['head'],)):
+            raise ValueError('Headerless (legacy) SD file: a supported versioned firmware mapping_profile and its exact '
+                             'pinned firmware_head are required')
+        profile={'name':claimed,'mappings':pinned['mappings'],'evidence':manifest['firmware_head'],
+                 'sd_format':sd_format_summary(None,manifest),'sources':None,'hz':None,'block':None}
     if not isinstance(assignment,dict) or assignment.get('boot_and_session_verified') is not True:
         raise ValueError('Explicit verified board boot/session assignment required')
     if not isinstance(manifest.get('launch_session'),str) or not manifest['launch_session'].strip():
@@ -218,6 +326,9 @@ def _resolution_manifest(manifest):
         if sensor not in profile['mappings']:
             raise ValueError('Unsupported sensor mapping: '+str(sensor))
         _,indices,kind,_=profile['mappings'][sensor][:4]
+        if profile['block'] is not None:
+            sources,hz=_declared_sources(profile['block'],sensor,profile['mappings'][sensor])
+            profile['sources'][sensor]=sources;profile['hz'].update(hz)
         if kind in mapped_kinds: raise ValueError('Choose one SD source for each semantic channel')
         mapped_kinds.append(kind)
         element=definitions.get(kind,{}).get('element',{})
@@ -254,7 +365,7 @@ def resolve_recording(db,max_database_bytes=MAX_DATABASE_BYTES):
       CREATE TABLE sd_sequence_holes(import_id INTEGER,start_ms INTEGER,end_ms INTEGER);
       CREATE INDEX sd_hole_lookup ON sd_sequence_holes(import_id,start_ms,end_ms);
     """)
-    unresolved=suppressed=processed=0
+    unresolved=suppressed=processed=0;sd_formats=[]
     # The resolved view serves every load cell in ADC-pin volts. Network rows
     # before the recording's loadcell_units mark (or all of them without it)
     # were stored on the DAQ legacy raw scale.
@@ -263,7 +374,10 @@ def resolve_recording(db,max_database_bytes=MAX_DATABASE_BYTES):
     db.execute('BEGIN IMMEDIATE')
     try:
         for import_id,encoded in db.execute('SELECT id,manifest_json FROM sd_imports ORDER BY id'):
-            manifest=json.loads(encoded);assignment,profile,selected=_resolution_manifest(manifest)
+            manifest=json.loads(encoded)
+            metadata_json=db.execute('SELECT metadata_json FROM sd_imports WHERE id=?',(import_id,)).fetchone()[0]
+            assignment,profile,selected=_resolution_manifest(manifest,format_block_from_metadata(json.loads(metadata_json)))
+            sd_formats.append({'import_id':import_id,**profile['sd_format']})
             lo,hi=assignment['start_utc_ms'],assignment['end_utc_ms'];previous_record=None
             records=db.execute('SELECT s.record_sequence,s.timestamp_ms,s.time_source FROM sd_sample_origins o '
                 'JOIN sd_samples s ON s.id=o.sample_id WHERE o.import_id=? ORDER BY o.record_index',(import_id,))
@@ -276,7 +390,8 @@ def resolve_recording(db,max_database_bytes=MAX_DATABASE_BYTES):
             previous={}
             by_sensor={}
             for name in selected:
-                for source_sensor in _options(profile['mappings'][name]).get('sensors',(name,)):
+                sources=profile['sources'][name] if profile['sources'] is not None else _options(profile['mappings'][name]).get('sensors',(name,))
+                for source_sensor in sources:
                     by_sensor.setdefault(source_sensor,[]).append(name)
             boxcars={};pending_pair={};boxcar_ms=None
 
@@ -298,8 +413,9 @@ def resolve_recording(db,max_database_bytes=MAX_DATABASE_BYTES):
                 provenance={k:v for k,v in sample.items() if k not in ('config','calibration_metadata')}
                 provenance.update(origin='sd',sd_sample_id=sample['sample_id'],received_timestamp_ms=None,
                     source_timestamp_ms=int(sample['fields']['timestamp_ms']),coverage_segment_id=segment_id,
-                    mapping={'profile':manifest['mapping_profile'],'sensor':name,'field':field,'indices':indices,
-                             'data_type':kind,'units':['V' if u=='sensor_raw' else u for u in units],'source_evidence':manifest['firmware_head']})
+                    mapping={'profile':profile['name'],'sensor':name,'field':field,'indices':indices,
+                             'data_type':kind,'units':['V' if u=='sensor_raw' else u for u in units],'source_evidence':profile['evidence'],
+                             'sd_format':profile['sd_format']})
                 if 'sensor_raw' in units:provenance['mapping']['converted_from']={'units':'legacy_raw','volts_per_raw':'16000/921'}
                 if extra:provenance['mapping'].update(extra)
                 processed+=1
@@ -318,7 +434,8 @@ def resolve_recording(db,max_database_bytes=MAX_DATABASE_BYTES):
                     mapping=profile['mappings'][name];field,indices,kind,units=mapping[:4];options=_options(mapping)
                     stamp=sample['utc_timestamp_ms']
                     try:
-                        if int(fields['uptime_frequency_hz'])!=options.get('uptime_hz',1000):raise ValueError('Uptime scale')
+                        expected_hz=profile['hz'][sensor] if profile['hz'] is not None else options.get('uptime_hz',1000)
+                        if int(fields['uptime_frequency_hz'])!=expected_hz:raise ValueError('Uptime scale')
                         if options.get('median_bin'):
                             size,period=options['median_bin']
                             box=boxcars.get(name)
@@ -409,7 +526,7 @@ def resolve_recording(db,max_database_bytes=MAX_DATABASE_BYTES):
         db.execute('CREATE TABLE IF NOT EXISTS sd_resolution_manifest(id INTEGER PRIMARY KEY CHECK(id=1),manifest_json TEXT NOT NULL)')
         summary={'format':'seds-sd-resolution','version':1,'axis':'canonical_utc','coverage_segments':segments,
                  'coverage_table':'sd_coverage_segments','network_suppressed_in_resolved_view':suppressed,
-                 'unresolved_samples':unresolved,'rows':count,'original_network_preserved':True}
+                 'unresolved_samples':unresolved,'rows':count,'original_network_preserved':True,'sd_formats':sd_formats}
         db.execute('INSERT OR REPLACE INTO sd_resolution_manifest VALUES(1,?)',(canonical(summary),))
         db.commit();return summary
     except Exception:
@@ -421,12 +538,14 @@ def worker():
     import tempfile
     request=json.load(sys.stdin)
     manifest=request['manifest']
-    _resolution_manifest(manifest)
+    source=Path(request['csv_path'])
+    # Select by the file's declared format (or the legacy pins) before copying.
+    _,profile,_=_resolution_manifest(manifest,read_format_block(source))
     global MINIMUM_FREE_BYTES
     MINIMUM_FREE_BYTES=request.get('minimum_free_bytes',0)
-    source=Path(request['csv_path'])
     create_derived_recording(request['source'],request['output'])
     with closing(sqlite3.connect(request['output'])) as db:
         imported=import_csv(db,source,manifest,max_bytes=request['max_bytes'],max_database_bytes=request['max_database_bytes'])
         result=resolve_recording(db,request['max_database_bytes']);result['import']=imported
+        result['sd_format']=profile['sd_format']
     print(canonical(result))
