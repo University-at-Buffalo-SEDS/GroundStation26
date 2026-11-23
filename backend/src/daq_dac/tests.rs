@@ -8,6 +8,7 @@ fn status(gate: u8, active: [bool; 2]) -> Status {
         flags: wire::FLAG_HARDWARE_READY | wire::FLAG_READBACK,
         uptime_ms: 1000,
         channels: [ChannelStatus::default(); 2],
+        table: Default::default(),
     };
     for (c, a) in active.into_iter().enumerate() {
         s.channels[c].active = a;
@@ -24,6 +25,7 @@ fn dc_request(channel: u8, offset_v: f64) -> ConfigRequest {
         frequency_hz: None,
         steps: None,
         dwell_ms: None,
+        ..Default::default()
     }
 }
 
@@ -101,14 +103,15 @@ fn plan_command_converts_connector_volts_and_reports_clamps() {
         waveform: Waveform::Sine,
         amplitude_v: 2.0,
         offset_v: 1.0,
-        frequency_hz: Some(5000.0),
+        frequency_hz: Some(50000.0),
         steps: None,
         dwell_ms: None,
+        ..Default::default()
     };
     let (c, clamped) = plan_command(&sine, 5).unwrap();
     // Pin 0.5 V offset leaves 0.3 V of room below.
     assert!((c.amplitude_v - 0.3).abs() < 1e-6);
-    assert_eq!(c.frequency_hz, 1000.0);
+    assert_eq!(c.frequency_hz, 10000.0);
     assert_eq!(clamped, vec!["amplitude", "frequency"]);
 
     let stair = ConfigRequest {
@@ -117,11 +120,12 @@ fn plan_command_converts_connector_volts_and_reports_clamps() {
         amplitude_v: 1.0,
         offset_v: 3.0,
         frequency_hz: None,
-        steps: Some(64),
+        steps: Some(640),
         dwell_ms: Some(5),
+        ..Default::default()
     };
     let (c, clamped) = plan_command(&stair, 5).unwrap();
-    assert_eq!((c.steps, c.dwell_ms), (32, 10));
+    assert_eq!((c.steps, c.dwell_ms), (256, 10));
     assert_eq!(clamped, vec!["steps", "dwell"]);
 
     assert!(plan_command(&dc_request(2, 1.0), 1).is_err());
@@ -457,6 +461,7 @@ fn validation_view_aligns_expected_and_warns_about_rate_and_attenuation() {
         frequency_hz: 2.0,
         steps: 0,
         dwell_ms: 0,
+        ..Default::default()
     };
     let samples: Vec<(i64, f64)> = (0..120)
         .map(|i| {
@@ -630,7 +635,7 @@ fn disable_channel_parsing_and_write_authorization() {
 }
 
 #[test]
-fn command_packet_is_32_bytes_to_sd_card_and_rejects_sequence_zero() {
+fn command_packet_is_48_bytes_to_sd_card_and_rejects_sequence_zero() {
     crate::telemetry_schema::initialize().unwrap();
     let (mut command, _) = plan_command(&dc_request(0, 2.0), 1).unwrap();
     command.sequence = 0;
@@ -813,4 +818,129 @@ async fn api_gates_enable_never_gates_disable_and_answers_json() {
     let (code, value) = json(api::sweep_cancel(State(state.clone()), headers.clone()).await).await;
     assert_eq!(code, StatusCode::ACCEPTED);
     assert_eq!(value["state"], "idle");
+}
+
+fn request(json: serde_json::Value) -> ConfigRequest {
+    serde_json::from_value(json).unwrap()
+}
+
+#[test]
+fn preview_reports_the_exact_table_and_achieved_frequency() {
+    let v = api::preview(
+        None,
+        &request(serde_json::json!({"channel": 0, "waveform": "square", "amplitude_v": 2.0, "offset_v": 3.2, "frequency_hz": 50.0, "duty_pct": 25.0})),
+    )
+    .unwrap();
+    assert_eq!(v["samples"], 256);
+    assert_eq!(v["frequency_hz"], 50.0);
+    assert_eq!(v["frequency_error_ppm"], 0.0);
+    assert_eq!(v["duty_achieved_pct"], 25.0);
+    let table = v["connector_v"].as_array().unwrap();
+    assert_eq!(table.len(), 256);
+    assert!((table[0].as_f64().unwrap() - 5.2).abs() < 0.002);
+    assert!((table[200].as_f64().unwrap() - 1.2).abs() < 0.002);
+    // The CRC is what the DAQ reports (DAQ golden vector square50d25 is at 1.6 +/- 1.0 pin).
+    let golden = api::preview(
+        None,
+        &request(serde_json::json!({"channel": 0, "waveform": "square", "amplitude_v": 2.0, "offset_v": 3.2, "frequency_hz": 50.0, "duty_pct": 25.0})),
+    )
+    .unwrap();
+    assert_eq!(golden["table_crc"], "4C829B77");
+    // Chirp, sawtooth, noise and errors.
+    let chirp = api::preview(
+        None,
+        &request(serde_json::json!({"channel": 1, "waveform": "chirp", "amplitude_v": 1.0, "offset_v": 3.0, "frequency_hz": 10.0, "frequency_stop_hz": 1000.0, "sweep_s": 10.0, "log_sweep": true})),
+    )
+    .unwrap();
+    assert_eq!(chirp["samples"], 200);
+    assert!(chirp["warnings"][0].as_str().unwrap().contains("logarithmic"));
+    let saw = api::preview(
+        None,
+        &request(serde_json::json!({"channel": 0, "waveform": "sawtooth", "amplitude_v": 1.0, "offset_v": 3.0, "frequency_hz": 7777.0, "ramp_down": true})),
+    )
+    .unwrap();
+    assert_eq!(saw["samples"], 18);
+    assert!(saw["frequency_error_ppm"].as_f64().unwrap().abs() < 300.0);
+    assert!(saw["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("visible steps")));
+    let noise = api::preview(
+        None,
+        &request(serde_json::json!({"channel": 0, "waveform": "noise", "amplitude_v": 1.0, "offset_v": 3.2, "frequency_hz": 1000.0})),
+    )
+    .unwrap();
+    assert_eq!((noise["samples"].as_u64(), noise["update_hz"].as_f64()), (Some(256), Some(1000.0)));
+    assert!(api::preview(None, &request(serde_json::json!({"channel": 0, "waveform": "chirp", "amplitude_v": 1.0, "offset_v": 3.0, "frequency_hz": 10.0}))).is_err());
+    assert!(serde_json::from_value::<ConfigRequest>(serde_json::json!({"channel": 0, "waveform": "sine", "bogus": 1})).is_err());
+}
+
+/// The same custom equation at two frequencies and amplitudes: one shape,
+/// rescaled and retimed by the DAQ's controls.
+#[test]
+fn custom_equation_follows_frequency_amplitude_offset_and_phase() {
+    let make = |f: f64, amp: f64, off: f64, phase: f64| {
+        api::preview(
+            None,
+            &request(serde_json::json!({
+                "channel": 0, "waveform": "arbitrary", "amplitude_v": amp, "offset_v": off,
+                "frequency_hz": f, "phase_deg": phase,
+                "custom": {"kind": "expression", "expression": "sin(2*pi*x)"}
+            })),
+        )
+        .unwrap()
+    };
+    let a = make(10.0, 2.0, 3.2, 0.0);
+    let b = make(100.0, 0.5, 4.0, 0.0);
+    assert_eq!(a["shape_crc"], b["shape_crc"]);
+    assert_eq!(a["upload_needed"], true);
+    assert_eq!((a["frequency_hz"].as_f64(), b["frequency_hz"].as_f64()), (Some(10.0), Some(100.0)));
+    assert_eq!((a["update_hz"].as_f64(), b["update_hz"].as_f64()), (Some(5120.0), Some(51200.0)));
+    let va: Vec<f64> = a["connector_v"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+    let vb: Vec<f64> = b["connector_v"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+    // Quarter period: offset + amplitude at P10 (one 1.6 mV code of tolerance).
+    assert!((va[128] - 5.2).abs() < 0.002 && (va[384] - 1.2).abs() < 0.002);
+    assert!((vb[128] - 4.5).abs() < 0.002 && (vb[384] - 3.5).abs() < 0.002);
+    // A quarter-turn phase starts the period at the peak.
+    let p = make(10.0, 2.0, 3.2, 90.0);
+    assert!((p["connector_v"][0].as_f64().unwrap() - 5.2).abs() < 0.002);
+    assert_eq!(p["shape_crc"], a["shape_crc"]);
+    // An out-of-range shape clips and warns; amplitude clamps like any wave.
+    let loud = api::preview(
+        None,
+        &request(serde_json::json!({"channel": 0, "waveform": "arbitrary", "amplitude_v": 9.0, "offset_v": 3.3,
+            "frequency_hz": 5.0, "custom": {"kind": "expression", "expression": "2*sin(2*pi*x)"}})),
+    )
+    .unwrap();
+    assert!(loud["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("clipped")));
+    assert_eq!(loud["clamped"], serde_json::json!(["amplitude"]));
+    // Errors surface with their position.
+    let err = api::preview(
+        None,
+        &request(serde_json::json!({"channel": 0, "waveform": "arbitrary", "amplitude_v": 1.0, "offset_v": 3.0,
+            "frequency_hz": 5.0, "custom": {"kind": "expression", "expression": "sin(x) + os(1)"}})),
+    )
+    .unwrap_err();
+    assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+    assert!(err.1.contains("Unknown function \"os\"") && err.1.contains("character 10"));
+    // An arbitrary request without a source is refused by the built-in planner.
+    assert!(plan_command(&request(serde_json::json!({"channel": 0, "waveform": "arbitrary", "frequency_hz": 1.0})), 1).is_err());
+}
+
+#[test]
+fn frequency_response_points_fit_gain_at_the_achieved_frequency() {
+    // 40 Hz stream, 2 Hz sine of amplitude 0.7 where 1.0 was expected: -3.1 dB.
+    let times: Vec<i64> = (0..200).map(|i| i * 25).collect();
+    let values: Vec<f64> = times
+        .iter()
+        .map(|t| 1.5 + 0.7 * (std::f64::consts::TAU * 2.0 * *t as f64 / 1000.0 + 0.3).sin())
+        .collect();
+    let p = sweep::response_point(&times, &values, 2.0, 1.0);
+    assert_eq!(p.samples, 200);
+    assert!((p.measured_amplitude.unwrap() - 0.7).abs() < 1e-6);
+    assert!((p.gain_db.unwrap() - 20.0 * 0.7f64.log10()).abs() < 1e-6);
+    let flat = sweep::response_point(&times, &values, 2.0, 0.7);
+    let check = sweep::response_check(&[flat.clone(), p.clone()]).unwrap();
+    assert!(!check.pass && (check.value - 3.098).abs() < 1e-3);
+    assert!(sweep::response_check(&[flat]).unwrap().pass);
+    let f = sweep::response_frequencies(0.2, 10.0, 5);
+    assert_eq!(f.len(), 5);
+    assert!((f[0] - 0.2).abs() < 1e-12 && (f[4] - 10.0).abs() < 1e-9 && (f[2] - (2.0f64).sqrt()).abs() < 1e-9);
 }

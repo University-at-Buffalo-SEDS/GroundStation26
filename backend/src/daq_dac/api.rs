@@ -1,7 +1,10 @@
 //! HTTP API for the DAC signal generator. Errors are JSON `{"error": "..."}`.
 use super::analysis::{self, Analysis};
+use super::custom::{self, CustomTable};
 use super::model::{self, Polarity, TARGETS, Target};
 use super::sweep;
+use super::upload::{self, Uploader};
+use super::waveform;
 use super::wire::{self, Command, Waveform};
 use super::{COMMAND_NAME, ConfigRequest, Refusal, STATUS_FRESH_MS, Validation};
 use crate::{auth::Permission, state::AppState, types::FlightState};
@@ -120,8 +123,18 @@ pub(super) struct Enabled {
 /// Gate, send and keep alive one configuration. Shared by the config
 /// endpoint and the sweep.
 pub(super) fn enable(state: &AppState, request: &ConfigRequest) -> Result<Enabled, ApiError> {
-    let (mut command, clamped) =
+    let (command, clamped) =
         super::plan_command(request, 1).map_err(|m| (StatusCode::BAD_REQUEST, m))?;
+    enable_command(state, request.clone(), command, clamped)
+}
+
+/// Gate, send and keep alive an already planned command.
+pub(super) fn enable_command(
+    state: &AppState,
+    request: ConfigRequest,
+    mut command: Command,
+    clamped: Vec<&'static str>,
+) -> Result<Enabled, ApiError> {
     let closed = || {
         (
             StatusCode::CONFLICT,
@@ -152,7 +165,7 @@ pub(super) fn enable(state: &AppState, request: &ConfigRequest) -> Result<Enable
             format!("DAQ DAC command could not be queued: {e}"),
         )
     })?;
-    state.daq_dac.set_desired(request.clone(), command, now);
+    state.daq_dac.set_desired(request, command, now);
     Ok(Enabled { command, clamped })
 }
 
@@ -183,6 +196,9 @@ pub(crate) async fn post_config(
             StatusCode::CONFLICT,
             "A DAC sweep is running; cancel it before setting the output by hand.",
         );
+    }
+    if request.waveform == Waveform::Arbitrary {
+        return post_arbitrary(&state, request);
     }
     match enable(&state, &request) {
         Ok(Enabled { command, clamped }) => {
@@ -248,9 +264,15 @@ pub(crate) async fn disable(
         Ok(c) => c,
         Err(message) => return json_error(StatusCode::BAD_REQUEST, message),
     };
-    // A sweep driving this channel stops too.
+    // A sweep or table upload for this channel stops too.
     {
         let inner = state.daq_dac.inner.lock().unwrap();
+        if inner.upload.state == UploadState::Running
+            && (channel.is_none() || inner.upload.channel == channel)
+            && let Some(cancel) = &inner.upload.cancel
+        {
+            cancel.store(true, Ordering::Release);
+        }
         if inner.sweep.state == sweep::State::Running
             && (channel.is_none() || inner.sweep.channel == channel)
             && let Some(cancel) = &inner.sweep.cancel
@@ -303,6 +325,65 @@ struct ChannelView {
     last_result: &'static str,
     disable_reason: &'static str,
     sequence: u32,
+    update_hz: f64,
+    samples: u16,
+    phase_deg: f64,
+    duty_pct: Option<f64>,
+    ramp_down: bool,
+    log_sweep: bool,
+    table_len: u16,
+    /// CRC-32 of the codes the DAQ's DMA plays.
+    table_crc: String,
+    /// Whether that CRC matches the table the GS computes from the applied
+    /// parameters (None when it cannot tell, e.g. an unknown shape).
+    table_crc_ok: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct TableView {
+    state: &'static str,
+    len: u16,
+    upload_id: u32,
+    shape_crc: String,
+    computed_crc: String,
+    chunks_received: u32,
+    chunk_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum UploadState {
+    #[default]
+    Idle,
+    Running,
+    Done,
+    Failed,
+}
+
+/// Progress of the arbitrary-shape upload the GS runs before enabling.
+#[derive(Default)]
+pub(super) struct UploadCtl {
+    pub state: UploadState,
+    pub channel: Option<u8>,
+    pub phase: Option<upload::Phase>,
+    pub chunks_confirmed: usize,
+    pub chunk_count: usize,
+    pub resent_chunks: usize,
+    pub shape_crc: Option<u32>,
+    pub message: Option<String>,
+    pub cancel: Option<Arc<AtomicBool>>,
+}
+
+#[derive(Serialize)]
+struct UploadView {
+    state: UploadState,
+    channel: Option<u8>,
+    phase: Option<upload::Phase>,
+    chunks_confirmed: usize,
+    chunk_count: usize,
+    resent_chunks: usize,
+    shape_crc: Option<String>,
+    message: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -332,6 +413,32 @@ struct StatusView {
     inputs: Vec<InputView>,
     /// Why the GS last turned the output off on its own, if it did.
     last_auto_off: Option<String>,
+    table: Option<TableView>,
+    upload: UploadView,
+    limits: serde_json::Value,
+}
+
+fn hex(v: u32) -> String {
+    format!("{v:08X}")
+}
+
+/// DAC limits for the UI (DAQ-Board docs/dac-waveforms.md).
+pub(super) fn limits() -> serde_json::Value {
+    serde_json::json!({
+        "frequency_hz": [waveform::FREQ_MIN_HZ, waveform::FREQ_MAX_HZ],
+        "noise_rate_hz": [waveform::NOISE_RATE_MIN_HZ, waveform::UPDATE_MAX_HZ],
+        "update_max_hz": waveform::UPDATE_MAX_HZ,
+        "periodic_samples": [waveform::PERIODIC_LEN_MIN, waveform::PERIODIC_LEN_MAX],
+        "shape_samples": [waveform::ARB_LEN_MIN, waveform::ARB_LEN_MAX],
+        "steps": [waveform::STEPS_MIN, waveform::STEPS_MAX],
+        "dwell_ms": [waveform::DWELL_MIN_MS, waveform::DWELL_MAX_MS],
+        "sweep_s": [f64::from(waveform::SWEEP_MIN_MS) / 1000.0, f64::from(waveform::SWEEP_MAX_MS) / 1000.0],
+        "duty_pct": [1.0, 99.0],
+        "dac_bits": 12,
+        "code_lsb_v": 3.3 / 4095.0 * model::BUFFER_GAIN,
+        "wav_max_bytes": super::audio::MAX_FILE_BYTES,
+        "expression": super::expr::vocabulary(),
+    })
 }
 
 fn connector(pin: f32) -> Option<f64> {
@@ -347,6 +454,29 @@ fn status_view(state: &AppState) -> StatusView {
         state.daq_dac.desired_request(0),
         state.daq_dac.desired_request(1),
     ];
+    let (shape, upload_view) = {
+        let inner = state.daq_dac.inner.lock().unwrap();
+        let u = &inner.upload;
+        (
+            inner.shape.clone(),
+            UploadView {
+                state: u.state,
+                channel: u.channel,
+                phase: u.phase,
+                chunks_confirmed: u.chunks_confirmed,
+                chunk_count: u.chunk_count,
+                resent_chunks: u.resent_chunks,
+                shape_crc: u.shape_crc.map(hex),
+                message: u.message.clone(),
+            },
+        )
+    };
+    // Only a shape the DAQ holds verified can predict an arbitrary channel.
+    let shape = shape.filter(|(crc, _)| {
+        status
+            .as_ref()
+            .is_some_and(|(s, _)| s.table.state == wire::TABLE_READY && s.table.crc == *crc)
+    });
     let channels = (0..2)
         .map(|c| {
             let ch = status
@@ -376,6 +506,16 @@ fn status_view(state: &AppState) -> StatusView {
                 last_result: wire::last_result_name(ch.last_result),
                 disable_reason: wire::disable_reason_name(ch.disable_reason),
                 sequence: ch.sequence,
+                update_hz: f64::from(ch.update_hz),
+                samples: ch.samples,
+                phase_deg: f64::from(ch.phase_q16) * 360.0 / 65536.0,
+                duty_pct: (ch.waveform == Waveform::Square as u8)
+                    .then(|| f64::from(ch.duty_q16) * 100.0 / 65536.0),
+                ramp_down: ch.waveform == Waveform::Sawtooth as u8 && ch.flags & wire::FLAG_RAMP_DOWN != 0,
+                log_sweep: ch.waveform == Waveform::Chirp as u8 && ch.flags & wire::FLAG_LOG_SWEEP != 0,
+                table_len: ch.table_len,
+                table_crc: hex(ch.table_crc),
+                table_crc_ok: ch.active.then(|| expected_crc(&ch, &shape)).flatten().map(|c| c == ch.table_crc),
             }
         })
         .collect::<Vec<_>>();
@@ -410,7 +550,29 @@ fn status_view(state: &AppState) -> StatusView {
             })
             .collect(),
         last_auto_off: state.daq_dac.last_drop(),
+        table: status.as_ref().map(|(s, _)| TableView {
+            state: wire::table_state_name(s.table.state),
+            len: s.table.len,
+            upload_id: s.table.upload_id,
+            shape_crc: hex(s.table.expected_crc),
+            computed_crc: hex(s.table.crc),
+            chunks_received: s.table.chunks.count_ones(),
+            chunk_count: usize::from(s.table.len).div_ceil(wire::CHUNK_SAMPLES),
+        }),
+        upload: upload_view,
+        limits: limits(),
     }
+}
+
+/// The play-table CRC a channel should report: from its applied parameters,
+/// and for an arbitrary wave from the shape the GS uploaded.
+fn expected_crc(ch: &wire::ChannelStatus, shape: &Option<(u32, Vec<i16>)>) -> Option<u32> {
+    if ch.waveform != Waveform::Arbitrary as u8 {
+        return waveform::expected_status_crc(ch);
+    }
+    let (_, shape) = shape.as_ref().filter(|(_, s)| s.len() == usize::from(ch.table_len))?;
+    let params = waveform::Params::from_status(ch)?;
+    waveform::fill_shape(&params, shape).map(|t| waveform::crc32(&t))
 }
 
 pub(crate) async fn get_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -551,6 +713,21 @@ pub(super) fn evaluate(
             SILENT_MS / 1000
         ));
     }
+    if let Some(wave) = snap.wave.filter(|w| !w.modelled()) {
+        warnings.push(format!(
+            "No expected trace is modelled for a {} output; compare the measured trace with the preview.",
+            wave.waveform.name()
+        ));
+        return (
+            Series {
+                t_ms: snap.samples.iter().map(|(t, _)| *t).collect(),
+                measured: snap.samples.iter().map(|(_, v)| *v).collect(),
+                expected: Vec::new(),
+            },
+            None,
+            warnings,
+        );
+    }
     let Some(wave) = snap.wave.filter(|_| !snap.samples.is_empty()) else {
         return (Series::default(), None, warnings);
     };
@@ -674,6 +851,13 @@ struct SweepRequest {
     dwell_ms: Option<u64>,
     #[serde(default)]
     load_cell_polarity: Polarity,
+    /// "linearity" (DC steps, default) or "frequency_response" (sine steps).
+    #[serde(default)]
+    preset: Option<String>,
+    #[serde(default)]
+    start_hz: Option<f64>,
+    #[serde(default)]
+    stop_hz: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -737,6 +921,30 @@ pub(crate) async fn post_sweep(
     }
     let model = target.model(request.attenuation, request.load_cell_polarity);
     let levels = model::sweep_levels(target, model, steps);
+    let response = match request.preset.as_deref() {
+        None | Some("linearity") => None,
+        Some("frequency_response") => {
+            // A quarter of the stream rate keeps four samples per period.
+            let top = target.stream_hz / 4.0;
+            let start = request.start_hz.unwrap_or(top / 50.0);
+            let stop = request.stop_hz.unwrap_or(top);
+            if !(start > 0.0 && stop > start && stop <= waveform::FREQ_MAX_HZ) {
+                return json_error(StatusCode::BAD_REQUEST, "Frequency response needs 0 < start_hz < stop_hz <= 10000.");
+            }
+            if levels.len() < 2 {
+                return json_error(StatusCode::BAD_REQUEST, format!("{} has no usable DAC range with this attenuator.", target.label));
+            }
+            let (lo, hi) = (levels[0], levels[levels.len() - 1]);
+            Some(sweep::Response {
+                frequencies_hz: sweep::response_frequencies(start, stop, steps.min(25)),
+                offset_pin_v: (lo + hi) / 2.0,
+                amplitude_pin_v: 0.4 * (hi - lo),
+            })
+        }
+        Some(other) => {
+            return json_error(StatusCode::BAD_REQUEST, format!("Unknown sweep preset {other:?}; use linearity or frequency_response."));
+        }
+    };
     if levels.len() < 2 {
         return json_error(
             StatusCode::BAD_REQUEST,
@@ -765,7 +973,7 @@ pub(crate) async fn post_sweep(
         inner.sweep = sweep::Ctl {
             state: sweep::State::Running,
             step: 0,
-            steps: levels.len(),
+            steps: response.as_ref().map_or(levels.len(), |r| r.frequencies_hz.len()),
             message: None,
             report: None,
             cancel: Some(cancel.clone()),
@@ -779,6 +987,7 @@ pub(crate) async fn post_sweep(
         polarity: request.load_cell_polarity,
         levels,
         dwell: Duration::from_millis(dwell_ms),
+        response,
     };
     tokio::spawn(sweep::run(state.clone(), plan, cancel));
     (StatusCode::ACCEPTED, Json(sweep_view(&state))).into_response()
@@ -795,4 +1004,307 @@ pub(crate) async fn sweep_cancel(
         cancel.store(true, Ordering::Release);
     }
     (StatusCode::ACCEPTED, Json(sweep_view(&state))).into_response()
+}
+
+fn bad_request(message: String) -> ApiError {
+    (StatusCode::BAD_REQUEST, message)
+}
+
+/// The length of the verified shape on the DAQ, to reuse when it still fits.
+fn verified_shape(state: &AppState) -> Option<wire::TableStatus> {
+    super::daq_status(state, Instant::now())
+        .filter(|(_, age)| *age <= STATUS_FRESH_MS)
+        .map(|(s, _)| s.table)
+        .filter(|t| t.state == wire::TABLE_READY)
+}
+
+/// Sample the custom source, then either enable at once (the DAQ already
+/// holds this exact shape: a pure amplitude/offset/phase/frequency change) or
+/// upload it first in the background.
+fn post_arbitrary(state: &Arc<AppState>, request: ConfigRequest) -> Response {
+    let Some(source) = request.custom.clone() else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "An arbitrary waveform needs a custom source (expression, values or WAV).",
+        );
+    };
+    let on_daq = verified_shape(state);
+    let table = match custom::build(&source, request.frequency_hz, on_daq.map(|t| t.len)) {
+        Ok(t) => t,
+        Err(message) => return json_error(StatusCode::BAD_REQUEST, message),
+    };
+    let mut slim = request.clone();
+    slim.custom = Some(source.slim());
+    slim.frequency_hz = Some(table.frequency_hz);
+    let (_, clamped) = match super::plan_arbitrary(&slim, &table, 1) {
+        Ok(p) => p,
+        Err(message) => return json_error(StatusCode::BAD_REQUEST, message),
+    };
+    if on_daq.is_some_and(|t| t.len == table.samples && t.crc == table.shape_crc) {
+        state.daq_dac.inner.lock().unwrap().shape = Some((table.shape_crc, table.shape.clone()));
+        let (command, clamped) = super::plan_arbitrary(&slim, &table, 1).expect("planned above");
+        return match enable_command(state, slim, command, clamped) {
+            Ok(Enabled { command, clamped }) => (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "accepted": true,
+                    "uploading": false,
+                    "sequence": command.sequence,
+                    "samples": table.samples,
+                    "shape_crc": hex(table.shape_crc),
+                    "clamped": clamped,
+                    "warnings": table.warnings,
+                    "message": format!(
+                        "DAC channel {} plays the shape already on the DAQ, re-scaled; no upload needed.",
+                        command.channel
+                    ),
+                })),
+            )
+                .into_response(),
+            Err(error) => error_response(error),
+        };
+    }
+    if let Some(refusal) = super::enable_refusal(
+        state.local_flight_state_snapshot(),
+        super::daq_status(state, Instant::now()).as_ref().map(|(s, a)| (s, *a)),
+    ) {
+        return error_response(refusal_error(refusal));
+    }
+    if crate::gse::capture_operator_origin(state).is_none() {
+        return error_response((
+            StatusCode::CONFLICT,
+            crate::board_recovery::coordinator::admission_closed_message(state, "Driving the DAQ DAC"),
+        ));
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut inner = state.daq_dac.inner.lock().unwrap();
+        if inner.upload.state == UploadState::Running {
+            return json_error(StatusCode::CONFLICT, "A DAC shape upload is already running.");
+        }
+        inner.upload = UploadCtl {
+            state: UploadState::Running,
+            channel: Some(request.channel),
+            phase: Some(upload::Phase::Begin),
+            chunk_count: usize::from(table.samples).div_ceil(wire::CHUNK_SAMPLES),
+            shape_crc: Some(table.shape_crc),
+            cancel: Some(cancel.clone()),
+            ..UploadCtl::default()
+        };
+    }
+    let response = serde_json::json!({
+        "accepted": true,
+        "uploading": true,
+        "samples": table.samples,
+        "shape_crc": hex(table.shape_crc),
+        "clamped": clamped,
+        "warnings": table.warnings,
+        "message": format!(
+            "Uploading a {}-sample shape (CRC {}) to the DAQ; channel {} starts once the DAQ confirms it.",
+            table.samples,
+            hex(table.shape_crc),
+            request.channel
+        ),
+    });
+    tokio::spawn(run_upload(state.clone(), slim, table, cancel));
+    (StatusCode::ACCEPTED, Json(response)).into_response()
+}
+
+fn upload_finish(state: &AppState, outcome: Result<String, String>) {
+    let mut inner = state.daq_dac.inner.lock().unwrap();
+    inner.upload.cancel = None;
+    match outcome {
+        Ok(message) => {
+            inner.upload.state = UploadState::Done;
+            inner.upload.message = Some(message);
+        }
+        Err(message) => {
+            log::warn!("DAQ DAC shape upload: {message}");
+            inner.upload.state = UploadState::Failed;
+            inner.upload.message = Some(message);
+        }
+    }
+}
+
+async fn run_upload(state: Arc<AppState>, request: ConfigRequest, table: CustomTable, cancel: Arc<AtomicBool>) {
+    let Some(router) = state.topology_router.get() else {
+        return upload_finish(&state, Err("DAQ network router is unavailable.".into()));
+    };
+    let mut up = Uploader::new(rand::random::<u32>() | 1, table.shape.clone(), Instant::now());
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return upload_finish(&state, Err("Upload cancelled.".into()));
+        }
+        let now = Instant::now();
+        let status = super::daq_status(&state, now);
+        if let Some(refusal) = super::enable_refusal(
+            state.local_flight_state_snapshot(),
+            status.as_ref().map(|(s, a)| (s, *a)),
+        ) {
+            return upload_finish(&state, Err(format!("Upload stopped: {}", refusal.message)));
+        }
+        let table_status = status.and_then(|(s, age)| {
+            now.checked_sub(Duration::from_millis(age)).map(|at| (s.table, at))
+        });
+        let messages = up.step(now, table_status);
+        for (i, message) in messages.iter().enumerate() {
+            if i > 0 {
+                tokio::time::sleep(upload::CHUNK_GAP).await;
+            }
+            if let Err(error) = super::send_table(router, message) {
+                log::warn!("DAQ DAC table chunk could not be queued: {error}");
+            }
+        }
+        {
+            let mut inner = state.daq_dac.inner.lock().unwrap();
+            inner.upload.phase = Some(up.phase);
+            inner.upload.chunks_confirmed = up.chunks_confirmed;
+            inner.upload.resent_chunks = up.resent_chunks;
+        }
+        match up.phase {
+            upload::Phase::Done => break,
+            upload::Phase::Failed => {
+                return upload_finish(
+                    &state,
+                    Err(up.error.clone().unwrap_or_else(|| "Upload failed.".into())),
+                );
+            }
+            _ => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    state.daq_dac.inner.lock().unwrap().shape = Some((table.shape_crc, table.shape.clone()));
+    let outcome = super::plan_arbitrary(&request, &table, 1)
+        .map_err(|m| m.to_string())
+        .and_then(|(command, clamped)| {
+            enable_command(&state, request, command, clamped).map_err(|(_, m)| m)
+        })
+        .map(|enabled| {
+            format!(
+                "Shape {} verified on the DAQ ({} chunks, {} resent); channel {} on.",
+                hex(table.shape_crc),
+                up.chunk_count(),
+                up.resent_chunks,
+                enabled.command.channel
+            )
+        });
+    upload_finish(&state, outcome);
+}
+
+#[derive(Serialize)]
+struct PreviewView {
+    waveform: Waveform,
+    samples: u16,
+    update_hz: f64,
+    requested_frequency_hz: Option<f64>,
+    /// What the DAQ will play (period rate; noise: sample rate).
+    frequency_hz: f64,
+    frequency_error_ppm: Option<f64>,
+    dwell_ms: u32,
+    /// CRC-32 the DAQ will report for the play table.
+    table_crc: String,
+    /// Arbitrary: the shape's CRC and whether a new upload is needed.
+    shape_crc: Option<String>,
+    upload_needed: Option<bool>,
+    /// One period (or the staircase/noise table) in P10 connector volts.
+    connector_v: Vec<f64>,
+    /// Arbitrary: the normalized shape (-1..1) before amplitude/offset.
+    shape: Option<Vec<f64>>,
+    duty_achieved_pct: Option<f64>,
+    clamped: Vec<&'static str>,
+    warnings: Vec<String>,
+}
+
+/// What a configuration will play, without sending anything: the exact
+/// table, achieved frequency, CRC and warnings.
+pub(super) fn preview(state: Option<&AppState>, request: &ConfigRequest) -> Result<serde_json::Value, ApiError> {
+    let mut warnings = Vec::new();
+    let (command, clamped, plan, shape, upload_needed) = if request.waveform == Waveform::Arbitrary {
+        let source = request
+            .custom
+            .as_ref()
+            .ok_or_else(|| bad_request("An arbitrary waveform needs a custom source.".into()))?;
+        let on_daq = state.and_then(verified_shape);
+        let table = custom::build(source, request.frequency_hz, on_daq.map(|t| t.len)).map_err(bad_request)?;
+        warnings.extend(table.warnings.iter().cloned());
+        let mut r = request.clone();
+        r.frequency_hz = Some(table.frequency_hz);
+        let (command, clamped) = super::plan_arbitrary(&r, &table, 1).map_err(bad_request)?;
+        let plan = waveform::plan_shape(&command, &table.shape)
+            .ok_or_else(|| bad_request("The DAQ timer cannot reach this rate.".into()))?;
+        let needed = !on_daq.is_some_and(|t| t.len == table.samples && t.crc == table.shape_crc);
+        if table.depends_on_frequency {
+            warnings.push("The expression uses t (or T, f, fs), so its shape changes with the frequency; a frequency change re-samples and re-uploads it.".into());
+        }
+        (command, clamped, plan, Some((table.shape_crc, table.shape)), Some(needed))
+    } else {
+        let (command, clamped) = super::plan_command(request, 1).map_err(bad_request)?;
+        let plan = waveform::plan(&command)
+            .ok_or_else(|| bad_request("The DAQ timer cannot reach this rate.".into()))?;
+        (command, clamped, plan, None, None)
+    };
+    let w = command.waveform;
+    let requested = w.uses_frequency().then(|| f64::from(command.frequency_hz));
+    let error_ppm = requested
+        .filter(|f| *f > 0.0 && plan.frequency_hz > 0.0)
+        .map(|f| (plan.frequency_hz - f) / f * 1e6);
+    if w == Waveform::Chirp {
+        warnings.push(format!(
+            "The chirp table is one sine period of {} samples; the DAQ retunes it every 50 ms from {} Hz to {} Hz over {} s ({}).",
+            plan.samples,
+            command.frequency_hz,
+            command.frequency_stop_hz,
+            f64::from(command.sweep_ms) / 1000.0,
+            if command.flags & wire::FLAG_LOG_SWEEP != 0 { "logarithmic" } else { "linear" }
+        ));
+    }
+    if w.is_periodic() && plan.samples < 32 {
+        warnings.push(format!(
+            "Only {} samples per period at this frequency (200 kS/s limit): expect visible steps.",
+            plan.samples
+        ));
+    }
+    let duty = (w == Waveform::Square).then(|| {
+        let high = plan.table.iter().filter(|c| **c > waveform::volts_to_code(f64::from(command.offset_v))).count();
+        high as f64 * 100.0 / f64::from(plan.samples)
+    });
+    let view = PreviewView {
+        waveform: w,
+        samples: plan.samples,
+        update_hz: plan.update_hz,
+        requested_frequency_hz: requested,
+        frequency_hz: plan.frequency_hz,
+        frequency_error_ppm: error_ppm,
+        dwell_ms: plan.dwell_ms,
+        table_crc: hex(plan.table_crc),
+        shape_crc: shape.as_ref().map(|(c, _)| hex(*c)),
+        upload_needed,
+        connector_v: plan
+            .table
+            .iter()
+            .map(|c| waveform::code_to_volts(*c) * model::BUFFER_GAIN)
+            .collect(),
+        shape: shape.map(|(_, s)| s.iter().map(|q| f64::from(*q) / 32767.0).collect()),
+        duty_achieved_pct: duty,
+        clamped,
+        warnings,
+    };
+    Ok(serde_json::to_value(view).expect("preview serializes"))
+}
+
+pub(crate) async fn post_preview(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = authorize_read(&state, &headers).await {
+        return response;
+    }
+    let request: ConfigRequest = match parse(&body) {
+        Ok(r) => r,
+        Err(response) => return response,
+    };
+    match preview(Some(&state), &request) {
+        Ok(view) => Json(view).into_response(),
+        Err(error) => error_response(error),
+    }
 }

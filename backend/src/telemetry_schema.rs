@@ -137,9 +137,11 @@ mod tests {
         initialize().unwrap();
         assert_eq!(data_type("DAQ_DAC_COMMAND").as_u32(), 206667655);
         assert_eq!(data_type("DAQ_DAC_STATUS").as_u32(), 160950952);
+        assert_eq!(data_type("DAQ_DAC_TABLE").as_u32(), 6815706);
         for (name, endpoint_name, bytes) in [
-            ("DAQ_DAC_COMMAND", "SD_CARD", 32usize),
-            ("DAQ_DAC_STATUS", "GROUND_STATION", 80),
+            ("DAQ_DAC_COMMAND", "SD_CARD", 48usize),
+            ("DAQ_DAC_STATUS", "GROUND_STATION", 136),
+            ("DAQ_DAC_TABLE", "SD_CARD", 76),
         ] {
             for (len, ok) in [(bytes, true), (bytes - 1, false), (bytes + 1, false)] {
                 assert_eq!(
@@ -174,6 +176,10 @@ mod tests {
         assert_eq!(status["reliable"], "Off");
         assert_eq!(status["priority"], 16);
         assert_eq!(status["endpoints"], serde_json::json!(["GROUND_STATION"]));
+        let table = find("DAQ_DAC_TABLE");
+        assert_eq!(table["reliable"], "Off");
+        assert_eq!(table["priority"], 16);
+        assert_eq!(table["endpoints"], serde_json::json!(["SD_CARD"]));
     }
 
     #[test]

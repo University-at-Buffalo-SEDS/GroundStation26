@@ -5,35 +5,66 @@ use super::wire::Waveform;
 use serde::Serialize;
 use std::f64::consts::{PI, TAU};
 
-/// Periodic waves are a zero-order hold of this many samples per period.
+/// Zero-order-hold samples per period when status does not say (v1 tables).
 pub const SAMPLES_PER_PERIOD: f64 = 32.0;
 
 /// The waveform the DAQ reports it is driving, in DAC-pin volts.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Wave {
     pub waveform: Waveform,
     pub offset_v: f64,
     pub amplitude_v: f64,
-    /// Actual frequency for square/sine/triangle.
+    /// Actual frequency for the periodic waves.
     pub frequency_hz: f64,
     pub steps: u16,
     pub dwell_ms: u32,
+    /// Table length playing (0: unknown, taken as 32).
+    pub samples: u16,
+    /// Wave flags (sawtooth ramp-down).
+    pub flags: u8,
+    /// Square duty, x 65536 (0: 50 %).
+    pub duty_q16: u16,
 }
 impl Wave {
     pub fn dc(offset_v: f64) -> Self {
         Self {
-            waveform: Waveform::Dc,
             offset_v,
-            amplitude_v: 0.0,
-            frequency_hz: 0.0,
-            steps: 0,
-            dwell_ms: 0,
+            ..Self::default()
+        }
+    }
+    /// Chirp, noise and uploaded tables have no expected-trace model here.
+    pub fn modelled(&self) -> bool {
+        !matches!(
+            self.waveform,
+            Waveform::Chirp | Waveform::Noise | Waveform::Arbitrary
+        )
+    }
+    pub fn samples_per_period(&self) -> f64 {
+        if self.samples > 1 {
+            f64::from(self.samples)
+        } else {
+            SAMPLES_PER_PERIOD
+        }
+    }
+    fn duty(&self) -> f64 {
+        if self.duty_q16 == 0 {
+            0.5
+        } else {
+            f64::from(self.duty_q16) / 65536.0
+        }
+    }
+    /// Shapes whose phase is found by grid search rather than a fundamental fit.
+    fn grid_phase(&self) -> bool {
+        match self.waveform {
+            Waveform::Staircase | Waveform::Sawtooth => true,
+            Waveform::Square => (self.duty() - 0.5).abs() > 1e-9,
+            _ => false,
         }
     }
     /// Repetition frequency, or None for DC.
     pub fn period_hz(&self) -> Option<f64> {
         match self.waveform {
-            Waveform::Dc => None,
+            Waveform::Dc | Waveform::Chirp | Waveform::Noise | Waveform::Arbitrary => None,
             Waveform::Staircase => {
                 let period = f64::from(self.steps.max(2)) * f64::from(self.dwell_ms) / 1000.0;
                 (period > 0.0).then(|| 1.0 / period)
@@ -46,10 +77,17 @@ impl Wave {
     fn unit(&self, frac: f64) -> f64 {
         let f = frac.rem_euclid(1.0);
         match self.waveform {
-            Waveform::Dc => 0.0,
+            Waveform::Dc | Waveform::Chirp | Waveform::Noise | Waveform::Arbitrary => 0.0,
             Waveform::Sine => (TAU * f).sin(),
+            Waveform::Sawtooth => {
+                if self.flags & super::wire::FLAG_RAMP_DOWN != 0 {
+                    1.0 - 2.0 * f
+                } else {
+                    -1.0 + 2.0 * f
+                }
+            }
             Waveform::Square => {
-                if f < 0.5 {
+                if f < self.duty() {
                     1.0
                 } else {
                     -1.0
@@ -73,11 +111,11 @@ impl Wave {
     }
     /// DAC pin volts at `frac` of a period, with the zero-order hold.
     pub fn pin_at(&self, frac: f64) -> f64 {
-        let held = match self.waveform {
-            Waveform::Square | Waveform::Sine | Waveform::Triangle => {
-                (frac.rem_euclid(1.0) * SAMPLES_PER_PERIOD).floor() / SAMPLES_PER_PERIOD
-            }
-            _ => frac,
+        let held = if self.waveform.is_periodic() {
+            let n = self.samples_per_period();
+            (frac.rem_euclid(1.0) * n).floor() / n
+        } else {
+            frac
         };
         self.offset_v + self.amplitude_v * self.unit(held)
     }
@@ -89,13 +127,13 @@ pub fn fundamental_coefficient(waveform: Waveform) -> f64 {
         Waveform::Sine => 1.0,
         Waveform::Square => 4.0 / PI,
         Waveform::Triangle => 8.0 / (PI * PI),
-        Waveform::Dc | Waveform::Staircase => 0.0,
+        _ => 0.0,
     }
 }
 /// The zero-order hold scales the fundamental by sinc(pi / N) and delays it by
 /// half a hold sample.
-pub fn zoh_gain() -> f64 {
-    let x = PI / SAMPLES_PER_PERIOD;
+pub fn zoh_gain(samples_per_period: f64) -> f64 {
+    let x = PI / samples_per_period;
     x.sin() / x
 }
 
@@ -212,7 +250,11 @@ pub struct Analysis {
 /// Phase (fraction of a period at t = 0) of a staircase that best matches the
 /// measured samples, by grid search of the de-meaned squared error.
 fn staircase_phase(t_s: &[f64], y: &[f64], wave: &Wave, model: PathModel, f: f64) -> f64 {
-    let grid = (u32::from(wave.steps.max(2)) * 16).min(1024);
+    let grid = if wave.waveform == Waveform::Staircase {
+        (u32::from(wave.steps.max(2)) * 16).min(1024)
+    } else {
+        256
+    };
     let mut best = (f64::INFINITY, 0.0);
     for g in 0..grid {
         let phase = f64::from(g) / f64::from(grid);
@@ -261,13 +303,13 @@ pub fn analyse(t_s: &[f64], y: &[f64], wave: &Wave, model: PathModel) -> (Vec<f6
     // Phase as a fraction of a period at t = 0.
     let t0 = t_s[0];
     let rel: Vec<f64> = t_s.iter().map(|t| t - t0).collect();
-    let phase = if wave.waveform == Waveform::Staircase {
+    let phase = if wave.grid_phase() {
         staircase_phase(&rel, y, wave, model, f)
     } else {
         match fit_fundamental(&rel, y, f) {
             Some((_, amplitude, measured_phase)) => {
                 out.measured_amplitude =
-                    Some(amplitude / (fundamental_coefficient(wave.waveform) * zoh_gain()));
+                    Some(amplitude / (fundamental_coefficient(wave.waveform) * zoh_gain(wave.samples_per_period())));
                 // A negative path slope inverts the wave.
                 let phase = if model.slope < 0.0 {
                     measured_phase + PI
@@ -275,7 +317,7 @@ pub fn analyse(t_s: &[f64], y: &[f64], wave: &Wave, model: PathModel) -> (Vec<f6
                     measured_phase
                 };
                 // The held wave's fundamental lags its shape by half a hold sample.
-                phase / TAU + 0.5 / SAMPLES_PER_PERIOD
+                phase / TAU + 0.5 / wave.samples_per_period()
             }
             None => 0.0,
         }
@@ -287,7 +329,7 @@ pub fn analyse(t_s: &[f64], y: &[f64], wave: &Wave, model: PathModel) -> (Vec<f6
     let residual: Vec<f64> = y.iter().zip(&expected).map(|(m, e)| m - e).collect();
     out.offset_error = mean(&residual);
     let line = linear_fit(&expected, y);
-    if wave.waveform == Waveform::Staircase {
+    if wave.grid_phase() {
         if let Some((slope, _)) = line {
             out.measured_amplitude = Some(slope.abs() * expected_amplitude);
         }
@@ -463,6 +505,7 @@ mod tests {
             frequency_hz: 0.25,
             steps: 0,
             dwell_ms: 0,
+            ..Default::default()
         };
         // 40 Hz stream, true gain 0.99, offset +0.01, unknown phase.
         let (t, y) = sample(&wave, DIRECT, 40.0, 30.0, 0.37, 0.99, 0.01, 0.0005);
@@ -498,6 +541,7 @@ mod tests {
                 frequency_hz: 0.5,
                 steps: 0,
                 dwell_ms: 0,
+                ..Default::default()
             };
             let (t, y) = sample(&wave, DIRECT, 40.0, 20.0, 0.1, 1.0, 0.0, 0.0);
             let (_, a) = analyse(&t, &y, &wave, DIRECT);
@@ -526,6 +570,7 @@ mod tests {
             frequency_hz: 1.0,
             steps: 0,
             dwell_ms: 0,
+            ..Default::default()
         };
         let (t, y) = sample(&wave, model, 40.0, 10.0, 0.6, 1.0, 0.0, 0.0);
         let (expected, a) = analyse(&t, &y, &wave, model);
@@ -547,6 +592,7 @@ mod tests {
             frequency_hz: 0.0,
             steps: 5,
             dwell_ms: 1000,
+            ..Default::default()
         };
         assert!((wave.period_hz().unwrap() - 0.2).abs() < 1e-12);
         let (t, y) = sample(&wave, DIRECT, 10.0, 30.0, 0.43, 1.02, 0.0, 0.0);
@@ -571,6 +617,7 @@ mod tests {
             frequency_hz: 0.05,
             steps: 0,
             dwell_ms: 0,
+            ..Default::default()
         };
         let (t, y) = sample(&wave, DIRECT, 4.0, 30.0, 0.0, 1.0, 0.0, 0.0);
         assert_eq!(analyse(&t, &y, &wave, DIRECT).1.measured_frequency_hz, None);

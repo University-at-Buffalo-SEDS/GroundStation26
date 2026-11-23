@@ -965,12 +965,12 @@
     },
     {
       "name": "DAQ_DAC_COMMAND",
-      "doc": "GS-only DAQ DAC signal generator command v1, exact 32 LE bytes: version, channel (0xFF all, disable only), enable, waveform, amplitude/offset/frequency f32 (DAC-pin volts, Hz), steps u16, lease_ms u16, dwell_ms u32, nonzero sequence u32, reserved. Level-triggered lease keepalive; enable only in Startup/Idle.",
+      "doc": "GS-only DAQ DAC signal generator command v2, exact 48 LE bytes (DAQ-Board docs/dac-waveforms.md): version, channel (0xFF all, disable only), enable, waveform 0-8, amplitude/offset/frequency f32 (DAC-pin volts, Hz), steps u16, lease_ms u16, dwell_ms u32, nonzero sequence u32, phase/duty Q16, chirp stop f32 and sweep ms, arbitrary table CRC-32 and length, flags, reserved. Level-triggered lease keepalive; enable only in Startup/Idle.",
       "class": "Data",
       "element": {
         "kind": "Static",
         "data_type": "UInt8",
-        "count": 32
+        "count": 48
       },
       "endpoints": [
         "SD_CARD"
@@ -980,15 +980,30 @@
     },
     {
       "name": "DAQ_DAC_STATUS",
-      "doc": "DAQ DAC signal generator status v1, exact 80 LE bytes: version, DAQ flight state, gate, flags, uptime ms, then two 36-byte channel blocks (active, waveform, last result, clamp flags, disable reason, steps, applied amplitude/offset/frequency, dwell, sequence, output and internal readback volts).",
+      "doc": "DAQ DAC signal generator status v2, exact 136 LE bytes: version, DAQ flight state, gate, flags, uptime ms, two 52-byte channel blocks (active, waveform, last result, clamp flags, disable reason, wave flags, steps, applied amplitude/offset, actual frequency, dwell, sequence, output and internal readback volts, update rate, table length playing, duty, phase, arbitrary length, CRC-32 of the table playing), then the uploaded-table block (state, length, upload id, expected and computed CRC, chunk bitmap).",
       "class": "Data",
       "element": {
         "kind": "Static",
         "data_type": "UInt8",
-        "count": 80
+        "count": 136
       },
       "endpoints": [
         "GROUND_STATION"
+      ],
+      "reliable": "Off",
+      "priority": 16
+    },
+    {
+      "name": "DAQ_DAC_TABLE",
+      "doc": "GS-only DAQ DAC arbitrary-table upload v1, exact 76 LE bytes: version, op (1 begin, 2 data, 3 commit, 4 clear), index u16 (begin/commit: length; data: first sample), upload id u32, value u32 (begin/commit: CRC-32; data: count), 32 x u16 DAC codes. The DAQ confirms through DAQ_DAC_STATUS.",
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "UInt8",
+        "count": 76
+      },
+      "endpoints": [
+        "SD_CARD"
       ],
       "reliable": "Off",
       "priority": 16

@@ -375,6 +375,7 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         )
         .route("/api/daq/dac", get(crate::daq_dac::get_status))
         .route("/api/daq/dac/config", post(crate::daq_dac::post_config))
+        .route("/api/daq/dac/preview", post(crate::daq_dac::post_preview))
         .route("/api/daq/dac/disable", post(crate::daq_dac::disable))
         .route(
             "/api/daq/dac/validation",

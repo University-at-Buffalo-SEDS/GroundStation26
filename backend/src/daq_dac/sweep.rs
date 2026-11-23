@@ -50,6 +50,9 @@ pub(super) struct Report {
     /// How the sweep ended and why, also saved in the file.
     pub outcome: State,
     pub message: Option<String>,
+    /// Frequency-response preset only.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub frequency_points: Vec<FrequencyPoint>,
 }
 
 #[derive(Default)]
@@ -70,6 +73,71 @@ pub(super) struct Plan {
     pub polarity: Polarity,
     pub levels: Vec<f64>,
     pub dwell: Duration,
+    /// Frequency-response preset: sine steps instead of DC levels.
+    pub response: Option<Response>,
+}
+
+/// A frequency-response sweep: a sine of fixed pin amplitude stepped through
+/// `frequencies_hz`, each point's gain fitted at the DAQ's achieved frequency.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct Response {
+    pub frequencies_hz: Vec<f64>,
+    pub offset_pin_v: f64,
+    pub amplitude_pin_v: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(super) struct FrequencyPoint {
+    pub frequency_hz: f64,
+    pub expected_amplitude: f64,
+    pub measured_amplitude: Option<f64>,
+    pub gain_db: Option<f64>,
+    pub samples: usize,
+}
+
+/// Fit one frequency-response point: the fundamental's amplitude at the
+/// achieved frequency against the path model's expected amplitude.
+pub(super) fn response_point(
+    times_ms: &[i64],
+    values: &[f64],
+    frequency_hz: f64,
+    expected_amplitude: f64,
+) -> FrequencyPoint {
+    let n = times_ms.len().min(values.len());
+    let t0 = times_ms.first().copied().unwrap_or(0);
+    let t: Vec<f64> = times_ms[..n].iter().map(|t| (t - t0) as f64 / 1000.0).collect();
+    let measured = analysis::fit_fundamental(&t, &values[..n], frequency_hz).map(|(_, a, _)| a);
+    FrequencyPoint {
+        frequency_hz,
+        expected_amplitude,
+        measured_amplitude: measured,
+        gain_db: measured
+            .filter(|_| expected_amplitude > 0.0)
+            .map(|m| 20.0 * (m / expected_amplitude).max(1e-12).log10()),
+        samples: n,
+    }
+}
+
+/// Frequency-response check: every point within +/-3 dB.
+pub(super) fn response_check(points: &[FrequencyPoint]) -> Option<Check> {
+    let worst = points
+        .iter()
+        .filter_map(|p| p.gain_db)
+        .fold(None::<f64>, |w, g| Some(w.map_or(g.abs(), |w| w.max(g.abs()))))?;
+    Some(Check {
+        name: "max_gain_deviation_db",
+        value: worst,
+        limit: 3.0,
+        pass: worst <= 3.0,
+    })
+}
+
+/// Log-spaced frequencies, capped at a quarter of the target's stream rate.
+pub(super) fn response_frequencies(start_hz: f64, stop_hz: f64, points: usize) -> Vec<f64> {
+    let points = points.max(2);
+    (0..points)
+        .map(|i| start_hz * (stop_hz / start_hz).powf(i as f64 / (points - 1) as f64))
+        .collect()
 }
 
 enum Stop {
@@ -110,6 +178,7 @@ pub(super) fn build_report(
         saved_path: None,
         outcome,
         message,
+        frequency_points: Vec::new(),
     }
 }
 
@@ -192,6 +261,7 @@ async fn run_steps(
             frequency_hz: None,
             steps: None,
             dwell_ms: None,
+            ..Default::default()
         };
         let enabled =
             super::api::enable(state, &request).map_err(|(_, message)| Stop::Failed(message))?;
@@ -225,6 +295,7 @@ async fn run_steps(
             target: plan.target,
             channel: plan.channel,
             values: Vec::new(),
+            times: Vec::new(),
             readbacks: Vec::new(),
             last_primary_ms: None,
         }));
@@ -253,6 +324,77 @@ async fn run_steps(
     Ok(())
 }
 
+async fn run_response(
+    state: &AppState,
+    plan: &Plan,
+    model: PathModel,
+    cancel: &AtomicBool,
+    points: &mut Vec<FrequencyPoint>,
+) -> Result<(), Stop> {
+    let response = plan.response.as_ref().expect("response plan");
+    let channel = usize::from(plan.channel);
+    for (i, f) in response.frequencies_hz.iter().copied().enumerate() {
+        if cancel.load(Ordering::Acquire) {
+            return Err(Stop::Cancelled);
+        }
+        state.daq_dac.set_progress(i + 1);
+        let request = ConfigRequest {
+            channel: plan.channel,
+            waveform: Waveform::Sine,
+            amplitude_v: response.amplitude_pin_v * super::model::BUFFER_GAIN,
+            offset_v: response.offset_pin_v * super::model::BUFFER_GAIN,
+            frequency_hz: Some(f),
+            ..Default::default()
+        };
+        let enabled =
+            super::api::enable(state, &request).map_err(|(_, message)| Stop::Failed(message))?;
+        let seq = enabled.command.sequence;
+        let deadline = Instant::now() + CONFIRM_TIMEOUT;
+        let (achieved, amplitude_pin) = loop {
+            check(state, plan, cancel, seq)?;
+            if let Some((status, _)) = super::daq_status(state, Instant::now()) {
+                let ch = status.channels[channel];
+                if ch.active && ch.sequence == seq && ch.frequency_hz > 0.0 {
+                    break (f64::from(ch.frequency_hz), f64::from(ch.amplitude_v));
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(Stop::Failed(format!(
+                    "The DAQ did not confirm the {f} Hz sine on channel {} within {} s.",
+                    plan.channel,
+                    CONFIRM_TIMEOUT.as_secs()
+                )));
+            }
+            tokio::time::sleep(POLL).await;
+        };
+        pause(state, plan, cancel, seq, SETTLE).await?;
+        state.daq_dac.set_collector(Some(Collector {
+            target: plan.target,
+            channel: plan.channel,
+            values: Vec::new(),
+            times: Vec::new(),
+            readbacks: Vec::new(),
+            last_primary_ms: None,
+        }));
+        // At least four periods per point.
+        let dwell = plan.dwell.max(Duration::from_secs_f64(4.0 / achieved));
+        let waited = pause(state, plan, cancel, seq, dwell).await;
+        let collected = state.daq_dac.set_collector(None);
+        waited?;
+        let collected = collected.expect("collector set above");
+        if collected.values.len() < 8 {
+            return Err(Stop::Failed(format!(
+                "Only {} samples from {} at {f} Hz; check the stream and the loopback cable.",
+                collected.values.len(),
+                plan.target.label
+            )));
+        }
+        let expected = (model.slope * amplitude_pin).abs();
+        points.push(response_point(&collected.times, &collected.values, achieved, expected));
+    }
+    Ok(())
+}
+
 pub(super) async fn run(state: Arc<AppState>, plan: Plan, cancel: Arc<AtomicBool>) {
     let started = crate::telemetry_task::get_current_timestamp_ms();
     let capture_key = format!("sweep-{started}");
@@ -268,7 +410,12 @@ pub(super) async fn run(state: Arc<AppState>, plan: Plan, cancel: Arc<AtomicBool
     );
     let model = plan.target.model(plan.attenuation, plan.polarity);
     let mut points = Vec::new();
-    let result = run_steps(&state, &plan, model, &cancel, &mut points).await;
+    let mut response_points = Vec::new();
+    let result = if plan.response.is_some() {
+        run_response(&state, &plan, model, &cancel, &mut response_points).await
+    } else {
+        run_steps(&state, &plan, model, &cancel, &mut points).await
+    };
     // Always leave the DAC off, whatever happened.
     state.daq_dac.set_collector(None);
     let disable = state
@@ -299,7 +446,13 @@ pub(super) async fn run(state: Arc<AppState>, plan: Plan, cancel: Arc<AtomicBool
         outcome,
         message.clone(),
     );
-    if !report.points.is_empty() {
+    if plan.response.is_some() {
+        let check = response_check(&response_points);
+        report.pass = outcome == State::Done && check.as_ref().is_some_and(|c| c.pass);
+        report.checks = check.into_iter().collect();
+        report.frequency_points = response_points;
+    }
+    if !report.points.is_empty() || !report.frequency_points.is_empty() {
         let path = report_dir(&state).join(format!("daq_dac_sweep_{started}.json"));
         report.saved_path = Some(path.display().to_string());
         let saved = match serde_json::to_vec_pretty(&report) {

@@ -9,13 +9,18 @@
 //! status goes stale. See `.workspace-progress/.../SPEC.md` for the contract.
 mod analysis;
 mod api;
+mod audio;
+mod custom;
+mod expr;
 mod model;
 mod sweep;
+mod upload;
+mod waveform;
 mod wire;
 
 pub(crate) use api::{
-    disable, get_status, get_sweep, get_validation, post_config, post_sweep, post_validation,
-    sweep_cancel,
+    disable, get_status, get_sweep, get_validation, post_config, post_preview, post_sweep,
+    post_validation, sweep_cancel,
 };
 pub(crate) use wire::Status;
 
@@ -49,25 +54,50 @@ const SETTLE: Duration = Duration::from_millis(500);
 const FALLBACK_AFTER_MS: i64 = 2_000;
 
 /// What the operator asked for, in connector volts at P10 (before any
-/// external attenuator).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// external attenuator). DAQ-Board docs/dac-waveforms.md defines each wave.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConfigRequest {
     pub channel: u8,
     pub waveform: Waveform,
     #[serde(default)]
     pub amplitude_v: f64,
+    #[serde(default)]
     pub offset_v: f64,
+    /// Periodic: frequency. Chirp: start. Noise: sample rate. Arbitrary:
+    /// table repetitions per second (WAV: derived from the playback rate).
     #[serde(default)]
     pub frequency_hz: Option<f64>,
     #[serde(default)]
     pub steps: Option<u16>,
     #[serde(default)]
     pub dwell_ms: Option<u32>,
+    /// Start phase, degrees (periodic and chirp).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_deg: Option<f64>,
+    /// Square high time, percent (1..99; default 50).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duty_pct: Option<f64>,
+    /// Sawtooth falls instead of rising.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ramp_down: bool,
+    /// Chirp end frequency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frequency_stop_hz: Option<f64>,
+    /// Chirp sweep duration, seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sweep_s: Option<f64>,
+    /// Chirp sweeps logarithmically.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub log_sweep: bool,
+    /// Arbitrary: the table source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom: Option<custom::CustomSource>,
 }
 
 /// Clamp a request to the DAC's linear range and build the pin-volt command.
-/// Returns the command and the names of the fields the GS clamped.
+/// Returns the command and the names of the fields the GS clamped. An
+/// arbitrary request is planned by `custom::build` and the upload instead.
 pub(crate) fn plan_command(
     request: &ConfigRequest,
     sequence: u32,
@@ -78,22 +108,36 @@ pub(crate) fn plan_command(
             request.channel
         ));
     }
+    let w = request.waveform;
+    if w == Waveform::Arbitrary {
+        return Err("An arbitrary waveform needs a custom table (expression, values or WAV).".into());
+    }
+    if request.custom.is_some() {
+        return Err(format!("A {} wave takes no custom table.", w.name()));
+    }
     if !request.offset_v.is_finite() || !request.amplitude_v.is_finite() {
         return Err("Offset and amplitude must be finite numbers of volts.".into());
     }
     if request.amplitude_v < 0.0 {
         return Err("Amplitude is a peak value and cannot be negative.".into());
     }
-    let uses_frequency = request.waveform.uses_frequency();
+    let uses_frequency = w.uses_frequency();
     let frequency = request.frequency_hz.unwrap_or(1.0);
     if !frequency.is_finite() || (uses_frequency && frequency <= 0.0) {
         return Err("Frequency must be a positive number of hertz.".into());
     }
     if uses_frequency && request.frequency_hz.is_none() {
-        return Err(format!(
-            "A {} wave needs frequency_hz.",
-            request.waveform.name()
-        ));
+        return Err(format!("A {} wave needs frequency_hz.", w.name()));
+    }
+    for (value, name) in [
+        (request.phase_deg, "Phase"),
+        (request.duty_pct, "Duty"),
+        (request.frequency_stop_hz, "Stop frequency"),
+        (request.sweep_s, "Sweep time"),
+    ] {
+        if value.is_some_and(|v| !v.is_finite()) {
+            return Err(format!("{name} must be a finite number."));
+        }
     }
     let mut clamped = Vec::new();
     let mut clamp = |value: f64, lo: f64, hi: f64, name: &'static str, relevant: bool| {
@@ -110,7 +154,7 @@ pub(crate) fn plan_command(
         "offset",
         true,
     );
-    let amplitude = if request.waveform == Waveform::Dc {
+    let amplitude = if w == Waveform::Dc {
         0.0
     } else {
         let room = (offset - model::DAC_MIN_V).min(model::DAC_MAX_V - offset);
@@ -122,37 +166,122 @@ pub(crate) fn plan_command(
             true,
         )
     };
-    let frequency = clamp(frequency, 0.01, 1000.0, "frequency", uses_frequency);
-    let staircase = request.waveform == Waveform::Staircase;
+    let (f_lo, f_hi) = if w == Waveform::Noise {
+        (waveform::NOISE_RATE_MIN_HZ, waveform::UPDATE_MAX_HZ)
+    } else {
+        (waveform::FREQ_MIN_HZ, waveform::FREQ_MAX_HZ)
+    };
+    let frequency = clamp(frequency, f_lo, f_hi, "frequency", uses_frequency);
+    let staircase = w == Waveform::Staircase;
     let steps = clamp(
         f64::from(request.steps.unwrap_or(8)),
-        2.0,
-        32.0,
+        f64::from(waveform::STEPS_MIN),
+        f64::from(waveform::STEPS_MAX),
         "steps",
         staircase,
     );
     let dwell = clamp(
         f64::from(request.dwell_ms.unwrap_or(1000)),
-        10.0,
-        20_000.0,
+        f64::from(waveform::DWELL_MIN_MS),
+        f64::from(waveform::DWELL_MAX_MS),
         "dwell",
         staircase,
     );
+    let phased = w.is_periodic() || w == Waveform::Chirp;
+    let phase_q16 = if phased {
+        let turns = request.phase_deg.unwrap_or(0.0).rem_euclid(360.0) / 360.0;
+        ((turns * 65536.0).round() as u32 % 65536) as u16
+    } else {
+        0
+    };
+    let square = w == Waveform::Square;
+    let duty_q16 = if square {
+        let pct = clamp(request.duty_pct.unwrap_or(50.0), 1.0, 99.0, "duty", true);
+        ((pct / 100.0 * 65536.0).round() as u16).clamp(waveform::DUTY_MIN_Q16, waveform::DUTY_MAX_Q16)
+    } else {
+        0
+    };
+    let chirp = w == Waveform::Chirp;
+    let stop = if chirp {
+        let stop = request
+            .frequency_stop_hz
+            .ok_or("A chirp needs frequency_stop_hz.")?;
+        if stop <= 0.0 {
+            return Err("Stop frequency must be a positive number of hertz.".into());
+        }
+        clamp(stop, waveform::FREQ_MIN_HZ, waveform::FREQ_MAX_HZ, "frequency", true)
+    } else {
+        0.0
+    };
+    let sweep_ms = if chirp {
+        let s = request.sweep_s.ok_or("A chirp needs sweep_s.")?;
+        clamp(
+            s * 1000.0,
+            f64::from(waveform::SWEEP_MIN_MS),
+            f64::from(waveform::SWEEP_MAX_MS),
+            "sweep",
+            true,
+        )
+        .round() as u32
+    } else {
+        0
+    };
+    let flags = match w {
+        Waveform::Sawtooth if request.ramp_down => wire::FLAG_RAMP_DOWN,
+        Waveform::Chirp if request.log_sweep => wire::FLAG_LOG_SWEEP,
+        _ => 0,
+    };
+    // Exactly the DAQ's float clamp, so it applies these values unchanged.
+    let (offset_f, amplitude_f) = waveform::clamp_pin(offset as f32, amplitude as f32, w != Waveform::Dc);
     Ok((
         Command {
             channel: request.channel,
             enable: true,
-            waveform: request.waveform,
-            amplitude_v: amplitude as f32,
-            offset_v: offset as f32,
-            frequency_hz: frequency as f32,
-            steps: steps as u16,
+            waveform: w,
+            flags,
+            amplitude_v: amplitude_f,
+            offset_v: offset_f,
+            frequency_hz: if uses_frequency { frequency as f32 } else { 0.0 },
+            frequency_stop_hz: stop as f32,
+            steps: if staircase { steps as u16 } else { 0 },
             lease_ms: LEASE_MS,
-            dwell_ms: dwell as u32,
+            phase_q16,
+            duty_q16,
+            table_len: 0,
+            dwell_ms: if staircase { dwell as u32 } else { 0 },
+            sweep_ms,
+            table_crc: 0,
             sequence,
         },
         clamped,
     ))
+}
+
+/// The command that plays an uploaded normalized shape: amplitude, offset,
+/// phase and frequency clamp exactly as for a sine, then the update rate
+/// (frequency x length) is held within the DAC limit.
+pub(crate) fn plan_arbitrary(
+    request: &ConfigRequest,
+    table: &custom::CustomTable,
+    sequence: u32,
+) -> Result<(Command, Vec<&'static str>), String> {
+    let as_sine = ConfigRequest {
+        waveform: Waveform::Sine,
+        custom: None,
+        duty_pct: None,
+        frequency_hz: Some(table.frequency_hz),
+        ..request.clone()
+    };
+    let (mut command, mut clamped) = plan_command(&as_sine, sequence)?;
+    command.waveform = Waveform::Arbitrary;
+    command.table_len = table.samples;
+    command.table_crc = table.shape_crc;
+    let top = ((waveform::UPDATE_MAX_HZ / f64::from(table.samples)) as f32).min(waveform::FREQ_MAX_HZ as f32);
+    if command.frequency_hz > top {
+        command.frequency_hz = top;
+        clamped.push("frequency");
+    }
+    Ok((command, clamped))
 }
 
 fn flight_state_allows(state: FlightState) -> bool {
@@ -295,6 +424,8 @@ struct Collector {
     target: &'static Target,
     channel: u8,
     values: Vec<f64>,
+    /// Sample times (ms, GS clock), parallel to `values`.
+    times: Vec<i64>,
     readbacks: Vec<f64>,
     last_primary_ms: Option<i64>,
 }
@@ -309,6 +440,10 @@ struct Inner {
     validation: Option<Validation>,
     sweep: sweep::Ctl,
     collector: Option<Collector>,
+    upload: api::UploadCtl,
+    /// The last shape uploaded (or found verified on the DAQ), by CRC, to
+    /// predict the CRC each arbitrary channel should report.
+    shape: Option<(u32, Vec<i16>)>,
 }
 
 impl Inner {
@@ -603,6 +738,7 @@ impl Runtime {
                 col.readbacks.push(f64::from(readback));
                 if col.target.is_internal() {
                     col.values.push(f64::from(readback));
+                    col.times.push(t_ms);
                 }
             }
         }
@@ -627,6 +763,7 @@ impl Runtime {
             && accept_source(&mut col.last_primary_ms, fallback, t_ms)
         {
             col.values.push(value);
+            col.times.push(t_ms);
         }
     }
 }
@@ -659,6 +796,9 @@ fn wave_of(ch: &wire::ChannelStatus) -> Wave {
         frequency_hz: f64::from(ch.frequency_hz),
         steps: ch.steps,
         dwell_ms: ch.dwell_ms,
+        samples: ch.samples,
+        flags: ch.flags,
+        duty_q16: ch.duty_q16,
     }
 }
 
@@ -717,6 +857,10 @@ fn command_packet(command: &Command) -> sedsnet::TelemetryResult<sedsnet::packet
     if command.sequence == 0 {
         return Err(sedsnet::TelemetryError::BadArg);
     }
+    gs_packet("DAQ_DAC_COMMAND", Arc::from(command.encode()))
+}
+
+fn gs_packet(name: &str, payload: Arc<[u8]>) -> sedsnet::TelemetryResult<sedsnet::packet::Packet> {
     // Stamped on the station's network clock in its time-base epoch when it
     // has one (the DAQ orders the lease by sequence, not by this stamp).
     let (stamp_ms, epoch) = crate::telemetry_task::network_time_router()
@@ -724,17 +868,23 @@ fn command_packet(command: &Command) -> sedsnet::TelemetryResult<sedsnet::packet
         .filter(|(ms, _)| *ms != 0)
         .unwrap_or((crate::telemetry_task::get_current_timestamp_ms(), 0));
     sedsnet::packet::Packet::new(
-        crate::telemetry_schema::data_type("DAQ_DAC_COMMAND"),
+        crate::telemetry_schema::data_type(name),
         &[crate::telemetry_schema::endpoint("SD_CARD")],
         "GS",
         stamp_ms,
-        Arc::from(command.encode()),
+        payload,
     )
     .map(|packet| packet.with_time_epoch(epoch))
 }
 
 fn send(router: &sedsnet::router::Router, command: &Command) -> Result<(), String> {
     command_packet(command)
+        .and_then(|packet| router.tx_queue(packet))
+        .map_err(|error| error.to_string())
+}
+
+fn send_table(router: &sedsnet::router::Router, msg: &wire::TableMsg) -> Result<(), String> {
+    gs_packet("DAQ_DAC_TABLE", Arc::from(msg.encode()))
         .and_then(|packet| router.tx_queue(packet))
         .map_err(|error| error.to_string())
 }
