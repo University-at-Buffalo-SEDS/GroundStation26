@@ -488,6 +488,83 @@ Copy the `IGT` folder to the root of the FC's SD card. On the card:
 The FC's own `irec*.csv` logs stay at the root. FileX reads FAT12, FAT16 and
 FAT32. Use 8.3 names; do not rename the folder.
 
+### 11.1 Using the committed mock flights
+
+`test-data/igt/` holds ready-made flights of the 6 in, 15 ft vehicle. Their
+README gives each one's apogee, Mach, accelerations and event times:
+
+| Folder | Use |
+| --- | --- |
+| `nominal_10k` | the default: a nominal flight to 10,000 ft AGL |
+| `measured_motor` | the 2026-11-16 motor as measured (7 kN s, about 4,500 ft) |
+| `high_wind` | 9 m/s wind with gusts: weathercocking and drift |
+| `early_apogee_noise` | Kalman stress: baro noise, outliers, Mach error and a false-descent step before apogee |
+| `off_nominal` | FC logic: a late main, an IMU saturation glitch, a frozen baro and a GPS dropout |
+
+To load one:
+
+1. Power the FC down and take out its SD card. Mount it on a computer.
+2. Delete any old `/IGT` folder on the card. Then copy the dataset's `IGT`
+   folder, not its parent, to the card root, so the card has
+   `/IGT/IMU0.CSV`, `/IGT/BARO0.CSV` and `/IGT/GPS0.CSV`. Leave the
+   `irec*.csv` logs where they are.
+   ```sh
+   rm -rf /media/$USER/SDCARD/IGT
+   cp -r test-data/igt/nominal_10k/IGT /media/$USER/SDCARD/
+   sync
+   ```
+3. Check the copy on the card the way the FC will. The sets are built for the
+   compiled IREC site (31.758, -102.046, 890 m). If the station's Launch site
+   setting is different, pass it, or regenerate with `--site`:
+   ```sh
+   python3 tools/igt_csv.py check /media/$USER/SDCARD --fc-site 31.758,-102.046,890.016
+   ```
+4. Eject the card, put it back in the FC, and follow section 12. Enter ground
+   test should report `IGT CSV ok: IMU 10446 247s, BARO 12367 247s, GPS 2378`
+   for `nominal_10k`. Validation reads about 1 MB, so it takes a few seconds.
+
+Each set starts with 10 s at rest on a 5° rail, because the motor lights
+about 10 s after Launch. The drogue is near apogee (about 36.8 s), the main
+at 457 m (about 140 s), and the vehicle lands about 215 s after Launch. After
+landing there are 30 s at rest, so the FC reaches Landed and ends the replay.
+
+The FC computes baro altitude with the sea-level constant 44330 against the
+pad pressure. At the 890 m site this reads about 2% high: the FC sees
+`nominal_10k` peak at about 3,108 m when the truth is 3,048 m. The main is
+then commanded at about 448 m true. The replayed `alt_m` column carries this
+deliberately, because it is what the board computes.
+
+### 11.2 Generating new mock flights
+
+`tools/flight_profile/generate.py` (needs numpy) is a 3-DOF model with a
+weathercock and pendulum attitude approximation. It covers the rail,
+component drag build-up versus Mach and Reynolds number, the measured
+hybrid thrust curve, roll, the drogue and main with opening shocks and swing,
+landing and tip-over. Its output goes through datasheet models of the BMI088,
+the BMP390 (with port lag, IIR and static-port error) and GPS (with a dropout
+during boost). It writes and checks the same layout. The output is
+deterministic for a given seed.
+
+Every assumption, with its source, is in `tools/flight_profile/vehicle.json`.
+When the team has a measured value, put it there. The 10 kN s question, for
+example, is `motor.total_impulse_ns`. Then run `--all` to regenerate the
+committed sets and their README.
+
+```sh
+python3 tools/flight_profile/generate.py --all                     # test-data/igt/*
+python3 tools/flight_profile/generate.py --variant nominal_10k --out /tmp/igt \
+    --wind 6 --wind-from 270 --gust 2 --seed 7                    # a new draw
+python3 tools/flight_profile/generate.py --out /tmp/igt --site 32.99,-106.97,1401 \
+    --apogee-m 3048 --no-noise                                    # another pad, ideal sensors
+python3 tools/flight_profile/generate.py --solve-dry-mass 3048     # dry mass for 10k ft
+python3 tools/flight_profile/generate.py --out /tmp/igt --set vehicle.dry_mass_kg=28 \
+    --set recovery.main_descent_mps=7
+```
+
+To see what the FC will decide before a test, run FlightComputer26
+`tools/igt_replay_host.py <folder>`. It replays the set through the FC's
+real replay, estimator and state-machine code on the host.
+
 ## 12. Procedure
 
 1. Load an FC image built with `--ground-test`, and put the CSVs on the SD
