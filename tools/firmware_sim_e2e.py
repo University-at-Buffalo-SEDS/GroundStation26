@@ -170,6 +170,10 @@ def main() -> int:
     a = p.parse_args()
     out = a.out.resolve()
     out.mkdir(parents=True, exist_ok=True)
+    if a.mode == "integrated_ground_test" and "FIRMWARE_SIM_CONTROL" not in os.environ:
+        # the IGT card goes in with its dataset before power-on. Swapping the card's contents while the FC runs (card
+        # out, dataset, card in, Retry SD) currently ends in an FC CSV parse fault: docs/firmware-sim.md, IGT
+        os.environ["FIRMWARE_SIM_CONTROL"] = json.dumps({"igt": {"dataset": "nominal_10k"}})
     proc, key = start_station(out, a.mode, a.port)
     st = Station(f"http://127.0.0.1:{a.port}", key, out)
     st.mode = a.mode
@@ -282,7 +286,12 @@ def fill(st: Station, check, nitrous_kg=5.0):
 
 def arm_and_launch(st: Station, check):
     state = None
-    for _ in range(20):
+    if st.mode == "test_fire":
+        # a test fire has no FC to arm: the station never publishes Armed there (gse/operational_policy.rs); the
+        # qualification's mission stage is Armed once the fill reached its target, and Launch goes from Idle
+        stage = st.wait(lambda: (gse(st).get("qualification") or {}).get("fill_target"), 30, "qualification Armed")
+        check("GSE qualification reaches Armed (fill target)", stage, qualification=gse(st).get("qualification"))
+    for _ in range(20 if st.mode != "test_fire" else 0):
         code, f = st.api("/flightstate")
         state = (f or {}).get("state") if isinstance(f, dict) else None
         if state == "Armed":
@@ -290,7 +299,8 @@ def arm_and_launch(st: Station, check):
         # HITL steps the flight state; other modes reach Armed from the fill itself
         code, _ = st.command("AdvanceFlightState") if st.mode == "hitl" else (0, None)
         time.sleep(3)
-    check("station and boards reach Armed", state == "Armed", state=state, fc=fc_phase(st))
+    if st.mode != "test_fire":
+        check("station and boards reach Armed", state == "Armed", state=state, fc=fc_phase(st))
     launched = False
     for _ in range(8):
         st.api("/api/board_abort/refresh", {})
@@ -346,7 +356,34 @@ def scenario_testing(st, check, result):
     # testing mode's own logic against the simulated boards: the links and the fill rules (its launch flow is not
     # driven here)
     boards_up(st, check)
+    dac_patch(st, check, result)
     fill(st, check)
+
+
+def dac_patch(st: Station, check, result, frequency_hz=20.0):
+    """The DAQ's DAC waveform engine through the simulated loopback cable: a sine on DAC channel 0 patched onto
+    MCP3564R CH2, measured by the DAQ's frame engine and judged by the station's DAC validation."""
+    st.api("/api/firmware-sim/control", {"patch": {"dac1": "mcp_ch2"}})
+    code, body = st.api("/api/daq/dac/config", {"channel": 0, "waveform": "sine", "amplitude_v": 1.0, "offset_v": 1.5,
+                                               "frequency_hz": frequency_hz})
+    st.log("DAC config", http=code, body=body)
+    code, body = st.api("/api/daq/dac/validation", {"target": "mcp_ch2", "channel": 0})
+    st.log("DAC validation", http=code, body=body)
+
+    def analysed():
+        code, v = st.api("/api/daq/dac/validation")
+        a = (v or {}).get("analysis") if code == 200 and isinstance(v, dict) else None
+        return v if a and (a.get("samples") or 0) >= 500 and a.get("measured_frequency_hz") else None
+    v = st.wait(analysed, 60, "DAC validation analysis", poll=2) or {}
+    a = v.get("analysis") or {}
+    result["dac"] = {"analysis": a, "warnings": v.get("warnings")}
+    f = a.get("measured_frequency_hz") or 0
+    amp, want = a.get("measured_amplitude") or 0, a.get("expected_amplitude") or 0
+    check("DAC sine plays through the patch into the DAQ (frequency and amplitude)",
+          abs(f - frequency_hz) < 0.05 * frequency_hz and want and abs(amp - want) < 0.1 * want,
+          analysis=a, warnings=v.get("warnings"))
+    st.api("/api/daq/dac/disable", {"channel": 0})
+    st.api("/api/firmware-sim/control", {"patch": {"dac1": None}})
 
 
 def peak(st: Station, data_type: str, seconds: float, index=0):
@@ -366,16 +403,25 @@ def gse(st: Station):
     return g if code == 200 and isinstance(g, dict) else {}
 
 
+def command_accepted(st: Station, name: str, timeout_s=60):
+    """Sends a GSE command until the station accepts it (an interlock such as a fresh tank PT sample can refuse it
+    for a moment after start-up); the refusals stay in the log."""
+    return st.wait(lambda: st.command(name)[0] == 200, timeout_s, f"{name} accepted", poll=3)
+
+
 def gse_procedure(st: Station, check, result):
     """The operator's GSE procedure: valve self-test, nitrogen test (dump at its hold), fill to the target; the
     station goes Armed when the fill target is reached (FirmwareSimulator test-operational-flight-sim.py gse_step)."""
     ready = st.wait(lambda: gse(st).get("topology_stable") and gse(st).get("phase") in ("idle", "cancelled", None) and gse(st), 120, "GSE topology stable", poll=2)
     check("GSE topology stable", ready, phase=gse(st).get("phase"))
+    # a dry valve self-test: the operator isolates the gas supplies first (the confirmation says so), then opens them
+    st.api("/api/firmware-sim/control", {"plant": {"nitrogen_bottle_open": False, "nitrous_bottle_open": False}})
     st.api("/api/gse/self-test-confirmation", {"confirmed": True})
-    st.command("ValveSelfTest")
+    command_accepted(st, "ValveSelfTest")
     ok = st.wait(lambda: (gse(st).get("qualification") or {}).get("self_test"), 180, "valve self-test", poll=2)
     check("valve self-test passes through the real VB/AB", ok, phase=gse(st).get("phase"), message=gse(st).get("message"))
-    st.command("NitrogenTest")
+    st.api("/api/firmware-sim/control", {"plant": {"nitrogen_bottle_open": True, "nitrous_bottle_open": True}})
+    command_accepted(st, "NitrogenTest")
     def n2():
         g = gse(st)
         if (g.get("qualification") or {}).get("nitrogen_test") and g.get("phase") == "passed":
@@ -386,13 +432,17 @@ def gse_procedure(st: Station, check, result):
         return None
     ok = st.wait(n2, 400, "nitrogen test", poll=2)
     check("nitrogen test passes (pressure steps on the plant, dump at the hold)", ok, phase=gse(st).get("phase"), message=gse(st).get("message"))
-    st.command("StartFill")
-    last_resume = [0.0]
+    command_accepted(st, "StartFill")
+    last_resume = [time.monotonic()]
     def filled():
         g = gse(st)
         if (g.get("qualification") or {}).get("fill_target"):
             return g
-        if g.get("phase") == "paused" and "below target" in str(g.get("message")) and time.monotonic() - last_resume[0] > 5:
+        stalled = g.get("phase") == "paused" and "below target" in str(g.get("message"))
+        # Start fill first zeroes the fill load cell; a preparation that expired (a notification asks to press Fill
+        # again) leaves the sequence where it was, so press it again
+        not_started = g.get("phase") == "passed" and not (g.get("qualification") or {}).get("filling_started")
+        if (stalled and time.monotonic() - last_resume[0] > 5) or (not_started and time.monotonic() - last_resume[0] > 30):
             last_resume[0] = time.monotonic()
             st.command("StartFill")
         return None
@@ -420,6 +470,19 @@ def scenario_test_fire(st, check, result):
           rest_v=kg1000_rest, peak_v=kg1000)
     check("the rocket stays on the stand", plant.get("flight", {}).get("phase") == "pad", phase=plant.get("flight", {}).get("phase"))
     check("the motor burns out", st.wait(lambda: st.plant().get("motor", {}).get("burned_out"), 30, "burnout"))
+    burn_report(st, check, result)
+
+
+def burn_report(st: Station, check, result):
+    """The station's burn report (thrust, impulse) from the capture of the burn (provisional 40 s after the start)."""
+    def report():
+        code, r = st.api("/api/burn_reports")
+        reports = r.get("reports") if code == 200 and isinstance(r, dict) else None
+        return reports[0] if reports else None
+    r = st.wait(report, 240, "burn report", poll=5)
+    result["burn_report"] = r
+    check("the station computes the burn report (thrust and impulse)",
+          r and (r.get("peak_thrust_n") or 0) > 100 and (r.get("total_impulse_ns") or 0) > 100, report=r)
 
 
 def scenario_normal(st, check, result):
@@ -432,7 +495,8 @@ def scenario_normal(st, check, result):
     check("RF NEO-M9N fix reaches the station (GPS gates)", rocket, fix=rocket)
     gps = st.latest("GPS_STATUS", "RF")
     result["normal"] = {"rocket_fix": rocket, "gps_status": gps}
-    fill(st, check)
+    # the full launch procedure: the station's own GSE procedure to Armed, then QD retract and Launch
+    gse_procedure(st, check, result)
     code, pol = st.api("/api/action_policy")
     reason = ""
     if code == 200 and isinstance(pol, dict):
@@ -440,6 +504,41 @@ def scenario_normal(st, check, result):
         reason = launch.get("disabled_reason") or ""
     result["normal"]["launch_gate"] = reason
     check("Launch is not held by the GPS gate", "gps" not in reason.lower(), launch_gate=reason)
+    if not arm_and_launch(st, check):
+        return
+    track = []
+
+    def follow():
+        code, a = st.api("/api/antenna/status")
+        r = (a or {}).get("rocket") if code == 200 and isinstance(a, dict) else None
+        if r and r.get("latitude") is not None and not r.get("stale"):
+            point = (r["latitude"], r["longitude"], r.get("altitude_m") or r.get("altitude"))
+            if not track or track[-1] != point:
+                track.append(point)
+        return None
+    import threading
+    stop = threading.Event()
+    def poll():
+        while not stop.is_set():
+            follow()
+            stop.wait(1)
+    th = threading.Thread(target=poll, daemon=True)
+    th.start()
+    try:
+        flight(st, check, result)
+    finally:
+        stop.set()
+        th.join(5)
+    result["normal"]["track"] = track
+    import math
+    def dist(a, b):
+        k = 111_320.0
+        return math.hypot((a[0] - b[0]) * k, (a[1] - b[1]) * k * math.cos(math.radians(a[0])))
+    drift = dist(track[0], track[-1]) if len(track) > 1 else 0
+    alts = [p[2] for p in track if isinstance(p[2], (int, float))]
+    check("the map track follows the flight (RF GPS positions at the station)",
+          len(track) >= 20 and drift > 50 and (not alts or max(alts) - min(alts) > 300),
+          points=len(track), drift_m=round(drift), alt_span_m=round(max(alts) - min(alts)) if alts else None)
 
 
 def scenario_igt(st, check, result):
@@ -461,14 +560,26 @@ def scenario_igt(st, check, result):
     ready = st.wait(lambda: igt().get("sd_ready") is True and igt(), 60, "FC SD ready", poll=2)
     check("the FC mounts the simulated SD card", ready, igt=igt())
     check("the FC runs the ground-test image", igt().get("fc_image") == "ground_test", fc_image=igt().get("fc_image"))
-    code, challenge = st.api("/api/igt/prepare", {"action": "enter"})
-    ticket = challenge.get("ticket") if isinstance(challenge, dict) else None
-    code, body = st.api("/api/igt/confirm", {"ticket": ticket}) if ticket else (code, challenge)
-    st.log("IGT enter", http=code, body=body)
+    def enter():
+        code, challenge = st.api("/api/igt/prepare", {"action": "enter"})
+        ticket = challenge.get("ticket") if isinstance(challenge, dict) else None
+        code, body = st.api("/api/igt/confirm", {"ticket": ticket}) if ticket else (code, challenge)
+        st.log("IGT enter", http=code, body=body)
+    enter()
+    # the FC refuses Enter while it still counts the station as lost (a radio path that came back seconds ago:
+    # reason 11, "refused (wrong state)"); the operator presses it again
+    for _ in range(5):
+        g = st.wait(lambda: igt() if str(igt().get("fc_mode", "")).lower() != "off" or igt().get("reason") == 11 else None,
+                    20, "FC answers Enter", poll=2) or {}
+        if str(g.get("fc_mode", "")).lower() != "off":
+            break
+        time.sleep(5)
+        enter()
     fc_ready = st.wait(lambda: str(igt().get("fc_mode", "")).lower() == "ready" and igt(), 60, "FC IGT Ready", poll=2)
     check("FC IGT reaches Ready (CSV replay loaded)", fc_ready, igt=igt())
     result["igt"] = igt()
-    fill(st, check)
+    # the stand body: the station's own GSE procedure to Armed (as in test fire)
+    gse_procedure(st, check, result)
     if arm_and_launch(st, check):
         phases = []
         def track():

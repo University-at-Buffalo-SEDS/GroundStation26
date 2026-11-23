@@ -78,7 +78,9 @@ FIRMWARE_SIM_ISOLATED = {
     "GS_COMMS_LINK_CONFIG": "config/comms.json",
 }
 # Seeds matching the bay's plant (FirmwareSimulator native_plant.rs): the DAQ load cell at 100 kg/V, a nitrogen
-# supply of 1000 psi and nitrous at 745 psi (so targets stay below them and below the VB relief at 850 psi).
+# supply of 1000 psi and nitrous at 745 psi absolute (so targets stay below them and below the VB relief at 850 psi).
+# The VB tank PT reads gauge: a vented nitrous fill at 20 C sits near 720 psig, so the nitrous pressure target is
+# above that (the fill ends on mass) and below the 800 psi ceiling.
 FIRMWARE_SIM_SEEDS = {
     # KG1000 (ch1) 545.8 kg/V, zero 0.2126 V; KG50 12 915 kg/V, zero 0.2112 V (docs/loadcell-investigation-2026-11.md),
     # on the calibration's legacy-raw scale (volts x 921/16000, DAQ MCP3564R_LEGACY_RAW_TO_VOLTS): KG1000 is then the
@@ -89,7 +91,7 @@ FIRMWARE_SIM_SEEDS = {
                       "dry_self_test_confirmed": False, "grouped_panel": True, "turbocharge_max_added_mass_kg": 0.5,
                       "turbocharge_pressure_deadband_psi": 12},
     "GS_FILL_TARGETS_CONFIG": {"version": 1, "fill_source": "kg50", "nitrogen": {"target_mass_kg": 0.5, "target_pressure_psi": 500},
-                               "nitrous": {"target_mass_kg": 5, "target_pressure_psi": 700}},
+                               "nitrous": {"target_mass_kg": 5, "target_pressure_psi": 760}},
     "GS_CHECKLISTS_FILE": {"revision": 0, "enforce_before_launch": False, "checklists": []},
     # Links are always the bay's (simulator overrides below); nothing here names a physical device.
     "GS_COMMS_LINK_CONFIG": {"version": 1, "av_bay": {"interface": "serial", "port": "/dev/null", "baud_rate": 115200, "protocol": "raw_uart"},
