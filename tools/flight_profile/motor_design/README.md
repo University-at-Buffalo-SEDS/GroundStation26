@@ -15,3 +15,17 @@ print file. It is kept outside the repository because of its size:
 
 The preset references those artifacts by sha256. Parts of the calibration are marked
 provisional in the preset (vapour-tail flow prior, ignition puck mass).
+
+## Star grain (current design)
+
+`star_grain.stl` is the star-port grain the team is switching to (added 2026-11-23),
+replacing the cylindrical port in the preset above. Measured from the STL (mm):
+
+- 10-point star, prismatic (constant cross-section along the length)
+- star tip radius 34.29 (1.35 in), valley radius 12.70 (0.50 in)
+- initial port area 1346 mm^2 (equivalent circle 41.4 mm), burning perimeter 451 mm
+- outer diameter 84.99, length 203.2 (8 in)
+- web 8.2 mm beyond the star tips, 29.8 mm behind the valleys
+
+The STL is the source of truth for the grain geometry; the motor model's star
+parameters are derived from it.
