@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 pub(crate) const DIR: &str = "fire_archive";
 const RECORD_FILE: &str = "fire.json";
 const CURVE_FILE: &str = "thrust.csv";
+const TANK_FILE: &str = "tank.csv";
 static LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -67,6 +68,10 @@ pub struct FireRecord {
     pub applied_plan: Option<serde_json::Value>,
     pub quality_flags: Vec<Flag>,
     pub simulated: bool,
+    /// Grain the motor burned (a name in the hybrid motor spec's `grains`); None = the spec's fire default.
+    pub grain: Option<String>,
+    /// Fuel burned (grain weighed before and after), kg: lets the fit adjust the regression law.
+    pub fuel_used_kg: Option<f64>,
     pub review: Review,
     /// Served only: whether the fit uses this record now.
     #[serde(skip_deserializing)]
@@ -84,7 +89,7 @@ impl FireRecord {
 }
 
 /// One accepted fire as the motor fit sees it.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct FitInput {
     pub id: String,
     pub label: String,
@@ -94,6 +99,11 @@ pub(crate) struct FitInput {
     pub ambient_c: Option<f64>,
     pub impulse_ns: f64,
     pub impulse_sigma_ns: f64,
+    /// Thrust (t s, N) and tank pressure (t s, psig) from the ignition reference, for the hybrid motor fit.
+    pub thrust: Vec<[f64; 2]>,
+    pub tank: Vec<[f64; 2]>,
+    pub grain: Option<String>,
+    pub fuel_used_kg: Option<f64>,
 }
 
 pub(crate) fn data_dir(state: &AppState) -> PathBuf {
@@ -120,10 +130,17 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 fn save_record(data: &Path, record: &FireRecord, curve: Option<&str>) -> std::io::Result<()> {
+    save_record_with_tank(data, record, curve, None)
+}
+
+fn save_record_with_tank(data: &Path, record: &FireRecord, curve: Option<&str>, tank: Option<&str>) -> std::io::Result<()> {
     let folder = archive_dir(data).join(&record.id);
     std::fs::create_dir_all(&folder)?;
     if let Some(curve) = curve {
         write_atomic(&folder.join(CURVE_FILE), curve.as_bytes())?;
+    }
+    if let Some(tank) = tank {
+        write_atomic(&folder.join(TANK_FILE), tank.as_bytes())?;
     }
     let mut stored = record.clone();
     stored.in_fit = false;
@@ -162,10 +179,19 @@ pub(crate) fn get(data: &Path, id: &str) -> Option<FireRecord> {
 }
 
 pub(crate) fn curve(data: &Path, id: &str) -> Option<Vec<[f64; 2]>> {
+    read_pairs(data, id, CURVE_FILE)
+}
+
+/// The fire's ox tank pressure trace (t s, psig), when the archive has one.
+pub(crate) fn tank_curve(data: &Path, id: &str) -> Option<Vec<[f64; 2]>> {
+    read_pairs(data, id, TANK_FILE)
+}
+
+fn read_pairs(data: &Path, id: &str, file: &str) -> Option<Vec<[f64; 2]>> {
     if !safe_id(id) {
         return None;
     }
-    let text = std::fs::read_to_string(archive_dir(data).join(id).join(CURVE_FILE)).ok()?;
+    let text = std::fs::read_to_string(archive_dir(data).join(id).join(file)).ok()?;
     Some(
         text.lines()
             .filter(|l| !l.starts_with('#') && !l.starts_with("t_s"))
@@ -183,7 +209,13 @@ pub(crate) fn fit_inputs_in(data: &Path) -> Vec<FitInput> {
         .filter(FireRecord::usable)
         .map(|r| {
             let impulse = r.impulse_ns.unwrap_or(0.0);
+            let thrust = curve(data, &r.id).unwrap_or_default();
+            let tank = tank_curve(data, &r.id).unwrap_or_default();
             FitInput {
+                thrust,
+                tank,
+                grain: r.grain.clone(),
+                fuel_used_kg: r.fuel_used_kg,
                 id: r.id,
                 label: r.label,
                 fill_kg: r.fill_kg.unwrap_or(0.0),
@@ -211,6 +243,7 @@ struct Seed {
     id: &'static str,
     record: &'static str,
     curve: Option<&'static str>,
+    tank: Option<&'static str>,
 }
 
 const SEEDS: &[Seed] = &[
@@ -220,11 +253,15 @@ const SEEDS: &[Seed] = &[
         curve: Some(include_str!(
             "../config/fire_archive_seed/2026-11-16_static_fire/thrust.csv"
         )),
+        tank: Some(include_str!(
+            "../config/fire_archive_seed/2026-11-16_static_fire/tank.csv"
+        )),
     },
     Seed {
         id: "2026-10-31_static_fire",
         record: include_str!("../config/fire_archive_seed/2026-10-31_static_fire/fire.json"),
         curve: None,
+        tank: None,
     },
 ];
 
@@ -235,11 +272,18 @@ pub(crate) fn ensure_seeded(data: &Path) -> std::io::Result<usize> {
     let mut written = 0;
     for seed in SEEDS {
         if archive_dir(data).join(seed.id).join(RECORD_FILE).exists() {
+            // A seed archived before tank traces were shipped gets its trace (the record is left alone).
+            if let Some(tank) = seed.tank {
+                let path = archive_dir(data).join(seed.id).join(TANK_FILE);
+                if !path.exists() {
+                    write_atomic(&path, tank.as_bytes())?;
+                }
+            }
             continue;
         }
         let record: FireRecord =
             serde_json::from_str(seed.record).map_err(std::io::Error::other)?;
-        save_record(data, &record, seed.curve)?;
+        save_record_with_tank(data, &record, seed.curve, seed.tank)?;
         written += 1;
     }
     Ok(written)
@@ -324,10 +368,18 @@ pub(crate) fn ingest(
     if !safe_id(&record.id) {
         return Err(format!("bad fire id {}", record.id));
     }
-    save_record(
+    let tank = (!report.tank_curve.is_empty()).then(|| {
+        let mut csv = String::from("t_s,tank_psig\n");
+        for [t, p] in &report.tank_curve {
+            csv.push_str(&format!("{t:.2},{p:.1}\n"));
+        }
+        csv
+    });
+    save_record_with_tank(
         data,
         &record,
         Some(&crate::burn_report::curve_csv(&report.curve)),
+        tank.as_deref(),
     )
     .map_err(|e| e.to_string())?;
     Ok(record.id)
@@ -346,6 +398,8 @@ pub(crate) struct Patch {
     pub ambient_c: Option<f64>,
     pub tank_psi_at_ignition: Option<f64>,
     pub supercharge_psi: Option<f64>,
+    pub fuel_used_kg: Option<f64>,
+    pub grain: Option<String>,
 }
 
 fn finite(v: Option<f64>, name: &str) -> Result<(), String> {
@@ -370,8 +424,14 @@ pub(crate) fn apply_patch(
         (patch.ambient_c, "ambient_c"),
         (patch.tank_psi_at_ignition, "tank_psi_at_ignition"),
         (patch.supercharge_psi, "supercharge_psi"),
+        (patch.fuel_used_kg, "fuel_used_kg"),
     ] {
         finite(v, n).map_err(bad)?;
+    }
+    if let Some(g) = &patch.grain {
+        if crate::apogee_planner::hybrid::spec()["grains"].get(g.as_str()).is_none() {
+            return Err(bad(format!("unknown grain {g} (see tools/flight_profile/motors/hybrid_motor.json grains)")));
+        }
     }
     let mut changes = Vec::new();
     if let Some(status) = patch.status {
@@ -411,6 +471,11 @@ pub(crate) fn apply_patch(
         patch.supercharge_psi,
         "supercharge_psi",
     );
+    set(&mut record.fuel_used_kg, patch.fuel_used_kg, "fuel_used_kg");
+    if let Some(g) = patch.grain {
+        changes.push(format!("grain {g}"));
+        record.grain = Some(g);
+    }
     record.review.reviewed_by = Some(actor.to_owned());
     record.review.reviewed_ms = Some(now_ms);
     save_record(data, &record, None)
@@ -589,12 +654,12 @@ async fn get_thrust(
         return response;
     }
     let data = data_dir(&state);
-    match tokio::task::spawn_blocking(move || curve(&data, &id))
+    match tokio::task::spawn_blocking(move || curve(&data, &id).map(|c| (c, tank_curve(&data, &id).unwrap_or_default())))
         .await
         .ok()
         .flatten()
     {
-        Some(c) => Json(json!({ "curve": c })).into_response(),
+        Some(c) => Json(json!({ "curve": c.0, "tank": c.1 })).into_response(),
         None => error(StatusCode::NOT_FOUND, "No thrust curve for that fire."),
     }
 }

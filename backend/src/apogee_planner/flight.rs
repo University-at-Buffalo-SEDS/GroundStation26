@@ -276,6 +276,15 @@ pub struct Motor {
     pub impulse: f64,
     #[serde(skip)]
     cum: Vec<f64>,
+    /// Physics motor (hybrid.rs): propellant left on the same time base (replaces the impulse-fraction mass
+    /// model and the residual fraction) and the nozzle exit area with the ambient pressure the curve was
+    /// computed at, so thrust gains (pa_ref - p) x exit area with altitude. Empty / 0 = the measured curve.
+    #[serde(skip)]
+    pub prop_curve: Vec<f64>,
+    #[serde(skip)]
+    pub exit_area_m2: f64,
+    #[serde(skip)]
+    pub pa_ref: f64,
 }
 
 pub fn parse_curve(csv: &str) -> (Vec<f64>, Vec<f64>) {
@@ -298,7 +307,7 @@ pub fn parse_curve(csv: &str) -> (Vec<f64>, Vec<f64>) {
 
 impl Motor {
     pub fn new(t: Vec<f64>, f: Vec<f64>, prop_kg: f64, exit_d: f64, osc_amp: f64, osc_hz: f64) -> Self {
-        let mut m = Self { t, f, prop_kg, exit_d, osc_amp, osc_hz, impulse: 0.0, cum: Vec::new() };
+        let mut m = Self { t, f, prop_kg, exit_d, osc_amp, osc_hz, impulse: 0.0, cum: Vec::new(), prop_curve: Vec::new(), exit_area_m2: 0.0, pa_ref: 0.0 };
         m.integrate();
         m
     }
@@ -354,6 +363,24 @@ impl Motor {
         } else {
             base
         }
+    }
+    /// Thrust at ambient pressure `p_air` (the altitude term applies to a physics motor only).
+    pub fn thrust_at(&self, tb: f64, p_air: f64) -> f64 {
+        let f = self.thrust(tb);
+        if f > 0.0 && self.exit_area_m2 > 0.0 { (f + (self.pa_ref - p_air) * self.exit_area_m2).max(0.0) } else { f }
+    }
+    /// Propellant left (physics motor).
+    pub fn prop_left(&self, tb: f64) -> f64 {
+        let n = self.prop_curve.len();
+        if tb <= 0.0 {
+            return self.prop_curve[0];
+        }
+        if tb >= self.burn_s() {
+            return self.prop_curve[n - 1];
+        }
+        let i = self.index(tb);
+        let k = (tb - self.t[i]) / (self.t[i + 1] - self.t[i]);
+        self.prop_curve[i] + (self.prop_curve[i + 1] - self.prop_curve[i]) * k
     }
     pub fn burnt_fraction(&self, tb: f64) -> f64 {
         if tb <= 0.0 {
@@ -516,7 +543,7 @@ pub fn fly(cfg: &Config, env: &Environment, motor: &Motor, dt: f64) -> FlightRes
     let aero = Aero::new(v, &cfg.aero, motor.exit_d);
     let (site, lat, dtk, psl) = (env.site_msl_m, env.site_lat_deg, env.temp_offset_k, env.p_sl_pa);
     let m_dry = v.dry_mass_kg;
-    let resid = motor.prop_kg * cfg.motor.residual_fraction;
+    let resid = if motor.prop_curve.is_empty() { motor.prop_kg * cfg.motor.residual_fraction } else { motor.prop_curve[motor.prop_curve.len() - 1] };
     let m_burn = motor.prop_kg - resid;
     let l = v.length_m;
     let aref = aero.aref;
@@ -538,12 +565,12 @@ pub fn fly(cfg: &Config, env: &Environment, motor: &Motor, dt: f64) -> FlightRes
     let mut step = 0u64;
     loop {
         let h = pos[2];
-        let (_, _, rho, a_snd, mu) = atmosphere(site + h.max(0.0), dtk, psl);
+        let (_, p_air, rho, a_snd, mu) = atmosphere(site + h.max(0.0), dtk, psl);
         let g = gravity(lat, site + h);
         let gvec = [0.0, 0.0, -g];
         let tb = t;
-        let thrust = motor.thrust(tb);
-        let mass = m_dry + resid + m_burn * (1.0 - motor.burnt_fraction(tb));
+        let thrust = motor.thrust_at(tb, p_air);
+        let mass = if motor.prop_curve.is_empty() { m_dry + resid + m_burn * (1.0 - motor.burnt_fraction(tb)) } else { m_dry + motor.prop_left(tb) };
         let (we, wn) = env.wind.at(h);
         let vair = [vel[0] - we, vel[1] - wn, vel[2]];
         let vmag = norm(vair);

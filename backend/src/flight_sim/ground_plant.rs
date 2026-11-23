@@ -1,5 +1,10 @@
 //! Proposed pure software tank plant; independent of GSE controller targets.
-//! Defaults are provisional training parameters, not measured hardware fits.
+//! Defaults are provisional training parameters, not measured hardware fits,
+//! except the run tank volume (measured 15.85 L, `apogee_planner::DEFAULT_TANK_VOLUME_L`
+//! from tools/flight_profile/vehicle.json) and the burn: with the pilot open the
+//! liquid leaves at the hybrid motor model's flow for the tank pressure
+//! (`apogee_planner::hybrid::ox_flow_at`), the same model the planner and the
+//! firmware simulator fly.
 //! Nothing here admits a command, acknowledges it, changes a flight state,
 //! grants qualification or opens a physical transport.
 #[derive(Clone, Copy, Debug)]
@@ -14,6 +19,8 @@ pub(super) struct Parameters {
     pub vapor_response_psi_s: f64,
     pub dump_liquid_kg_s: f64,
     pub pilot_liquid_kg_s: f64,
+    /// Pilot flow from the hybrid motor model (true) or the fixed `pilot_liquid_kg_s`.
+    pub pilot_from_motor_model: bool,
     pub dump_pressure_psi_s: f64,
     pub vent_pressure_psi_s: f64,
     pub sealed_leak_psi_s: f64,
@@ -23,14 +30,16 @@ impl Default for Parameters {
         Self {
             nitrous_supply_psi: 745.0,
             nitrogen_supply_psi: 1000.0,
-            tank_volume_m3: 0.018,
+            tank_volume_m3: crate::apogee_planner::DEFAULT_TANK_VOLUME_L / 1000.0,
             liquid_density_kg_m3: 750.0,
-            max_liquid_kg: 12.0,
+            // 11 kg of liquid at 750 kg/m^3 is 14.7 L of the 15.85 L tank (the 95 % rule below)
+            max_liquid_kg: 11.0,
             liquid_fill_kg_s: 8.0 / 18.0,
             nitrogen_rise_psi_s: 20.0,
             vapor_response_psi_s: 26.0,
             dump_liquid_kg_s: 0.55,
             pilot_liquid_kg_s: 1.0,
+            pilot_from_motor_model: true,
             dump_pressure_psi_s: 80.0,
             vent_pressure_psi_s: 0.25,
             sealed_leak_psi_s: 0.0,
@@ -129,14 +138,27 @@ impl Plant {
         self.last_ms = Some(now);
         Ok(())
     }
+    /// The hybrid motor's liquid flow for this plant's gauge pressures (psi).
+    fn motor_ox_flow(tank_psig: f64, vapour_psig: f64) -> f64 {
+        use crate::apogee_planner::hybrid;
+        let params = hybrid::calibrated(None);
+        let atm = hybrid::ATM;
+        hybrid::ox_flow_at(&params, hybrid::data(), tank_psig * hybrid::PSI + atm, vapour_psig.max(1.0) * hybrid::PSI + atm, atm)
+    }
     fn integrate(&mut self, dt: f64, v: Valves, p: Parameters) {
         let old_headspace = (p.tank_volume_m3 - self.liquid_kg / p.liquid_density_kg_m3)
             .max(p.tank_volume_m3 * 0.05);
         if v.nitrous && !v.dump && self.pressure_psi() < p.nitrous_supply_psi {
             self.liquid_kg = (self.liquid_kg + p.liquid_fill_kg_s * dt).min(p.max_liquid_kg);
         }
-        let loss = if v.dump { p.dump_liquid_kg_s } else { 0.0 }
-            + if v.pilot { p.pilot_liquid_kg_s } else { 0.0 };
+        let pilot = if !v.pilot || self.liquid_kg <= 0.0 {
+            0.0
+        } else if p.pilot_from_motor_model {
+            Self::motor_ox_flow(self.pressure_psi(), self.vapor_partial_psi)
+        } else {
+            p.pilot_liquid_kg_s
+        };
+        let loss = if v.dump { p.dump_liquid_kg_s } else { 0.0 } + pilot;
         self.liquid_kg = (self.liquid_kg - loss * dt).max(0.0);
         let headspace = (p.tank_volume_m3 - self.liquid_kg / p.liquid_density_kg_m3)
             .max(p.tank_volume_m3 * 0.05);
@@ -163,6 +185,32 @@ impl Plant {
         }
     }
 }
+#[cfg(test)]
+mod motor_tests {
+    use super::*;
+
+    #[test]
+    fn the_tank_is_the_measured_one_and_holds_about_11_kg_of_liquid() {
+        let p = Parameters::default();
+        assert!((p.tank_volume_m3 * 1000.0 - 15.8537).abs() < 1e-9);
+        assert!(p.validate());
+        assert!(!Parameters { max_liquid_kg: 12.0, ..p }.validate(), "12 kg would overfill 15.85 L at 95 %");
+    }
+
+    #[test]
+    fn the_pilot_drains_at_the_motor_model_flow() {
+        let p = Parameters::default();
+        let mut a = Plant::empty();
+        a.liquid_kg = 8.0;
+        a.vapor_partial_psi = 745.0;
+        let flow = Plant::motor_ox_flow(745.0, 745.0);
+        assert!(flow > 1.0 && flow < 5.0, "about 2 kg/s at 745 psi: {flow}");
+        a.step(0, Valves::default(), p).unwrap();
+        a.step(1000, Valves { pilot: true, ..Default::default() }, p).unwrap();
+        assert!((8.0 - a.liquid_kg - flow).abs() < 0.3 * flow, "drained {} in 1 s", 8.0 - a.liquid_kg);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

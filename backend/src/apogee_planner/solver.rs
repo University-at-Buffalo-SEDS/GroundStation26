@@ -1,7 +1,7 @@
 //! Fill mass and supercharge pressure for a target apogee
 //! (docs/apogee-planner.md section 4). Policy: fill first, then pressure.
 use super::flight::{fly, Config, Environment, FlightResult};
-use super::motor::{motor_for_fill, MotorFit};
+use super::motor::{motor_for_fill, physics_motor_for_fill, MotorFit, PhysicsMotor};
 use super::n2o;
 use super::weather::Snapshot;
 use serde::{Deserialize, Serialize};
@@ -18,6 +18,8 @@ pub struct Input {
     pub cfg: Config,
     pub weather: Snapshot,
     pub fit: MotorFit,
+    /// The physics motor; None flies the impulse-scaling model (the fallback).
+    pub physics: Option<PhysicsMotor>,
     pub target_m: f64,
     /// Tank (N2O) temperature, °C: the override or the surface temperature.
     pub tank_c: f64,
@@ -76,7 +78,11 @@ struct Ctx<'a> {
 impl Ctx<'_> {
     fn fly(&mut self, fill: f64, psi: f64, impulse_factor: f64, env: Option<&Environment>, tank_c: Option<f64>) -> (FlightResult, f64, f64) {
         let i = self.input;
-        let m = motor_for_fill(&i.cfg, &i.fit, fill, tank_c.unwrap_or(i.tank_c), psi, i.tank_volume_l, impulse_factor);
+        let tc = tank_c.unwrap_or(i.tank_c);
+        let m = match &i.physics {
+            Some(pm) => physics_motor_for_fill(&i.cfg, pm, fill, tc, psi, i.tank_volume_l, impulse_factor),
+            None => motor_for_fill(&i.cfg, &i.fit, fill, tc, psi, i.tank_volume_l, impulse_factor),
+        };
         self.flights += 1;
         let r = fly(&i.cfg, env.unwrap_or(&self.env), &m.motor, i.dt);
         (r, m.impulse_ns, m.sigma_rel)

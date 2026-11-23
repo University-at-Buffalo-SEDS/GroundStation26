@@ -98,7 +98,15 @@ operator approves it.
 
 ## 2. Motor model as a function of fill
 
-`backend/src/apogee_planner/motor.rs`, `n2o.rs`.
+**Physics motor (default, setting `motor_model = "physics"`).** The hybrid motor model
+(docs/hybrid-motor-model.md; `hybrid.rs`, `hybrid_fit.rs`) burns the fill at the tank
+temperature and supercharge for every trial flight: tank blowdown, Dyer injector, the STL
+star grain, the CEA chamber and an altitude-dependent nozzle, refitted by the station to its
+accepted archive fires, with a learned residual from 3 fires. The plan reports the fit and
+its quality (`physics_fit`). The impulse-scaling model below stays as the fallback
+(`motor_model = "scaling"`).
+
+**Impulse-scaling motor (fallback).** `backend/src/apogee_planner/motor.rs`, `n2o.rs`.
 
 **Base curve.** The 2026-11-16 fire, re-extracted with the KG50 unloading
 (`tools/flight_profile/extract_thrust.py`, section 7): 9.19 kN·s (7.6-10.1), 5.65 s
@@ -362,6 +370,13 @@ ignition, `R_post` its settled value after the burn and `F(t)` the KG1000 readin
    `burn_thrust.csv`, announced with a notification, and fed into the fire archive as a
    pending record.
 5. HITL and simulated data are marked `simulated` and excluded from the fit by default.
+6. **Predicted vs measured** (docs/hybrid-motor-model.md section 7): every report keeps the
+   ox tank trace (`tank_curve`, 0.1 s medians, psig) and, when the chamber PT read, the
+   chamber trace (`chamber_curve`). It also carries `predicted`, the calibrated hybrid
+   motor's thrust, tank and chamber curves (every 0.05 s) for the report's fill reading
+   and ignition tank pressure, so a client can overlay the model on the measurement.
+   The fire archive stores the tank trace as `tank.csv`; the motor fit uses it. No
+   frontend view draws the overlay yet.
 
 **Implementation notes** (`backend/src/burn_report.rs`, `burn_report/thrust.rs`,
 `burn_report/merge.rs`):

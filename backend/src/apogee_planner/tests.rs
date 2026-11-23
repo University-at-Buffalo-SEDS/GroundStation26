@@ -400,6 +400,7 @@ fn ork_import_reads_the_sweet_v6_design() {
 fn solver_input(target_m: f64) -> solver::Input {
     let w = weather::ManualWeather { surface_temp_c: 15.0, ..Default::default() }.snapshot(FIXTURE_SITE, 0, 0);
     solver::Input {
+        physics: None,
         cfg: flight::Config::reference(),
         weather: w,
         fit: motor::MotorFit::fit(&[motor::FitPoint::reference()]),
@@ -698,15 +699,42 @@ async fn an_administrator_setting_12_l_is_kept_across_a_restart() {
 }
 
 /// `cargo test -p groundstation_backend print_reference_plans -- --ignored --nocapture`
+fn physics_motor(input: &solver::Input) -> motor::PhysicsMotor {
+    let f = hybrid_fit::spec_fit();
+    let env = input.weather.environment(input.cfg.environment.wind_shear_exponent, input.cfg.environment.wind_profile_cap);
+    let pad_pa = flight::atmosphere(env.site_msl_m, env.temp_offset_k, env.p_sl_pa).1;
+    motor::PhysicsMotor { params: f.params(None), sigma_rel: 0.098, residual: None, pad_pa }
+}
+
+#[test]
+fn the_physics_motor_solves_a_10k_ft_plan_within_limits() {
+    let mut input = solver_input(3048.0);
+    input.tank_c = 20.0;
+    input.weather.surface_temp_c = 20.0;
+    input.dt = 0.002;
+    input.physics = Some(physics_motor(&input));
+    let s = solver::solve(&input);
+    assert!(s.fill_mass_kg <= s.limits.max_fill_kg + 1e-9 && s.supercharge_psi <= s.limits.max_supercharge_psi + 1e-9, "{s:?}");
+    if s.status == "ok" {
+        assert!((s.apogee_m - 3048.0).abs() < 60.0, "{}", s.apogee_m);
+    }
+    assert!(s.impulse_sigma_ns > 0.05 * s.impulse_ns);
+}
+
 #[test]
 #[ignore]
 fn print_reference_plans() {
-    for (t, target) in [(20.0, 3048.0), (5.0, 3048.0), (20.0, 2500.0), (30.0, 2500.0)] {
+    for (model, t, target) in [("scaling", 20.0, 3048.0), ("physics", 20.0, 3048.0), ("scaling", 5.0, 3048.0), ("physics", 5.0, 3048.0), ("physics", 30.0, 3048.0), ("scaling", 20.0, 2500.0), ("physics", 20.0, 2500.0)] {
         let mut input = solver_input(target);
         input.tank_c = t;
         input.weather.surface_temp_c = t;
         input.dt = 0.001;
+        if model == "physics" {
+            input.physics = Some(physics_motor(&input));
+        }
+        let started = std::time::Instant::now();
         let s = solver::solve(&input);
+        println!("{model} ({:.1} s)", started.elapsed().as_secs_f64());
         println!(
             "{t:>4} C target {target:.0} m: {} fill {:.2} kg sc {:.0} psi apogee {:.0} ({:.0}..{:.0}) reach {:.0} rail {:.1} mach {:.2} drift {:.0} I {:.0}±{:.0} pv {:.0} maxfill {:.2} flights {}\n   {:?}",
             s.status, s.fill_mass_kg, s.supercharge_psi, s.apogee_m, s.apogee_band_m[0], s.apogee_band_m[1], s.max_achievable_apogee_m,
@@ -726,6 +754,7 @@ fn archive_fires_become_fit_points_and_the_seed_reproduces_the_reference() {
         ambient_c: None,
         impulse_ns: 9192.0,
         impulse_sigma_ns: 900.0,
+        ..Default::default()
     };
     let pts = fit_points_from(vec![seed.clone()]);
     assert!((pts[0].mean_pressure_pa / motor::reference_mean_pressure_pa() - 1.0).abs() < 1e-6);

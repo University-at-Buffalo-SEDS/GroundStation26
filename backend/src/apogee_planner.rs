@@ -22,6 +22,8 @@ use std::sync::{Arc, Mutex};
 pub(crate) mod flight;
 #[path = "apogee_planner/hybrid.rs"]
 pub(crate) mod hybrid;
+#[path = "apogee_planner/hybrid_fit.rs"]
+pub(crate) mod hybrid_fit;
 #[path = "apogee_planner/motor.rs"]
 pub(crate) mod motor;
 #[path = "apogee_planner/n2o.rs"]
@@ -44,6 +46,8 @@ const CALIBRATION_FILE: &str = "flight_calibration.json";
 const APPLIED_FILE: &str = "applied.json";
 const APPLIED_LOG: &str = "applied.jsonl";
 const FIT_HISTORY_FILE: &str = "fit_history.json";
+/// Optional trained residual hyperparameters (tools/flight_profile/hybrid_residual.py).
+const RESIDUAL_FILE: &str = "residual_model.json";
 /// A plan older than this must be recomputed before it can be applied.
 pub(crate) const PLAN_MAX_AGE_MS: i64 = 30 * 60 * 1000;
 const MAX_ORK_BYTES: usize = 32 * 1024 * 1024;
@@ -57,6 +61,10 @@ const ASSUMED_TANK_VOLUME_L: f64 = 12.0;
 const SETTINGS_VERSION: u32 = 1;
 
 // ------------------------------------------------------------ settings
+
+fn physics_model() -> String {
+    "physics".into()
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -73,6 +81,10 @@ pub struct Settings {
     pub min_fill_kg: f64,
     pub meop_psi: f64,
     pub nominal_supercharge_psi: Option<f64>,
+    /// `physics` (the hybrid motor model, docs/hybrid-motor-model.md) or `scaling` (the measured curve
+    /// scaled by the fitted impulse per kg, the fallback).
+    #[serde(default = "physics_model")]
+    pub motor_model: String,
     /// Settings written before the version existed read as 0 (not the current default).
     #[serde(default)]
     pub version: u32,
@@ -93,6 +105,7 @@ impl Default for Settings {
             min_fill_kg: 3.0,
             meop_psi: 750.0,
             nominal_supercharge_psi: None,
+            motor_model: physics_model(),
             version: SETTINGS_VERSION,
         }
     }
@@ -128,6 +141,9 @@ impl Settings {
         }
         if !matches!(self.weather_source.as_str(), "manual" | "open_meteo" | "cached") {
             return Err("Weather source must be manual, open_meteo or cached.".into());
+        }
+        if !matches!(self.motor_model.as_str(), "physics" | "scaling") {
+            return Err("Motor model must be physics or scaling.".into());
         }
         self.manual_weather.validate()?;
         if let Some(t) = self.tank_temp_c {
@@ -192,6 +208,17 @@ pub struct Plan {
     /// Hash of the inputs; an apply needs the inputs unchanged.
     pub inputs_hash: String,
     pub settings: Settings,
+    /// `physics` or `scaling`: the motor the plan flew.
+    #[serde(default)]
+    pub motor_model: String,
+    /// The hybrid motor fit the physics motor used (its values, the fires and their fit quality).
+    #[serde(default)]
+    pub physics_fit: Option<hybrid_fit::PhysicsFit>,
+    /// The flight grain of the physics motor and whether the learned residual was on.
+    #[serde(default)]
+    pub flight_grain: Option<String>,
+    #[serde(default)]
+    pub residual_active: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -310,6 +337,10 @@ pub(crate) fn load(state: &AppState, dir: PathBuf) {
     inner.data_dir = Some(dir);
 }
 
+fn data_dir_of(state: &AppState) -> Option<PathBuf> {
+    rt(state).inner.lock().unwrap().data_dir.clone()
+}
+
 fn now_ms() -> i64 {
     crate::telemetry_task::get_current_timestamp_ms() as i64
 }
@@ -379,6 +410,8 @@ fn pressure_limit(state: &AppState, settings: &Settings) -> (f64, Vec<String>) {
 }
 
 struct Prepared {
+    physics_fit: Option<hybrid_fit::PhysicsFit>,
+    residual_active: bool,
     input: solver::Input,
     vehicle_source: String,
     fit: motor::MotorFit,
@@ -393,7 +426,8 @@ struct Prepared {
 fn prepare(state: &AppState) -> Result<Prepared, (StatusCode, String)> {
     let now = now_ms();
     let site = site(state);
-    let points = fit_points(state);
+    let fire_inputs = crate::fire_archive::fit_inputs(state);
+    let points = fit_points_from(fire_inputs.clone());
     let fit = motor::MotorFit::fit(&points);
     let targets = current_targets(state);
     let inner = rt(state).inner.lock().unwrap();
@@ -448,10 +482,33 @@ fn prepare(state: &AppState) -> Result<Prepared, (StatusCode, String)> {
     }))
     .unwrap_or_default());
     let weather_age_s = ((now - snapshot.fetched_ms).max(0) as f64) / 1000.0;
+    let (mut physics, mut physics_fit, mut residual_active) = (None, None, false);
+    if settings.motor_model == "physics" {
+        let pf = hybrid_fit::cached_fit(&fire_inputs);
+        let env = snapshot.environment(cfg.environment.wind_shear_exponent, cfg.environment.wind_profile_cap);
+        let pad_pa = flight::atmosphere(env.site_msl_m, env.temp_offset_k, env.p_sl_pa).1;
+        let hyper = data_dir_of(state)
+            .and_then(|d| read_json::<hybrid_fit::ResidualHyper>(&d, RESIDUAL_FILE))
+            .unwrap_or_default();
+        let residual = hybrid_fit::residual(&pf, &hybrid_fit::fire_data(&fire_inputs), hyper);
+        residual_active = residual.is_some();
+        let grain = hybrid::spec()["flight_grain"].as_str().unwrap_or("").to_string();
+        let placeholder = hybrid::spec()["grains"][&grain]["_about"].as_str().is_some_and(|a| a.contains("PLACEHOLDER"));
+        if placeholder {
+            extra.push(format!("The flight grain ({grain}) uses PLACEHOLDER star dimensions until the real ones are entered (tools/flight_profile/motors/hybrid_motor.json)."));
+        }
+        if pf.source == "spec" {
+            extra.push("No accepted fire with a thrust curve: the motor uses the shipped calibration.".into());
+        }
+        physics = Some(motor::PhysicsMotor { params: pf.params(None), sigma_rel: pf.impulse_sigma_rel, residual, pad_pa });
+        physics_fit = Some(pf);
+    }
+    let hash = fnv(&format!("{hash}{}{}", settings.motor_model, serde_json::to_string(&physics_fit).unwrap_or_default()));
     let input = solver::Input {
         cfg,
         weather: snapshot,
         fit: fit.clone(),
+        physics,
         target_m: settings.target_apogee_m,
         tank_c,
         tank_volume_l: settings.tank_volume_l,
@@ -463,7 +520,7 @@ fn prepare(state: &AppState) -> Result<Prepared, (StatusCode, String)> {
         launch_ms,
         dt: 0.001,
     };
-    Ok(Prepared { input, vehicle_source, fit, targets, cd_scale, hash, weather_age_s, settings, extra_warnings: extra })
+    Ok(Prepared { physics_fit, residual_active, input, vehicle_source, fit, targets, cd_scale, hash, weather_age_s, settings, extra_warnings: extra })
 }
 
 /// Computes a plan from the current settings and weather (blocking: run off the async runtime).
@@ -487,6 +544,10 @@ pub(crate) fn compute(state: &AppState, principal: Option<&AuthPrincipal>) -> Re
         tank_temp_c: p.input.tank_c,
         station_mode: crate::runtime_mode::label(crate::runtime_mode::current()).to_string(),
         inputs_hash: p.hash,
+        motor_model: p.settings.motor_model.clone(),
+        flight_grain: p.physics_fit.as_ref().map(|_| hybrid::spec()["flight_grain"].as_str().unwrap_or("").to_string()),
+        physics_fit: p.physics_fit,
+        residual_active: p.residual_active,
         settings: p.settings,
     };
     let mut inner = rt(state).inner.lock().unwrap();

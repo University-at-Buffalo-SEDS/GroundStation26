@@ -188,6 +188,46 @@ pub fn motor_for_fill(cfg: &Config, fit: &MotorFit, fill_kg: f64, tank_c: f64, s
     FillMotor { motor, impulse_ns: imp, sigma_rel: sigma, mean_pressure_pa: pbar }
 }
 
+/// The physics motor (docs/hybrid-motor-model.md): the calibrated hybrid model for the flight grain, the
+/// station's fit values, its impulse uncertainty and the learned residual when there is one.
+#[derive(Clone)]
+pub struct PhysicsMotor {
+    pub params: super::hybrid::Params,
+    pub sigma_rel: f64,
+    pub residual: Option<super::hybrid_fit::Gp>,
+    /// Ambient pressure at the pad (Pa): the curve is computed there and corrected with altitude in flight.
+    pub pad_pa: f64,
+}
+
+impl std::fmt::Debug for PhysicsMotor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PhysicsMotor").field("sigma_rel", &self.sigma_rel).field("residual", &self.residual.is_some()).finish()
+    }
+}
+
+/// The physics motor's burn for a fill, as the flight model's motor.
+pub fn physics_motor_for_fill(cfg: &Config, pm: &PhysicsMotor, fill_kg: f64, tank_c: f64, supercharge_psig: f64, tank_volume_l: f64, impulse_factor: f64) -> FillMotor {
+    use super::hybrid;
+    use super::hybrid_fit::ResidualModel;
+    let mut p = pm.params.clone();
+    p.tank_volume_l = tank_volume_l;
+    let b = hybrid::simulate(&p, hybrid::data(), fill_kg, tank_c, supercharge_psig, pm.pad_pa, 0.01);
+    let (t, f, pl) = hybrid::curve_for_flight(&b, 0.05);
+    let (mut k, mut var) = (impulse_factor, pm.sigma_rel.powi(2));
+    if let Some(gp) = &pm.residual {
+        let area0 = hybrid::data().grain(&p.grain).at(0.0).0;
+        let (mean, v) = gp.predict(&super::hybrid_fit::features(fill_kg, supercharge_psig, tank_c, area0));
+        k *= mean.exp();
+        var += v;
+    }
+    let mut motor = Motor::new(t, f.iter().map(|x| x * k).collect(), pl[0], p.exit_d_m, cfg.motor.oscillation_amplitude, cfg.motor.oscillation_hz);
+    motor.prop_curve = pl;
+    motor.exit_area_m2 = std::f64::consts::PI / 4.0 * p.exit_d_m * p.exit_d_m;
+    motor.pa_ref = pm.pad_pa;
+    let impulse = motor.impulse;
+    FillMotor { motor, impulse_ns: impulse, sigma_rel: var.sqrt(), mean_pressure_pa: b.summary.peak_pc_pa }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

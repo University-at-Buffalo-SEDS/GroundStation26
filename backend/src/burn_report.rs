@@ -116,6 +116,71 @@ pub struct BurnReport {
     pub kg50_term_ns: f64,
     pub startup_fill_impulse_ns: f64,
     pub archive_id: Option<String>,
+    /// Ox tank pressure (psig) from the ignition reference, 0.1 s bin medians: the motor fit uses it.
+    #[serde(default)]
+    pub tank_curve: Vec<[f64; 2]>,
+    /// Chamber pressure (psig) from the ignition reference, 0.1 s bin medians, when the PT read.
+    #[serde(default)]
+    pub chamber_curve: Vec<[f64; 2]>,
+    /// The hybrid motor model's prediction for this fill and tank pressure, for the overlay.
+    #[serde(default)]
+    pub predicted: Option<Predicted>,
+}
+
+/// The hybrid motor model's prediction of a burn (docs/hybrid-motor-model.md section 7).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Predicted {
+    pub model: String,
+    pub grain: String,
+    pub fill_kg: f64,
+    pub tank_c: f64,
+    pub impulse_ns: f64,
+    pub burn_time_s: f64,
+    pub peak_thrust_n: f64,
+    /// (t s, thrust N), (t s, tank psig), (t s, chamber psig) every 0.05 s.
+    pub curve: Vec<[f64; 2]>,
+    pub tank_curve: Vec<[f64; 2]>,
+    pub chamber_curve: Vec<[f64; 2]>,
+}
+
+/// The calibrated model's burn for a fill reading and an ignition tank pressure (saturated N2O).
+pub(crate) fn predict(fill_kg: f64, tank_psig: f64, ambient_pa: f64) -> Option<Predicted> {
+    use crate::apogee_planner::hybrid;
+    if !(fill_kg > 0.1 && tank_psig > 20.0) {
+        return None;
+    }
+    let grain = hybrid::fire_grain();
+    let p = hybrid::Params::from_spec(hybrid::spec(), Some(grain), true).ok()?;
+    let tank_c = hybrid::tsat((tank_psig + 14.696) * hybrid::PSI) - 273.15;
+    let b = hybrid::simulate(&p, hybrid::data(), fill_kg, tank_c, 0.0, ambient_pa, 0.01);
+    let pick = |f: &dyn Fn(&hybrid::Sample) -> f64| -> Vec<[f64; 2]> {
+        b.samples.iter().step_by(5).map(|s| [(s.t * 1000.0).round() / 1000.0, (f(s) * 10.0).round() / 10.0]).collect()
+    };
+    Some(Predicted {
+        model: "hybrid_motor (calibrated)".into(),
+        grain: grain.into(),
+        fill_kg,
+        tank_c,
+        impulse_ns: b.summary.impulse_ns,
+        burn_time_s: b.summary.burn_time_s,
+        peak_thrust_n: b.summary.peak_thrust_n,
+        curve: pick(&|s| s.thrust),
+        tank_curve: pick(&|s| s.p_tank / hybrid::PSI - 14.696),
+        chamber_curve: pick(&|s| (s.pc - ambient_pa) / hybrid::PSI),
+    })
+}
+
+/// 0.1 s bin medians of (t, value) from 0 to `end` s.
+fn binned(points: &[(f64, f64)], end: f64) -> Vec<[f64; 2]> {
+    let mut bins: BTreeMap<i64, Vec<f64>> = BTreeMap::new();
+    for (t, v) in points {
+        if *t >= 0.0 && *t < end {
+            bins.entry((*t / 0.1) as i64).or_default().push(*v);
+        }
+    }
+    bins.into_iter()
+        .filter_map(|(i, v)| Some([((i as f64 + 0.5) * 0.1 * 100.0).round() / 100.0, (median(v)? * 10.0).round() / 10.0]))
+        .collect()
 }
 
 #[derive(Serialize)]
@@ -333,6 +398,9 @@ pub(crate) fn compute(inputs: &Inputs, meta: Meta) -> Result<BurnReport, String>
             "chamber PT shows no pressure rise (disconnected or dead)",
         ));
     }
+    let chamber_valid = chamber.as_ref().is_some_and(|c| c.valid);
+    // The stand's ambient is not measured here: a standard 99 kPa site (the spec's test_ambient_pa).
+    let predicted = tank_at.and_then(|p| predict(thrust.kg50_pre_kg, p, 99_000.0));
     let consumed = thrust.kg50_pre_kg - thrust.kg50_post_kg;
     let consumed = (consumed > 0.05).then_some((consumed * 1000.0).round() / 1000.0);
     let isp = consumed.map(|m| (thrust.total_impulse_ns / (m * thrust::G) * 10.0).round() / 10.0);
@@ -410,6 +478,9 @@ pub(crate) fn compute(inputs: &Inputs, meta: Meta) -> Result<BurnReport, String>
         kg50_term_ns: thrust.kg50_term_ns,
         startup_fill_impulse_ns: thrust.startup_fill_impulse_ns,
         archive_id: None,
+        tank_curve: binned(&tank, 12.0),
+        chamber_curve: if chamber_valid { binned(&chamber_rel, 12.0) } else { Vec::new() },
+        predicted,
     })
 }
 

@@ -59,6 +59,15 @@ def set_path(cfg: dict, dotted: str, value):
 
 def load_motor(cfg: dict) -> fs.Motor:
     m = cfg['motor']
+    if m.get('model') == 'hybrid':
+        import hybrid_motor as hm
+        h = m.get('hybrid', {})
+        env = cfg['environment']
+        tank_c = h.get('tank_c') if h.get('tank_c') is not None else env.get('pad_temp_c', 15.0)
+        pad_pa = fs.atmosphere(env['site_msl_m'], env.get('temp_offset_k', 0.0))[1]
+        over = {'grain': hm.grain_config(hm.load_spec(), h['grain'])} if h.get('grain') else None
+        return fs.Motor.hybrid(h.get('fill_kg', 8.0), tank_c, h.get('supercharge_psig', 0.0), pad_pa,
+                               osc_amp=m['oscillation_amplitude'], osc_hz=m['oscillation_hz'], overrides=over)
     return fs.Motor.load(HERE / m['thrust_curve_csv'], m['propellant_mass_kg'], m['nozzle_exit_diameter_m'],
                          m['total_impulse_ns'], m['oscillation_amplitude'], m['oscillation_hz'],
                          m.get('scale_propellant_with_impulse', False), m.get('impulse_scaling_thrust_exponent', 1.0))
@@ -112,7 +121,8 @@ def summarize(cfg, truth: fs.Truth, motor: fs.Motor, rows: dict, folder: Path) -
     sizes = {p.name: p.stat().st_size for p in sorted((folder / 'IGT').glob('*.CSV'))}
     s = {
         'motor': {
-            'curve': cfg['motor']['thrust_curve_csv'],
+            'curve': (cfg['motor']['thrust_curve_csv'] if cfg['motor'].get('model') != 'hybrid'
+                      else f"hybrid_motor.py ({cfg['motor'].get('hybrid', {}).get('fill_kg', 8.0)} kg fill)"),
             'total_impulse_ns': round(motor.impulse, 1),
             'scaled': cfg['motor']['total_impulse_ns'] is not None,
             'peak_thrust_n': round(max(motor.f), 1),
@@ -298,6 +308,8 @@ def main(argv=None) -> int:
     ap.add_argument('--wind-from', type=float, help='bearing the wind blows from (deg)')
     ap.add_argument('--gust', type=float, help='gust sigma (m/s); 0 = steady')
     ap.add_argument('--site', help='lat,lon,msl of the pad (must match the FC launch site setting)')
+    ap.add_argument('--motor', choices=['measured', 'hybrid'], help='measured thrust curve (default) or the hybrid physics motor')
+    ap.add_argument('--fill', type=float, help='hybrid motor: GS fill reading (kg)')
     ap.add_argument('--impulse', type=float, help='rescale the thrust curve to this total impulse (N s)')
     ap.add_argument('--apogee-m', type=float, help='rescale the impulse to reach this apogee')
     ap.add_argument('--solve-dry-mass', type=float, metavar='APOGEE_M', help='print the dry mass for this apogee and exit')
@@ -319,6 +331,10 @@ def main(argv=None) -> int:
             env['site_lat_deg'], env['site_lon_deg'], env['site_msl_m'] = (float(x) for x in a.site.split(','))
         if a.impulse:
             cfg['motor']['total_impulse_ns'] = a.impulse
+        if a.motor:
+            cfg['motor']['model'] = a.motor
+        if a.fill is not None:
+            cfg['motor'].setdefault('hybrid', {})['fill_kg'] = a.fill
         for kv in a.set:
             k, _, v = kv.partition('=')
             set_path(cfg, k, json.loads(v))
