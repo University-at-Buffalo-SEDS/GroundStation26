@@ -159,6 +159,13 @@ fn archive_report(record: &crate::fire_archive::FireRecord, curve: Vec<[f64; 2]>
         kg50_term_ns: 0.0,
         startup_fill_impulse_ns: 0.0,
         archive_id: Some(record.id.clone()),
+        tank_curve: Vec::new(),
+        chamber_curve: Vec::new(),
+        // the hybrid motor model for the archived conditions (fill, tank, supercharge, ambient, grain)
+        predicted: record.fill_kg.and_then(|fill| {
+            let (tank_c, sc) = crate::apogee_planner::hybrid_fit::conditions(record.tank_psi_at_ignition, record.supercharge_psi, record.ambient_c);
+            burn_report::predict_for(fill, tank_c, sc, record.grain.as_deref(), 99_000.0)
+        }),
     }
 }
 

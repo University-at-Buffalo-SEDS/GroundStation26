@@ -648,6 +648,31 @@ fn saved_flight_captures_queue_a_report_in_every_mode() {
     assert!(!RUNTIME.lock().unwrap().queue.contains(&folder));
 }
 
+/// The 2026-11-16 fire as a report computed from the committed window (valve open at t = 0).
+pub(crate) fn real_fire_report() -> BurnReport {
+    let t0 = 1_800_000_000_000i64;
+    let mut inputs = Inputs { valve_open_ms: vec![t0], ..Default::default() };
+    for (name, ty, sender) in [("kg1000_kg", "LOADCELL_WEIGHT_KG", "DAQ"), ("kg50_kg", "LOADCELL_50_WEIGHT_KG", "DAQ"), ("tank_psi", "PRESSURE_TRANSDUCER_CALIBRATED", "VB")] {
+        for (t, v) in window_channel(name) {
+            inputs.push_gs(t0 + (t * 1000.0).round() as i64, ty, sender, &[Some(v)]);
+        }
+    }
+    let meta = Meta { id: "fire".into(), capture_id: None, capture_label: "fire".into(), mode: "test_fire".into(), simulated: false, created_ms: 0 };
+    compute(&inputs, meta).unwrap()
+}
+
+#[test]
+fn reports_keep_the_tank_trace_and_the_hybrid_model_prediction() {
+    let r = real_fire_report();
+    assert!(r.tank_curve.len() > 60, "0.1 s tank medians: {}", r.tank_curve.len());
+    assert!((r.tank_curve[0][1] - 404.0).abs() < 8.0, "{:?}", r.tank_curve[0]);
+    let p = r.predicted.as_ref().expect("the model's prediction");
+    assert!((p.fill_kg - 5.65).abs() < 0.05 && (p.tank_c + 3.1).abs() < 0.5, "{p:?}");
+    assert!((p.impulse_ns / 9192.0 - 1.0).abs() < 0.10, "{}", p.impulse_ns);
+    assert_eq!(p.tank_curve.len(), p.curve.len());
+    assert!(r.chamber_curve.is_empty(), "no chamber PT in this window");
+}
+
 #[test]
 fn no_burn_means_no_report() {
     let mut inputs = Inputs::default();

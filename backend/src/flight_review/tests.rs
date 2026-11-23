@@ -348,6 +348,18 @@ fn propellant_split_and_planner_prediction() {
 }
 
 #[test]
+fn the_hybrid_model_prediction_is_preferred_and_carries_the_pressures() {
+    let seed = crate::burn_report::tests::real_fire_report();
+    let p = motor::hybrid_model_prediction(&seed).unwrap();
+    assert_eq!(p.model, "hybrid_model");
+    assert!((p.total_impulse_ns.unwrap() / 9192.0 - 1.0).abs() < 0.08, "{:?}", p.total_impulse_ns);
+    assert_eq!(p.tank_psi.len(), p.curve.len());
+    assert!(p.tank_psi[0][1] > 380.0);
+    let chosen = motor::prediction(Some(&seed), Some(&serde_json::json!({"plan_id": "p1", "impulse_ns": 9192.0}))).unwrap();
+    assert_eq!(chosen.model, "hybrid_model", "preferred over the planner's scaled curve");
+}
+
+#[test]
 fn zip_round_trips() {
     let mut z = zip::Zip::new(T0);
     z.add("a.txt", b"hello hello hello hello hello");

@@ -580,9 +580,18 @@ pub(crate) async fn motor_bundle(
     zip.add("thrust_curve.csv", thrust.as_bytes());
     listed.push(("thrust_curve.csv", "thrust curve (t from ignition, N)"));
     if let Some(p) = view.predicted.as_ref().filter(|p| !p.curve.is_empty()) {
-        let mut csv = format!("# predicted: {}\nt_s,thrust_n\n", p.label);
-        for [t, f] in &p.curve {
-            let _ = writeln!(csv, "{t:.3},{f:.1}");
+        let with_pressures = p.tank_psi.len() == p.curve.len() && p.chamber_psi.len() == p.curve.len();
+        let mut csv = if with_pressures {
+            format!("# predicted: {}\nt_s,thrust_n,tank_psig,chamber_psig\n", p.label)
+        } else {
+            format!("# predicted: {}\nt_s,thrust_n\n", p.label)
+        };
+        for (i, [t, f]) in p.curve.iter().enumerate() {
+            if with_pressures {
+                let _ = writeln!(csv, "{t:.3},{f:.1},{:.1},{:.1}", p.tank_psi[i][1], p.chamber_psi[i][1]);
+            } else {
+                let _ = writeln!(csv, "{t:.3},{f:.1}");
+            }
         }
         zip.add("predicted_thrust_curve.csv", csv.as_bytes());
         listed.push(("predicted_thrust_curve.csv", "predicted thrust curve"));

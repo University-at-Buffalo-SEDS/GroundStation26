@@ -146,13 +146,23 @@ pub struct Predicted {
 /// The calibrated model's burn for a fill reading and an ignition tank pressure (saturated N2O).
 pub(crate) fn predict(fill_kg: f64, tank_psig: f64, ambient_pa: f64) -> Option<Predicted> {
     use crate::apogee_planner::hybrid;
-    if !(fill_kg > 0.1 && tank_psig > 20.0) {
+    if !(tank_psig > 20.0) {
         return None;
     }
-    let grain = hybrid::fire_grain();
-    let p = hybrid::Params::from_spec(hybrid::spec(), Some(grain), true).ok()?;
     let tank_c = hybrid::tsat((tank_psig + 14.696) * hybrid::PSI) - 273.15;
-    let b = hybrid::simulate(&p, hybrid::data(), fill_kg, tank_c, 0.0, ambient_pa, 0.01);
+    predict_for(fill_kg, tank_c, 0.0, None, ambient_pa)
+}
+
+/// The calibrated model's burn for archived conditions: fill reading, tank temperature, supercharge and grain
+/// (None = the spec's fire grain).
+pub(crate) fn predict_for(fill_kg: f64, tank_c: f64, supercharge_psig: f64, grain: Option<&str>, ambient_pa: f64) -> Option<Predicted> {
+    use crate::apogee_planner::hybrid;
+    if !(fill_kg > 0.1 && tank_c.is_finite()) {
+        return None;
+    }
+    let grain = grain.filter(|g| hybrid::spec()["grains"].get(*g).is_some()).unwrap_or(hybrid::fire_grain());
+    let p = hybrid::Params::from_spec(hybrid::spec(), Some(grain), true).ok()?;
+    let b = hybrid::simulate(&p, hybrid::data(), fill_kg, tank_c, supercharge_psig, ambient_pa, 0.01);
     let pick = |f: &dyn Fn(&hybrid::Sample) -> f64| -> Vec<[f64; 2]> {
         b.samples.iter().step_by(5).map(|s| [(s.t * 1000.0).round() / 1000.0, (f(s) * 10.0).round() / 10.0]).collect()
     };

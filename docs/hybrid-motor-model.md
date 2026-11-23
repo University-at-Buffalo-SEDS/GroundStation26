@@ -322,6 +322,10 @@ The design allows a learned correction later (`hybrid_fit.rs`, `ResidualModel`):
 - The fire archive stores `tank.csv` from the report, which the next fit uses. Its record gains `grain` and
   `fuel_used_kg`, editable through PATCH.
 - `GET /api/fire_archive/{id}/thrust` also returns the tank trace.
+- The Motor & flight review (`flight_review/motor.rs` `hybrid_model_prediction`) prefers this prediction over the
+  planner's scaled curve, in the overlay and in `predicted_thrust_curve.csv`. The CSV gains tank and chamber
+  columns. For an archive-only fire, the model runs at the record's conditions: fill, tank pressure or ambient
+  and supercharge, and grain.
 
 **Firmware simulator.** The plant builds a `hybrid_motor::Motor` from its tank at ignition and steps it as the
 tank's authority during the burn. Thrust drives the stand's load cells, Pc the DAQ chamber PT, and p_tank the VB

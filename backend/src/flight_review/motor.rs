@@ -19,6 +19,9 @@ pub struct Predicted {
     pub peak_thrust_n: Option<f64>,
     /// (t s from ignition, thrust N); empty when only the totals are known.
     pub curve: Vec<[f64; 2]>,
+    /// (t s, psig) on the curve's time base when the model gives them (the hybrid model does).
+    pub tank_psi: Vec<[f64; 2]>,
+    pub chamber_psi: Vec<[f64; 2]>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -141,13 +144,31 @@ fn series(inputs: &Inputs, t0: i64, burn_end_s: f64) -> Series {
     out
 }
 
-/// The physics hybrid motor model's predicted curve for this burn. The
-/// model is being added separately (`.workspace-progress/hybrid-motor-*`);
-/// until it lands this returns nothing and the planner's prediction is shown.
-/// When it does, call it here with the report's fill, tank pressure and
-/// temperature; its curve is preferred over the planner's.
-pub(crate) fn hybrid_model_prediction(_report: &BurnReport) -> Option<Predicted> {
-    None
+/// The physics hybrid motor model's predicted curve for this burn
+/// (docs/hybrid-motor-model.md): the report's own prediction, else the
+/// calibrated model run for the report's fill reading and ignition tank
+/// pressure (saturated N2O at that pressure, a 99 kPa stand). Preferred over
+/// the planner's scaled curve.
+pub(crate) fn hybrid_model_prediction(report: &BurnReport) -> Option<Predicted> {
+    let p = report
+        .predicted
+        .clone()
+        .or_else(|| burn_report::predict(report.fill_at_ignition_kg?, report.tank_psi_at_ignition?, 99_000.0))?;
+    let sigma = crate::apogee_planner::hybrid_fit::spec_fit().impulse_sigma_rel;
+    Some(Predicted {
+        model: "hybrid_model".into(),
+        label: format!(
+            "Hybrid motor model ({} grain, fill {:.2} kg, tank {:.1} °C)",
+            p.grain, p.fill_kg, p.tank_c
+        ),
+        total_impulse_ns: Some((p.impulse_ns * 10.0).round() / 10.0),
+        impulse_sigma_ns: Some((p.impulse_ns * sigma * 10.0).round() / 10.0),
+        burn_time_s: Some((p.burn_time_s * 100.0).round() / 100.0),
+        peak_thrust_n: Some((p.peak_thrust_n * 10.0).round() / 10.0),
+        curve: p.curve,
+        tank_psi: p.tank_curve,
+        chamber_psi: p.chamber_curve,
+    })
 }
 
 /// The apogee planner's motor for the plan applied before this burn (the
@@ -188,6 +209,7 @@ pub(crate) fn planner_prediction(plan: &serde_json::Value) -> Option<Predicted> 
         burn_time_s: burn.map(|(a, b)| ((b - a) * 100.0).round() / 100.0),
         peak_thrust_n: Some(peak),
         curve,
+        ..Default::default()
     })
 }
 
