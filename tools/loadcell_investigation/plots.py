@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Figures for docs/loadcell-investigation-2026-11.md. Usage: plots.py NPZ_DIR OUT_DIR"""
+"""Figures for docs/loadcell-investigation-2026-11.md.
+Usage: plots.py NPZ_DIR OUT_DIR [FIGURE...]   (FIGURE: a function name below; default all)"""
 import sys, os
 import numpy as np
 import matplotlib
@@ -24,23 +25,64 @@ def panels(n, title, h=1.6):
     fig.suptitle(title, x=0.01, ha='left', fontsize=10, color=INK)
     return fig, ax
 
+# Burn start in the 11-16 fire recording: 9.2 s after the first KG1000 sample, where DAQ
+# VMAIN returns to 14.2 V and the ox tank starts emptying (report section 2.3).
+FIRE_T0_OFFSET_MS = 9200
+
 def fire_ignition(d, out):
+    """Ignition window: KG1000, KG50, DAQ VMAIN and the gateway (GB) battery rail in
+    separate panels on one t - T0 axis. GB BATTERY_VOLTAGE is the gateway LTC2990 V1
+    through its 91k/10k divider (volts); BATTERY_CURRENT is its LTC2990 current channel
+    (amps). Both arrive at about 1 Hz. Also writes the GB/VMAIN samples of the window to
+    fire-20261116-gb-power.csv."""
+    import csv
+    from datetime import datetime, timezone
+    from matplotlib.ticker import MultipleLocator
     z = load(d, '2026-11-17_00-59-46_065')
-    t1, k1 = s(z, 'DAQ|KG1000'); t0 = t1[0]
-    sel = lambda t: (t - t0) / 1000.0
-    fig, ax = panels(4, '2026-11-16 test fire (recording 2026-11-17 00:59:46 UTC), first 25 s')
-    m = sel(t1) < 25
-    ax[0].plot(sel(t1)[m], k1[m] * K, color=BLUE); ax[0].axhline(2.4, color=RED, lw=0.8, ls='--')
-    ax[0].set_ylabel('KG1000\nADC-pin V'); ax[0].text(0.3, 2.55, 'ADC full scale 2.4 V', color=RED, fontsize=8)
-    t5, k5 = s(z, 'DAQ|KG50'); m = sel(t5) < 25
-    ax[1].plot(sel(t5)[m], k5[m] * 1000, color=ORANGE); ax[1].set_ylabel('KG50 (P6)\ninput mV')
-    tp, vm = s(z, 'DAQ|DAQ_POWER_MONITOR', 2); m = sel(tp) < 25
-    ax[2].plot(sel(tp)[m], vm[m], color=AQUA, marker='.', ms=2, lw=0.8); ax[2].set_ylabel('DAQ VMAIN V')
-    tf, fp = s(z, 'VB|OX_TANK_PRESSURE'); m = sel(tf) < 25
-    ax[3].plot(sel(tf)[m], fp[m], color=YELLOW); ax[3].set_ylabel('Ox tank psi'); ax[3].set_xlabel('seconds from recording start')
-    for a in ax: a.axvline(9.2, color=MUTED, lw=0.8, ls=':')
-    ax[3].text(9.4, 300, 'supply restored /\nburn starts', fontsize=8, color=MUTED)
+    t1, k1 = s(z, 'DAQ|KG1000'); T0 = t1[0] + FIRE_T0_OFFSET_MS
+    rel = lambda t: (t - T0) / 1000.0
+    lo_s, hi_s = -FIRE_T0_OFFSET_MS / 1000.0, 25 - FIRE_T0_OFFSET_MS / 1000.0
+    win = lambda t: (rel(t) >= lo_s) & (rel(t) < hi_s)
+    t0_utc = datetime.fromtimestamp(T0 / 1000, timezone.utc).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+    fig, ax = plt.subplots(6, 1, sharex=True, figsize=(11, 1.55 * 6 + 0.9))
+    fig.suptitle(f'2026-11-16 test fire, ignition window. T0 = burn start = {t0_utc} UTC '
+                 f'(recording 2026-11-17 00:59:46 UTC + {FIRE_T0_OFFSET_MS / 1000:g} s)',
+                 x=0.01, ha='left', fontsize=10, color=INK)
+    m = win(t1)
+    ax[0].plot(rel(t1)[m], k1[m] * K, color=BLUE); ax[0].axhline(2.4, color=RED, lw=0.8, ls='--')
+    ax[0].set_ylabel('DAQ KG1000\nADC-pin V'); ax[0].text(lo_s + 0.2, 2.55, 'ADC full scale 2.4 V', color=RED, fontsize=8)
+    t5, k5 = s(z, 'DAQ|KG50'); m = win(t5)
+    ax[1].plot(rel(t5)[m], k5[m] * 1000, color=ORANGE); ax[1].set_ylabel('DAQ KG50 (P6)\ninput mV')
+    tp, vm = s(z, 'DAQ|DAQ_POWER_MONITOR', 2); mp = win(tp)
+    ax[2].plot(rel(tp)[mp], vm[mp], color=AQUA, marker='.', ms=2, lw=0.8); ax[2].set_ylabel('DAQ VMAIN V\n(4 Hz)')
+    tg, vg = s(z, 'GB|BATTERY_VOLTAGE'); mg = win(tg)
+    ax[3].plot(rel(tg)[mg], vg[mg], color=INK, marker='o', ms=3, lw=0.8); ax[3].set_ylabel('Gateway (GB)\nbattery V (1 Hz)')
+    # Same volts per division as the VMAIN panel, so a dip of equal size looks equal.
+    lo, hi = ax[2].get_ylim(); off = np.nanmedian(vg[mg]) - np.nanmedian(vm[mp & (rel(tp) > 0)])
+    ax[3].set_ylim(lo + off, hi + off)
+    ax[3].text(lo_s + 0.2, lo + off + 0.15 * (hi - lo), f'GB {np.nanmin(vg[mg]):.2f}–{np.nanmax(vg[mg]):.2f} V in this window; '
+               'same V/div as VMAIN panel', fontsize=8, color=MUTED)
+    ti, ig = s(z, 'GB|BATTERY_CURRENT'); mi = win(ti)
+    ax[4].plot(rel(ti)[mi], ig[mi], color=MUTED, marker='o', ms=3, lw=0.8); ax[4].set_ylabel('Gateway (GB)\nbattery A (1 Hz)')
+    ax[4].set_ylim(0, max(1.0, np.nanmax(ig[mi]) * 1.3))
+    tf, fp = s(z, 'VB|OX_TANK_PRESSURE'); m = win(tf)
+    ax[5].plot(rel(tf)[m], fp[m], color=YELLOW); ax[5].set_ylabel('Ox tank psi')
+    ax[5].set_xlabel('t − T0 (s)')
+    ax[5].set_xlim(lo_s, hi_s)
+    ax[5].xaxis.set_major_locator(MultipleLocator(1)); ax[5].xaxis.set_minor_locator(MultipleLocator(0.25))
+    for a in ax:
+        a.axvline(0, color=RED, lw=0.9, ls=':')
+        a.tick_params(axis='x', which='both', labelbottom=True, labelsize=7.5)
+    ax[0].text(0, 1.01, 'T0', transform=ax[0].get_xaxis_transform(), ha='center', va='bottom', fontsize=8, color=RED)
+    ax[5].text(0.2, 300, 'supply restored /\nburn starts', fontsize=8, color=MUTED)
     fig.tight_layout(); fig.savefig(os.path.join(out, 'fire-20261116-ignition.png'), dpi=110); plt.close(fig)
+    with open(os.path.join(out, 'fire-20261116-gb-power.csv'), 'w', newline='') as f:
+        w = csv.writer(f); w.writerow(['t_minus_T0_s', 'sender', 'data_type', 'value', 'unit'])
+        rows = [(rel(t), snd, typ, v, u) for tt, vv, snd, typ, u, mm in
+                ((tp, vm, 'DAQ', 'DAQ_POWER_MONITOR[2] VMAIN', 'V', mp), (tg, vg, 'GB', 'BATTERY_VOLTAGE', 'V', mg),
+                 (ti, ig, 'GB', 'BATTERY_CURRENT', 'A', mi)) for t, v in zip(tt[mm], vv[mm])]
+        for r in sorted(rows, key=lambda r: r[0]):
+            w.writerow([f'{r[0]:.3f}', r[1], r[2], f'{r[3]:.4f}', r[4]])
 
 def fire_overview(d, out):
     z = load(d, '2026-11-17_00-59-46_065')
@@ -102,4 +144,8 @@ def kg50_cross_check(d, out):
 if __name__ == '__main__':
     d, out = sys.argv[1], sys.argv[2]
     os.makedirs(out, exist_ok=True)
-    fire_ignition(d, out); fire_overview(d, out); rail_1106(d, out); calibration_steps(out); kg50_cross_check(d, out)
+    figs = {'fire_ignition': lambda: fire_ignition(d, out), 'fire_overview': lambda: fire_overview(d, out),
+            'rail_1106': lambda: rail_1106(d, out), 'calibration_steps': lambda: calibration_steps(out),
+            'kg50_cross_check': lambda: kg50_cross_check(d, out)}
+    for name in sys.argv[3:] or figs:
+        figs[name]()

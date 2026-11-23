@@ -14,7 +14,7 @@ Figures and per-recording numbers are in
 
 - `extract.py` turns a `/api/recordings/{id}/csv` export into an `.npz`;
 - `analyze.py` computes the statistics;
-- `plots.py` draws the figures.
+- `plots.py` draws the figures (`plots.py NPZ_DIR OUT_DIR [fire_ignition ...]` redraws only the named ones).
 
 They work on any future recording.
 
@@ -180,6 +180,27 @@ Other calibration-handling problems:
   over the 2.4 V full scale). At 9.2 s VMAIN returned to 14.2 V at the same moment the
   tank started emptying. During the burn, KG1000 swung between the floor (0.02 V) and the
   clamp: the open lead found earlier. No usable thrust trace exists.
+- **Gateway rail during the same dips (DAQ-local, not shared).** The plot now has the
+  gateway's own LTC2990 readings in separate panels: GB `BATTERY_VOLTAGE` (V1 through its
+  91 k/10 k divider, volts) and `BATTERY_CURRENT` (amps). Both arrive at ≈1 Hz (1 069 rows each),
+  against 4 Hz for VMAIN. T0 is 00:59:55.286 UTC (recording start + 9.2 s).
+  - From −9.2 s to T0, VMAIN sat at 11.1 V while the gateway read 14.11 V. At T0 VMAIN
+    jumped 3.1 V, and the gateway moved by less than 0.02 V (14.11–14.13 V across the window).
+    Gateway current stayed at 0.51–0.62 A.
+  - The same holds for every VMAIN < 12.5 V burst in the recording. The 58 gateway samples
+    taken inside a burst read 14.08–14.12 V. Median gateway voltage is 14.099 V with VMAIN
+    < 12.5 V and 14.096 V with VMAIN > 13.5 V, and GB/VMAIN correlation over the 28 min is
+    r = 0.03. The VB battery also stayed at
+    15.76–15.89 V.
+  - The two rails do share real events. At 19.7 min (post-fire) both stepped down together:
+    GB 14.13 → 13.47 → 13.92 V and VMAIN 14.22 → 13.43 → ≈13.9 V. That rules out
+    "the gateway rail never moves".
+  - So the 14.2 → 11 V state is in the DAQ's own supply path: its input connector or
+    harness, its input diode/OR-ing, or a DAQ ground return. It is not a sag of the common
+    supply or of the ground the gateway sees.
+  - Caveat: the gateway samples at 1 Hz and cannot see sub-second transients. Only the
+    multi-second 11 V plateaus are covered.
+  - Data for the window: `fire-20261116-gb-power.csv`.
 - **Whole fire recording.** There were four dip bursts. KG1000 went to the top clamp in
   every one: 1 358 of 1 730 samples with VMAIN < 12.5 V, and 732 clamp samples otherwise
   (the open lead). The ADC die temperature jumped about +5 °C in each dip, and KG50 showed
