@@ -253,6 +253,9 @@ pub struct Imported {
     pub motor_mount: Option<MotorMount>,
     pub components: Vec<ComponentMass>,
     pub warnings: Vec<String>,
+    /// The component build-up before any stage mass override (kg).
+    #[serde(default)]
+    pub computed_mass_kg: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -282,6 +285,15 @@ fn roughness(finish: &str) -> Option<f64> {
     }
 }
 
+/// An outer-shape transition (or the nose): axial start, length, fore and aft radius.
+#[derive(Clone, Debug)]
+struct Shoulder {
+    start: f64,
+    len: f64,
+    r1: f64,
+    r2: f64,
+}
+
 struct Walker {
     components: Vec<ComponentMass>,
     warnings: Vec<String>,
@@ -290,11 +302,29 @@ struct Walker {
     max_radius: f64,
     motor_mount: Option<MotorMount>,
     finish: Option<f64>,
+    transitions: Vec<Shoulder>,
 }
 
 fn density(el: &Element) -> Option<(f64, String)> {
     let m = el.child("material")?;
     Some((m.attr("density")?.parse().ok()?, m.attr("type").unwrap_or("bulk").to_string()))
+}
+
+fn flag(el: &Element, name: &str) -> bool {
+    el.child(name).is_some_and(|c| c.text.trim() == "true")
+}
+
+fn name_of(el: &Element, kind: &str) -> String {
+    el.child("name").map(|n| n.text.trim().to_string()).unwrap_or_else(|| kind.into())
+}
+
+/// Axial extent of a component: its length, a packed length (mass objects,
+/// recovery devices) or a fin set's root chord.
+fn length_of(el: &Element) -> f64 {
+    if el.name.ends_with("finset") {
+        return el.num("rootchord").unwrap_or(0.0);
+    }
+    el.num("length").or_else(|| el.num("packedlength")).unwrap_or(0.0)
 }
 
 /// Axial start of a child component (from the nose tip).
@@ -318,33 +348,77 @@ fn child_start(el: &Element, parent_start: f64, parent_len: f64, len: f64, after
 }
 
 impl Walker {
+    /// A component's own mass. An `overridemass` replaces it unless the
+    /// override covers the subcomponents too (`overridesubcomponentsmass`);
+    /// that case is settled by `assembly` once the children are walked.
     fn push(&mut self, el: &Element, kind: &str, mass: f64, cg: f64, start: f64) {
+        let whole = flag(el, "overridesubcomponentsmass");
         let (mass, overridden) = match el.num("overridemass") {
-            Some(m) if el.child("overridemass").is_some() => (m, true),
+            Some(m) if !whole => (m, true),
             _ => (mass, false),
         };
         // An override CG is measured from the component's front.
-        let cg = el.num("overridecg").map_or(cg, |c| start + c);
+        let cg = if flag(el, "overridesubcomponentscg") { cg } else { el.num("overridecg").map_or(cg, |c| start + c) };
         if mass > 0.0 {
-            self.components.push(ComponentMass {
-                kind: kind.into(),
-                name: el.child("name").map(|n| n.text.trim().to_string()).unwrap_or_else(|| kind.into()),
-                mass_kg: mass,
-                cg_from_nose_m: cg,
-                overridden,
-            });
+            self.components.push(ComponentMass { kind: kind.into(), name: name_of(el, kind), mass_kg: mass, cg_from_nose_m: cg, overridden });
         }
     }
 
-    /// A component and its children; `start`/`len` is its own axial extent.
-    fn component(&mut self, el: &Element, start: f64, parent_radius: f64) {
+    /// An override that covers the component and all its subcomponents
+    /// (`components[first..]`): the parts stay listed and one adjustment entry
+    /// brings their total to the override, at the override CG if the CG is
+    /// overridden for the assembly too (else the parts' CG is kept).
+    /// Returns the parts' computed total when an override applied.
+    fn assembly(&mut self, el: &Element, kind: &str, first: usize, start: f64, len: f64) -> Option<f64> {
+        if !flag(el, "overridesubcomponentsmass") {
+            return None;
+        }
+        let target = el.num("overridemass")?;
+        let parts = &self.components[first..];
+        let sum: f64 = parts.iter().map(|c| c.mass_kg).sum();
+        let moment: f64 = parts.iter().map(|c| c.mass_kg * c.cg_from_nose_m).sum();
+        let parts_cg = if sum > 0.0 { moment / sum } else { start + len / 2.0 };
+        let cg = match el.num("overridecg") {
+            Some(c) if flag(el, "overridesubcomponentscg") => start + c,
+            _ => parts_cg,
+        };
+        let delta = target - sum;
+        if delta.abs() > 1e-9 {
+            let at = if delta.abs() > 1e-6 { (target * cg - moment) / delta } else { cg };
+            self.components.push(ComponentMass {
+                kind: kind.into(),
+                name: format!("{} (override adjustment)", name_of(el, kind)),
+                mass_kg: delta,
+                cg_from_nose_m: at,
+                overridden: true,
+            });
+        } else if (cg - parts_cg).abs() > 1e-9 && target > 0.0 {
+            // Same mass, moved CG: a zero-sum pair would be noise; shift the parts.
+            let shift = cg - parts_cg;
+            for c in &mut self.components[first..] {
+                c.cg_from_nose_m += shift;
+            }
+        }
+        self.warnings.push(format!(
+            "{}: override mass {target:.3} kg covers it and its subcomponents (computed {sum:.3} kg).",
+            name_of(el, kind)
+        ));
+        Some(sum)
+    }
+
+    /// A component and its children; `start` is its axial start.
+    fn component(&mut self, el: &Element, start: f64, parent_radius: f64, siblings: &[(f64, f64, f64)]) {
         let pi = std::f64::consts::PI;
-        let len = el.num("length").unwrap_or(0.0);
+        let len = length_of(el);
         let kind = el.name.as_str();
+        let first = self.components.len();
         let mut inner_radius = parent_radius;
+        let auto_or = |name: &str, fallback: f64| {
+            if el.is_auto(name) && el.child(name).is_some_and(|c| c.text.trim() == "auto") { fallback } else { el.num(name).unwrap_or(fallback) }
+        };
         match kind {
-            "nosecone" | "transition" => {
-                let r = el.num("aftradius").unwrap_or(parent_radius);
+            "nosecone" => {
+                let r = auto_or("aftradius", parent_radius);
                 let t = el.num("thickness").unwrap_or(0.002);
                 let shape = el.child("shape").map(|s| s.text.trim().to_string()).unwrap_or_else(|| "ogive".into());
                 let (wet, cg_frac) = match shape.as_str() {
@@ -353,7 +427,7 @@ impl Walker {
                 };
                 let rho = density(el).map(|d| d.0).unwrap_or(1850.0);
                 self.push(el, kind, wet * t * rho, start + cg_frac * len, start);
-                if kind == "nosecone" && self.nose.is_none() {
+                if self.nose.is_none() {
                     self.nose = Some((len, r, shape));
                 }
                 self.max_radius = self.max_radius.max(r);
@@ -362,8 +436,21 @@ impl Walker {
                     self.finish = el.child("finish").and_then(|f| roughness(&f.text));
                 }
             }
+            "transition" => {
+                let r1 = auto_or("foreradius", parent_radius);
+                let r2 = auto_or("aftradius", parent_radius);
+                let t = el.num("thickness").unwrap_or(0.002);
+                // Frustum shell (curved shapes differ little in area).
+                let wet = pi * (r1 + r2) * (len * len + (r1 - r2).powi(2)).sqrt();
+                let cg_frac = if r1 + r2 > 0.0 { (r1 + 2.0 * r2) / (3.0 * (r1 + r2)) } else { 0.5 };
+                let rho = density(el).map(|d| d.0).unwrap_or(1850.0);
+                self.push(el, kind, wet * t * rho, start + cg_frac * len, start);
+                self.transitions.push(Shoulder { start, len, r1, r2 });
+                self.max_radius = self.max_radius.max(r1).max(r2);
+                inner_radius = r1.min(r2) - t;
+            }
             "bodytube" => {
-                let r = el.num("radius").unwrap_or(parent_radius);
+                let r = auto_or("radius", parent_radius);
                 let t = el.num("thickness").unwrap_or(0.002);
                 let rho = density(el).map(|d| d.0).unwrap_or(1850.0);
                 self.push(el, kind, pi * (r * r - (r - t).max(0.0).powi(2)) * len * rho, start + len / 2.0, start);
@@ -373,8 +460,9 @@ impl Walker {
                     self.finish = el.child("finish").and_then(|f| roughness(&f.text));
                 }
             }
-            "innertube" => {
-                let r = el.num("outerradius").unwrap_or(parent_radius * 0.5);
+            "innertube" | "tubecoupler" => {
+                // A coupler's automatic outer radius is the parent's inner radius.
+                let r = auto_or("outerradius", if kind == "tubecoupler" { parent_radius } else { parent_radius * 0.5 });
                 let t = el.num("thickness").unwrap_or(0.002);
                 let rho = density(el).map(|d| d.0).unwrap_or(1850.0);
                 self.push(el, kind, pi * (r * r - (r - t).max(0.0).powi(2)) * len * rho, start + len / 2.0, start);
@@ -384,10 +472,17 @@ impl Walker {
                 inner_radius = r - t;
             }
             "centeringring" | "bulkhead" | "engineblock" => {
-                let ro = if el.is_auto("outerradius") || el.num("outerradius").is_none() { parent_radius } else { el.num("outerradius").unwrap() };
-                let ri = if kind == "bulkhead" { 0.0 } else { el.num("innerradius").unwrap_or(0.0) };
+                let ro = auto_or("outerradius", parent_radius);
+                // An automatic inner radius fits the inner tube it rings (the
+                // largest one overlapping it axially).
+                let tube = siblings
+                    .iter()
+                    .filter(|(s, l, _)| *s < start + len.max(1e-6) && start < s + l)
+                    .map(|x| x.2)
+                    .fold(0.0_f64, f64::max);
+                let ri = if kind == "bulkhead" { 0.0 } else { auto_or("innerradius", tube) };
                 let rho = density(el).map(|d| d.0).unwrap_or(700.0);
-                self.push(el, kind, pi * (ro * ro - ri * ri) * len * rho, start + len / 2.0, start);
+                self.push(el, kind, pi * (ro * ro - ri * ri).max(0.0) * len * rho, start + len / 2.0, start);
             }
             "trapezoidfinset" => {
                 let n = el.num("fincount").unwrap_or(3.0);
@@ -413,8 +508,15 @@ impl Walker {
                     "parachute" => pi * (el.num("diameter").unwrap_or(0.0) / 2.0).powi(2),
                     _ => el.num("striplength").unwrap_or(0.0) * el.num("stripwidth").unwrap_or(0.0),
                 };
-                let m = density(el).filter(|d| d.1 == "surface").map(|d| d.0 * area).unwrap_or(0.0);
-                self.push(el, kind, m, start + len / 2.0, start);
+                let canopy = density(el).filter(|d| d.1 == "surface").map(|d| d.0 * area).unwrap_or(0.0);
+                // Shroud lines, as OpenRocket counts them: count x length x line density.
+                let lines = el
+                    .child("linematerial")
+                    .filter(|m| m.attr("type") == Some("line"))
+                    .and_then(|m| m.attr("density")?.parse::<f64>().ok())
+                    .map(|rho| rho * el.num("linecount").unwrap_or(0.0) * el.num("linelength").unwrap_or(0.0))
+                    .unwrap_or(0.0);
+                self.push(el, kind, canopy + lines, start + len / 2.0, start);
             }
             "shockcord" => {
                 let m = density(el).filter(|d| d.1 == "line").map(|d| d.0 * el.num("cordlength").unwrap_or(0.0)).unwrap_or(0.0);
@@ -429,12 +531,25 @@ impl Walker {
                 self.push(el, kind, 0.0, start + len / 2.0, start);
             }
         }
+        let children = el.subcomponents();
         let mut after = start;
-        for c in el.subcomponents() {
-            let clen = if c.name == "trapezoidfinset" { c.num("rootchord").unwrap_or(0.0) } else { c.num("length").unwrap_or(0.0) };
-            let cs = child_start(c, start, len, clen, &mut after);
-            self.component(c, cs, inner_radius.max(0.0));
+        let placed: Vec<(f64, f64)> = children
+            .iter()
+            .map(|c| {
+                let clen = length_of(c);
+                (child_start(c, start, len, clen, &mut after), clen)
+            })
+            .collect();
+        let tubes: Vec<(f64, f64, f64)> = children
+            .iter()
+            .zip(&placed)
+            .filter(|(c, _)| c.name == "innertube")
+            .filter_map(|(c, p)| Some((p.0, p.1, c.num("outerradius")?)))
+            .collect();
+        for (c, (cs, _)) in children.iter().zip(&placed) {
+            self.component(c, *cs, inner_radius.max(0.0), &tubes);
         }
+        self.assembly(el, kind, first, start, len);
     }
 }
 
@@ -448,6 +563,15 @@ fn barrowman_fins(f: &Fins, sweep: f64, le_x: f64, body_r: f64) -> (f64, f64) {
     (cna, xf)
 }
 
+/// Barrowman transition (shoulder or boattail): normal-force slope (on the
+/// reference radius) and its CP. A boattail gives a negative slope.
+fn barrowman_transition(t: &Shoulder, r_ref: f64) -> (f64, f64) {
+    let cna = 2.0 * ((t.r2 / r_ref).powi(2) - (t.r1 / r_ref).powi(2));
+    let k = if t.r2 > 0.0 { t.r1 / t.r2 } else { 0.0 };
+    let x = t.start + t.len / 3.0 * (1.0 + 1.0 / (1.0 + k));
+    (cna, x)
+}
+
 /// Imports a `.ork` (ZIP, gzip or plain XML) into planner vehicle parameters,
 /// keeping the reference vehicle's values for what the file cannot give.
 pub fn import(bytes: &[u8], reference: &Vehicle) -> Result<Imported, String> {
@@ -457,7 +581,16 @@ pub fn import(bytes: &[u8], reference: &Vehicle) -> Result<Imported, String> {
     }
     let rocket = root.child("rocket").ok_or("The OpenRocket file has no <rocket>.")?;
     let name = rocket.child("name").map(|n| n.text.trim().to_string()).unwrap_or_else(|| "Rocket".into());
-    let mut w = Walker { components: Vec::new(), warnings: Vec::new(), nose: None, fins: None, max_radius: 0.0, motor_mount: None, finish: None };
+    let mut w = Walker {
+        components: Vec::new(),
+        warnings: Vec::new(),
+        nose: None,
+        fins: None,
+        max_radius: 0.0,
+        motor_mount: None,
+        finish: None,
+        transitions: Vec::new(),
+    };
     let stages: Vec<&Element> = rocket.subcomponents().iter().filter(|s| s.name == "stage").collect();
     if stages.is_empty() {
         return Err("The OpenRocket file has no stages.".into());
@@ -473,28 +606,26 @@ pub fn import(bytes: &[u8], reference: &Vehicle) -> Result<Imported, String> {
         .fold(0.0_f64, f64::max);
     let radius = if radius > 0.0 { radius } else { reference.diameter_m / 2.0 };
     let mut x = 0.0;
+    let mut computed = 0.0;
     for s in &stages {
+        let first = w.components.len();
+        let s_start = x;
         for c in s.subcomponents() {
-            let len = c.num("length").unwrap_or(0.0);
-            w.component(c, x, radius);
-            x += len;
+            w.component(c, x, radius, &[]);
+            x += length_of(c);
         }
+        let s_len = x - s_start;
+        computed += w.components[first..].iter().map(|c| c.mass_kg).sum::<f64>();
+        // A stage's own mass is zero; an override without the subcomponents adds to it.
+        w.push(s, "stage", 0.0, s_start + s_len / 2.0, s_start);
+        w.assembly(s, "stage", first, s_start, s_len);
     }
     let length = x;
     if length <= 0.1 {
         return Err("The OpenRocket rocket has no length.".into());
     }
-    let mut dry: f64 = w.components.iter().map(|c| c.mass_kg).sum();
-    let mut cg = if dry > 0.0 { w.components.iter().map(|c| c.mass_kg * c.cg_from_nose_m).sum::<f64>() / dry } else { length / 2.0 };
-    for el in std::iter::once(rocket).chain(stages.iter().copied()) {
-        if let Some(m) = el.num("overridemass") {
-            dry = m;
-            w.warnings.push(format!("{} has an override mass of {m:.2} kg: used as the dry mass.", el.name));
-        }
-        if let Some(c) = el.num("overridecg") {
-            cg = c;
-        }
-    }
+    let dry: f64 = w.components.iter().map(|c| c.mass_kg).sum();
+    let cg = if dry > 0.0 { w.components.iter().map(|c| c.mass_kg * c.cg_from_nose_m).sum::<f64>() / dry } else { length / 2.0 };
     if dry <= 0.5 {
         return Err("The OpenRocket rocket has no mass (no materials or mass components).".into());
     }
@@ -516,8 +647,15 @@ pub fn import(bytes: &[u8], reference: &Vehicle) -> Result<Imported, String> {
             (reference.fins.clone(), reference.cn_alpha_per_rad - 2.0, cg + reference.static_margin_cal * 2.0 * r)
         }
     };
-    let cna = 2.0 + cna_f;
-    let cp = (2.0 * xn + cna_f * xf) / cna;
+    // Nose (2 per rad on its own base), fins, and the shoulders/boattail.
+    let mut cna = 2.0 * (w.nose.as_ref().map_or(r, |n| n.1) / r).powi(2) + cna_f;
+    let mut moment = (cna - cna_f) * xn + cna_f * xf;
+    for t in &w.transitions {
+        let (c, xt) = barrowman_transition(t, r);
+        cna += c;
+        moment += c * xt;
+    }
+    let cp = moment / cna;
     let margin = (cp - cg) / (2.0 * r);
     if margin < 1.0 {
         w.warnings.push(format!("Static margin {margin:.2} cal (without the propellant) is below 1 cal."));
@@ -525,6 +663,12 @@ pub fn import(bytes: &[u8], reference: &Vehicle) -> Result<Imported, String> {
     if w.motor_mount.is_none() {
         w.warnings.push("No inner tube is marked as the motor mount.".into());
     }
+    // A boattail: the last outer component narrows toward the base.
+    let boattail = w
+        .transitions
+        .iter()
+        .find(|t| (t.start + t.len - length).abs() < 1e-6 && t.r2 < t.r1)
+        .map(|t| 2.0 * t.r2);
     let vehicle = Vehicle {
         length_m: length,
         diameter_m: 2.0 * r,
@@ -534,7 +678,17 @@ pub fn import(bytes: &[u8], reference: &Vehicle) -> Result<Imported, String> {
         surface_roughness_m: w.finish.unwrap_or(reference.surface_roughness_m),
         cn_alpha_per_rad: cna,
         static_margin_cal: margin.clamp(0.5, 6.0),
+        boattail_aft_diameter_m: boattail,
         ..reference.clone()
     };
-    Ok(Imported { name, vehicle, cg_from_nose_m: cg, cp_from_nose_m: cp, motor_mount: w.motor_mount, components: w.components, warnings: w.warnings })
+    Ok(Imported {
+        name,
+        vehicle,
+        cg_from_nose_m: cg,
+        cp_from_nose_m: cp,
+        motor_mount: w.motor_mount,
+        components: w.components,
+        warnings: w.warnings,
+        computed_mass_kg: computed,
+    })
 }

@@ -187,6 +187,8 @@ class Aero:
         self.fin_front = fins['count'] * fins['thickness_m'] * fins['span_m'] / self.aref
         self.fineness = self.L / self.d
         self.rough = v['surface_roughness_m']
+        # Base drag acts on the boattail's aft area (the body's without one).
+        self.base_frac = (min(v.get('boattail_aft_diameter_m') or self.d, self.d) / self.d) ** 2
         self.exit_frac = (exit_d / self.d) ** 2
         self.k_prot = a['protuberance_factor']
         self.cd_extra = a['cd_extra']
@@ -206,7 +208,7 @@ class Aero:
         cf *= (1 - 0.1 * mach * mach) if mach < 1 else 1 / (1 + 0.15 * mach * mach) ** 0.58
         friction = cf * ((1 + 1 / (2 * self.fineness)) * self.s_body +
                          (1 + 2 * self.fin_tc) * self.s_fins) / self.aref
-        base = self._base(mach) * ((1 - self.exit_frac) if thrusting else 1.0)
+        base = self._base(mach) * (max(self.base_frac - self.exit_frac, 0.0) if thrusting else self.base_frac)
         m = min(mach, 0.9)
         fin_le = ((1 - m * m) ** -0.417 - 1) * self.fin_front
         fin_te = self._base(mach) * self.fin_front

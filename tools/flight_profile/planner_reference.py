@@ -30,7 +30,8 @@ CASES = [
     ('scaled_5000', {'motor.total_impulse_ns': 5000.0}),
     ('hot_windy', {'environment.temp_offset_k': 15.0, 'environment.wind_mps': 8.0, 'environment.wind_from_deg': 200.0}),
     ('cold_low_site', {'environment.temp_offset_k': -10.0, 'environment.site_msl_m': 200.0}),
-    ('heavy_40kg_dry', {'vehicle.dry_mass_kg': 40.0}),
+    ('light_33kg_dry', {'vehicle.dry_mass_kg': 33.2}),
+    ('no_boattail', {'vehicle.boattail_aft_diameter_m': None}),
     ('steep_rail', {'launch.tilt_deg': 2.0, 'launch.azimuth_deg': 0.0, 'motor.total_impulse_ns': 9000.0}),
 ]
 

@@ -427,7 +427,7 @@ fn prepare(state: &AppState) -> Result<Prepared, (StatusCode, String)> {
             cfg.vehicle = v.imported.vehicle.clone();
             format!("OpenRocket import: {}", v.imported.name)
         }
-        None => "tools/flight_profile/vehicle.json (assumed)".to_string(),
+        None => "tools/flight_profile/vehicle.json (SWEET_V6.ork)".to_string(),
     };
     let cd_scale = inner.calibration.cd_scale();
     cfg.aero.cd_scale = cd_scale;
@@ -772,7 +772,7 @@ pub(crate) fn view(state: &AppState) -> Value {
         None => {
             let v = flight::Config::reference().vehicle;
             json!({
-                "source": "default", "name": "tools/flight_profile/vehicle.json (assumed)",
+                "source": "default", "name": "tools/flight_profile/vehicle.json (SWEET_V6.ork)",
                 "dry_mass_kg": v.dry_mass_kg, "length_m": v.length_m, "diameter_m": v.diameter_m,
                 "cn_alpha_per_rad": v.cn_alpha_per_rad, "static_margin_cal": v.static_margin_cal,
                 "imported_ms": null, "warnings": [],

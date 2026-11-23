@@ -40,6 +40,9 @@ pub struct Vehicle {
     pub roll_damping_length_m: f64,
     #[serde(default = "ccw")]
     pub roll_direction: String,
+    /// Aft diameter of a boattail: base drag acts on this area, not the body's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boattail_aft_diameter_m: Option<f64>,
 }
 fn ccw() -> String {
     "ccw".into()
@@ -377,6 +380,7 @@ struct Aero {
     fin_front: f64,
     fineness: f64,
     rough: f64,
+    base_frac: f64,
     exit_frac: f64,
     k_prot: f64,
     cd_extra: f64,
@@ -402,6 +406,7 @@ impl Aero {
             fin_front: v.fins.count * v.fins.thickness_m * v.fins.span_m / aref,
             fineness: l / d,
             rough: v.surface_roughness_m,
+            base_frac: (v.boattail_aft_diameter_m.unwrap_or(d).min(d) / d).powi(2),
             exit_frac: (exit_d / d).powi(2),
             k_prot: a.protuberance_factor,
             cd_extra: a.cd_extra,
@@ -420,7 +425,7 @@ impl Aero {
         let mut cf = cf_t.max(cf_r);
         cf *= if mach < 1.0 { 1.0 - 0.1 * mach * mach } else { 1.0 / (1.0 + 0.15 * mach * mach).powf(0.58) };
         let friction = cf * ((1.0 + 1.0 / (2.0 * self.fineness)) * self.s_body + (1.0 + 2.0 * self.fin_tc) * self.s_fins) / self.aref;
-        let base = Self::base(mach) * if thrusting { 1.0 - self.exit_frac } else { 1.0 };
+        let base = Self::base(mach) * if thrusting { (self.base_frac - self.exit_frac).max(0.0) } else { self.base_frac };
         let m = mach.min(0.9);
         let fin_le = ((1.0 - m * m).powf(-0.417) - 1.0) * self.fin_front;
         let fin_te = Self::base(mach) * self.fin_front;

@@ -284,14 +284,112 @@ fn ork_import_reads_zip_gzip_and_plain_files() {
 #[test]
 fn ork_import_honours_overrides_and_refuses_junk() {
     let reference = flight::Config::reference().vehicle;
-    let with_override = ORK_XML.replace("<name>Sustainer</name>", "<name>Sustainer</name><overridemass>33.0</overridemass>");
-    let i = ork::import(with_override.as_bytes(), &reference).unwrap();
+    let plain = ork::import(ORK_XML.as_bytes(), &reference).unwrap();
+    // A stage override covering its subcomponents replaces the whole build-up...
+    let whole = ORK_XML.replace(
+        "<name>Sustainer</name>",
+        "<name>Sustainer</name><overridemass>33.0</overridemass><overridesubcomponentsmass>true</overridesubcomponentsmass>",
+    );
+    let i = ork::import(whole.as_bytes(), &reference).unwrap();
     assert!((i.vehicle.dry_mass_kg - 33.0).abs() < 1e-9);
+    assert!((i.computed_mass_kg - plain.vehicle.dry_mass_kg).abs() < 1e-9);
+    assert!((i.cg_from_nose_m - plain.cg_from_nose_m).abs() < 1e-9, "the CG is kept without a CG override");
     assert!(i.warnings.iter().any(|w| w.contains("override mass")));
+    // ...one without it is the stage's own (otherwise zero) mass, added.
+    let own = ORK_XML.replace("<name>Sustainer</name>", "<name>Sustainer</name><overridemass>3.0</overridemass>");
+    let i = ork::import(own.as_bytes(), &reference).unwrap();
+    assert!((i.vehicle.dry_mass_kg - plain.vehicle.dry_mass_kg - 3.0).abs() < 1e-9);
+    // A part override covering its subcomponents, with an assembly CG.
+    let body = ORK_XML.replace(
+        "<name>Body</name>",
+        "<name>Body</name><overridemass>20.0</overridemass><overridesubcomponentsmass>true</overridesubcomponentsmass><overridecg>2.0</overridecg><overridesubcomponentscg>true</overridesubcomponentscg>",
+    );
+    let i = ork::import(body.as_bytes(), &reference).unwrap();
+    let nose = i.components.iter().find(|c| c.kind == "nosecone").unwrap();
+    let body_moment: f64 = i.components.iter().filter(|c| c.kind != "nosecone").map(|c| c.mass_kg * c.cg_from_nose_m).sum();
+    assert!((i.vehicle.dry_mass_kg - nose.mass_kg - 20.0).abs() < 1e-9);
+    assert!((body_moment / 20.0 - (0.762 + 2.0)).abs() < 1e-9, "assembly CG from the body's front");
     assert!(ork::import(b"PK\x03\x04garbage", &reference).is_err());
     assert!(ork::import(b"<notrocket/>", &reference).unwrap_err().contains("OpenRocket"));
     assert!(ork::import(b"<openrocket><rocket><subcomponents></subcomponents></rocket></openrocket>", &reference).unwrap_err().contains("stages"));
     assert!(ork::import(b"<openrocket><rocket>", &reference).is_err());
+}
+
+/// The team's design (tools/flight_profile/vehicle/SWEET_V6.ork, OpenRocket 24.12).
+const SWEET_V6: &[u8] = include_bytes!("../../../tools/flight_profile/vehicle/SWEET_V6.ork");
+
+#[test]
+fn ork_import_reads_the_sweet_v6_design() {
+    let reference = flight::Config::reference().vehicle;
+    let i = ork::import(SWEET_V6, &reference).unwrap();
+    assert_eq!(i.name, "SWEET_V6");
+    let v = &i.vehicle;
+    let near = |got: f64, want: f64, tol: f64, what: &str| assert!((got - want).abs() <= tol, "{what}: {got} vs {want}");
+    // Ten outer components end to end; carbon tubes of radius 0.078232 ("auto 0.078232" too).
+    near(v.length_m, 4.38658, 1e-9, "length");
+    near(v.diameter_m, 0.156464, 1e-9, "diameter");
+    near(v.nose_length_m, 0.5334, 1e-9, "nose");
+    for (got, want, what) in [
+        (v.fins.count, 3.0, "fin count"),
+        (v.fins.root_m, 0.250825, "root chord"),
+        (v.fins.tip_m, 0.1381125, "tip chord"),
+        (v.fins.span_m, 0.174625, "fin height"),
+        (v.fins.thickness_m, 0.006604, "fin thickness"),
+    ] {
+        near(got, want, 1e-12, what);
+    }
+    near(v.boattail_aft_diameter_m.unwrap(), 0.10795, 1e-9, "boattail aft diameter");
+    near(v.surface_roughness_m, 20e-6, 1e-12, "smooth nose finish");
+    // The stage override (overridesubcomponentsmass, measured in Midland) is the
+    // dry mass and CG; the component build-up it replaces is OpenRocket's own
+    // 34.32 kg (the burnout mass of the older TESTFIRE_NOTFULLOXTANK run).
+    near(v.dry_mass_kg, 40.84, 1e-9, "dry mass");
+    near(i.cg_from_nose_m, 2.667, 1e-9, "CG");
+    near(i.computed_mass_kg, 34.324, 0.002, "component build-up");
+    let total: f64 = i.components.iter().map(|c| c.mass_kg).sum();
+    near(total, 40.84, 1e-9, "the listed parts and adjustments add up");
+    let stage = i.components.iter().find(|c| c.name == "Stage (override adjustment)").unwrap();
+    near(stage.mass_kg, 40.84 - i.computed_mass_kg, 1e-9, "stage adjustment");
+    // The motor hardware is a mass object inside the build-up, not on top of it.
+    let motor = i.components.iter().find(|c| c.name == "EntireMotor_nofuel").unwrap();
+    near(motor.mass_kg, 14.3199111209, 1e-9, "motor hardware");
+    near(motor.cg_from_nose_m, 2.755265 + 0.854075, 1e-6, "motor hardware station");
+    // Section overrides covering their subcomponents (overridesubcomponentsmass).
+    let section = |name: &str| -> f64 {
+        let at = i.components.iter().position(|c| c.name == name).unwrap();
+        let end = i.components.iter().position(|c| c.name == format!("{name} (override adjustment)")).unwrap();
+        i.components[at..=end].iter().map(|c| c.mass_kg).sum()
+    };
+    near(section("Nose cone"), 0.84027, 1e-9, "nose section");
+    near(section("Payload Tube"), 3.53804, 1e-9, "payload section");
+    near(section("DITW Container"), 4.46356, 1e-9, "DITW section");
+    near(section("Lower Body Tube"), 2.58766, 1e-9, "lower body section");
+    // An override of the tube alone (Recovery Tube) keeps its children; the
+    // main chute counts its 16 x 6.096 m of 29 g/m lines, as OpenRocket does.
+    let chute = i.components.iter().find(|c| c.name == "Main Parachute").unwrap();
+    near(chute.mass_kg, 0.067 * std::f64::consts::PI * 1.778_f64.powi(2) + 16.0 * 6.096 * 0.029, 1e-9, "main parachute");
+    assert!(!i.components.iter().any(|c| c.name == "Reefed Parachute"), "overridden to 0 kg");
+    // Centering rings with automatic radii: tube inner radius to the chamber's outer radius.
+    let ring = i.components.iter().find(|c| c.name == "Lower Centering Ring").unwrap();
+    near(ring.mass_kg, std::f64::consts::PI * ((0.078232_f64 - 0.002).powi(2) - 0.0507_f64.powi(2)) * 0.009525 * 2700.0, 1e-9, "auto ring");
+    assert_eq!(i.motor_mount, Some(ork::MotorMount { length_m: 0.720725, diameter_m: 2.0 * (0.0507 - 0.005742000000000004) }));
+    // Barrowman: nose + 3 fins + boattail; OpenRocket's CP is 3.20-3.25 m and
+    // its margin 3.5-3.7 cal coasting (IREC_STANDARDREPORT).
+    near(i.cp_from_nose_m, 3.213, 0.002, "CP");
+    near(v.cn_alpha_per_rad, 9.28, 0.01, "CNa");
+    near(v.static_margin_cal, 3.49, 0.01, "static margin");
+    // vehicle.json carries the same import.
+    let cfg = flight::Config::reference().vehicle;
+    near(cfg.length_m, v.length_m, 1e-9, "vehicle.json length");
+    near(cfg.diameter_m, v.diameter_m, 1e-9, "vehicle.json diameter");
+    near(cfg.dry_mass_kg, v.dry_mass_kg, 1e-9, "vehicle.json dry mass");
+    near(cfg.nose_length_m, v.nose_length_m, 1e-9, "vehicle.json nose");
+    near(cfg.boattail_aft_diameter_m.unwrap(), 0.10795, 1e-9, "vehicle.json boattail");
+    near(cfg.cn_alpha_per_rad, v.cn_alpha_per_rad, 0.005, "vehicle.json CNa");
+    near(cfg.static_margin_cal, v.static_margin_cal, 0.005, "vehicle.json margin");
+    for (a, b) in [(cfg.fins.root_m, v.fins.root_m), (cfg.fins.tip_m, v.fins.tip_m), (cfg.fins.span_m, v.fins.span_m), (cfg.fins.thickness_m, v.fins.thickness_m), (cfg.fins.count, v.fins.count)] {
+        near(a, b, 1e-9, "vehicle.json fins");
+    }
 }
 
 // ------------------------------------------------------------ solver
