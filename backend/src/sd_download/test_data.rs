@@ -1,5 +1,5 @@
 //! Realistic SD files for the transfer tests: a port of the FC launch-file
-//! shape of `tools/gen_sd.py` (firmware float text, field order, record mix)
+//! shape of the synthetic launch-file generator used for the measurements (firmware float text, field order, record mix)
 //! with synthetic signals, so a test can make a few hundred KB in memory.
 
 /// `sd_format_float`: binary64 normalisation of a binary32, 9 digits.

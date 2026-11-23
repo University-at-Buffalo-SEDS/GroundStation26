@@ -422,7 +422,7 @@ sequenceDiagram
 - Rate (DATA bytes per second, headers included; the env names are kept from v1, where they counted CSV bytes):
   - radio: `GS_FC_SD_RADIO_MAX_BYTES_PER_SEC`, default 768 B/s;
   - wired: `GS_FC_SD_WIRED_MAX_BYTES_PER_SEC`, default 64 KiB/s (the FC's SD reads and encoding are the real limit).
-- Adaptive radio rate (`AdaptiveRate`, AIMD): while the FC is Landed or in Recovery, no command was sent for 30 s, GPS is fresh, the GS radio queue is nearly empty and the link is good, the rate rises by 128 B/s every 2 s up to `GS_FC_SD_RADIO_CEILING_BYTES_PER_SEC` (default 1536). A gap or a bad block halves it (not below 256 B/s). Any yield trigger returns it to at most the base at once.
+- Adaptive radio rate (`AdaptiveRate`, AIMD): while the FC is Landed or in Recovery, no command was sent for 30 s, GPS is fresh, the GS radio queue is nearly empty and the link is good, the rate rises by 128 B/s every 2 s up to `GS_FC_SD_RADIO_CEILING_BYTES_PER_SEC` (default 1280: ≈1.73 KB/s down, which with ≈1.5 KB/s of AV-bay telemetry leaves ≈6 % of the 3.4 KB/s turn). A gap or a bad block halves it (not below 256 B/s). Any yield trigger returns it to at most the base at once.
 - Link detection (`fc::link`):
   - `GS_FC_SD_LINK=radio|wired` overrides;
   - otherwise the link is radio whenever the AV-bay link is an RFD modem (raw-UART serial or a configured RFD profile), unless the FC has been heard only on the umbilical side;
@@ -509,7 +509,7 @@ The file size is derived from FC docs §7.5 and §3. The launch file runs from L
 Measured on real SEDSnet routers with the production radio side (`wire_bytes_per_payload_byte_on_an_instant_link`, a 328 KB FC-shaped file):
 
 - a 460-byte DATA message is three 192-byte frames: 1.35 wire bytes down per DATA byte (SEDSnet chunk and P2P headers, 4-byte radio frame header);
-- per CSV byte: 0.235 B down and 0.036 B up (ACKs every 3 messages, OPEN, HASH). With the real FC SDX ratio (6.3x on `tools/gen_sd.py`'s launch file, 6.0x as DATA with headers) that is about 0.22 B down per CSV byte, against 2.1 in v1;
+- per CSV byte: 0.235 B down and 0.036 B up (ACKs every 3 messages, OPEN, HASH). With the real FC SDX ratio (6.3x on a synthetic FC launch file built with the firmware formatters, 6.0x as DATA with headers) that is about 0.22 B down per CSV byte, against 2.1 in v1;
 - on the turn simulation, with three command pauses: 0.260 down, 0.057 up.
 
 Lossy radio (`a_lossy_radio_with_a_link_drop_and_a_restart_still_yields_the_identical_file`, random frame loss each way, a 3 s link cut and a station restart, 164 KB file, rate uncapped): byte-identical every time; 5 % loss 31 s (1.20x the file read by the board), 15 % 55 s (1.11x), 30 % 106 s (1.71x).
@@ -517,12 +517,12 @@ Lossy radio (`a_lossy_radio_with_a_link_drop_and_a_restart_still_yields_the_iden
 | Path | DATA rate | CSV rate | 2.7 MB launch file | 60 s lead-up (FC ≈3.9 MB) | DAQ launch file (12.6 MB, 30 s) |
 | --- | --- | --- | --- | --- | --- |
 | Direct radio, default | 768 B/s; down ≈1.0 KB/s (30 % of the 3.4 KB/s turn) | ≈4.6 KB/s | 2.7e6 / 4,640 = 582 s ≈ **9.7 min** (v1: 88 min) | ≈14 min | n/a (DAQ is on the fill link) |
-| Direct radio, adaptive ceiling | 1536 B/s; down ≈2.1 KB/s (with 1.5 KB/s telemetry the turn is full) | ≈9.3 KB/s | ≈ **4.9 min** (v1: 70 min) | ≈7 min | n/a |
-| Via RRLS (takeover) | the same RF turn cap from the FC; RRLS->GS SDX + zstd (8.4x) | FC->RRLS as direct; forward ≈6.5–11 KB/s | ≈ **4.9–9.7 min** to the RRLS; the forward follows at the same airtime | ≈7–14 min | n/a |
+| Direct radio, adaptive ceiling | 1280 B/s; down ≈1.73 KB/s (with 1.5 KB/s telemetry ≈94 % of the turn) | ≈7.7 KB/s | 2.7e6 / 7,730 = 349 s ≈ **5.8 min** (v1: 70 min) | ≈8.4 min | n/a |
+| Via RRLS (takeover) | the same RF turn cap from the FC; RRLS->GS SDX + zstd (8.4x) | FC->RRLS as direct; forward ≈6.5–11 KB/s | ≈ **5.8–9.7 min** to the RRLS; the forward follows at the same airtime | ≈8.4–14 min | n/a |
 | **Bench (wired)** | 64 KiB/s (512-byte messages, window 8; the FC's SD reads bound it) | ≤ ≈390 KB/s | ≈7 s at the DATA cap; the FC's SD read speed rules | ≈10 s | n/a |
 | DAQ fill link | 16 KiB/s (`GS_SD_DOWNLOAD_MAX_BYTES_PER_SEC`), 1 KiB messages, window 16 | ≈84 KB/s (5.1x) | n/a | DAQ lead-up (≈6.6 MB at 110 KB/s of rows) at 8 KiB/s: ≈160 s | 12.6e6 / 83,600 = 151 s ≈ **2.5 min** (v1: 12.8 min) |
 
-The CSV rates use the C encoder's measured ratios on `tools/gen_sd.py` files (FC 6.27x, DAQ 5.19x; as DATA with message headers 6.04x and 5.10x).
+The CSV rates use the C encoder's measured ratios on synthetic launch files built with the firmware formatters from the IGT nominal_10k flight and the 2026-11-16 fire window (generator kept outside the repo) (FC 6.27x, DAQ 5.19x; as DATA with message headers 6.04x and 5.10x).
 
 **The bench path is the fast way to power down early.** Reconnect the recovered rocket by umbilical, USB or CAN (no RFD radio in the path). The same service and collection run without operator action, at up to 64 KiB/s of DATA. If the station cannot tell the FC is wired (for example the AV-bay link is still an RFD modem), set `GS_FC_SD_LINK=wired`. The radio path suits a vehicle that stays powered until recovery. To power off sooner, use the bench.
 

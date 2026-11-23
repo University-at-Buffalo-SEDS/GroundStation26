@@ -66,7 +66,7 @@ action is needed: the trigger is the FC's Landed held 5 s, or Recovery. The
 collection runs at the lowest priority:
 
 - radio: 768 B/s of DATA (about 4.6 KB/s of CSV), rising by 128 B/s every
-  2 s up to 1536 B/s while recovery traffic is light, halved on losses;
+  2 s up to 1280 B/s while recovery traffic is light, halved on losses;
 - it pauses for commands (10 s), stalled recovery GPS, radio congestion,
   another SD transfer, or an operator stop;
 - it resumes across link drops and restarts.
@@ -81,7 +81,7 @@ powered off" readiness.
 | Path | Time |
 | --- | --- |
 | AV-bay radio at 768 B/s of DATA | ≈9.7 min (v1: 88 min) |
-| AV-bay radio at the 1536 B/s adaptive ceiling | ≈4.9 min (v1: 70 min) |
+| AV-bay radio at the 1280 B/s adaptive ceiling | ≈5.8 min (v1: 70 min) |
 | Via the RRLS (takeover) | no faster from the FC: the RF board's radio turn caps all AV-bay egress |
 | **Bench, 64 KiB/s of DATA** | **seconds; the FC's SD reads rule** |
 

@@ -18,7 +18,7 @@
 //!
 //! It is the lowest-priority user of the link: a streamed transfer whose
 //! window and rate the station sets ([`profile`], [`rate`]: radio 460-byte
-//! DATA messages, window 6, 768 B/s of DATA rising to 1536 B/s while the
+//! DATA messages, window 6, 768 B/s of DATA rising to 1280 B/s while the
 //! link is calm; wired 512-byte messages, window 8, 64 KiB/s), paused (rate 0)
 //! while commands
 //! were sent in the last 10 s, while recovery GPS stalls, while the radio is
@@ -119,11 +119,11 @@ pub(crate) fn rate(link: Link) -> u64 {
 /// carries ~1.5 KB/s of telemetry. A 460-byte DATA message goes out as three
 /// 192-byte frames, about 1.35 wire bytes per DATA byte down (measured by
 /// `wire_bytes_per_payload_byte_on_an_instant_link`), so the 768 B/s start
-/// uses ~1.0 KB/s of the turn and the 1536 B/s ceiling ~2.1 KB/s: at the
-/// ceiling the turn is full with telemetry, which is why the rate rises only
-/// while the GS radio queue stays nearly empty and halves on any gap.
+/// uses ~1.0 KB/s of the turn and the 1280 B/s ceiling ~1.73 KB/s: with
+/// telemetry that is ~3.2 KB/s, about 6 % below the turn. The rate also rises
+/// only while the GS radio queue stays nearly empty, and halves on any gap.
 pub(crate) fn radio_ceiling() -> u64 {
-    env_rate("GS_FC_SD_RADIO_CEILING_BYTES_PER_SEC", 1536, 64..=4096).max(rate(Link::Radio))
+    env_rate("GS_FC_SD_RADIO_CEILING_BYTES_PER_SEC", 1280, 64..=4096).max(rate(Link::Radio))
 }
 
 /// Adaptive radio rate (AIMD): starts at the base rate, rises by `STEP`
