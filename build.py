@@ -1199,6 +1199,7 @@ def print_usage(exit_code: int = 1) -> None:
     print("  ./build.py plain                   # docker only: pass --progress plain")
     print("  ./build.py log=build.log           # tee command output into a log file")
     print("  ./build.py --remote HOST [...]     # compile backend and web UI on HOST (user:password@host, user@host or host)")
+    print("  ./build.py [--remote HOST] sim-bundle  # firmware-simulation bundle (docs/firmware-sim.md); add --sim to a build to include it")
     print("                                     # in an Ubuntu 24.04 container, then copy the results back (needs ssh, rsync, docker)")
     print("  ./build.py docker [pi_build|no_pi] [testing]")
     print("  ./build.py rrls                   # headless recovery backend + web UI, no local launch GPIO")
@@ -1227,6 +1228,7 @@ def main() -> None:
     max_size_mode = False
     plain_mode = False
     use_existing = False
+    sim_bundle = False
     frontend_dev = False
     backend_only = False
     rrls_mode = False
@@ -1276,6 +1278,8 @@ def main() -> None:
             backend_only = True
         elif arg == "existing":
             use_existing = True
+        elif arg in {"sim-bundle", "sim_bundle", "--sim"}:
+            sim_bundle = True
         elif arg in {"--frontend-dev", "frontend-dev", "frontend_dev"}:
             frontend_dev = True
         elif arg.startswith("log="):
@@ -1292,6 +1296,18 @@ def main() -> None:
         else:
             print(f"Error: Invalid argument '{arg}'.", file=sys.stderr)
             print_usage()
+
+    if sim_bundle:
+        repo_root = Path(__file__).resolve().parent
+        if remote:
+            # x86_64 bundle built on HOST, installed into the local cache
+            _remote_build().build_sim_bundle(repo_root)
+        else:
+            subprocess.run([sys.executable, str(repo_root / "tools" / "firmware_sim.py"), "build"], check=True)
+            subprocess.run([sys.executable, str(repo_root / "tools" / "firmware_sim.py"), "bundle", "--out",
+                            str(repo_root / "target" / "firmware-sim-bundle.tar.gz")], check=True)
+        if all(a.lower() in {"sim-bundle", "sim_bundle", "--sim"} for a in raw_args):
+            return
 
     if video_transcoder and any((
         force_pi, force_no_pi, docker_mode, testing_mode, hitl_mode,

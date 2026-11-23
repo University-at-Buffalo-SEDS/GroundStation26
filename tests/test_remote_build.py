@@ -155,6 +155,36 @@ class CheckoutFileTests(unittest.TestCase):
         self.assertEqual(files, {".gitignore", "Cargo.toml", "Cargo.lock", "src/main.rs", "vendor/asset.js", "new.txt"})
 
 
+class SimBundleTests(unittest.TestCase):
+    def test_sim_bundle_stages_sources_builds_in_the_container_and_installs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {remote_build.ENV: "rylan:Secret@jupiter"}):
+            repo = Path(tmp).resolve()
+            local_runs = []
+            with patch.object(remote_build, "_image", return_value="img"), \
+                    patch.object(remote_build.Remote, "push") as push, \
+                    patch.object(remote_build.Remote, "rsync") as rsync, \
+                    patch.object(remote_build.Remote, "pull") as pull, \
+                    patch.object(remote_build.Remote, "run") as run, \
+                    patch.object(remote_build.subprocess, "run", side_effect=lambda cmd, **kw: local_runs.append(cmd)):
+                out = remote_build.build_sim_bundle(repo)
+            # sources staged locally as plain trees, then sent; the checkout pushed as for a station build
+            self.assertEqual(local_runs[0][2:4], ["stage", "--out"])
+            push.assert_called_once()
+            self.assertIn("-sim-sources/", rsync.call_args.args[1])
+            command = run.call_args.args[0]
+            self.assertIn("build --sources /build/", command)
+            self.assertIn("bundle --out /build/firmware-sim-bundle.tar.gz", command)
+            self.assertNotIn("Secret", command, "no credentials reach the remote command")
+            self.assertEqual(pull.call_args.args[1], repo / "target" / "firmware-sim-bundle.tar.gz")
+            self.assertEqual(local_runs[-1][2], "install")
+            self.assertEqual(out, repo / "target" / "firmware-sim-bundle.tar.gz")
+
+    def test_builder_image_carries_the_native_sim_toolchain_and_keeps_the_station_one(self) -> None:
+        for need in ("gcc-multilib", "gcc-arm-none-eabi", "ninja-build", "i686-unknown-linux-gnu",
+                     "gcc-aarch64-linux-gnu", "aarch64-unknown-linux-gnu", "wasm32-unknown-unknown"):
+            self.assertIn(need, remote_build.DOCKERFILE)
+
+
 class BuildWrapperTests(unittest.TestCase):
     def test_backend_build_uses_remote_when_requested(self) -> None:
         import importlib.util
