@@ -229,6 +229,9 @@ pub(crate) fn status_json() -> Value {
     })
 }
 
+/// The plant's battery packs by board node (FirmwareSimulator native_plant.rs `default_batteries`).
+const BATTERY_NODES: [&str; 3] = ["power", "gateway", "valve"];
+
 /// Validated plant/fault control document (unknown keys refused).
 pub(crate) fn validate_control(body: &Value) -> Result<Value, String> {
     let obj = body.as_object().ok_or("control must be an object")?;
@@ -354,6 +357,29 @@ pub(crate) fn validate_control(body: &Value) -> Result<Value, String> {
                 }
                 out.insert(key.clone(), value.clone());
             }
+            "batteries" => {
+                // the boards' battery packs (power, gateway, valve): set a state of charge (applied once per new
+                // value) and add a constant load
+                let b = value.as_object().ok_or("batteries must be an object")?;
+                for (node, entry) in b {
+                    if !BATTERY_NODES.contains(&node.as_str()) {
+                        return Err(format!("unknown battery {node} (have: {})", BATTERY_NODES.join(", ")));
+                    }
+                    let entry = entry.as_object().ok_or_else(|| format!("battery {node} must be an object"))?;
+                    for (k, v) in entry {
+                        let x = v.as_f64().ok_or_else(|| format!("battery {node} {k} must be a number"))?;
+                        let ok = match k.as_str() {
+                            "soc" => (0.0..=1.0).contains(&x),
+                            "load_w" => (0.0..=500.0).contains(&x),
+                            _ => return Err(format!("unknown battery input {k} (soc, load_w)")),
+                        };
+                        if !ok {
+                            return Err(format!("battery {node} {k} out of range"));
+                        }
+                    }
+                }
+                out.insert(key.clone(), value.clone());
+            }
             _ => return Err(format!("unknown control section {key}")),
         }
     }
@@ -384,16 +410,17 @@ fn write_control(dir: &std::path::Path, control: &Value) -> std::io::Result<()> 
 }
 
 /// Top-level sections of `update` replace those of `current`, except
-/// `faults` and `patch`, which merge per key: a client that sends only the
-/// faults or patch inputs it knows (the UI panel, a test tool) keeps the
-/// others (a P10 swap, a drift, the DAC attenuations) instead of clearing
-/// them. Clearing a key takes an explicit value (false, 0, null).
+/// `faults`, `patch` and `batteries`, which merge per key: a client that sends
+/// only the faults, patch inputs or battery it knows (the UI panel, a test
+/// tool) keeps the others (a P10 swap, a drift, the DAC attenuations, another
+/// pack's charge) instead of clearing them. Clearing a key takes an explicit
+/// value (false, 0, null).
 pub(crate) fn merge_control(current: Option<Value>, update: Value) -> Value {
     let mut merged = current.filter(Value::is_object).unwrap_or_else(|| json!({}));
     if let (Some(m), Some(u)) = (merged.as_object_mut(), update.as_object()) {
         for (k, v) in u {
             match (k.as_str(), m.get_mut(k).and_then(Value::as_object_mut), v.as_object()) {
-                ("faults" | "patch", Some(stored), Some(sent)) => {
+                ("faults" | "patch" | "batteries", Some(stored), Some(sent)) => {
                     for (key, value) in sent {
                         stored.insert(key.clone(), value.clone());
                     }
@@ -483,6 +510,9 @@ mod tests {
         let merged = merge_control(Some(stored), json!({"faults": {"radio_drop": false, "stuck_valves": {}}, "patch": {"dac1": "kg50", "dac2": null}}));
         assert_eq!(merged["faults"], json!({"p10_inputs_swapped": true, "kg50_drift_kg_per_c": 0.2, "radio_drop": false, "stuck_valves": {}}));
         assert_eq!(merged["patch"], json!({"dac1": "kg50", "dac1_attenuation": 0.5, "dac2_attenuation": 0.25, "dac2": null}));
+        // one pack's charge leaves the others'
+        let merged = merge_control(Some(json!({"batteries": {"power": {"soc": 0.1}}})), json!({"batteries": {"gateway": {"soc": 0.02}}}));
+        assert_eq!(merged["batteries"], json!({"power": {"soc": 0.1}, "gateway": {"soc": 0.02}}));
     }
 
     #[tokio::test]
@@ -512,7 +542,8 @@ mod tests {
                         "conditions": {"ambient_c": 35.0, "wind_mps": 9.0, "wind_from_deg": 300.0,
                                        "wind_levels": [{"alt_m": 0.0, "speed_mps": 4.0, "from_deg": 300.0}, {"alt_m": 3000.0, "speed_mps": 15.0, "from_deg": 270.0}]},
                         "loads": {"kg50_kg": 10.0},
-                        "patch": {"dac1": "hvain1", "dac2": null, "dac1_attenuation": 0.5}, "igt": {"dataset": "nominal_10k"}});
+                        "patch": {"dac1": "hvain1", "dac2": null, "dac1_attenuation": 0.5}, "igt": {"dataset": "nominal_10k"},
+                        "batteries": {"gateway": {"soc": 0.02}, "power": {"soc": 1.0, "load_w": 20.0}, "valve": {}}});
         assert_eq!(validate_control(&ok).unwrap(), ok);
         for bad in [
             json!({"plant": {"qd_connected": "no"}}),
@@ -529,6 +560,11 @@ mod tests {
             json!({"patch": {"dac1": "sar1"}}),
             json!({"igt": {"dataset": "../../etc"}}),
             json!({"patch": {"dac1_attenuation": 0.0}}),
+            json!({"batteries": {"daq": {"soc": 0.5}}}),
+            json!({"batteries": {"gateway": {"soc": 1.5}}}),
+            json!({"batteries": {"gateway": {"load_w": -1.0}}}),
+            json!({"batteries": {"gateway": {"r0_ohm": 1.0}}}),
+            json!({"batteries": {"gateway": 0.5}}),
             json!([1]),
         ] {
             assert!(validate_control(&bad).is_err(), "{bad}");
