@@ -2817,7 +2817,7 @@ mod persistence_callback_tests {
                 .unwrap()
                 .map(|packet| (*name, packet))
         }).collect();
-        assert_eq!(bootstrap.len(), 8);
+        assert_eq!(bootstrap.len(), 9);
         assert!(source.get_cached_network_variable(
             crate::telemetry_schema::data_type(FLIGHT_STATE_TYPE)).unwrap().is_none(),
             "unknown-origin default must not create a managed state owner");
