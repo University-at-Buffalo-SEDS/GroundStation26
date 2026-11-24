@@ -32,7 +32,10 @@ a separate durable journal over the same paired radio allowance; see
 the dry self-test confirmation or other operational qualification.
 
 Received calibration is validated before merging and written durably before
-changing live state. Application waits for Idle, no running sequence/zero
+changing live state. Applying it is a local write: the station's calibration
+`revision` moves, so an editor that loaded before it must reload before saving
+(see `docs/frontend/api.md`, Calibration revisions). Revisions are per station
+and are not exchanged. Application waits for Idle, no running sequence/zero
 capture, and cleared sequence qualification. A physical 50 kg input change
 also waits until recording is Idle and clears old source samples. Importing
 calibration never marks a self-test or nitrogen test complete. HITL does not

@@ -623,6 +623,54 @@ Calibration documents keep legacy fields for `ch1` and `iadc`. Additional channe
 `extra_channels[channel_id]` with generic `linear`, `zero_raw`, `points`, and `fit` fields. Generic
 points use `{ "expected": number, "raw": number }`.
 
+#### Calibration revisions and reference provenance
+
+The calibration file carries `revision` (u64). `GET /api/calibration` and every
+write's reply return it. Every write of the file adds one: an editor save,
+`capture_zero`, `capture_span`, `capture_thermal_zero`, `long_zero/apply`, a
+50 kg input change (`POST /api/calibration/kg50_input`) and its periodic
+re-stamp by the input sync, the MCP3564R reference (`/mcp_vref`), the chamber
+PT setting, the automatic zero and a calibration document applied from the
+paired station. A request that changes nothing (the same input or reference
+again) and `POST /api/calibration/refit` (a stub that returns the current file)
+write nothing and leave it. A file saved before the field existed loads as
+revision 0; loading or migrating it on start-up is not a write.
+
+`POST /api/calibration` names what it was edited from:
+
+```json
+{"channel": "ch1", "calibration": { ... }, "revision": 41, "fitted_mcp_vref_v": 2.2}
+```
+
+- `revision`: the revision the editor loaded. Missing: `428 Precondition
+  Required` (a client from before revisions; it must reload). Not the
+  station's: `409` "Calibration changed on the station since it was loaded
+  (loaded revision 41, station revision 42). Nothing was saved: reload the
+  calibration and re-apply your changes."
+- `fitted_mcp_vref_v`: the MCP3564R reference (V) the points, zero, fit and
+  thermal correction were captured and fitted at, i.e. the `mcp_vref_v` of the
+  document loaded. Required for `ch1` and `kg50` (`422` when missing), ignored
+  for `iadc`. Not the station's current reference: `409` naming both values.
+  The station stamps the saved channel and thermal entry with this value; it
+  never converts the save or substitutes the current setting. A per-channel
+  `fitted_mcp_vref_v` inside `calibration` is ignored.
+- A changed reference is itself a write, so an editor that loaded before the
+  change is refused by its revision first.
+- `kg50` saves are also refused (`409`) when the 50 kg input changed.
+
+`capture_zero` and `capture_span` take the same `revision` and `mcp_vref_v`
+(the reference of the document the reading was taken against; required for
+KG1000/KG50) with the same statuses, and are refused (`409`) when their
+samples, from `capture_started_ms` or the default look-back window, began
+before the reference last changed (`mcp_vref_changed_ms`, station ms).
+`capture_thermal_zero` is refused the same way when the reference changed
+inside its settling window, and `long_zero/apply` when the capture was taken
+under another reference than the current one.
+
+Not covered: the station cannot tell whether the DAQ has applied a new
+reference yet. Its health report raises a warning while the DAQ's applied
+reference differs from the setting; do not capture while it is shown.
+
 Load-cell units (calibration `version` 2): for KG1000 (`ch1`) and the AMP2 KG50
 input, KG1000/KG50 telemetry and every calibration input value (`zero_raw`,
 `points[].raw`, `temperature_captures[].raw`, thermal `raw_per_c` and points,
