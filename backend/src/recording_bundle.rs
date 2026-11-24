@@ -147,6 +147,7 @@ pub(crate) async fn build(
     options: &Options,
     now_ms: i64,
 ) -> Result<Vec<u8>, (StatusCode, String)> {
+    let state_for_plans = state.clone();
     let router = sources(state);
     let required = |route: String| {
         let router = router.clone();
@@ -222,34 +223,13 @@ pub(crate) async fn build(
         && let Some(points) = trajectory.as_ref().and_then(|t| t["points"].as_array())
         && !points.is_empty()
     {
-        let budget = (options.tiles_max_mb.unwrap_or(DEFAULT_TILE_BUDGET_MB).min(MAX_TILE_BUDGET_MB) as usize) << 20;
-        let max_zoom = map_config.as_ref().and_then(|m| m["max_native_zoom"].as_u64()).unwrap_or(16).min(17) as u32;
-        let (mut la0, mut la1, mut lo0, mut lo1) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
-        for p in points {
-            let (Some(la), Some(lo)) = (p["latitude"].as_f64(), p["longitude"].as_f64()) else { continue };
-            (la0, la1, lo0, lo1) = (la0.min(la), la1.max(la), lo0.min(lo), lo1.max(lo));
-        }
-        let (mut used, mut count, mut complete) = (0usize, 0u64, true);
-        'zoom: for z in 10..=max_zoom {
-            let (x0, y0) = tile_of(la1, lo0, z);
-            let (x1, y1) = tile_of(la0, lo1, z);
-            for x in x0.saturating_sub(1)..=x1 + 1 {
-                for y in y0.saturating_sub(1)..=y1 + 1 {
-                    let Ok(bytes) = fetch(&router, headers, &format!("/tiles/{z}/{x}/{y}.jpg")).await else { continue };
-                    if bytes.is_empty() {
-                        continue;
-                    }
-                    if used + bytes.len() > budget {
-                        complete = false;
-                        break 'zoom;
-                    }
-                    used += bytes.len();
-                    count += 1;
-                    entries.add(&format!("tiles/{z}/{x}/{y}.jpg"), bytes, "image/jpeg");
-                }
-            }
-        }
-        tiles = json!({"included": count, "bytes": used, "budget_bytes": budget, "complete": complete});
+        let track: Vec<(f64, f64)> = points.iter().filter_map(|p| Some((p["latitude"].as_f64()?, p["longitude"].as_f64()?))).collect();
+        tiles = add_tiles(&mut entries, &router, headers, &track, map_config.as_ref(), options.tiles_max_mb).await;
+    }
+    // The station's most recent flight plans, for a predicted-vs-actual overlay offline.
+    let plans = crate::flight_plan::list(&crate::flight_plan::directory(&state_for_plans));
+    if !plans.is_empty() {
+        entries.add_json("derived/flight_plans.json", &json!({"plans": plans.into_iter().take(5).collect::<Vec<_>>()}));
     }
 
     entries.files.insert(0, ("data/telemetry.csv".to_owned(), csv, "text/csv"));
@@ -262,6 +242,99 @@ pub(crate) async fn build(
         "source": {"station_name": crate::host_power::station_name(), "recording": id},
         "mode": replay["mode"],
         "recorded_mode": context.as_ref().map(|c| c["recorded_mode"].clone()).unwrap_or(Value::Null),
+        "time_range": {"start_ms": replay["snapshot"]["start_ms"], "end_ms": replay["snapshot"]["end_ms"]},
+        "rows": rows,
+        "tiles": tiles,
+        "missing": entries.missing,
+        "entries": entries.files.iter().map(|(path, bytes, media_type)| json!({
+            "path": path, "bytes": bytes.len(), "sha256": sha256_hex(bytes), "media_type": media_type,
+        })).collect::<Vec<_>>(),
+    });
+    let mut zip = crate::flight_review::zip::Zip::new(now_ms);
+    zip.add("manifest.json", &serde_json::to_vec_pretty(&manifest).unwrap_or_default());
+    for (path, bytes, _) in &entries.files {
+        zip.add(path, bytes);
+    }
+    Ok(zip.finish())
+}
+
+/// Cached map tiles around a track, lowest zoom first, within the budget.
+async fn add_tiles(entries: &mut Entries, router: &Router, headers: &HeaderMap, track: &[(f64, f64)], map_config: Option<&Value>, max_mb: Option<u32>) -> Value {
+    let budget = (max_mb.unwrap_or(DEFAULT_TILE_BUDGET_MB).min(MAX_TILE_BUDGET_MB) as usize) << 20;
+    let max_zoom = map_config.and_then(|m| m["max_native_zoom"].as_u64()).unwrap_or(16).min(17) as u32;
+    let (mut la0, mut la1, mut lo0, mut lo1) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+    for &(la, lo) in track {
+        (la0, la1, lo0, lo1) = (la0.min(la), la1.max(la), lo0.min(lo), lo1.max(lo));
+    }
+    let (mut used, mut count, mut complete) = (0usize, 0u64, true);
+    'zoom: for z in 10..=max_zoom {
+        let (x0, y0) = tile_of(la1, lo0, z);
+        let (x1, y1) = tile_of(la0, lo1, z);
+        for x in x0.saturating_sub(1)..=x1 + 1 {
+            for y in y0.saturating_sub(1)..=y1 + 1 {
+                let Ok(bytes) = fetch(router, headers, &format!("/tiles/{z}/{x}/{y}.jpg")).await else { continue };
+                if bytes.is_empty() {
+                    continue;
+                }
+                if used + bytes.len() > budget {
+                    complete = false;
+                    break 'zoom;
+                }
+                used += bytes.len();
+                count += 1;
+                entries.add(&format!("tiles/{z}/{x}/{y}.jpg"), bytes, "image/jpeg");
+            }
+        }
+    }
+    json!({"included": count, "bytes": used, "budget_bytes": budget, "complete": complete})
+}
+
+/// A flight plan as a replay bundle (docs/flight-plans.md): the predicted
+/// trajectory as FC rows in `replay.json`, the station's configuration and
+/// geometry as for a recording, the plan itself, and tiles around its track.
+pub(crate) async fn build_plan(state: Arc<AppState>, headers: &HeaderMap, plan: &Value, now_ms: i64) -> Result<Vec<u8>, (StatusCode, String)> {
+    let router = sources(state);
+    let mut entries = Entries { files: Vec::new(), missing: Vec::new() };
+    let mut replay = crate::flight_plan::replay_document(plan);
+    let layout = entries.optional(&router, headers, "/api/layout", "config/layout.json").await;
+    // The live layout route serializes some maps in hash order: store it canonically.
+    if let Some(layout) = &layout
+        && let Some(entry) = entries.files.iter_mut().find(|(path, _, _)| path == "config/layout.json")
+    {
+        entry.1 = serde_json::to_vec_pretty(layout).unwrap_or_default();
+    }
+    let boards = entries.optional(&router, headers, "/api/boards", "config/boards.json").await;
+    let geometry = entries.optional(&router, headers, crate::vehicle_geometry::PATH, "models/vehicle_geometry.json").await;
+    entries.optional(&router, headers, "/api/diagrams", "config/diagrams.json").await;
+    let map_config = entries.optional(&router, headers, "/api/map_config", "config/map_config.json").await;
+    let trajectory = crate::flight_plan::replay_trajectory(&replay);
+    entries.add_json("derived/trajectory.json", &trajectory);
+    entries.add_json("derived/flight_plan.json", plan);
+    if let Some(layout) = &layout {
+        replay["layout"] = layout.clone();
+    }
+    if let Some(boards) = &boards {
+        replay["boards"] = boards["boards"].clone();
+    }
+    if let Some(geometry) = &geometry {
+        replay["vehicle_geometry"] = geometry.clone();
+    }
+    let track: Vec<(f64, f64)> = plan["points"].as_array().into_iter().flatten().filter_map(|p| Some((p["lat_deg"].as_f64()?, p["lon_deg"].as_f64()?))).collect();
+    let tiles = add_tiles(&mut entries, &router, headers, &track, map_config.as_ref(), None).await;
+    let csv = crate::flight_plan::replay_csv(&replay);
+    let rows = replay["samples"].as_array().map_or(0, Vec::len);
+    entries.files.insert(0, ("data/telemetry.csv".to_owned(), csv.into_bytes(), "text/csv"));
+    entries.files.insert(0, ("replay.json".to_owned(), serde_json::to_vec(&replay).unwrap_or_default(), "application/json"));
+    let manifest = json!({
+        "format": FORMAT,
+        "version": VERSION,
+        "created_ms": now_ms,
+        "generator": format!("groundstation_backend {}", env!("CARGO_PKG_VERSION")),
+        "source": {"station_name": crate::host_power::station_name(), "recording": replay["recording"], "flight_plan": plan["id"]},
+        "predicted": true,
+        "label": replay["label"],
+        "mode": "flight",
+        "recorded_mode": "normal",
         "time_range": {"start_ms": replay["snapshot"]["start_ms"], "end_ms": replay["snapshot"]["end_ms"]},
         "rows": rows,
         "tiles": tiles,

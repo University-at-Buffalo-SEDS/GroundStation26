@@ -99,6 +99,7 @@ mod igt;
 mod proximity_lock;
 mod launch_site;
 mod apogee_planner;
+mod flight_plan;
 mod valve_report_health;
 mod mission_sync;
 mod fc_command_gate;
