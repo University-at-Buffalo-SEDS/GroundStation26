@@ -5,8 +5,9 @@
 //! so. The background refresh asks each umbilical board once every two
 //! seconds in turn, so the station used to show the latch up to two seconds
 //! late. For a short window after an Abort the station now asks every present
-//! umbilical board that does not yet read Aborted at once, and again shortly
-//! after any reply that still did not show the Abort.
+//! umbilical board that has not read back Aborted at once, and again shortly
+//! after any reply that still did not show the Abort. A board's pushed Abort
+//! latch shows it Aborted sooner but is not readback, so it is still asked.
 //!
 //! BOARD_RECOVERY_REQUEST is one ordered SDK stream (one packet in flight per
 //! type, whatever the destination), so an AV-bay query waiting on the radio
@@ -123,8 +124,9 @@ impl AbortConfirmRefresh {
             return 0;
         }
         let Some(since) = self.since else { return 0 };
-        // Present boards this mode tracks that do not yet read Aborted.
-        let aborted = state.board_abort.masks().0;
+        // Present boards this mode tracks that have not read back Aborted
+        // since the press (a pushed latch shows the Abort, it is not readback).
+        let aborted = abort_read_back_since(state, since);
         let candidates = scope::mode_scope(crate::station_mode::local_mode())
             & crate::board_abort::present_mask(state)
             & !aborted;
@@ -185,7 +187,7 @@ impl AbortConfirmRefresh {
         if state.topology_router.get().is_none() {
             return 0;
         }
-        let aborted = state.board_abort.masks().0;
+        let aborted = abort_read_back_since(state, since);
         self.av_bay_owed &= scope::mode_scope(crate::station_mode::local_mode())
             & crate::board_abort::present_mask(state)
             & !aborted;
@@ -250,6 +252,25 @@ impl AbortConfirmRefresh {
         }
     }
 }
+/// Boards (BOARDS mask) whose own query readback shows the Abort, from a
+/// query sent at or after `since`.
+///
+/// Only readback ends a board's prompt Abort confirmation. A board's pushed
+/// latch (`observe_abort_push`) shows it Aborted at once but is never
+/// readback; counting it here (the station's Abort mask) dropped every board
+/// that pushed from the confirmation, so its readback waited for the next
+/// background query, which is paused while the AV bay is relayed: RF read
+/// back 16 s after a relayed Abort in every native pyro_paths run.
+fn abort_read_back_since(state: &AppState, since: Stamp) -> u8 {
+    let inner = state.board_recovery.inner.lock().unwrap();
+    inner.values.iter().enumerate().fold(0, |mask, (at, row)| {
+        let read_back = row.as_ref().is_some_and(|row| {
+            row.observed_after.checked_duration_since(since).is_some()
+                && (row.value.flags & 1 != 0 || row.value.state == Some(crate::types::FlightState::Aborted as u8))
+        });
+        if read_back { mask | (1 << at) } else { mask }
+    })
+}
 /// Whether an AV-bay BOARD_RECOVERY_REQUEST is in flight: the one ordered
 /// stream then holds every umbilical query behind it.
 pub(crate) fn av_bay_query_in_flight(router: &sedsnet::router::Router) -> bool {
@@ -293,6 +314,28 @@ mod tests {
     use super::*;
     use sedsnet::packet::Packet;
     use sedsnet::router::{Router, RouterConfig, RouterSideOptions};
+
+    /// What a query reply that shows the Abort does: the board's readback row
+    /// (for a query sent now) and its Abort.
+    fn read_back_aborted(state: &AppState, board: Board) {
+        let now = Stamp::now();
+        state.board_recovery.inner.lock().unwrap().values[index(board).unwrap()] = Some(Observation {
+            value: Readback {
+                result: 0,
+                state: Some(crate::types::FlightState::Aborted as u8),
+                flags: 0x2d,
+                nonce: 1,
+                boot: 2,
+                epoch: 3,
+                uptime: 4,
+                outputs: 0,
+                issuer: 5,
+            },
+            received: now,
+            observed_after: now,
+        });
+        state.board_abort.observe_abort(board, std::time::Instant::now(), 1);
+    }
 
     /// An AV-bay head that starts 2.5 s after the press and lives the whole
     /// delivery span (4.8 s) retires at 7.3 s; the umbilical queries behind
@@ -377,10 +420,10 @@ mod tests {
         // already reads Aborted.
         let old = Stamp::now() - Duration::from_millis(500);
         state.board_recovery.inner.lock().unwrap().queries[4] = Some(Query { abort_revision: 0, nonce: 7, sent: old, received: false });
-        state.board_abort.observe_abort(Board::ActuatorBoard, std::time::Instant::now(), 1);
         let mut confirm = AbortConfirmRefresh::default();
         assert_eq!(confirm.poll(&state), 0, "no Abort, no prompt queries");
         confirm.start();
+        read_back_aborted(&state, Board::ActuatorBoard);
         assert!(confirm.active());
         assert_eq!(confirm.poll(&state), 0b111_0000, "VB, GB and DAQ at once; AB already reads Aborted; no AV-bay board");
         {
@@ -395,7 +438,7 @@ mod tests {
         assert_eq!(confirm.poll(&state), 0, "one prompt query per board in flight");
         assert!(confirm.active(), "readback still owed: AV-bay background queries stay held");
         for board in [Board::ValveBoard, Board::GatewayBoard, Board::DaqBoard] {
-            state.board_abort.observe_abort(board, std::time::Instant::now(), 2);
+            read_back_aborted(&state, board);
         }
         assert_eq!(confirm.poll(&state), 0);
         assert!(!confirm.active(), "every umbilical board reads Aborted: the window closes early");
@@ -430,7 +473,7 @@ mod tests {
         if scope::mode_scope(crate::station_mode::local_mode()) & 0b111 == 0 {
             // Test fire tracks no AV bay: nothing is owed there.
             for board in [Board::ActuatorBoard, Board::ValveBoard, Board::GatewayBoard, Board::DaqBoard] {
-                state.board_abort.observe_abort(board, std::time::Instant::now(), 1);
+                read_back_aborted(&state, board);
             }
             let _ = confirm.poll(&state);
             assert_eq!(confirm.poll_av_bay(&state), 0);
@@ -439,7 +482,7 @@ mod tests {
         }
         assert_eq!(confirm.poll(&state), 0b111_1000);
         for board in [Board::ActuatorBoard, Board::ValveBoard, Board::GatewayBoard, Board::DaqBoard] {
-            state.board_abort.observe_abort(board, std::time::Instant::now(), 1);
+            read_back_aborted(&state, board);
         }
         let _ = confirm.poll(&state);
         assert!(!confirm.active(), "umbilical readback is in");
@@ -449,7 +492,7 @@ mod tests {
         assert!(av_bay_query_in_flight(&host));
         assert_eq!(confirm.poll_av_bay(&state), 0, "one AV-bay query in flight at a time");
         // FC reads Aborted and its query is answered: PB next, then RF.
-        state.board_abort.observe_abort(Board::FlightComputer, std::time::Instant::now(), 2);
+        read_back_aborted(&state, Board::FlightComputer);
         let mut next = Vec::new();
         for board in [Board::PowerBoard, Board::RFBoard] {
             let start = std::time::Instant::now();
@@ -462,11 +505,71 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             };
             next.push(sent);
-            state.board_abort.observe_abort(board, std::time::Instant::now(), 3);
+            read_back_aborted(&state, board);
         }
         assert_eq!(next, [0b100, 0b001], "PB, then RF");
         assert_eq!(confirm.poll_av_bay(&state), 0);
         assert!(!confirm.av_bay_active(), "every AV-bay board reads Aborted");
+    }
+
+    /// Native pyro_paths (SEDSnet 7.0.0 and 7.0.1, every run): RF, FC and PB
+    /// push their Abort latch within a second of a relayed Abort, which shows
+    /// them Aborted. Counting that as readback dropped them from the
+    /// confirmation, so RF (asked last) was never asked and read back only
+    /// 16 s later. A pushed latch shows the Abort; only readback ends a board's
+    /// confirmation.
+    #[tokio::test]
+    async fn a_pushed_abort_latch_still_gets_its_readback_query() {
+        let fixture = crate::board_recovery::tests::http_fixture().await;
+        let state = fixture.state.clone();
+        if scope::mode_scope(crate::station_mode::local_mode()) & 0b111 == 0 {
+            return; // test fire tracks no AV bay
+        }
+        let host = Arc::new(Router::new(RouterConfig::new([]).with_sender("GS")));
+        assert!(state.topology_router.set(host.clone()).is_ok());
+        let opts = RouterSideOptions { reliable_enabled: true, ..Default::default() };
+        let radio = host.add_side_packed_with_options("rocket_comms", |_| Ok(()), opts.clone());
+        let umbilical = host.add_side_packed_with_options("umbilical_comms", |_| Ok(()), opts);
+        for board in BOARDS {
+            let side = if UMBILICAL.contains(&index(board).unwrap()) { umbilical } else { radio };
+            let announce = sedsnet::discovery::build_discovery_announce(
+                board.sender_id(), 1, &[crate::telemetry_schema::endpoint(endpoint(board))]).unwrap();
+            host.rx_from_side(&announce, side).unwrap();
+            state.board_status.lock().unwrap().get_mut(&board).unwrap().last_seen_instant = Some(std::time::Instant::now());
+        }
+        let mut service = crate::telemetry_task::RouterServiceForTest::default();
+        service.pump(&host);
+        let mut confirm = AbortConfirmRefresh::default();
+        confirm.start();
+        // Every board pushes its latch: all are shown Aborted, none has read back.
+        for board in BOARDS {
+            state.board_abort.observe_abort(board, std::time::Instant::now(), 1);
+        }
+        assert_eq!(state.board_abort.masks().0, 0b111_1111, "every board is shown Aborted");
+        assert_eq!(confirm.poll(&state), 0b111_1000, "the umbilical boards are still asked for readback");
+        for board in [Board::ActuatorBoard, Board::ValveBoard, Board::GatewayBoard, Board::DaqBoard] {
+            read_back_aborted(&state, board);
+        }
+        let _ = confirm.poll(&state);
+        assert!(!confirm.active(), "umbilical readback is in");
+        assert!(confirm.av_bay_active(), "the AV bay still owes readback although it is shown Aborted");
+        let mut asked = Vec::new();
+        for board in [Board::FlightComputer, Board::PowerBoard, Board::RFBoard] {
+            let start = std::time::Instant::now();
+            let sent = loop {
+                service.pump(&host);
+                let sent = confirm.poll_av_bay(&state);
+                if sent != 0 || start.elapsed() > Duration::from_secs(10) {
+                    break sent;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            asked.push(sent);
+            read_back_aborted(&state, board);
+        }
+        assert_eq!(asked, [0b010, 0b100, 0b001], "FC, PB, then RF");
+        assert_eq!(confirm.poll_av_bay(&state), 0);
+        assert!(!confirm.av_bay_active(), "every AV-bay board has read back Aborted");
     }
 
     /// Review of 925b07a: a silent FC (unreachable over the relay) comes due
@@ -544,11 +647,11 @@ mod tests {
             &[crate::telemetry_schema::endpoint(endpoint(Board::RFBoard))], "GS", 1, Arc::from(&[0u8; 32][..])).unwrap()).unwrap();
         service.pump(&host);
         assert!(av_bay_query_in_flight(&host), "the background RF query is in flight");
-        for board in [Board::ActuatorBoard, Board::ValveBoard, Board::GatewayBoard, Board::DaqBoard] {
-            state.board_abort.observe_abort(board, std::time::Instant::now(), 1);
-        }
         let mut confirm = AbortConfirmRefresh::default();
         confirm.start();
+        for board in [Board::ActuatorBoard, Board::ValveBoard, Board::GatewayBoard, Board::DaqBoard] {
+            read_back_aborted(&state, board);
+        }
         let _ = confirm.poll(&state);
         confirm.backdate(AV_BAY_EARLY);
         assert_eq!(confirm.poll_av_bay(&state), 0b010, "FC is asked although RF's background query is in flight");
@@ -573,13 +676,13 @@ mod tests {
                 board.sender_id(), 1, &[crate::telemetry_schema::endpoint(endpoint(board))]).unwrap();
             host.rx_from_side(&announce, side).unwrap();
         }
-        for board in [Board::ActuatorBoard, Board::ValveBoard, Board::GatewayBoard, Board::DaqBoard] {
-            state.board_abort.observe_abort(board, std::time::Instant::now(), 1);
-        }
         let mut service = crate::telemetry_task::RouterServiceForTest::default();
         service.pump(&host);
         let mut confirm = AbortConfirmRefresh::default();
         confirm.start();
+        for board in [Board::ActuatorBoard, Board::ValveBoard, Board::GatewayBoard, Board::DaqBoard] {
+            read_back_aborted(&state, board);
+        }
         if scope::mode_scope(crate::station_mode::local_mode()) & 0b111 == 0 {
             let _ = confirm.poll(&state);
             assert_eq!(confirm.poll_av_bay(&state), 0, "test fire tracks no AV bay");
