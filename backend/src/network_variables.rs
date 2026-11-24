@@ -1019,6 +1019,14 @@ pub fn set_flight_state(router: &Router, state: u8) -> Result<()> {
     set_flight_state_at(router, state, control_stamp(router)?)
 }
 
+/// A write stamped like an ordinary control (`system_clock::control_packet_stamp`):
+/// network UTC with its epoch once established, else the station's wall
+/// clock. Testing's Startup declaration uses it: Testing establishes no network
+/// time of its own, so `set_flight_state` (network UTC required) never ran there.
+pub(crate) fn set_flight_state_control_stamped(router: &Router, state: u8) -> Result<()> {
+    set_flight_state_at(router, state, crate::system_clock::control_packet_stamp(router))
+}
+
 /// An RRLS in takeover writing its operator's Abort. It must not depend on
 /// network UTC (fullnet C-fix2): it is stamped like every other control
 /// (system_clock::control_packet_stamp), network UTC with its epoch when

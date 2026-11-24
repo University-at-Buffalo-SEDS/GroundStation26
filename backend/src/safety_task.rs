@@ -611,9 +611,15 @@ async fn safety_loop(
                 router.own_network_variable(crate::telemetry_schema::data_type("FLIGHT_STATE")).is_some(),
             )
         {
-            match crate::network_variables::set_flight_state(router, FlightState::Startup as u8) {
+            match crate::network_variables::set_flight_state_control_stamped(router, FlightState::Startup as u8) {
                 Ok(()) => log::info!("Testing: published the station's Startup FLIGHT_STATE for the boards"),
-                Err(err) => log::warn!("Testing: could not publish the Startup FLIGHT_STATE: {err}"),
+                // retried every pass until the network clock is set (once at boot): log it once
+                Err(err) => {
+                    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        log::info!("Testing: the Startup FLIGHT_STATE waits for network time: {err}");
+                    }
+                }
             }
         }
 
