@@ -544,10 +544,24 @@ def scenario_test_fire(st, check, result):
           rest_v=kg1000_rest, peak_v=kg1000)
     check("the rocket stays on the stand", plant.get("flight", {}).get("phase") == "pad", phase=plant.get("flight", {}).get("phase"))
     check("the motor burns out", st.wait(lambda: st.plant().get("motor", {}).get("burned_out"), 30, "burnout"))
-    burn_report(st, check, result)
+    burn_report(st, check, result, after_provisional=lambda: return_to_idle(st, check))
 
 
-def burn_report(st: Station, check, result):
+def return_to_idle(st: Station, check):
+    """After the fire the operator steps the station back to Idle (a test fire has no FC to land): that ends the
+    launch capture, and SD downloads (the DAQ launch file for the final burn report) run only in Idle."""
+    def state():
+        code, f = st.api("/flightstate")
+        return (f or {}).get("state") if code == 200 and isinstance(f, dict) else None
+    for _ in range(10):
+        if state() == "Idle":
+            break
+        st.command("RewindFlightState")
+        st.sleep(3)
+    check("the station steps back to Idle after the fire", state() == "Idle", state=state())
+
+
+def burn_report(st: Station, check, result, after_provisional=None):
     """The station's burn report (thrust, impulse): provisional from the capture of the burn, final once the DAQ's SD
     launch file is merged (the station fetches it after the burn)."""
     def report(final=False):
@@ -556,10 +570,15 @@ def burn_report(st: Station, check, result):
         if not reports:
             return None
         return reports[0] if not final or reports[0].get("status") == "final" else None
-    r = st.wait(report, 240, "burn report", poll=5)
+    def thrust_report():
+        r = report()
+        return r if r and (r.get("peak_thrust_n") or 0) > 100 else None
+    r = st.wait(thrust_report, 240, "burn report", poll=5) or report()
     check("the station computes the burn report (thrust and impulse)",
           r and (r.get("peak_thrust_n") or 0) > 100 and (r.get("total_impulse_ns") or 0) > 100,
           report={k: (r or {}).get(k) for k in ("status", "peak_thrust_n", "total_impulse_ns", "burn_time_s", "isp_s", "flags")})
+    if after_provisional:
+        after_provisional()
     final = st.wait(lambda: report(True), 600, "final burn report (DAQ SD launch file merged)", poll=10)
     code, daq = st.api("/api/sd_download")
     result["burn_report"] = final or report()
