@@ -154,6 +154,18 @@ pub(crate) mod hold {
             })
         }
     }
+    impl Held {
+        /// Ends the hold `delay` later on the tokio clock. With that clock
+        /// paused (`tokio::time::pause`, current-thread runtime) the release
+        /// lands at a fixed point of an async waiter's retry window, which is
+        /// measured on the same clock, however loaded the host is.
+        pub(crate) fn release_after_on_tokio_clock(self, delay: Duration) -> tokio::task::JoinHandle<()> {
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                drop(self);
+            })
+        }
+    }
     impl Drop for Held {
         fn drop(&mut self) {
             *self.gate.released.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;

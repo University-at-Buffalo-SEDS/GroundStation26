@@ -332,12 +332,16 @@ async fn start_fill_command_waits_out_a_held_sdk_core() {
     assert_eq!(command_allowed(&plant.state, &TelemetryCommand::StartFill), Some(false));
     assert!(command_gate_core_busy(&plant.state, &TelemetryCommand::StartFill),
         "a held core is not undelivered commands");
-    let release = held.release_after(std::time::Duration::from_millis(60));
+    // The release and the retry window share the paused tokio clock, so the
+    // release always lands inside the window, however loaded the host is.
+    tokio::time::pause();
+    let release = held.release_after_on_tokio_clock(std::time::Duration::from_millis(60));
     assert!(
         crate::web::command_allowed_waiting_out_core(&plant.state, &TelemetryCommand::StartFill).await,
         "the same press is admitted once the core is free"
     );
-    release.join().unwrap();
+    release.await.unwrap();
+    tokio::time::resume();
     assert!(handle_command(&plant.state, &TelemetryCommand::StartFill));
     plant.until(|rt| rt.engine.status.phase == Phase::Filling);
 }
