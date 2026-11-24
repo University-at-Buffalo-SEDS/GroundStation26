@@ -73,9 +73,17 @@ The landing ellipse is the 95 % (χ² 2-dof) ellipse of the sample covariance.
 The apogee mean, sd, p05 and p95 are reported with it, plus every sample's
 landing point.
 
-| Workstation (24 threads, debug build) | Release, workstation | Pi 5 estimate (4 × A76) |
+CPU cost, measured in release with `flight_plan_tests::cpu_cost` (run it with
+`cargo test --release -p groundstation_backend cpu_cost -- --ignored --nocapture`):
+
+| | Workstation (24 threads) | Pi 5 estimate (4 × A76, about 4× slower per core) |
 |---|---|---|
-| see the test log | see the CPU table in the report | ≈ 4-6 × the workstation's per-core time ÷ 4 cores |
+| one dispersion flight (0.002 s step) | 1.9 ms per core | ≈ 8 ms per core |
+| plan, no dispersion | 6 ms (scaling motor) / 10 ms (physics) | ≈ 25-40 ms |
+| plan, 50 samples (default) | 22-23 ms | ≈ 0.15 s |
+| plan, 200 samples | 54-55 ms | ≈ 0.5 s |
+| plan, 500 samples (the maximum) | — | ≈ 1.1 s |
+| LOS prediction (48 descents, one core) | 1.5 ms | ≈ 6 ms per second of prediction |
 
 ### Storage
 
@@ -187,7 +195,55 @@ cut (the last fix, phase and time since the fix) on a recording.
 
 ### Validation
 
-These numbers come from `los_predict_tests::signal_cuts_on_the_mock_flight_predict_the_landing`
-on the IGT `nominal_10k` mock flight (`tools/flight_profile`, gusts and
-parachute swing on). The table is in the test output (`--nocapture`) and the
-report.
+**Flight model.**
+
+- **Rust against Python.** The trajectory is the planner's flight model, and
+  its Rust port agrees with `flightsim.py` within 0.5 % (`reference_cases`).
+- **The nominal_10k mock flight** (`flight_plan_tests::validation_against_the_mock_flight`).
+  The flight is `tools/flight_profile` with the full Python descent (gusts and
+  swing), the same motor, and 4 m/s wind from 300°.
+  - Apogee: 3046 m against the mock's 3048 m (−0.07 %).
+  - Landing: 30 m from the mock's landing point. The drift is 1023 m @ 89.0°
+    against 1012 m @ 87.4°.
+  - Landing time: 196 s against 194 s after ignition.
+- **SWEET_V6's stored OpenRocket sims** (`tools/flight_profile/ork_sims.py`).
+  OpenRocket's apogee comes first, ours second:
+
+  | Simulation | Apogee (OR / ours) | Difference |
+  |---|---|---|
+  | TESTFIRE_NOTFULLOXTANK | 2729 / 2678 m | −2 % |
+  | IREC_STANDARDREPORT | 2112 / 2079 m | −2 % |
+  | Simulation 1 | 2799 / 2747 m | −2 % |
+  | Simulation 2 | 2780 / 2722 m | −2 % |
+  | Simulation 3 | 2902 / 2837 m | −2 % |
+  | Simulation 4 | 2076 / 2054 m | −1 % |
+
+  Peak speed and acceleration agree within 0.5 %. Ours is lower in apogee
+  because of the +10 % friction and 0.02 Cd protuberance allowance
+  (docs/apogee-planner.md).
+- **A plan against the planner.** A plan for a given fill flies exactly the
+  planner's own flight for that fill (`a_plan_flies_the_planners_models_and_stores`).
+
+**LOS prediction.** `los_predict_tests::signal_cuts_on_the_mock_flight_predict_the_landing`
+cuts the nominal_10k signal at points along the flight. It gives the error of
+the predicted landing, the 95 % landing ellipse, and the error of the predicted
+position 20 s after the cut:
+
+| Cut (s after start) | Phase | Landing error | 95 % ellipse | +20 s position error | True landing inside |
+|---|---|---|---|---|---|
+| 25 | coast (climbing) | 58 m | 1311 × 717 m | 54 m | yes |
+| 36 | coast (apogee) | 52 m | 1281 × 694 m | 64 m | yes |
+| 45 | drogue | 26 m | 1219 × 657 m | 22 m | yes |
+| 80 | drogue | 19 m | 954 × 511 m | 13 m | yes |
+| 120 | drogue | 45 m | 655 × 346 m | 7 m | yes |
+| 145 | main | 61 m | 435 × 224 m | 12 m | yes |
+| 180 | main | 31 m | 164 × 82 m | 23 m | yes |
+
+The ellipses come from the manual-weather wind σ (the planner's 2 m/s plus
+gusts, capped at 50 % of the speed), so they are deliberately wide; a forecast
+narrows them. The live test drives the state machine from the same flight: it
+goes quiet for 20 s, then a fix returns and the logged error is checked.
+
+There is no firmware-sim Normal flight recording with GPS motion on this
+workstation (the sim captures found are pad, fill and test-fire), so the mock
+flight is the dataset.
