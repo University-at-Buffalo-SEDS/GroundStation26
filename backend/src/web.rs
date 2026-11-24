@@ -3069,7 +3069,7 @@ async fn send_command_inner(
     headers: HeaderMap,
     Json(cmd): Json<TelemetryCommand>,
 ) -> (StatusCode, String) {
-    let cmd = crate::operator_phase::seal(&state,cmd);
+    let cmd = crate::operator_phase::seal_waiting(&state,cmd).await;
     let safe_manual = crate::operator_queue::safe_manual::Intent::capture(&state, &cmd);
     let recovery_origin = crate::operator_queue::manual_origin::Origin::capture(&state,&cmd);
     let fill_origin = matches!(cmd, TelemetryCommand::StartFill)
@@ -6392,8 +6392,10 @@ pub(crate) async fn handle_ws_control_text_with_source(
     let frame_name = serde_json::from_str::<serde_json::Value>(&text)
         .ok()
         .and_then(|value| value.get("cmd").and_then(|v| v.as_str()).map(str::to_owned));
-    let phase_origin = serde_json::from_str::<WsCommand>(&text).ok()
-        .map(|cmd|crate::operator_phase::seal(&state_for_recv,cmd.cmd));
+    let phase_origin = match serde_json::from_str::<WsCommand>(&text) {
+        Ok(cmd) => Some(crate::operator_phase::seal_waiting(&state_for_recv, cmd.cmd).await),
+        Err(_) => None,
+    };
     let safe_manual = phase_origin.as_ref().and_then(|cmd| crate::operator_queue::safe_manual::Intent::capture(&state_for_recv, cmd));
     let mut recovery_origin = phase_origin.as_ref().and_then(|cmd| crate::operator_queue::manual_origin::Origin::capture(&state_for_recv, cmd));
     let fill_origin = (frame_name.as_deref() == Some("StartFill"))

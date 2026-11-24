@@ -207,6 +207,46 @@ pub(crate) fn is_local(command: &TelemetryCommand) -> bool {
     matches!(command,TelemetryCommand::OperatorPhase{intent} if intent.local())
 }
 pub(crate) fn seal(state: &AppState, command: TelemetryCommand) -> TelemetryCommand {
+    match try_seal(state, command) {
+        Ok(command) => command,
+        Err(command) => seal_with(state, command, None),
+    }
+}
+/// How often, and how far apart, `seal_waiting` asks again while the phase
+/// owners are held.
+const SEAL_ATTEMPTS: u32 = 5;
+const SEAL_RETRY: Duration = Duration::from_millis(20);
+/// `seal` for a press: while another owner momentarily holds the flight
+/// state or the GSE runtime, ask again (up to 100 ms) instead of sealing the
+/// press against a placeholder. A placeholder (revision u64::MAX, or Aborted
+/// for the phase) can never validate, so the press was refused as "expired
+/// or the flight state changed" although nothing had changed (native
+/// rrls_relay: 2 of 13 State +1 presses in relay, 1 s after the previous step).
+pub(crate) async fn seal_waiting(state: &AppState, mut command: TelemetryCommand) -> TelemetryCommand {
+    for _ in 1..SEAL_ATTEMPTS {
+        match try_seal(state, command) {
+            Ok(sealed) => return sealed,
+            Err(unsealed) => command = unsealed,
+        }
+        tokio::time::sleep(SEAL_RETRY).await;
+    }
+    seal(state, command)
+}
+/// `seal`, or the command back unsealed when a phase owner is held now.
+fn try_seal(state: &AppState, command: TelemetryCommand) -> Result<TelemetryCommand, TelemetryCommand> {
+    if !(crate::runtime_mode::is_hitl()
+        && matches!(command, TelemetryCommand::AdvanceFlightState | TelemetryCommand::RewindFlightState)
+        && !crate::rrls::is_rrls())
+    {
+        return Ok(seal_with(state, command, None));
+    }
+    let Some(mode) = crate::gse::operator_phase_mode(state) else { return Err(command) };
+    let Ok(expected) = state.state.try_lock().map(|value| *value) else { return Err(command) };
+    Ok(seal_with(state, command, Some((mode, expected))))
+}
+/// `captured`: the phase mode and flight state read at the press, or None to
+/// read them now (a held owner leaves a placeholder that never validates).
+fn seal_with(state: &AppState, command: TelemetryCommand, captured: Option<((bool, u64), FlightState)>) -> TelemetryCommand {
     if crate::runtime_mode::is_hitl() {
         let forward = match command {
             TelemetryCommand::AdvanceFlightState => true,
@@ -216,14 +256,13 @@ pub(crate) fn seal(state: &AppState, command: TelemetryCommand) -> TelemetryComm
         if crate::rrls::is_rrls() {
             return command;
         }
-        let (local, revision) = crate::gse::operator_phase_mode(state).unwrap_or((true, u64::MAX));
+        let ((local, revision), expected) = captured.unwrap_or_else(|| {
+            (
+                crate::gse::operator_phase_mode(state).unwrap_or((true, u64::MAX)),
+                state.state.try_lock().ok().map(|value| *value).unwrap_or(FlightState::Aborted),
+            )
+        });
         let token = crate::operator_queue::Token::capture(state, 0);
-        let expected = state
-            .state
-            .try_lock()
-            .ok()
-            .map(|value| *value)
-            .unwrap_or(FlightState::Aborted);
         TelemetryCommand::OperatorPhase {
             intent: Intent {
                 ticket: crate::gse::operator_phase_ticket(state, token),
@@ -902,6 +941,44 @@ mod tests {
             [1]
         );
         assert!(events.try_recv().is_err());
+    }
+    /// Native rrls_relay: a State +1 pressed while another owner held the GSE
+    /// runtime (or the flight state) for a moment was sealed against a
+    /// placeholder (revision u64::MAX) that can never validate, and refused
+    /// as "expired or the flight state changed". The press now waits the hold
+    /// out and seals what the operator saw.
+    #[tokio::test]
+    async fn a_press_while_the_phase_owner_is_held_seals_once_it_is_free() {
+        crate::mode_suite!(Hitl);
+        let fixture = crate::actuator_plumbing::http_tests::Fixture::new().await;
+        let state = fixture.state.clone();
+        let held = state.gse.lock().unwrap();
+        let TelemetryCommand::OperatorPhase { intent: placeholder } = seal(&state, TelemetryCommand::AdvanceFlightState) else {
+            panic!("sealed origin required")
+        };
+        drop(held);
+        assert!(!placeholder.validate(&state), "a press sealed against the held owner never validates");
+        let gse = state.gse.clone();
+        let release = std::thread::spawn(move || {
+            let held = gse.lock().unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            drop(held);
+        });
+        while state.gse.try_lock().is_ok() {
+            std::thread::yield_now();
+        }
+        let TelemetryCommand::OperatorPhase { intent } = seal_waiting(&state, TelemetryCommand::AdvanceFlightState).await else {
+            panic!("sealed origin required")
+        };
+        release.join().unwrap();
+        assert!(intent.validate(&state), "the press is sealed once the owner lets go");
+        assert_eq!(intent.context().0, FlightState::Idle);
+        // Anything else is sealed at once, held owner or not.
+        let held = state.gse.lock().unwrap();
+        let started = std::time::Instant::now();
+        assert!(matches!(seal_waiting(&state, TelemetryCommand::Abort).await, TelemetryCommand::Abort));
+        assert!(started.elapsed() < SEAL_RETRY, "an Abort never waits for a phase owner");
+        drop(held);
     }
     /// A held SDK core admits nothing, so the operator's phase step is offered
     /// again until the router pass ends instead of being refused outright.
