@@ -157,9 +157,15 @@ fn the_last_fix_velocity_comes_from_the_track() {
 
 /// The live state machine: packets stop in flight, the station predicts; a
 /// GPS fix comes back and the error is logged. (The module state is global, so
-/// this is the only test that drives it.)
+/// this is the only test that drives it.) It runs in its own test process:
+/// other tests reload that global state (`igt::load_persisted` points the log
+/// at their own directory, rows from any FC sender reach `observe_row`), and
+/// under host load such a reload landed mid-test and moved the log away.
 #[tokio::test]
 async fn live_loss_and_return_of_signal() {
+    if crate::operator_queue::isolated_case(module_path!(), "live_loss_and_return_of_signal") {
+        return;
+    }
     let root = crate::recording_export::tests::TestDirectory::new();
     let state = crate::recording_export::tests::export_state(&root.0, true).await;
     load(root.0.clone());
