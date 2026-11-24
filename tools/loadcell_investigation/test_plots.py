@@ -36,6 +36,15 @@ class OverRangeTests(unittest.TestCase):
         # The run before the 4 -> 100 gap stops one sample interval later; the last run likewise.
         self.assertEqual(plots.spans(x, m), [(0.0, 2.0), (4.0, 5.0), (101.0, 102.0)])
 
+    def test_mcp_vref_rescales_volts_only(self):
+        self.assertEqual(plots.mcp_v(2.4).item(), 2.4)  # default: as recorded
+        old = plots.MCP_VREF
+        try:
+            plots.MCP_VREF = 2.2
+            self.assertAlmostEqual(plots.mcp_v(3.375).item(), 3.09375)
+        finally:
+            plots.MCP_VREF = old
+
     def test_without_breaks_line(self):
         y = plots.without(np.array([1.0, 2.0, 3.0]), np.array([False, True, False]))
         self.assertTrue(np.isnan(y[1]))

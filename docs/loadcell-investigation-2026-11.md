@@ -97,6 +97,31 @@ when the cell is excited, 0.17–0.19 V on the bench.
 "VMAIN min" is the DAQ's own reading. The 10.31 V and 11.00 V minima are not real battery
 voltages: they were read while +3V3A was lifted (§2.3).
 
+### 1.1 MCP3564R reference: ≈2.2 V on this DAQ, not 2.4 V (added 2026-11-23)
+
+This DAQ's MCP3564R internal reference measures **≈2.2 V**, not the nominal 2.4 V. It
+drifted after heat during a board repair, and the board is due for repair in December. The
+firmware assumed 2.4 V, so **every MCP3564R volt in these recordings reads ≈9 % high**
+(2.4 / 2.2 = 1.091). That covers KG1000/AMP2 pin volts, the P6 KG50 input, the single-ended
+P6 legs, the chamber PT and the other HVAIN inputs, and the ADC die temperature.
+
+- **Ratiometric results are unaffected.** Codes, over range (|code| > 2²³ − 1), the kg
+  calibrations fitted on those volts, the KG50 vs (CH2 − CH3) ratio, step sensitivities, R²,
+  correlations and drift in kg are all ratios to the same code scale. None of the
+  conclusions that rest on them change.
+- **Absolute volts are ≈9 % high.** Examples: the KG1000 zero 0.209 V is ≈0.19 V at the pin,
+  the bench AMP1 bias 0.2277 V is ≈0.209 V, the P6 common mode 1.137 V is ≈1.04 V, and the
+  chamber psig (connector V × 200) was ≈9 % high. Numbers in this report are left as
+  recorded; where an absolute volt matters it is marked.
+- **VMAIN is not affected.** It is measured by the STM32 ADC1 against VDDA/VREF+ = +3V3A, not
+  against the MCP reference. The +3V3A estimates in §2.3.2 (≈4.19 V fire, ≈4.18 V 11-06)
+  are unchanged by this correction.
+- The firmware now takes the reference from a per-board GS setting (`DAQ_MCP_REFERENCE`,
+  default 2.4 V; this station 2.2 V, "measured approx., re-measure after the December
+  repair"). It is recorded in DAQ_INPUT_HEALTH word 27 and on the SD card as `mcp_vref_v`.
+- The figures keep the recorded 2.4 V scale and say so on the axis. `plots.py --mcp-vref 2.2`
+  redraws the MCP-derived volts at this board's reference.
+
 ## 2. Findings with evidence
 
 ### 2.1 KG50 was the P6 differential input in every site session
@@ -113,8 +138,8 @@ This settles several things:
 - **The sensor chain was stable across sessions.**
   - The ratio between two independent ADC paths stays within ±1 %, so the PGA and
     reference did not change.
-  - The bridge common mode stays at 1.137 ± 0.001 V, so excitation from `+VREF_BUF` is
-    stable to ~0.1 %.
+  - The bridge common mode stays at 1.137 ± 0.001 V (≈1.04 V real, §1.1), so excitation
+    from `+VREF_BUF` is stable to ~0.1 %.
   - A wiring fault that changes sensitivity (high-resistance excitation pin, open sense
     lead) would move the common mode or the ratio. Neither moved.
 - **The 12 915 calibration was a P6-volts calibration.** It is not an AMP2 raw-count one.
@@ -140,9 +165,11 @@ migration (legacy raw × 16000/921).
 
 **KG1000.** The calibration is sound for what it covers.
 
-- The zero is 0.2126 V, against an AMP1 nominal bias of 0.218 V.
+- The zero is 0.2126 V, against an AMP1 nominal bias of 0.218 V. (At the ≈2.2 V reference
+  of §1.1 the zero is ≈0.195 V at the pin.)
 - 545.8 kg/V implies 1.83 mV/V at 9.6 V excitation and 100.9× gain, which is physical for
-  a 2 mV/V cell. This also confirms the legacy-raw→volts factor k = 16000/921.
+  a 2 mV/V cell. (With the ≈2.2 V reference the volts per kg are ≈9 % lower, ≈1.68 mV/V;
+  still physical. The kg calibration itself is ratiometric and unaffected.) This also confirms the legacy-raw→volts factor k = 16000/921.
 - It covers only 10 % of the 1000 kg range and has never been checked against thrust.
 
 **KG50.** The points are inconsistent in a way electronics cannot explain.
@@ -213,9 +240,10 @@ shade their intervals (hatched, "KG1000 over range (ADC)") in every panel.
 
 #### 2.3.1 The "3.375 V" plateau is an over-range code, not a reading
 
-KG1000 sat at code **0xB40000** = +11 796 480 = 1.40625 × 2²³. On the 2.4 V scale that is
-1.40625 × 2.4 V = 3.375 V, which earlier versions of this report and its plots gave as a
-voltage. The MCP3564R datasheet (DS20006391C) says it is not one:
+KG1000 sat at code **0xB40000** = +11 796 480 = 1.40625 × 2²³, i.e. 1.40625 × full scale.
+On the assumed 2.4 V scale that is 1.40625 × 2.4 V = 3.375 V, which earlier versions of
+this report and its plots gave as a voltage. With this board's real ≈2.2 V reference
+(§1.1) the same code would be ≈3.09 V. The MCP3564R datasheet (DS20006391C) says it is not one:
 
 - **§5.6 "ADC Output Data Format"** (p. 48–49, Tables 5-7 and 5-8, Figure 5-8) and the
   CONFIG3 `DATA_FORMAT[1:0]` description (§8):
@@ -226,7 +254,8 @@ voltage. The MCP3564R datasheet (DS20006391C) says it is not one:
     [−2·VREF, +2·VREF − 1 LSb], and codes saturate at 0x0FFFFFF (+16 777 215) /
     0x1000000 (−16 777 216).
   - "The ADC accuracy is not maintained on the full extended range, but only on a smaller
-    range, which is approximately equal to ±1.05 × VREF." That is ±2.52 V here.
+    range, which is approximately equal to ±1.05 × VREF." That is ±2.31 V at the real
+    ≈2.2 V reference (±2.52 V at the nominal 2.4 V).
   - There is **no over-range status bit**. Over range is visible only as
     |code| > 2²³ − 1.
 - **§3.2**: "The differential input voltage should not exceed an absolute of ±VREF/GAIN for
@@ -235,7 +264,8 @@ voltage. The MCP3564R datasheet (DS20006391C) says it is not one:
   Absolute maximum ratings: AVDD −0.3 to 4.0 V; analog inputs −0.3 V to AVDD + 0.3 V.
 
 So 0xB40000 is neither a measurement nor the documented clip: the 25-bit clip would be
-0x0FFFFFF (≈4.8 V equivalent), and 3.375 V is far outside the ±1.05·VREF accuracy range.
+0x0FFFFFF (≈4.4 V equivalent at 2.2 V, ≈4.8 V at 2.4 V), and 1.40625 × VREF is far outside
+the ±1.05·VREF accuracy range.
 It is an **over-range (overloaded) code**.
 
 - The code is bit-exact and constant, with its low 18 bits zero, and held for seconds at
@@ -245,7 +275,18 @@ It is an **over-range (overloaded) code**.
   drop by D24 (§2.3.2).
 - The reference did not collapse. A collapsing VREF would make the codes larger, noisy and
   tracking VMAIN, not one fixed code. The internal 2.4 V bandgap is specified for AVDD
-  2.7–3.6 V.
+  2.7–3.6 V. (Its static ≈2.2 V value on this board, §1.1, is a separate, permanent offset
+  from the repair, not a collapse during the intervals.)
+**Plateau as a pin voltage: 3.09 V vs the +3V3A lift (open check).** Rescaled to the real
+reference, the plateau is ≈3.09 V. Read as a pin voltage, that fits a Schottky (D24) clamp
+to an *un-lifted* +3V3A of ≈2.9–3.3 V better than 3.375 V did. But under the lift
+hypothesis (§2.3.2) +3V3A was ≈4.2 V during those same intervals, which would put the D24
+clamp, and the MCP's own AVDD + 0.3 V input limit, well above 3.09 V. Both cannot describe
+the same instant. This supports reading the plateau as an overloaded-modulator code with no
+defined meaning (beyond ±1.05·VREF), not as a pin voltage. The alternative is that the lift
+was smaller or intermittent. The bench test (§2.3.4) settles it by scoping AMP1_OUT at the
+MCP pin, +3V3A and REFIN+ together.
+
 - On 11-06 the same plateau reads 0xB3FFFA–0xB3FFFE after the legacy float round trip,
   i.e. the same code.
 - Over range in the recordings: 2 259 of 45 300 KG1000 samples at the fire, 416 of 16 948
@@ -271,7 +312,9 @@ through ≈2.2 kΩ and 100 Ω, feeds MCP3564R CH0 and is clamped to +3V3A by Sch
 5. The MCP3564R's AVDD is +3V3A too, so its die-temperature sensor and reference-dependent
    readings move in the same intervals.
 
-**Arithmetic.** The battery voltage is known independently from the gateway (§2.3.3):
+**Arithmetic.** The battery voltage is known independently from the gateway (§2.3.3).
+VMON goes through the STM32 ADC1 against +3V3A, not through the MCP3564R, so the MCP
+reference correction (§1.1) does not change any of these numbers:
 
 | | DAQ VMAIN read (median) | Gateway battery | VMAIN / battery | Implied +3V3A = 3.3 V × battery / VMAIN |
 |---|---|---|---|---|
@@ -333,7 +376,8 @@ low" (< 3.15 V) faults. The GS warns, critical above 3.6 V.
 - **The MCP3564R moves with it.** Its die-temperature reading jumped about +5 °C in each
   interval, and KG50 (on the same ADC) showed ±0.1 mV spikes plus +0.1/+0.36 kg steps that
   persisted. Its single-ended P6 readings (CH2, CH3) read 2.2 % higher (1.139 → 1.165 V
-  median). The P6 bridge is ratiometric to the MCP reference, so this points at the ADC,
+  median, as recorded; ≈1.04 → 1.07 V at the real ≈2.2 V reference — the 2.2 % is a ratio
+  and unaffected). The P6 bridge is ratiometric to the MCP reference, so this points at the ADC,
   not the bridge.
 - **DAQ input current.** The DAQ's own input-current reading rose from 0.084 A to 0.104 A
   during the intervals (both nights). Corrected by the 0.782 VDDA factor that is ≈0.13 A,
@@ -350,7 +394,7 @@ low" (< 3.15 V) faults. The GS warns, critical above 3.6 V.
 - **Exceptions.** Over range without a VMAIN dip exists: one 2.6 s plateau run at
   T0 + 368.8 s (VMAIN 14.11 V), the 4.3 s run on 11-06 at 10.8 min (VMAIN 13.29 V), and
   most of the sub-second runs during the burn. Over range is therefore necessary but not
-  sufficient. That fits the mechanism: the MCP reports over range once AMP1_OUT passes 2.4 V, but D24
+  sufficient. That fits the mechanism: the MCP reports over range once AMP1_OUT passes VREF (≈2.2 V), but D24
   only carries significant current once AMP1_OUT exceeds +3V3A + V_F (≈3.6 V), and a
   sub-second excursion can fall between 4 Hz VMAIN samples. The bench test settles it.
 
@@ -452,7 +496,8 @@ The 0.2126 V calibrated-zero line is a constant and is not a column.
   would suggest the gap closing (valve steps ≤0.4 kg).
 - **KG1000 site vs bench zero.** The site zero (0.207–0.213 V) is 15–20 mV below the bench
   reading (0.2277 V). The bench reading is the amplifier bias with no cell, so the
-  difference is the cell's own offset, not a site effect.
+  difference is the cell's own offset, not a site effect. (All three are ≈9 % high in
+  absolute volts, §1.1; the difference is ≈14–18 mV real.)
 - **KG50 fire-night drift.** This is the largest site-only accuracy problem after
   calibration. The die temperature is not a load-cell temperature, but the box and the
   cell cooled together after dark, so the correlation is consistent with a
@@ -476,7 +521,9 @@ The 0.2126 V calibrated-zero line is a constant and is not a column.
   site sessions. Wind could still bias the *mean* through side load on a single rod, which
   noise statistics cannot see. It needs the push test in §5.
 - **The old firmware conversion.**
-  - Legacy raw × k gives the AMP1 bias exactly.
+  - Legacy raw × k gives the AMP1 bias closely (0.2277 V recorded vs 0.218 V nominal; at
+    the real ≈2.2 V reference it is ≈0.209 V, so this check fits within ≈4–5 % either way
+    and does not distinguish the two references).
   - The KG1000 sensitivity is physical.
   - P6 was volts all along.
   - No scale or sign bug was found in the old DAQ/GS logic. The KG1000 slope was constant
@@ -527,7 +574,7 @@ The 0.2126 V calibrated-zero line is a constant and is not a column.
    - Watch the logged P6 CM in future recordings.
 10. **AMP1/AMP2 headroom.**
     - AMP1's 0.218 V bias leaves only ~0.19 V (≈100 kg) below zero before the amplifier
-      floor.
+      floor. (The kg figure is ratiometric; the volts are ≈9 % high, §1.1.)
     - Fine for compression thrust, but a tension pull or the gap-closing ringing at
       ignition will clip.
     - AMP2 (P8) is not used.
@@ -711,7 +758,7 @@ Log GS recordings throughout. Each step names the hypothesis it tests. Do them i
 
 | # | Test | Pass/fail signal | Separates |
 |---|---|---|---|
-| 1 | DMM at the DAQ connector: P8/P7 pin 1→2 (9.6 V), P6 pin 1→2 (2.4 V), each signal line to DAQ GND, unloaded and with a known mass | Excitation within 1 %; signal CM ≈ excitation/2; Δsignal = mV/V × excitation × m/FS | Excitation, wiring, common mode |
+| 1 | DMM at the DAQ connector: P8/P7 pin 1→2 (9.6 V), P6 pin 1→2 (2.4 V nominal; ≈2.2 V on this board until the December repair, §1.1), each signal line to DAQ GND, unloaded and with a known mass | Excitation within 1 %; signal CM ≈ excitation/2; Δsignal = mV/V × excitation × m/FS | Excitation, wiring, common mode |
 | 2 | Same at the cell end, through the field harness | ≤10 mV excitation difference | Cable/connector resistance |
 | 3 | Wiggle each connector and cable for 30 s while logging | No step > 0.1 kg | Intermittent pins (KG1000 lead) |
 | 4 | Run the DAQ from an isolated battery, nothing else connected, then reconnect CAN, stand, VB/AB, one at a time; log VMAIN, VDDA (word 25) and the gateway battery | Any KG step on a connection, with +3V3A in 3.15–3.45 V and no over-range flag | Supply/ground loop (no longer the explanation of the VMAIN dips, §2.3.5) |

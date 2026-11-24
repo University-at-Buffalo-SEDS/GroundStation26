@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Figures for docs/loadcell-investigation-2026-11.md.
-Usage: plots.py NPZ_DIR OUT_DIR [FIGURE...]   (FIGURE: a function name below; default all)"""
+Usage: plots.py [--mcp-vref V] NPZ_DIR OUT_DIR [FIGURE...]   (FIGURE: a function name below; default all)
+--mcp-vref: the board's real MCP3564R reference for MCP-derived volts (KG1000, KG50). The
+recordings were converted with the nominal 2.4 V (the default); the fire-campaign DAQ's
+reference measures about 2.2 V, so its volts read about 9 % high. Codes, over range and
+kg calibrations are ratiometric and do not depend on it."""
 import sys, os
 import numpy as np
 import matplotlib
@@ -30,6 +34,13 @@ LEGACY_PER_CODE = 2.2104 / 2 ** 27
 OVER_RANGE_LABEL = 'KG1000 over range (ADC)'
 # Firmware of the time converted the STM32 ADC1 VMON channel assuming VDDA = +3V3A = 3.3 V.
 VDDA_ASSUMED = 3.3
+# Reference the recordings' MCP volts were converted with, and the one to plot them at.
+MCP_VREF_RECORDED = 2.4
+MCP_VREF = MCP_VREF_RECORDED
+
+def mcp_v(x):
+    """MCP-derived volts rescaled from the recorded 2.4 V reference to MCP_VREF."""
+    return np.asarray(x, float) * (MCP_VREF / MCP_VREF_RECORDED)
 
 def kg1000_code(raw):
     return np.asarray(raw, float) / LEGACY_PER_CODE
@@ -100,13 +111,14 @@ def fire_ignition(d, out):
                  f'(recording 2026-11-17 00:59:46 UTC + {FIRE_T0_OFFSET_MS / 1000:g} s)',
                  x=0.01, ha='left', fontsize=10, color=INK)
     m1 = win(t1); ov = over_range(kg1000_code(k1)); band = spans(rel(t1)[m1], ov[m1])
-    ax[0].plot(rel(t1)[m1], without(k1[m1] * K, ov[m1]), color=BLUE); ax[0].axhline(2.4, color=RED, lw=0.8, ls='--')
-    ax[0].set_ylabel('DAQ KG1000\nADC-pin V'); ax[0].text(lo_s + 0.2, 2.45, 'ADC full scale 2.4 V', color=RED, fontsize=8)
+    ax[0].plot(rel(t1)[m1], without(mcp_v(k1[m1] * K), ov[m1]), color=BLUE); ax[0].axhline(MCP_VREF, color=RED, lw=0.8, ls='--')
+    ax[0].set_ylabel(f'DAQ KG1000\nADC-pin V\n(VREF {MCP_VREF:g} V)')
+    ax[0].text(lo_s + 0.2, MCP_VREF + 0.05, f'ADC full scale = VREF = {MCP_VREF:g} V', color=RED, fontsize=8)
     ax[0].set_ylim(0, 2.9)
-    ax[0].text(lo_s + 0.2, 1.2, 'over range: code > 2^23−1 (plateau 0xB40000, the old "3.375 V"),\n'
-               'an overloaded ADC code, not a reading; not plotted', fontsize=8, color=RED)
+    ax[0].text(lo_s + 0.2, 1.2, f'over range: code > 2^23−1 (plateau 0xB40000 = 1.40625 × full scale, '
+               f'"{1.40625 * MCP_VREF:.3f} V"),\nan overloaded ADC code, not a reading; not plotted', fontsize=8, color=RED)
     t5, k5 = s(z, 'DAQ|KG50'); m5 = win(t5)
-    ax[1].plot(rel(t5)[m5], k5[m5] * 1000, color=ORANGE); ax[1].set_ylabel('DAQ KG50 (P6)\ninput mV')
+    ax[1].plot(rel(t5)[m5], mcp_v(k5[m5]) * 1000, color=ORANGE); ax[1].set_ylabel('DAQ KG50 (P6)\ninput mV')
     tp, vm = s(z, 'DAQ|DAQ_POWER_MONITOR', 2); mp = win(tp)
     ax[2].plot(rel(tp)[mp], vm[mp], color=AQUA, marker='.', ms=2, lw=0.8); ax[2].set_ylabel('DAQ VMAIN V\n(4 Hz)')
     tg, vg = s(z, 'GB|BATTERY_VOLTAGE'); mg = win(tg)
@@ -138,7 +150,7 @@ def fire_ignition(d, out):
     ax[5].text(0.2, 300, 'KG1000 back in range, VMAIN\nartifact ends / burn starts', fontsize=8, color=MUTED)
     fig.tight_layout(); fig.savefig(os.path.join(out, 'fire-20261116-ignition.png'), dpi=110); plt.close(fig)
     write_wide_csv(os.path.join(out, 'fire-20261116-ignition.csv'), T0,
-                   [('kg1000_adc_pin_v', t1[m1], k1[m1] * K), ('kg50_p6_input_mv', t5[m5], k5[m5] * 1000),
+                   [('kg1000_adc_pin_v', t1[m1], mcp_v(k1[m1] * K)), ('kg50_p6_input_mv', t5[m5], mcp_v(k5[m5]) * 1000),
                     ('vmain_v', tp[mp], vm[mp]), ('gb_battery_v', tg[mg], vg[mg]),
                     ('gb_battery_a', ti[mi], ig[mi]), ('ox_tank_psi', tf[mf], fp[mf])])
 
@@ -176,8 +188,8 @@ def kg1000_log_panels(z, title, n):
     mins = lambda t: (t - t0) / 60000.0
     ov = over_range(kg1000_code(k1)); band = spans(mins(t1), ov)
     fig, ax = panels(n, title)
-    ax[0].plot(mins(t1), without(k1 * K, ov), color=BLUE, lw=0.6); ax[0].set_ylabel('KG1000 V'); ax[0].set_yscale('log')
-    ax[0].axhline(2.4, color=RED, lw=0.8, ls='--')
+    ax[0].plot(mins(t1), without(mcp_v(k1 * K), ov), color=BLUE, lw=0.6); ax[0].set_ylabel(f'KG1000 V\n(VREF {MCP_VREF:g} V)')
+    ax[0].set_yscale('log'); ax[0].axhline(MCP_VREF, color=RED, lw=0.8, ls='--')
     tp, vm = s(z, 'DAQ|DAQ_POWER_MONITOR', 2)
     ax[1].plot(mins(tp), vm, color=AQUA, lw=0.6, label='DAQ VMAIN'); ax[1].set_ylabel('VMAIN V')
     battery_reference(ax[1], z, mins)
@@ -192,21 +204,25 @@ def fire_overview(d, out):
     """Whole 11-16 fire recording: KG1000, DAQ VMAIN, KG50 and the ADC die temperature on
     one minutes axis from the first KG1000 sample. Also writes every plotted sample to
     fire-20261116-overview.csv (wide, full resolution; see write_wide_csv): kg1000_adc_pin_v
-    (including the over-range samples the figure leaves out), vmain_v, kg50_p6_input_mv (only after 0.4 min, as plotted; the panel's y-limits 3.6-3.95 mV clip
-    a few points that are still in the CSV) and adc_die_temp_c. The dashed 0.2126 V
+    (including the over-range samples the figure leaves out), vmain_v, kg50_p6_input_mv
+    (only after 0.4 min, as plotted; the panel's y-limits 3.6-3.95 mV clip a few points
+    that are still in the CSV) and adc_die_temp_c; MCP volts at --mcp-vref, as plotted. The dashed 0.2126 V
     calibrated-zero line is a constant and not a CSV column."""
     z = load(d, '2026-11-17_00-59-46_065')
     fig, ax, mins = kg1000_log_panels(z, '2026-11-16 test fire, whole recording (28 min)', 4)
-    ax[0].axhline(0.2126, color=MUTED, lw=0.8, ls='--'); ax[0].text(20, 0.3, 'calibrated zero 0.213 V', fontsize=8, color=MUTED)
+    z0 = float(mcp_v(0.2126)); ax[0].axhline(z0, color=MUTED, lw=0.8, ls='--')
+    ax[0].text(20, 0.3, f'calibrated zero {z0:.3f} V', fontsize=8, color=MUTED)
     t5, k5 = s(z, 'DAQ|KG50'); g = mins(t5) > 0.4
-    ax[2].plot(mins(t5)[g], k5[g] * 1000, color=ORANGE, lw=0.6); ax[2].set_ylabel('KG50 input mV'); ax[2].set_ylim(3.6, 3.95)
+    ax[2].plot(mins(t5)[g], mcp_v(k5[g]) * 1000, color=ORANGE, lw=0.6); ax[2].set_ylabel('KG50 input mV')
+    ax[2].set_ylim(*mcp_v([3.6, 3.95]))
     tt, tc = s(z, 'DAQ|DAQ_ADC_TEMPERATURE')
     ax[3].plot(mins(tt), tc, color=YELLOW, lw=0.8); ax[3].set_ylabel('ADC die °C'); ax[3].set_xlabel('minutes')
     fig.tight_layout(); fig.savefig(os.path.join(out, 'fire-20261116-overview.png'), dpi=110); plt.close(fig)
     t1, k1 = s(z, 'DAQ|KG1000')
     tp, vm = s(z, 'DAQ|DAQ_POWER_MONITOR', 2)
     write_wide_csv(os.path.join(out, 'fire-20261116-overview.csv'), t1[0],
-                   [('kg1000_adc_pin_v', t1, k1 * K), ('vmain_v', tp, vm), ('kg50_p6_input_mv', t5[g], k5[g] * 1000), ('adc_die_temp_c', tt, tc)])
+                   [('kg1000_adc_pin_v', t1, mcp_v(k1 * K)), ('vmain_v', tp, vm),
+                    ('kg50_p6_input_mv', t5[g], mcp_v(k5[g]) * 1000), ('adc_die_temp_c', tt, tc)])
 
 def rail_1106(d, out):
     z = load(d, '2026-11-06_22-51-01_544')
@@ -248,10 +264,13 @@ def kg50_cross_check(d, out):
     fig.tight_layout(); fig.savefig(os.path.join(out, 'kg50-p6-cross-check.png'), dpi=110); plt.close(fig)
 
 if __name__ == '__main__':
-    d, out = sys.argv[1], sys.argv[2]
+    args = sys.argv[1:]
+    if args[:1] == ['--mcp-vref']:
+        MCP_VREF = float(args[1]); args = args[2:]
+    d, out = args[0], args[1]
     os.makedirs(out, exist_ok=True)
     figs = {'fire_ignition': lambda: fire_ignition(d, out), 'fire_overview': lambda: fire_overview(d, out),
             'rail_1106': lambda: rail_1106(d, out), 'calibration_steps': lambda: calibration_steps(out),
             'kg50_cross_check': lambda: kg50_cross_check(d, out)}
-    for name in sys.argv[3:] or figs:
+    for name in args[2:] or figs:
         figs[name]()
