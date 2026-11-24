@@ -465,10 +465,21 @@ pub(crate) async fn build(
             listed
         }).collect::<Vec<_>>(),
     });
+    if !sd_summary.is_null() {
+        manifest["sd"] = sd_summary;
+    }
+    if let Some(media) = media {
+        manifest["media"] = media;
+    }
     let mut zip = crate::flight_review::zip::Zip::new(now_ms);
     zip.add("manifest.json", &serde_json::to_vec_pretty(&manifest).unwrap_or_default());
     for entry in &entries.files {
-        zip.add(&entry.path, &entry.bytes);
+        // Recorded media is compressed already.
+        if entry.path.starts_with("media/") && entry.media_type != "application/json" {
+            zip.add_stored(&entry.path, &entry.bytes);
+        } else {
+            zip.add(&entry.path, &entry.bytes);
+        }
     }
     Ok(zip.finish())
 }
@@ -561,22 +572,10 @@ pub(crate) async fn build_plan(state: Arc<AppState>, headers: &HeaderMap, plan: 
             listed
         }).collect::<Vec<_>>(),
     });
-    if !sd_summary.is_null() {
-        manifest["sd"] = sd_summary;
-    }
-    let mut manifest = manifest;
-    if let Some(media) = media {
-        manifest["media"] = media;
-    }
     let mut zip = crate::flight_review::zip::Zip::new(now_ms);
     zip.add("manifest.json", &serde_json::to_vec_pretty(&manifest).unwrap_or_default());
     for entry in &entries.files {
-        // Recorded media is compressed already.
-        if entry.path.starts_with("media/") && entry.media_type != "application/json" {
-            zip.add_stored(&entry.path, &entry.bytes);
-        } else {
-            zip.add(&entry.path, &entry.bytes);
-        }
+        zip.add(&entry.path, &entry.bytes);
     }
     Ok(zip.finish())
 }

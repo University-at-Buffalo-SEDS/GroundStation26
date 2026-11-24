@@ -826,6 +826,7 @@ async fn review_windows(root: &Path, state: &Arc<AppState>, app: &axum::Router, 
     }
     crate::flight_review::pin_now(None);
     out.add("replay-bundle/review/requests", Value::Array(requests));
+}
 
 /// The same bundle with recorded camera segments and crew voice
 /// (`?video=1&voice=1`, `recording_bundle_media`), from synthetic files: its
