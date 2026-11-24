@@ -47,10 +47,16 @@ fn safe_segment(id: &str) -> bool {
     !id.is_empty() && id.len() <= 128 && id != "." && id != ".." && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
 }
 
+/// A query flag: `1`, `true`, `on` or `yes` (any case) is set.
+fn flag<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    let text = String::deserialize(deserializer)?;
+    Ok(matches!(text.to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct Options {
     /// Include cached map tiles around the recorded track.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "flag")]
     pub tiles: bool,
     /// Tile budget in MiB (default 8, at most 32).
     pub tiles_max_mb: Option<u32>,
@@ -67,6 +73,19 @@ pub(crate) struct Options {
     /// `false` leaves out the review inputs (`flight_review::offline`): the
     /// review and review exports of a custom window then need the station.
     pub review: Option<bool>,
+    /// Include recorded camera segments overlapping the recording (`recording_bundle_media`).
+    #[serde(default, deserialize_with = "flag")]
+    pub video: bool,
+    /// Video budget in MiB (default 32, at most 64).
+    pub video_max_mb: Option<u32>,
+    /// Include recorded crew voice overlapping the recording.
+    #[serde(default, deserialize_with = "flag")]
+    pub voice: bool,
+    /// Voice budget in MiB (default 8, at most 16).
+    pub voice_max_mb: Option<u32>,
+    /// Media directories; the station's own when `None` (tests set them).
+    #[serde(skip)]
+    pub media_dirs: Option<crate::recording_bundle_media::MediaDirs>,
 }
 
 pub(crate) fn routes() -> Router<Arc<AppState>> {
@@ -79,8 +98,17 @@ async fn download(
     Path(id): Path<String>,
     Query(options): Query<Options>,
 ) -> Response {
-    if let Err(response) = crate::web::authorize_headers(&state, &headers, Permission::ViewData).await {
-        return response;
+    let principal = match crate::web::authorize_headers(&state, &headers, Permission::ViewData).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    // Recorded media keeps the access its own pages need: camera archives
+    // are stream-manager material, crew voice is for voice participants.
+    if options.video && !principal.can_manage_stream() {
+        return (StatusCode::FORBIDDEN, "Camera video in a bundle requires stream-manager access").into_response();
+    }
+    if options.voice && !principal.permissions.allows(Permission::VoiceTransmit) {
+        return (StatusCode::FORBIDDEN, "Crew voice in a bundle requires voice permission").into_response();
     }
     if !crate::recording_export::valid_id(&id) {
         return StatusCode::BAD_REQUEST.into_response();
@@ -395,6 +423,17 @@ pub(crate) async fn build(
         }
     }
 
+    // Optional recorded camera video and crew voice overlapping the recording.
+    let media_request = crate::recording_bundle_media::Request { video: options.video, video_max_mb: options.video_max_mb, voice: options.voice, voice_max_mb: options.voice_max_mb };
+    let dirs = options.media_dirs.clone().unwrap_or_else(crate::recording_bundle_media::MediaDirs::station);
+    let media = crate::recording_bundle_media::entries(&media_request, &dirs, replay["snapshot"]["start_ms"].as_i64(), replay["snapshot"]["end_ms"].as_i64(), now_ms).await;
+    let media = media.map(|(files, summary)| {
+        for (path, bytes, media_type) in files {
+            entries.add(&path, bytes, media_type, None);
+        }
+        summary
+    });
+
     let csv_entry = Entry { path: "data/telemetry.csv".into(), bytes: csv, media_type: "text/csv", route: Some(format!("/api/recordings/{id}/csv")) };
     let replay_entry = Entry {
         path: "replay.json".into(),
@@ -525,10 +564,19 @@ pub(crate) async fn build_plan(state: Arc<AppState>, headers: &HeaderMap, plan: 
     if !sd_summary.is_null() {
         manifest["sd"] = sd_summary;
     }
+    let mut manifest = manifest;
+    if let Some(media) = media {
+        manifest["media"] = media;
+    }
     let mut zip = crate::flight_review::zip::Zip::new(now_ms);
     zip.add("manifest.json", &serde_json::to_vec_pretty(&manifest).unwrap_or_default());
     for entry in &entries.files {
-        zip.add(&entry.path, &entry.bytes);
+        // Recorded media is compressed already.
+        if entry.path.starts_with("media/") && entry.media_type != "application/json" {
+            zip.add_stored(&entry.path, &entry.bytes);
+        } else {
+            zip.add(&entry.path, &entry.bytes);
+        }
     }
     Ok(zip.finish())
 }
@@ -577,6 +625,58 @@ mod tests {
         let db_bytes = std::fs::metadata(root.0.join(id)).map(|m| m.len()).unwrap_or(0);
         println!("realistic_capture_bundle_size: {rows} rows, recording db {db_bytes} bytes, bundle {} bytes, built in {:?}", bundle.len(), started.elapsed());
         assert!(bundle.len() < 64 << 20);
+    }
+
+    #[test]
+    fn options_read_the_documented_query() {
+        let parse = |q: &str| axum::extract::Query::<Options>::try_from_uri(&format!("/x?{q}").parse().unwrap()).map(|o| o.0);
+        let o = parse("tiles=1&tiles_max_mb=4&video=1&video_max_mb=48&voice=true&voice_max_mb=2").unwrap();
+        assert!(o.tiles && o.video && o.voice);
+        assert_eq!((o.tiles_max_mb, o.video_max_mb, o.voice_max_mb), (Some(4), Some(48), Some(2)));
+        let o = parse("video=0").unwrap();
+        assert!(!o.video && !o.voice && !o.tiles && o.media_dirs.is_none());
+    }
+
+    /// Bundle sizes with recorded media for a realistic ten-minute capture:
+    /// two cameras at 2 Mbit/s in one-minute segments (about 15 MB each) and
+    /// 90 s of crew voice in 30 bursts. Run with `--ignored --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn realistic_media_bundle_size() {
+        let root = std::env::temp_dir().join(format!("gs-media-size-{}", rand::random::<u64>()));
+        let t0 = 1_767_225_600_000i64;
+        let put = |path: std::path::PathBuf, len: usize, modified: i64| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            // Incompressible, like encoded video.
+            let bytes: Vec<u8> = (0..len).map(|i| (i as u32).wrapping_mul(2_654_435_761).to_le_bytes()[3]).collect();
+            std::fs::write(&path, bytes).unwrap();
+            std::fs::File::options().write(true).open(&path).unwrap().set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(modified as u64)).unwrap();
+        };
+        for camera in ["pad", "tower"] {
+            for minute in 0..10i64 {
+                let s = (t0 + minute * 60_000) / 1000 % 86_400;
+                let name = format!("2026-01-01_{:02}-{:02}-{:02}-000000.mp4", s / 3600, s / 60 % 60, s % 60);
+                put(root.join("video").join(camera).join(name), 15_000_000, t0 + (minute + 1) * 60_000);
+            }
+        }
+        for burst in 0..30i64 {
+            let start = t0 + burst * 20_000;
+            put(root.join("voice/crew").join(format!("{start}-{}.wav", burst % 4)), 44 + 3_000 * 32, start + 3_000);
+        }
+        let dirs = crate::recording_bundle_media::MediaDirs { video: Some(root.join("video")), voice: Some(root.join("voice")) };
+        for (video_mb, voice_mb) in [(None, None), (Some(64), Some(16))] {
+            let request = crate::recording_bundle_media::Request { video: true, video_max_mb: video_mb, voice: true, voice_max_mb: voice_mb };
+            let started = std::time::Instant::now();
+            let (files, summary) = crate::recording_bundle_media::entries(&request, &dirs, Some(t0), Some(t0 + 600_000), t0 + 86_400_000).await.unwrap();
+            let mut zip = crate::flight_review::zip::Zip::new(0);
+            for (path, bytes, _) in &files {
+                zip.add_stored(path, bytes);
+            }
+            let bytes = zip.finish().len();
+            println!("realistic_media_bundle_size: caps {video_mb:?}/{voice_mb:?} MiB: video {} of {} clips, voice {} of {}, media entries {bytes} bytes, in {:?}",
+                summary["video"]["included"], summary["video"]["candidates"], summary["voice"]["included"], summary["voice"]["candidates"], started.elapsed());
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

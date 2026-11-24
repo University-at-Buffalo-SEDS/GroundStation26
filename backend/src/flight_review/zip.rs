@@ -25,10 +25,24 @@ impl Zip {
     }
 
     pub(crate) fn add(&mut self, name: &str, data: &[u8]) {
-        let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
-        let _ = encoder.write_all(data);
-        let compressed = encoder.finish().unwrap_or_default();
-        let (method, body): (u16, &[u8]) = if compressed.len() < data.len() {
+        self.add_entry(name, data, true);
+    }
+
+    /// An entry stored without compression: media that is compressed
+    /// already (MP4, Opus), where deflate only spends CPU.
+    pub(crate) fn add_stored(&mut self, name: &str, data: &[u8]) {
+        self.add_entry(name, data, false);
+    }
+
+    fn add_entry(&mut self, name: &str, data: &[u8], deflate: bool) {
+        let compressed = if deflate {
+            let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+            let _ = encoder.write_all(data);
+            encoder.finish().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let (method, body): (u16, &[u8]) = if deflate && compressed.len() < data.len() {
             (8, &compressed)
         } else {
             (0, data)

@@ -741,6 +741,7 @@ async fn replay_bundle(root: &Path, state: &Arc<AppState>, app: &axum::Router, o
     binary_fixture("replay-bundle/flight.csv", &csv);
     bundle_exports(root, state, app, id, &bundle, out).await;
     review_windows(root, state, app, out).await;
+    replay_bundle_media(state, app, &headers, id, out).await;
 }
 
 /// Custom-window motor/flight reviews and exports (`raster=false`) as the
@@ -825,6 +826,29 @@ async fn review_windows(root: &Path, state: &Arc<AppState>, app: &axum::Router, 
     }
     crate::flight_review::pin_now(None);
     out.add("replay-bundle/review/requests", Value::Array(requests));
+
+/// The same bundle with recorded camera segments and crew voice
+/// (`?video=1&voice=1`, `recording_bundle_media`), from synthetic files: its
+/// `media/index.json` and the whole bundle, which the UI opens to play the
+/// clips against the replay clock.
+async fn replay_bundle_media(state: &Arc<AppState>, app: &axum::Router, headers: &axum::http::HeaderMap, id: &str, out: &mut Fixtures) {
+    // A viewer cannot take camera archives or crew voice out in a bundle.
+    for query in ["video=1", "voice=1"] {
+        let request = Request::builder().uri(format!("/api/recordings/{id}/bundle?{query}")).header("Authorization", "Bearer viewer-token").body(Body::empty()).unwrap();
+        assert_eq!(app.clone().oneshot(request).await.unwrap().status(), StatusCode::FORBIDDEN, "{query}");
+    }
+    let media = crate::recording_bundle_media::tests::fixture(T0);
+    let options = crate::recording_bundle::Options { video: true, voice: true, media_dirs: Some(media.dirs.clone()), ..Default::default() };
+    let bundle = crate::recording_bundle::build(state.clone(), headers, id, &options, T0 + 86_400_000).await.unwrap();
+    let files: std::collections::BTreeMap<String, Vec<u8>> = crate::flight_review::zip::read(&bundle).into_iter().collect();
+    let index: Value = serde_json::from_slice(&files["media/index.json"]).unwrap();
+    assert!(index["clips"].as_array().is_some_and(|c| c.iter().any(|c| c["kind"] == "video") && c.iter().any(|c| c["kind"] == "voice")));
+    for clip in index["clips"].as_array().unwrap() {
+        assert_eq!(files[clip["path"].as_str().unwrap()].len() as u64, clip["bytes"].as_u64().unwrap());
+    }
+    assert_eq!(bundle_manifest(&bundle)["media"], json!({"video": index["video"], "voice": index["voice"]}));
+    out.add("replay-bundle/media.index", index);
+    binary_fixture("replay-bundle/media.gsreplay", &bundle);
 }
 
 /// GET with the viewer's credentials; the report worker allows one job at a

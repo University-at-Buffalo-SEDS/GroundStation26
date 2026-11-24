@@ -3,7 +3,9 @@
 Ground Station's MediaMTX configuration records every published camera stream to
 disk automatically. These are the **original encoded video/audio tracks**, remuxed
 into fragmented MP4 without transcoding. They are not uncompressed sensor frames.
-The browser voice channel is separate and is not recorded.
+The browser voice channel is separate; it is recorded only where crew voice
+recording is turned on (`crew-voice.md`, "Recording"). Replay bundles can carry
+the segments that overlap a recording (`?video=1`, `replay-bundle.md`).
 
 Each camera gets its own directory and timestamped MP4 segments, normally about
 one minute long. Segment boundaries depend on incoming keyframes. One-second

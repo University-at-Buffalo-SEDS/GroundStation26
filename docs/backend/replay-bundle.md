@@ -152,6 +152,52 @@ phase with no station.
 - `review=false` leaves out `derived/review_inputs.json` and the hybrid
   motor model (custom review windows then need the station). On by default:
   a ten-minute capture at flight rates gains about 2 MB.
+- `?video=1` adds recorded camera segments that overlap the recording;
+  `video_max_mb` sets their budget: 32 MiB by default, at most 64. It needs
+  stream-manager access, as the camera archive does (403 otherwise).
+- `?voice=1` adds recorded crew voice bursts that overlap the recording;
+  `voice_max_mb` sets their budget: 8 MiB by default, at most 16. It needs
+  the voice permission (403 otherwise).
+
+Flags accept `1`, `true`, `on` or `yes`. Before this change `?tiles=1` was
+refused: the query parser read only `true` and `false`.
+
+## Recorded media
+
+`backend/src/recording_bundle_media.rs` adds the media options:
+
+- **What it includes.** Whole files, untrimmed, whose span overlaps the
+  recording's `[start_ms, end_ms]`. Within each budget the smallest files go
+  first. Files written in the last five seconds are still being recorded and
+  are left out.
+- **Entries.** `media/video/<stream>/<file>.mp4` (the MediaMTX segment) and
+  `media/voice/<stream>/<start_ms>-<speaker>.wav`, stored without
+  compression. `media/index.json` lists every clip:
+  `{kind, stream, file, path, start_ms, end_ms, bytes, media_type, timing}`.
+- **Summary.** The index and the manifest's `media` key (present only when a
+  kind was requested) give per kind `requested`, `recorded`, `candidates`,
+  `included`, `bytes`, `budget_bytes`, `complete`, and `skipped` with a
+  reason for each file left out.
+- **Routes.** These entries carry no `route`: the UI reads them by path and
+  plays them against the replay clock. The format and the player are in the
+  UI's `docs/replay-bundle.md`, "Recorded media".
+- **Camera timing.** MediaMTX names segments
+  `%Y-%m-%d_%H-%M-%S-%f` in the receiver's local time. The station takes the
+  one quarter-hour UTC offset that puts that name less than 15 minutes
+  before the file's last write. Segments are about a minute long, so the
+  answer is unique and needs no time-zone setting. The last write is the
+  segment's end. A file whose write time does not fit (copied or touched) is
+  read as UTC and one minute long, and its `timing` says so.
+- **Voice.** Bursts come from the opt-in recorder (`crew-voice.md`,
+  "Recording"). When `GS_VOICE_RECORDINGS_DIR` is not set, `voice.recorded`
+  is false and the index notes that this station does not record voice.
+- **Sizes.** Camera video is large compared with the caps. At 2 Mbit/s a
+  one-minute segment is about 15 MB, so the 32 MiB default holds two
+  segments and the 64 MiB maximum four. Voice is 1.9 MB per minute of
+  speech. `recording_bundle::tests::realistic_media_bundle_size` measures a
+  ten-minute capture with two cameras and 30 bursts: 32.9 MB of media at the
+  defaults and 62.9 MB at the maximum. With every option at its maximum a
+  bundle stays under the 192 MiB a reader (and the import) accepts.
 
 The ZIP writer is `flight_review::zip` (deflate, no ZIP64). Bundles are
 reproducible: the same recording and time give the same bytes.
