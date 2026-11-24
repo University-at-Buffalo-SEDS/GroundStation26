@@ -262,13 +262,6 @@
       "media_type": "application/json",
       "path": "derived/review_inputs.json",
       "sha256": "e61e7d10609205018351a669fb88e97b70369737fd6bd8ee8846fa71cd7f6914"
-    },
-    {
-      "bytes": 85,
-      "media_type": "application/json",
-      "path": "derived/stations.json",
-      "route": "/api/antenna/status",
-      "sha256": "7606c466b13ec37e60c7d88d1802d39fa61813244e695a481c62bfc9aa14a41d"
     }
   ],
   "format": "gsreplay",

@@ -350,8 +350,11 @@ pub(crate) async fn build(
         }
     }
     // Ground-station and RRLS positions at export (the replay scene's
-    // station camera and masts); small, so always included when served.
-    entries.optional(&router, headers, "/api/antenna/status", "derived/stations.json").await;
+    // station camera and masts): station state like the records below, and
+    // left out with them (`records=false`).
+    if options.records != Some(false) {
+        entries.optional(&router, headers, "/api/antenna/status", "derived/stations.json").await;
+    }
     // An SD-resolved recording's receipt rows and SD sources (recording_bundle_sd).
     let mut sd_summary = Value::Null;
     if let Ok(path) = crate::recording_export::recording_path(&crate::recording_export::directory(&state), id).await

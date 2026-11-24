@@ -35,6 +35,9 @@ resource:
 - the recovery search tracks recorded from the recording's start until 6
   hours after its end, as `derived/recovery_search.json`, only when there are
   any ([recovery-search.md](recovery-search.md)).
+- the ground-station and RRLS positions at export (`GET /api/antenna/status`)
+  as `derived/stations.json`, for the replay scene's station camera and
+  masts; station state like the records below, left out with `records=false`.
 
 `GET /api/flight_plans/{id}/bundle` builds the same format for a flight plan
 (`recording_bundle::build_plan`, docs/flight-plans.md). It has
