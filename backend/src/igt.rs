@@ -1120,6 +1120,7 @@ pub(crate) fn load_persisted(state: &AppState) {
     settings::load(state, dir.clone());
     crate::launch_site::load(state, dir.clone());
     crate::apogee_planner::load(state, dir.clone());
+    crate::los_predict::load(dir.clone());
     crate::proximity_lock::load(state, dir);
 }
 

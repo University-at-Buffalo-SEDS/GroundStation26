@@ -17,6 +17,13 @@ resource:
 - the replay context, alerts and trajectory;
 - the flight review, apogee planner state, and any burn report or
   fire-archive entry that names the recording.
+- the station's five newest flight plans (`derived/flight_plans.json`, when
+  there are any), for a predicted-vs-actual overlay offline.
+
+`GET /api/flight_plans/{id}/bundle` builds the same format for a flight plan
+(`recording_bundle::build_plan`, docs/flight-plans.md). It has
+`manifest.predicted: true`, synthesized FC rows in `replay.json`, and
+`derived/flight_plan.json`.
 
 `manifest.json` lists every entry with its SHA-256 and records what the
 station could not supply.

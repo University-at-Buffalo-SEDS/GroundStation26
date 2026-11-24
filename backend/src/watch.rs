@@ -609,6 +609,8 @@ pub struct Target {
     pub stale: bool,
     pub source: String,
     pub fallback: bool,
+    /// A prediction (the loss-of-signal drift), not a fix.
+    pub predicted: bool,
 }
 
 /// Same keys as the phone's snapshot; the watch takes pages, settings and
@@ -734,6 +736,7 @@ fn targets(input: &Inputs<'_>) -> Vec<Target> {
                     fix.source.clone()
                 },
                 fallback: fix.manual,
+                predicted: false,
             })
         })
         .collect()
@@ -1006,9 +1009,24 @@ async fn get_status(
         stale_after_s: query.stale_after_s.unwrap_or(30).clamp(5, 600),
         actions,
     };
+    let mut status = build_status(&input);
+    if let Some((lat, lon, alt, age_ms)) = crate::los_predict::watch_target() {
+        status.targets.push(Target {
+            id: "rocket_predicted",
+            label: crate::los_predict::LABEL.to_string(),
+            lat,
+            lon,
+            alt_m: Some(alt),
+            age_ms,
+            stale: false,
+            source: "Prediction".into(),
+            fallback: false,
+            predicted: true,
+        });
+    }
     (
         [(axum::http::header::CACHE_CONTROL, "no-store")],
-        Json(build_status(&input)),
+        Json(status),
     )
         .into_response()
 }

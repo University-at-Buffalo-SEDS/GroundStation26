@@ -100,6 +100,7 @@ mod proximity_lock;
 mod launch_site;
 mod apogee_planner;
 mod flight_plan;
+mod los_predict;
 mod valve_report_health;
 mod mission_sync;
 mod fc_command_gate;
@@ -2571,6 +2572,8 @@ async fn main() -> anyhow::Result<()> {
     ));
     // Proximity lock: staleness, override expiry and publication.
     crate::proximity_lock::spawn_tick(state.clone());
+    // Loss-of-signal drift prediction (advisory).
+    crate::los_predict::spawn_tick(state.clone());
     let _valve_report_health = tokio::spawn(crate::valve_report_health::service(
         state.clone(),
         state.shutdown_subscribe(),

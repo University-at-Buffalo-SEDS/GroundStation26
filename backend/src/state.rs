@@ -2691,6 +2691,7 @@ impl AppState {
             crate::antenna::observe(&row);
         }
         crate::flight_maxima::observe_row(self, &row);
+        crate::los_predict::observe_row(&row);
         const CACHE_WINDOW_MS: i64 = 20 * 60 * 1000;
         const CACHE_MAX_ROWS: usize = 250_000;
 

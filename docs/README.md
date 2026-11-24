@@ -27,6 +27,8 @@ independently.
 - [Raw stream feed](backend/raw-stream-feed.md): read-only WebSocket/NDJSON feed of every
   telemetry stream for overlays and external scripts; stream viewer tokens.
 - [Replay bundles](backend/replay-bundle.md): `.gsreplay` export of one recording for replay with no station.
+- [Flight plans and loss-of-signal prediction](flight-plans.md): manual flight/burn simulations kept
+  as predicted flights, and the drift prediction that guides recovery when the rocket goes quiet.
 - [Frontend contract fixtures](backend/contract-fixtures.md): real replies the UI decodes;
   how to regenerate and run them.
 - [Station mode switch](backend/station-modes.md): switch build and simulation
