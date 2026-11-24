@@ -1,0 +1,63 @@
+{
+  "defaults": {
+    "dispersion": {
+      "samples": 50,
+      "seed": 1
+    },
+    "fill_kg": null,
+    "kind": "flight",
+    "label": null,
+    "launch": {
+      "azimuth_deg": 60.0,
+      "rail_length_m": 5.18,
+      "tilt_deg": 5.0
+    },
+    "motor_model": "physics",
+    "site": {
+      "alt_msl_m": 890.016,
+      "lat_deg": 31.758,
+      "lon_deg": -102.046
+    },
+    "supercharge_psi": 750.0,
+    "tank_temp_c": null,
+    "target_apogee_m": 3048.0,
+    "weather": {
+      "manual": {
+        "gust_mps": 1.0,
+        "surface_pressure_hpa": null,
+        "surface_temp_c": 20.0,
+        "wind_1km_from_deg": null,
+        "wind_1km_mps": null,
+        "wind_3km_from_deg": null,
+        "wind_3km_mps": null,
+        "wind_from_deg": 300.0,
+        "wind_mps": 4.0
+      },
+      "source": "planner"
+    }
+  },
+  "limits": {
+    "max_plans": 50,
+    "max_samples": 500
+  },
+  "plans": [
+    {
+      "apogee_m": 3766.5,
+      "created_by": "operator",
+      "created_ms": 1767225600000,
+      "dispersion_samples": 20,
+      "fill_kg": 8.5,
+      "id": "fp-1767225600000-7c0a141b",
+      "kind": "flight",
+      "label": "8.5 kg nominal",
+      "landing": {
+        "bearing_deg": 90.3,
+        "drift_m": 1230.5,
+        "lat_deg": 31.7579382,
+        "lon_deg": -102.0329859
+      },
+      "supercharge_psi": 750.0,
+      "warnings": 1
+    }
+  ]
+}

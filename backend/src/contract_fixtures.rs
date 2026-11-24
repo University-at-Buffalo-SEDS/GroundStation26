@@ -780,6 +780,65 @@ async fn replay_export(app: &axum::Router, out: &mut Fixtures) {
     out.add("replay-export/flight", file);
 }
 
+/// Flight plans: a computed plan as the station stores and serves it, the list
+/// (with the request defaults), the plan bundle's manifest; and the
+/// loss-of-signal prediction for a simulated cut and the idle live view.
+async fn flight_plans(state: &Arc<AppState>, app: &axum::Router, out: &mut Fixtures) {
+    use crate::flight_plan::{DispersionRequest, Request, WeatherRequest};
+    let request = Request {
+        kind: Some("flight".into()),
+        label: Some("8.5 kg nominal".into()),
+        fill_kg: Some(8.5),
+        supercharge_psi: Some(750.0),
+        tank_temp_c: Some(15.0),
+        motor_model: Some("scaling".into()),
+        weather: Some(WeatherRequest {
+            source: Some("manual".into()),
+            manual: Some(crate::apogee_planner::weather::ManualWeather { surface_temp_c: 20.0, wind_mps: 4.0, wind_from_deg: 300.0, gust_mps: 1.0, ..Default::default() }),
+        }),
+        site: Some(crate::apogee_planner::weather::Site { lat_deg: 31.758, lon_deg: -102.046, alt_msl_m: 890.0 }),
+        dispersion: Some(DispersionRequest { samples: Some(20), seed: Some(1) }),
+        ..Default::default()
+    };
+    let mut plan = crate::flight_plan::compute(state, &request, Some("operator".into()), T0).unwrap();
+    // Timings are wall-clock readings.
+    plan["compute_ms"] = json!(0.0);
+    plan["dispersion"]["compute_ms"] = json!(0.0);
+    crate::flight_plan::save(&crate::flight_plan::directory(state), &plan).unwrap();
+    let id = plan["id"].as_str().unwrap().to_string();
+    out.add("flight-plans/list", get_ok(app, "/api/flight_plans", Some("viewer")).await);
+    out.add("flight-plans/plan", get_ok(app, &format!("/api/flight_plans/{id}"), Some("viewer")).await);
+    let (status, refused) = call(app.clone(), "POST", "/api/flight_plans/run", Some("viewer"), Some(json!({}))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    out.add("flight-plans/run-forbidden", refused);
+    let headers = {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("Authorization", "Bearer viewer-token".parse().unwrap());
+        h
+    };
+    let bundle = crate::recording_bundle::build_plan(state.clone(), &headers, &plan, T0).await.unwrap();
+    out.add("flight-plans/bundle-manifest", bundle_manifest(&bundle));
+    let body = json!({
+        "last_fix": {"t_ms": T0, "lat_deg": 31.7595, "lon_deg": -102.041, "alt_msl_m": 2500.0, "ve_mps": 3.5, "vn_mps": -1.0, "vu_mps": -25.0},
+        "phase": "drogue", "elapsed_s": 12.0, "site": {"lat_deg": 31.758, "lon_deg": -102.046, "alt_msl_m": 890.0}, "samples": 16,
+    });
+    let (status, mut simulated) = call(app.clone(), "POST", "/api/los_prediction/simulate", Some("viewer"), Some(body)).await;
+    assert_eq!(status, StatusCode::OK, "{simulated}");
+    // The station position is the station GPS when one is known (process-wide): pin it to the launch site.
+    simulated["station"] = json!({"lat_deg": 31.758, "lon_deg": -102.046});
+    simulated["from_station"] = Value::Null;
+    out.add("los-prediction/simulate", simulated);
+    // The live view reads process-wide state other tests drive: record its idle shape.
+    let mut live = get_ok(app, "/api/los_prediction", Some("viewer")).await;
+    for (k, v) in [("state", json!("idle")), ("comparison", Value::Null), ("history", json!([])), ("settings", json!({"enabled": true, "timeout_s": 5.0})), ("flight_state", json!("Idle"))] {
+        live[k] = v;
+    }
+    for k in ["last_fix", "signal_lost_ms", "since_fix_s", "phase", "predicted_now", "landing", "station", "from_station", "wind_source", "overlay"] {
+        live[k] = Value::Null;
+    }
+    out.add("los-prediction/idle", live);
+}
+
 #[tokio::test]
 async fn contract_fixtures_match_the_backend() {
     let _mode = thread_mode(Mode::Normal);
@@ -804,6 +863,7 @@ async fn contract_fixtures_match_the_backend() {
     vehicle_geometry(&app, &mut out).await;
     replay_export(&app, &mut out).await;
     replay_bundle(&root.0, &state, &app, &mut out).await;
+    flight_plans(&state, &app, &mut out).await;
     drop(_mode);
     board_abort_hitl(&mut out).await;
     self_test_confirmation(&mut out).await;
