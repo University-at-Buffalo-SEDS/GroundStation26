@@ -919,6 +919,37 @@ pub(crate) fn view(state: &AppState) -> Value {
     })
 }
 
+/// A settings write applied to the stored settings: fields the client sends
+/// replace the stored ones, fields it leaves out (`motor_model`, a tank limit
+/// it shows as not set, anything a newer station adds) keep their stored
+/// values. A client that names a settings `version` other than this
+/// station's was built for another planner and is refused rather than
+/// silently migrated or downgraded.
+pub(crate) fn merge_settings(current: &Settings, patch: &Value) -> Result<Settings, (StatusCode, String)> {
+    let Some(fields) = patch.as_object() else {
+        return Err((StatusCode::BAD_REQUEST, "Invalid planner settings: expected a JSON object.".into()));
+    };
+    if let Some(version) = fields.get("version") {
+        match version.as_u64() {
+            Some(v) if v == u64::from(SETTINGS_VERSION) => {}
+            Some(v) => {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!("These planner settings are version {v}; this station's are version {SETTINGS_VERSION}. Reload the planner and save again."),
+                ));
+            }
+            None => return Err((StatusCode::BAD_REQUEST, "Invalid planner settings: version must be an integer.".into())),
+        }
+    }
+    let mut merged = serde_json::to_value(current).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if let Some(stored) = merged.as_object_mut() {
+        for (key, value) in fields {
+            stored.insert(key.clone(), value.clone());
+        }
+    }
+    serde_json::from_value(merged).map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid planner settings: {e}")))
+}
+
 pub(crate) fn update_settings(state: &AppState, principal: &AuthPrincipal, mut settings: Settings) -> Result<Value, (StatusCode, String)> {
     // An administrator's settings are current whatever version the client sent.
     settings.version = SETTINGS_VERSION;
@@ -1030,9 +1061,14 @@ async fn put_settings(State(state): State<Arc<AppState>>, headers: HeaderMap, bo
         Ok(p) => p,
         Err(r) => return r,
     };
-    let settings: Settings = match serde_json::from_slice(&body) {
-        Ok(s) => s,
+    let patch: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
         Err(e) => return error((StatusCode::BAD_REQUEST, format!("Invalid planner settings: {e}"))),
+    };
+    let current = rt(&state).inner.lock().unwrap().settings.clone();
+    let settings = match merge_settings(&current, &patch) {
+        Ok(s) => s,
+        Err(e) => return error(e),
     };
     match update_settings(&state, &p, settings) {
         Ok(v) => Json(v).into_response(),

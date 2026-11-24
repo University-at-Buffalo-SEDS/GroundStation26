@@ -770,3 +770,27 @@ fn archive_fires_become_fit_points_and_the_seed_reproduces_the_reference() {
     assert!(pts[0].mean_pressure_pa > motor::reference_mean_pressure_pa() * 1.3);
     assert_eq!(fit_points_from(Vec::new()), vec![motor::FitPoint::reference()], "empty archive: the reference fire");
 }
+
+#[test]
+fn a_settings_write_keeps_what_the_client_leaves_out_and_refuses_another_version() {
+    let current = Settings { motor_model: "scaling".into(), tank_volume_l: 14.2, min_fill_kg: 4.5, ..Default::default() };
+    // What an older UI sends: no motor_model, version or tank limits.
+    let patch = json!({"target_apogee_m": 2500.0, "display_unit": "m", "weather_source": "manual", "online_weather_enabled": false,
+        "launch_time_ms": null, "manual_weather": serde_json::to_value(&current.manual_weather).unwrap(), "tank_temp_c": null, "nominal_supercharge_psi": null});
+    let merged = merge_settings(&current, &patch).unwrap();
+    assert_eq!(merged.target_apogee_m, 2500.0);
+    assert_eq!(merged.motor_model, "scaling", "not reset to the default model");
+    assert_eq!(merged.tank_volume_l, 14.2, "a limit the client shows as not set stays the station's");
+    assert_eq!(merged.min_fill_kg, 4.5);
+    assert_eq!(merged.version, SETTINGS_VERSION);
+    // A round trip of the whole document is accepted unchanged.
+    let whole = serde_json::to_value(&current).unwrap();
+    assert_eq!(merge_settings(&current, &whole).unwrap(), current);
+    // Version 0 (or a newer one) is another planner's settings: refused, not migrated or downgraded.
+    for version in [0, SETTINGS_VERSION + 1] {
+        let mut stale = whole.clone();
+        stale["version"] = version.into();
+        assert_eq!(merge_settings(&current, &stale).unwrap_err().0, StatusCode::CONFLICT);
+    }
+    assert_eq!(merge_settings(&current, &json!([1])).unwrap_err().0, StatusCode::BAD_REQUEST);
+}
