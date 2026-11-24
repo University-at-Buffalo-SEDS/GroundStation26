@@ -376,11 +376,12 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        for _ in 0..100 {
-            if intent.pending_epoch().is_none() {
-                break;
-            }
-            tokio::task::yield_now().await;
+        // The publisher signals from inside `admit`, before its claim is
+        // accepted and dropped on the other worker: wait for that by time, not
+        // by a count of yields, which a preempted worker (host load) outlasts.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while intent.pending_epoch().is_some() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
         assert_eq!(intent.pending_epoch(), None);
         assert_eq!(calls.load(Ordering::SeqCst), 3);
