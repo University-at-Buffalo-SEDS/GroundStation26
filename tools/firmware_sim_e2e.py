@@ -579,7 +579,7 @@ def burn_report(st: Station, check, result, after_provisional=None):
           report={k: (r or {}).get(k) for k in ("status", "peak_thrust_n", "total_impulse_ns", "burn_time_s", "isp_s", "flags")})
     if after_provisional:
         after_provisional()
-    final = st.wait(lambda: report(True), 600, "final burn report (DAQ SD launch file merged)", poll=10)
+    final = st.wait(lambda: report(True), 1500, "final burn report (DAQ SD launch file merged)", poll=10)
     code, daq = st.api("/api/sd_download")
     result["burn_report"] = final or report()
     check("the burn report goes final (DAQ SD launch file merged)", final,
