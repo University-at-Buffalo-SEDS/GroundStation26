@@ -358,7 +358,7 @@ pub(crate) fn vehicle_geometry(state: &AppState) -> Option<Arc<crate::vehicle_ge
     rt(state).inner.lock().unwrap().geometry.clone()
 }
 
-fn data_dir_of(state: &AppState) -> Option<PathBuf> {
+pub(crate) fn data_dir_of(state: &AppState) -> Option<PathBuf> {
     rt(state).inner.lock().unwrap().data_dir.clone()
 }
 
@@ -430,29 +430,54 @@ fn pressure_limit(state: &AppState, settings: &Settings) -> (f64, Vec<String>) {
     (limit, sources)
 }
 
-struct Prepared {
-    physics_fit: Option<hybrid_fit::PhysicsFit>,
-    residual_active: bool,
-    input: solver::Input,
-    vehicle_source: String,
+pub(crate) struct Prepared {
+    pub(crate) physics_fit: Option<hybrid_fit::PhysicsFit>,
+    pub(crate) residual_active: bool,
+    pub(crate) input: solver::Input,
+    pub(crate) vehicle_source: String,
     fit: motor::MotorFit,
     targets: Targets,
     cd_scale: f64,
     hash: String,
     weather_age_s: f64,
     settings: Settings,
-    extra_warnings: Vec<String>,
+    pub(crate) extra_warnings: Vec<String>,
+}
+
+/// What a manual flight simulation changes in the planner's inputs: its own
+/// copy of the settings (weather, tank, motor model) and launch site.
+pub(crate) struct Overrides {
+    pub(crate) settings: Settings,
+    pub(crate) site: Option<weather::Site>,
+    /// The computation's clock (the plan's creation time).
+    pub(crate) now_ms: Option<i64>,
 }
 
 fn prepare(state: &AppState) -> Result<Prepared, (StatusCode, String)> {
-    let now = now_ms();
-    let site = site(state);
+    prepare_with(state, None)
+}
+
+/// The planner's current settings (a manual simulation passes a modified copy).
+pub(crate) fn settings_snapshot(state: &AppState) -> Settings {
+    rt(state).inner.lock().unwrap().settings.clone()
+}
+
+/// The planner's launch site.
+pub(crate) fn launch_site(state: &AppState) -> weather::Site {
+    site(state)
+}
+
+/// The planner's inputs (vehicle, weather, motor fit, limits) for the current
+/// settings or the overrides of a manual simulation.
+pub(crate) fn prepare_with(state: &AppState, overrides: Option<&Overrides>) -> Result<Prepared, (StatusCode, String)> {
+    let now = overrides.and_then(|o| o.now_ms).unwrap_or_else(now_ms);
+    let site = overrides.and_then(|o| o.site).unwrap_or_else(|| site(state));
     let fire_inputs = crate::fire_archive::fit_inputs(state);
     let points = fit_points_from(fire_inputs.clone());
     let fit = motor::MotorFit::fit(&points);
     let targets = current_targets(state);
     let inner = rt(state).inner.lock().unwrap();
-    let settings = inner.settings.clone();
+    let settings = overrides.map(|o| o.settings.clone()).unwrap_or_else(|| inner.settings.clone());
     let launch_ms = settings.launch_time_ms.unwrap_or(now);
     let mut extra = Vec::new();
     let snapshot = match settings.weather_source.as_str() {
@@ -811,6 +836,19 @@ pub(crate) fn rehearse_in_firmware_sim(state: &AppState, principal: &AuthPrincip
         format!("Apogee plan weather sent to the firmware simulation by {}: {}.", actor(principal).unwrap_or_default(), control["conditions"]),
     );
     Ok(json!({"control": control, "sim_environment": env}))
+}
+
+/// The weather the station flies now: the applied plan's, else the last plan's,
+/// else the cached forecast, else the manual entry (works offline).
+pub(crate) fn current_weather(state: &AppState) -> weather::Snapshot {
+    let inner = rt(state).inner.lock().unwrap();
+    inner
+        .applied
+        .as_ref()
+        .map(|a| a.plan.weather.clone())
+        .or_else(|| inner.last_plan.as_ref().map(|p| p.weather.clone()))
+        .or_else(|| inner.weather_cache.clone())
+        .unwrap_or_else(|| inner.settings.manual_weather.snapshot(site(state), now_ms(), now_ms()))
 }
 
 pub(crate) fn sim_environment(state: &AppState) -> Value {

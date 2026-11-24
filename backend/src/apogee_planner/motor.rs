@@ -207,6 +207,20 @@ impl std::fmt::Debug for PhysicsMotor {
 
 /// The physics motor's burn for a fill, as the flight model's motor.
 pub fn physics_motor_for_fill(cfg: &Config, pm: &PhysicsMotor, fill_kg: f64, tank_c: f64, supercharge_psig: f64, tank_volume_l: f64, impulse_factor: f64) -> FillMotor {
+    physics_burn_for_fill(cfg, pm, fill_kg, tank_c, supercharge_psig, tank_volume_l, impulse_factor).0
+}
+
+/// `physics_motor_for_fill` plus the burn it came from and the thrust factor
+/// applied to that burn (the impulse factor times the learned residual).
+pub fn physics_burn_for_fill(
+    cfg: &Config,
+    pm: &PhysicsMotor,
+    fill_kg: f64,
+    tank_c: f64,
+    supercharge_psig: f64,
+    tank_volume_l: f64,
+    impulse_factor: f64,
+) -> (FillMotor, super::hybrid::Burn, f64) {
     use super::hybrid;
     use super::hybrid_fit::ResidualModel;
     let mut p = pm.params.clone();
@@ -225,7 +239,8 @@ pub fn physics_motor_for_fill(cfg: &Config, pm: &PhysicsMotor, fill_kg: f64, tan
     motor.exit_area_m2 = std::f64::consts::PI / 4.0 * p.exit_d_m * p.exit_d_m;
     motor.pa_ref = pm.pad_pa;
     let impulse = motor.impulse;
-    FillMotor { motor, impulse_ns: impulse, sigma_rel: var.sqrt(), mean_pressure_pa: b.summary.peak_pc_pa }
+    let peak_pc = b.summary.peak_pc_pa;
+    (FillMotor { motor, impulse_ns: impulse, sigma_rel: var.sqrt(), mean_pressure_pa: peak_pc }, b, k)
 }
 
 #[cfg(test)]

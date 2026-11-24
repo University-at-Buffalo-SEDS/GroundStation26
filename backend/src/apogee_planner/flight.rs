@@ -228,6 +228,19 @@ impl WindProfile {
         }
         (e, n)
     }
+    /// The whole profile turned clockwise by `deg` (wind from `from + deg`).
+    pub fn rotated(&self, deg: f64) -> Self {
+        let mut w = self.clone();
+        w.from_deg = (w.from_deg + deg).rem_euclid(360.0);
+        let (s, c) = deg.to_radians().sin_cos();
+        for l in &mut w.levels {
+            // Wind vectors point downwind; a clockwise turn of the source turns them clockwise too.
+            let (e, n) = (l.1, l.2);
+            l.1 = e * c + n * s;
+            l.2 = -e * s + n * c;
+        }
+        w
+    }
     pub fn scaled(&self, k: f64) -> Self {
         let mut w = self.clone();
         w.surface_mps *= k;
@@ -323,6 +336,14 @@ impl Motor {
                 m.prop_kg *= k;
             }
         }
+        m
+    }
+    /// The same motor with every thrust sample times `k` (time base, propellant and nozzle unchanged).
+    pub fn thrust_scaled(&self, k: f64) -> Self {
+        let mut m = Self::new(self.t.clone(), self.f.iter().map(|x| x * k).collect(), self.prop_kg, self.exit_d, self.osc_amp, self.osc_hz);
+        m.prop_curve = self.prop_curve.clone();
+        m.exit_area_m2 = self.exit_area_m2;
+        m.pa_ref = self.pa_ref;
         m
     }
     /// Thrust axis times `a`, time axis times `b`.
@@ -537,8 +558,45 @@ enum Phase {
     Coast,
 }
 
+/// One sampled state of a traced flight: time from ignition, ENU position and
+/// velocity from the pad (m, m/s), the attitude (ENU quaternion w x y z) while
+/// it is modelled (ascent), and the flight phase.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TracePoint {
+    pub t: f64,
+    pub pos: V3,
+    pub vel: V3,
+    pub q: Option<Q>,
+    pub phase: &'static str,
+}
+
+/// What a traced flight records: a point every `ascent_every_s` up to apogee
+/// and every `descent_every_s` after it, and the events with their positions.
+#[derive(Clone, Debug, Default)]
+pub struct Trace {
+    pub ascent_every_s: f64,
+    pub descent_every_s: f64,
+    pub points: Vec<TracePoint>,
+    /// (kind, t from ignition, ENU position).
+    pub events: Vec<(&'static str, f64, V3)>,
+    /// Added to the descent's own clock for the points and events it records.
+    pub t_offset: f64,
+}
+
+impl Trace {
+    pub fn new(ascent_every_s: f64, descent_every_s: f64) -> Self {
+        Self { ascent_every_s, descent_every_s, ..Default::default() }
+    }
+}
+
 /// Flies to apogee (the Python ascent, gusts off), then the descent drift.
 pub fn fly(cfg: &Config, env: &Environment, motor: &Motor, dt: f64) -> FlightResult {
+    fly_traced(cfg, env, motor, dt, None)
+}
+
+/// `fly`, recording the trajectory into `trace` when given. The numbers are
+/// the same with or without a trace.
+pub fn fly_traced(cfg: &Config, env: &Environment, motor: &Motor, dt: f64, mut trace: Option<&mut Trace>) -> FlightResult {
     let v = &cfg.vehicle;
     let aero = Aero::new(v, &cfg.aero, motor.exit_d);
     let (site, lat, dtk, psl) = (env.site_msl_m, env.site_lat_deg, env.temp_offset_k, env.p_sl_pa);
@@ -563,7 +621,21 @@ pub fn fly(cfg: &Config, env: &Environment, motor: &Motor, dt: f64) -> FlightRes
     let mut t = 0.0_f64;
     let mut res = FlightResult::default();
     let mut step = 0u64;
+    let every = trace.as_ref().map_or(0, |tr| ((tr.ascent_every_s / dt).round() as u64).max(1));
+    if let Some(tr) = trace.as_deref_mut() {
+        tr.events.push(("ignition", 0.0, pos));
+    }
     loop {
+        if let Some(tr) = trace.as_deref_mut()
+            && step % every == 0
+        {
+            let label = match phase {
+                Phase::Pad => "pad",
+                Phase::Rail | Phase::Boost => "boost",
+                Phase::Coast => "coast",
+            };
+            tr.points.push(TracePoint { t, pos, vel, q: Some(q), phase: label });
+        }
         let h = pos[2];
         let (_, p_air, rho, a_snd, mu) = atmosphere(site + h.max(0.0), dtk, psl);
         let g = gravity(lat, site + h);
@@ -585,6 +657,9 @@ pub fn fly(cfg: &Config, env: &Environment, motor: &Motor, dt: f64) -> FlightRes
             if thrust > mass * g * rail_dir[2] * fric {
                 phase = Phase::Rail;
                 res.liftoff_s = t;
+                if let Some(tr) = trace.as_deref_mut() {
+                    tr.events.push(("liftoff", t, pos));
+                }
             }
         } else if phase == Phase::Rail {
             let cd = aero.cd(mach, rho * vmag * l / mu, thrust > 0.0);
@@ -599,6 +674,9 @@ pub fn fly(cfg: &Config, env: &Environment, motor: &Motor, dt: f64) -> FlightRes
             if s_rail >= lau.rail_length_m {
                 phase = Phase::Boost;
                 res.rail_exit_mps = sp;
+                if let Some(tr) = trace.as_deref_mut() {
+                    tr.events.push(("rail_exit", t, pos));
+                }
             }
         }
         if matches!(phase, Phase::Boost | Phase::Coast) {
@@ -606,6 +684,9 @@ pub fn fly(cfg: &Config, env: &Environment, motor: &Motor, dt: f64) -> FlightRes
             if phase == Phase::Boost && tb >= motor.burn_s() {
                 phase = Phase::Coast;
                 res.burnout_s = t;
+                if let Some(tr) = trace.as_deref_mut() {
+                    tr.events.push(("burnout", t, pos));
+                }
             }
             let vh = if vmag > 0.5 { unit(vair) } else { u };
             let re = rho * vmag.max(0.1) * l / mu;
@@ -633,6 +714,10 @@ pub fn fly(cfg: &Config, env: &Environment, motor: &Motor, dt: f64) -> FlightRes
                 res.apogee_s = t;
                 res.apogee_m = h;
                 res.apogee_en_m = (pos[0], pos[1]);
+                if let Some(tr) = trace.as_deref_mut() {
+                    tr.points.push(TracePoint { t, pos, vel, q: Some(q), phase: "coast" });
+                    tr.events.push(("apogee", t, pos));
+                }
                 break;
             }
         }
@@ -668,40 +753,151 @@ pub fn fly(cfg: &Config, env: &Environment, motor: &Motor, dt: f64) -> FlightRes
             break;
         }
     }
-    descent(cfg, env, &mut res);
+    descent(cfg, env, &mut res, trace);
     res
 }
 
-/// Terminal-velocity descent from apogee under the drogue then the main,
-/// drifting with the wind; sets the landing drift.
-fn descent(cfg: &Config, env: &Environment, res: &mut FlightResult) {
+/// Where a descent starts: ENU position (m from the pad, `h` AGL), the time
+/// (from ignition), the drogue delay still to run (None: the drogue is already
+/// out) and whether the main is already open.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DescentStart {
+    pub e: f64,
+    pub n: f64,
+    pub h: f64,
+    pub t: f64,
+    pub drogue_in_s: Option<f64>,
+    pub main_open: bool,
+}
+
+/// Descent rates and wind multipliers for one descent (1.0 = the vehicle's).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DescentScale {
+    pub drogue_rate: f64,
+    pub main_rate: f64,
+}
+
+impl Default for DescentScale {
+    fn default() -> Self {
+        Self { drogue_rate: 1.0, main_rate: 1.0 }
+    }
+}
+
+/// End of a descent: landing ENU (m), the landing time (from ignition) and the
+/// time the main opened, if it did.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DescentEnd {
+    pub e: f64,
+    pub n: f64,
+    pub t: f64,
+    pub main_s: Option<f64>,
+}
+
+/// Terminal-velocity descent under the drogue then the main, drifting with the
+/// wind. The drogue delay coasts at the start height with the wind there.
+pub fn descend(cfg: &Config, env: &Environment, start: DescentStart, scale: DescentScale, dt: f64, mut trace: Option<&mut Trace>) -> DescentEnd {
     let r = &cfg.recovery;
     let (site, dtk, psl) = (env.site_msl_m, env.temp_offset_k, env.p_sl_pa);
     let rho_ref = atmosphere(site + r.drogue_rate_ref_alt_agl_m, dtk, psl).2;
     let rho_g = atmosphere(site, dtk, psl).2;
-    let (mut e, mut n) = res.apogee_en_m;
-    let mut h = res.apogee_m;
-    let mut t = 0.0;
-    // Coasting through the drogue delay drifts with the wind too.
-    let (we, wn) = env.wind.at(h);
-    e += we * r.drogue_delay_after_apogee_s;
-    n += wn * r.drogue_delay_after_apogee_s;
-    t += r.drogue_delay_after_apogee_s;
-    let dt = 0.25;
+    let (mut e, mut n, mut h, mut t) = (start.e, start.n, start.h, start.t);
+    let mut main_open = start.main_open;
+    let mut main_s = None;
+    if let Some(delay) = start.drogue_in_s.filter(|d| *d > 0.0) {
+        let (we, wn) = env.wind.at(h);
+        if let Some(tr) = trace.as_deref_mut() {
+            let k = ((delay / tr.descent_every_s.max(1e-3)).ceil() as usize).max(1);
+            let off = tr.t_offset;
+            for i in 0..k {
+                let x = delay * i as f64 / k as f64;
+                tr.points.push(TracePoint { t: off + t + x, pos: [e + we * x, n + wn * x, h], vel: [we, wn, 0.0], q: None, phase: "coast" });
+            }
+        }
+        e += we * delay;
+        n += wn * delay;
+        t += delay;
+    }
+    if start.drogue_in_s.is_some()
+        && let Some(tr) = trace.as_deref_mut()
+    {
+        tr.events.push(("drogue", tr.t_offset + t, [e, n, h]));
+    }
+    let every = trace.as_ref().map_or(0, |tr| ((tr.descent_every_s / dt).round() as u64).max(1));
+    let mut step = 0u64;
     while h > 0.0 && t < 3600.0 {
         let rho = atmosphere(site + h, dtk, psl).2;
-        let rate = if h > r.main_deploy_alt_agl_m {
-            r.drogue_descent_mps * (rho_ref / rho).sqrt()
+        let opened = main_open || h <= r.main_deploy_alt_agl_m;
+        if opened && !main_open {
+            main_open = true;
+            main_s = Some(t);
+            if let Some(tr) = trace.as_deref_mut() {
+                tr.events.push(("main", tr.t_offset + t, [e, n, h]));
+            }
+        }
+        let rate = if !opened {
+            r.drogue_descent_mps * scale.drogue_rate * (rho_ref / rho).sqrt()
         } else {
-            r.main_descent_mps * (rho_g / rho).sqrt()
+            r.main_descent_mps * scale.main_rate * (rho_g / rho).sqrt()
         };
         let (we, wn) = env.wind.at(h);
+        if let Some(tr) = trace.as_deref_mut()
+            && step % every == 0
+        {
+            tr.points.push(TracePoint { t: tr.t_offset + t, pos: [e, n, h], vel: [we, wn, -rate], q: None, phase: if opened { "main" } else { "drogue" } });
+        }
         e += we * dt;
         n += wn * dt;
         h -= rate * dt;
         t += dt;
+        step += 1;
     }
-    res.descent_s = t;
-    res.drift_m = (e * e + n * n).sqrt();
-    res.drift_bearing_deg = e.atan2(n).to_degrees().rem_euclid(360.0);
+    if let Some(tr) = trace.as_deref_mut() {
+        tr.points.push(TracePoint { t: tr.t_offset + t, pos: [e, n, 0.0], vel: [0.0; 3], q: None, phase: "landed" });
+        tr.events.push(("landing", tr.t_offset + t, [e, n, 0.0]));
+    }
+    DescentEnd { e, n, t, main_s }
+}
+
+/// The descent from apogee; sets the landing drift.
+fn descent(cfg: &Config, env: &Environment, res: &mut FlightResult, mut trace: Option<&mut Trace>) {
+    let start = DescentStart {
+        e: res.apogee_en_m.0,
+        n: res.apogee_en_m.1,
+        h: res.apogee_m,
+        t: 0.0,
+        drogue_in_s: Some(cfg.recovery.drogue_delay_after_apogee_s),
+        main_open: false,
+    };
+    // The trace is on the flight clock; the descent's own clock starts at apogee.
+    if let Some(tr) = trace.as_deref_mut() {
+        tr.t_offset = res.apogee_s;
+    }
+    let end = descend(cfg, env, start, DescentScale::default(), 0.25, trace);
+    res.descent_s = end.t;
+    res.drift_m = (end.e * end.e + end.n * end.n).sqrt();
+    res.drift_bearing_deg = end.e.atan2(end.n).to_degrees().rem_euclid(360.0);
+}
+
+/// Unpowered point-mass coast (drag along the airflow, the vehicle's Cd build-up)
+/// from an ENU state (`pos[2]` AGL) until the vertical speed reaches zero
+/// (apogee) or `max_s` passes. Returns the state there and the time taken.
+pub fn coast_to_apogee(cfg: &Config, env: &Environment, mass: f64, pos: V3, vel: V3, dt: f64, max_s: f64) -> (V3, V3, f64) {
+    let aero = Aero::new(&cfg.vehicle, &cfg.aero, cfg.motor.nozzle_exit_diameter_m);
+    let (mut p, mut v, mut t) = (pos, vel, 0.0);
+    while v[2] > 0.0 && t < max_s {
+        let h = p[2];
+        let (_, _, rho, a_snd, mu) = atmosphere(env.site_msl_m + h.max(0.0), env.temp_offset_k, env.p_sl_pa);
+        let g = gravity(env.site_lat_deg, env.site_msl_m + h);
+        let (we, wn) = env.wind.at(h);
+        let vair = [v[0] - we, v[1] - wn, v[2]];
+        let vmag = norm(vair);
+        let cd = aero.cd(vmag / a_snd, rho * vmag.max(0.1) * aero.l / mu, false);
+        let k = 0.5 * rho * vmag * aero.aref * cd / mass;
+        for i in 0..3 {
+            v[i] += (-k * vair[i] - if i == 2 { g } else { 0.0 }) * dt;
+            p[i] += v[i] * dt;
+        }
+        t += dt;
+    }
+    (p, v, t)
 }
