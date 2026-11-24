@@ -46,6 +46,7 @@ mod client_settings;
 mod watch;
 mod raw_stream;
 mod diagrams;
+mod vehicle_geometry;
 mod command_probe;
 mod command_proxy;
 mod comms;

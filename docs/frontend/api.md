@@ -553,6 +553,20 @@ Frontend expectations:
 
 - The frontend uses this to disable or allow action buttons, not merely to decorate the UI.
 
+### `GET /api/vehicle/geometry`
+
+ViewData. The station's vehicle generated from its OpenRocket design (apogee
+planner import, `GS_VEHICLE_ORK`, else the built-in `SWEET_V6.ork`):
+`{"schema":"gs26.vehicle_geometry","version":1,"source":{…},"length_m","diameter_m",
+"span_m","profile":[[x,r]…],"sections","nose","fins","internals","tanks","recovery",
+"separations","rail_guides","motor","nozzle","parts","svg","warnings"}`, metres from the
+nose tip. `ETag` is the source hash (304 on `If-None-Match`). Clients refuse other
+schema/version values and draw a generic rocket; they cache the last good reply per
+station. Full schema and the named parts: [vehicle geometry](../vehicle-geometry.md).
+Fixture: `backend/tests/contract-fixtures/vehicle/geometry.json`. The programme reads it
+from `/api/media-assets/program/vehicle-geometry?ticket=` when the state's
+`vehicle_geometry_hash` changes; the saved-replay state carries `vehicle_geometry`.
+
 ## Optional or Feature-Specific HTTP Endpoints
 
 Telemetry rates are compile-time board settings, not managed network variables.

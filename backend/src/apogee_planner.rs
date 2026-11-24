@@ -42,6 +42,8 @@ const DIR: &str = "apogee_planner";
 const SETTINGS_FILE: &str = "settings.json";
 const WEATHER_FILE: &str = "weather_cache.json";
 const VEHICLE_FILE: &str = "vehicle_import.json";
+/// The imported `.ork` itself, kept so the drawn geometry (crate::vehicle_geometry) is regenerated at startup.
+const VEHICLE_ORK_FILE: &str = "vehicle_import.ork";
 const CALIBRATION_FILE: &str = "flight_calibration.json";
 const APPLIED_FILE: &str = "applied.json";
 const APPLIED_LOG: &str = "applied.jsonl";
@@ -280,6 +282,7 @@ struct Inner {
     settings: Settings,
     weather_cache: Option<weather::Snapshot>,
     vehicle: Option<VehicleImport>,
+    geometry: Option<Arc<crate::vehicle_geometry::Geometry>>,
     calibration: FlightCalibration,
     last_plan: Option<Plan>,
     applied: Option<Applied>,
@@ -331,10 +334,28 @@ pub(crate) fn load(state: &AppState, dir: PathBuf) {
     }
     inner.weather_cache = read_json(&dir, WEATHER_FILE);
     inner.vehicle = read_json(&dir, VEHICLE_FILE);
+    inner.geometry = inner.vehicle.as_ref().and_then(|v| imported_geometry(&dir, v.file_name.as_deref()));
     inner.calibration = read_json(&dir, CALIBRATION_FILE).unwrap_or_default();
     inner.applied = read_json(&dir, APPLIED_FILE);
     inner.fit_history = read_json(&dir, FIT_HISTORY_FILE).unwrap_or_default();
     inner.data_dir = Some(dir);
+}
+
+/// The drawn geometry of the imported `.ork` (an import from before the file was kept has none).
+fn imported_geometry(dir: &Path, file_name: Option<&str>) -> Option<Arc<crate::vehicle_geometry::Geometry>> {
+    let bytes = std::fs::read(dir.join(DIR).join(VEHICLE_ORK_FILE)).ok()?;
+    match crate::vehicle_geometry::generate(&bytes, "import", file_name.unwrap_or("vehicle.ork")) {
+        Ok(g) => Some(Arc::new(g)),
+        Err(e) => {
+            log::warn!("Apogee planner: the imported .ork's geometry could not be generated ({e}); the default design is drawn.");
+            None
+        }
+    }
+}
+
+/// The geometry of the planner's imported vehicle, if one is imported.
+pub(crate) fn vehicle_geometry(state: &AppState) -> Option<Arc<crate::vehicle_geometry::Geometry>> {
+    rt(state).inner.lock().unwrap().geometry.clone()
 }
 
 fn data_dir_of(state: &AppState) -> Option<PathBuf> {
@@ -898,14 +919,19 @@ pub(crate) fn import_ork(state: &AppState, principal: &AuthPrincipal, bytes: &[u
         return Err((StatusCode::PAYLOAD_TOO_LARGE, "The .ork file is too large.".into()));
     }
     let imported = ork::import(bytes, &flight::Config::reference().vehicle).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let geometry = crate::vehicle_geometry::generate(bytes, "import", file_name.as_deref().unwrap_or("vehicle.ork"))
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let record = VehicleImport { imported_ms: now_ms(), file_name, imported };
     {
         let mut inner = rt(state).inner.lock().unwrap();
         if let Some(dir) = inner.data_dir.clone() {
-            write_json(&dir, VEHICLE_FILE, &record)
+            let saved = std::fs::create_dir_all(dir.join(DIR)).and_then(|_| std::fs::write(dir.join(DIR).join(VEHICLE_ORK_FILE), bytes));
+            saved
+                .and_then(|_| write_json(&dir, VEHICLE_FILE, &record))
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("The vehicle was not saved: {e}")))?;
         }
         inner.vehicle = Some(record.clone());
+        inner.geometry = Some(Arc::new(geometry));
     }
     crate::web::persist_message_db_only(
         state,
@@ -928,8 +954,10 @@ pub(crate) fn clear_ork(state: &AppState, principal: &AuthPrincipal) -> Result<V
     let mut inner = rt(state).inner.lock().unwrap();
     if let Some(dir) = inner.data_dir.clone() {
         let _ = std::fs::remove_file(dir.join(DIR).join(VEHICLE_FILE));
+        let _ = std::fs::remove_file(dir.join(DIR).join(VEHICLE_ORK_FILE));
     }
     inner.vehicle = None;
+    inner.geometry = None;
     drop(inner);
     Ok(view(state))
 }

@@ -20,6 +20,8 @@ independently.
   synced to the signed-in account.
 - [Watch direct link](backend/watch-direct.md): watch tokens, the compact watch status and
   watch-eligible page actions.
+- [Vehicle geometry](vehicle-geometry.md): the airframe the dashboard draws, generated
+  from the station's OpenRocket design and served at `GET /api/vehicle/geometry`.
 - [Live diagrams](live-diagrams.md): the declarative fill, AV-bay, network and stand
   topologies, the valve/flow rules and the programme scenes.
 - [Raw stream feed](backend/raw-stream-feed.md): read-only WebSocket/NDJSON feed of every

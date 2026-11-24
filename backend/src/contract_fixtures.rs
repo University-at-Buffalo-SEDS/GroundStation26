@@ -334,6 +334,11 @@ async fn station_modes(root: &Path, state: &Arc<AppState>, out: &mut Fixtures) {
     }
 }
 
+/// `GET /api/vehicle/geometry`: the built-in design's drawn geometry (docs/vehicle-geometry.md).
+async fn vehicle_geometry(app: &axum::Router, out: &mut Fixtures) {
+    out.add("vehicle/geometry", get_ok(app, crate::vehicle_geometry::PATH, Some("viewer")).await);
+}
+
 /// `GET /api/station_mode` (operating mode metadata).
 async fn operating_mode(app: &axum::Router, out: &mut Fixtures) {
     out.add("station-mode/status", get_ok(app, "/api/station_mode", Some("viewer")).await);
@@ -672,6 +677,7 @@ async fn contract_fixtures_match_the_backend() {
     rrls_status(&app, &mut out).await;
     auth(&app, &mut out).await;
     fc_estimator(&app, &mut out).await;
+    vehicle_geometry(&app, &mut out).await;
     drop(_mode);
     board_abort_hitl(&mut out).await;
     self_test_confirmation(&mut out).await;

@@ -120,7 +120,7 @@ impl Element {
     pub fn is_auto(&self, name: &str) -> bool {
         self.child(name).is_some_and(|c| c.text.trim().starts_with("auto"))
     }
-    fn subcomponents(&self) -> &[Element] {
+    pub(crate) fn subcomponents(&self) -> &[Element] {
         self.child("subcomponents").map(|s| s.children.as_slice()).unwrap_or(&[])
     }
 }
@@ -320,7 +320,7 @@ fn name_of(el: &Element, kind: &str) -> String {
 
 /// Axial extent of a component: its length, a packed length (mass objects,
 /// recovery devices) or a fin set's root chord.
-fn length_of(el: &Element) -> f64 {
+pub(crate) fn length_of(el: &Element) -> f64 {
     if el.name.ends_with("finset") {
         return el.num("rootchord").unwrap_or(0.0);
     }
@@ -328,7 +328,7 @@ fn length_of(el: &Element) -> f64 {
 }
 
 /// Axial start of a child component (from the nose tip).
-fn child_start(el: &Element, parent_start: f64, parent_len: f64, len: f64, after: &mut f64) -> f64 {
+pub(crate) fn child_start(el: &Element, parent_start: f64, parent_len: f64, len: f64, after: &mut f64) -> f64 {
     let (method, off) = match el.child("axialoffset").or_else(|| el.child("position")) {
         Some(p) => (
             p.attr("method").or_else(|| p.attr("type")).unwrap_or("top").to_string(),

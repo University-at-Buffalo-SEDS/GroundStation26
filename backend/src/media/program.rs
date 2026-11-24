@@ -58,6 +58,7 @@ pub(super) fn routes() -> Router<Arc<MediaState>> {
             }),
         )
         .route("/api/media-assets/program/state", get(program_state))
+        .route("/api/media-assets/program/vehicle-geometry", get(program_vehicle_geometry))
         .route("/api/media-assets/program/audio", get(program_audio))
         .route(
             "/assets/program-audio.js",
@@ -273,7 +274,23 @@ async fn program_state(
     let diagram_topology = crate::diagrams::is_scene(effective_scene)
         .then(|| crate::diagrams::scene_topology(effective_scene))
         .flatten();
-    Ok(([(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"broadcast":presentation.broadcast,"streams":streams,"server_now_ms":now,"telemetry":telemetry,"diagram_topology":diagram_topology}))).into_response())
+    // The page fetches the vehicle geometry (program_vehicle_geometry) only when this hash changes.
+    let vehicle_geometry_hash = crate::vehicle_geometry::current(&state.app).source.hash.clone();
+    Ok(([(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"broadcast":presentation.broadcast,"streams":streams,"server_now_ms":now,"telemetry":telemetry,"diagram_topology":diagram_topology,"vehicle_geometry_hash":vehicle_geometry_hash}))).into_response())
+}
+
+/// The station's vehicle geometry for the programme page (its silhouettes);
+/// the same reply as `GET /api/vehicle/geometry`, under the programme ticket.
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
+async fn program_vehicle_geometry(
+    State(state): State<Arc<MediaState>>,
+    Query(query): Query<MediaQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let headers = ticket_headers(&state, &headers, &query, "program").await?;
+    authorize(&state, &headers, Permission::ViewData).await?;
+    let geometry = crate::vehicle_geometry::current(&state.app);
+    Ok(([(header::CACHE_CONTROL, "no-cache")], Json(geometry.as_ref().clone())).into_response())
 }
 
 #[derive(Deserialize)]

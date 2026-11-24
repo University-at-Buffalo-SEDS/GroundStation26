@@ -49,6 +49,11 @@ the dashboard picks them up on the next page load. No rebuild is needed.
 }
 ```
 
+**Frames** may carry `"vehicle": {"x", "y", "w", "h", "highlight": ["avionics"]}`:
+the station's vehicle (docs/vehicle-geometry.md) drawn nose up, true to scale, centred
+in that box, with the sections of the listed roles highlighted and the separations
+marked. The stand's IGT frame and the AV-bay view's `vehicle` frame use it.
+
 **Node kinds.** `bottle`, `regulator`, `junction`, `tank`, `chamber`,
 `atmosphere`, `board`, `sensor`, `battery`, `station`, `bus`, `load_cell`,
 `pyro` and `output`.

@@ -265,7 +265,7 @@ async fn scene_state(
     let config = contract::recorded_vehicle_config(&state, &headers, &query).await?;
     let now = contract::program_now_ms();
     Ok(no_store(
-        serde_json::json!({"replay_position_ms":plan.elapsed(now),"plan":plan,"config":config,"server_now_ms":now}),
+        serde_json::json!({"replay_position_ms":plan.elapsed(now),"plan":plan,"config":config,"server_now_ms":now,"vehicle_geometry":crate::vehicle_geometry::current(&state.app).as_ref()}),
     ))
 }
 fn requested_types(config: &serde_json::Value) -> Vec<String> {

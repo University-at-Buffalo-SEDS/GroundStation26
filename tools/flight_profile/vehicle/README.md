@@ -24,3 +24,22 @@ Notes:
 Replace this file when the design changes and update `vehicle.json` from the import:
 the planner test `ork_import_reads_the_sweet_v6_design` imports this file and checks
 `vehicle.json` against it.
+
+## Drawn geometry
+
+The station also draws the vehicle from this file: `backend/src/vehicle_geometry.rs`
+generates the outer profile, sections, fins, internal tubes, recovery and separation
+points, the motor and colours, and serves them at `GET /api/vehicle/geometry`
+(docs/vehicle-geometry.md). The dashboard builds the 3D model, replay scenes and 2D
+silhouettes from that reply, so nothing in the UI is specific to this design.
+
+It is generated when the backend starts (and when an `.ork` is imported in the apogee
+planner, which then replaces this file for drawing). After replacing this file:
+
+```bash
+cargo test -p groundstation_backend vehicle_geometry      # update the key numbers in the test with the design
+GS_UPDATE_CONTRACT_FIXTURES=1 cargo test -p groundstation_backend contract_fixtures
+```
+
+then refresh the UI's copy of `backend/tests/contract-fixtures/vehicle/geometry.json`
+(`scripts/check_backend_contract_fixtures.py --update` in the UI repository).

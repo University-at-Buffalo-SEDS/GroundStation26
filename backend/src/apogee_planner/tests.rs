@@ -631,6 +631,9 @@ async fn settings_vehicle_and_calibration_persist() {
     assert!(import_ork(&r.state, &principal(false, true), ORK_XML.as_bytes(), None).is_err(), "admin only");
     let plan = compute(&r.state, None).unwrap();
     assert!(plan.vehicle_source.contains("Synthetic 6in"));
+    // The drawn geometry follows the imported design and is regenerated from the kept file at startup.
+    assert!(vehicle_geometry(&r.state).unwrap().source.rocket.contains("Synthetic 6in"));
+    assert_eq!(crate::vehicle_geometry::current(&r.state).source.kind, "import");
     let applied = apply(&r.state, &principal(false, true), &plan.id).unwrap();
     let v = calibrate_flight(&r.state, &principal(false, true), Some(applied.plan.solution.apogee_m * 0.9)).unwrap();
     let k = v["flight_calibration"]["cd_scale"].as_f64().unwrap();
@@ -641,6 +644,7 @@ async fn settings_vehicle_and_calibration_persist() {
     let inner = rt(&again).inner.lock().unwrap();
     assert!((inner.settings.target_apogee_m - 2000.0).abs() < 1e-9);
     assert_eq!(inner.vehicle.as_ref().unwrap().file_name.as_deref(), Some("synthetic.ork"));
+    assert_eq!(inner.geometry.as_ref().unwrap().source.file, "synthetic.ork");
     assert_eq!(inner.calibration.points.len(), 1);
     assert_eq!(inner.applied.as_ref().unwrap().plan.id, plan.id);
     assert!(!inner.fit_history.is_empty());

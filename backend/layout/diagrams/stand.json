@@ -15,7 +15,8 @@
   ],
   "frames": [
     { "id": "stand", "label": "Motor on the test stand", "x": 16, "y": 48, "w": 700, "h": 596 },
-    { "id": "rocket", "label": "Rocket on the ground (FC replaying: SIMULATED)", "x": 736, "y": 48, "w": 448, "h": 596, "when": "igt" }
+    { "id": "rocket", "label": "Rocket on the ground (FC replaying: SIMULATED)", "x": 736, "y": 48, "w": 448, "h": 596, "when": "igt",
+      "vehicle": { "x": 1040, "y": 76, "w": 130, "h": 556, "highlight": ["avionics"] } }
   ],
   "nodes": [
     { "id": "tank", "kind": "tank", "label": "Run tank", "x": 110, "y": 110, "w": 120, "h": 270,

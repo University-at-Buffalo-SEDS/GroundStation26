@@ -3,7 +3,7 @@
   "id": "av_bay",
   "title": "AV bay in flight",
   "description": "Flight computer, power board and RF board on the AV-bay CAN-FD bus; the RFD900x radio to the ground station and the RRLS; sensors, estimator, pyro channels, outputs and SD logging. AV-bay radio data is stale after 10 s.",
-  "view_box": [0, 0, 1200, 660],
+  "view_box": [0, 0, 1290, 660],
   "stale_ms": 10000,
   "sources": [
     "GroundStation26 docs/data-pipeline.md sections 2.6 and 2.7 (FC 5 Hz, RF and PB 1 Hz)",
@@ -13,7 +13,9 @@
   ],
   "frames": [
     { "id": "bay", "label": "AV bay", "x": 16, "y": 48, "w": 768, "h": 596 },
-    { "id": "ground", "label": "Ground", "x": 804, "y": 48, "w": 380, "h": 596 }
+    { "id": "ground", "label": "Ground", "x": 804, "y": 48, "w": 380, "h": 596 },
+    { "id": "vehicle", "label": "Vehicle", "x": 1204, "y": 48, "w": 72, "h": 596,
+      "vehicle": { "x": 1210, "y": 76, "w": 60, "h": 556, "highlight": ["avionics", "recovery"] } }
   ],
   "nodes": [
     { "id": "imu", "kind": "sensor", "label": "IMU", "sublabel": "accel / gyro, 5 Hz", "x": 40, "y": 80, "w": 200, "h": 40 },
