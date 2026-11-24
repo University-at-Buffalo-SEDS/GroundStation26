@@ -631,7 +631,11 @@ fn finite_three_radio_mesh_recovers_actual_reliable_commands_and_receipts() {
                 failure = Some("child output capture failed or exceeded 1 MiB per stream".into());
                 break;
             }
-            if started.elapsed() > std::time::Duration::from_secs(30) {
+            // A hang guard only: the campaign runs on virtual time, so the
+            // wall time it takes says nothing about the radio. A loaded host
+            // (full suite beside other builds) can take several times the
+            // ~10 s it needs alone.
+            if started.elapsed() > std::time::Duration::from_secs(300) {
                 failure = Some("isolated shared-air campaign timed out".into());
                 break;
             }
