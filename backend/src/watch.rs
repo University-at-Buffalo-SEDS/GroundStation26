@@ -655,6 +655,39 @@ pub struct Inputs<'a> {
     pub metric: bool,
     pub stale_after_s: i64,
     pub actions: BTreeMap<String, ActionState>,
+    /// The layout's `watch_items`: an item listed there reads those channels
+    /// instead of its built-in ones.
+    pub bindings: &'a [crate::layout::WatchItemBinding],
+}
+
+/// One telemetry channel: `(data_type, sender, index)`.
+type Channel = (String, Option<String>, usize);
+
+/// A telemetry item's channels: the layout's binding for its id, else the
+/// built-in ones. `None` for an item that is not telemetry.
+fn item_channels(def: &ItemDef, bindings: &[crate::layout::WatchItemBinding]) -> Option<Vec<Channel>> {
+    let Source::Telemetry { channels, .. } = def.source else {
+        return None;
+    };
+    Some(match bindings.iter().find(|binding| binding.id == def.id) {
+        Some(binding) => binding
+            .channels
+            .iter()
+            .map(|c| (c.data_type.clone(), c.sender_id.clone(), c.index))
+            .collect(),
+        None => channels
+            .iter()
+            .map(|(dt, sender, index)| (dt.to_string(), sender.map(str::to_string), *index))
+            .collect(),
+    })
+}
+
+/// Every channel any item reads.
+fn wanted_channels(bindings: &[crate::layout::WatchItemBinding]) -> Vec<Channel> {
+    let mut wanted: Vec<Channel> = ITEMS.iter().filter_map(|item| item_channels(item, bindings)).flatten().collect();
+    wanted.sort();
+    wanted.dedup();
+    wanted
 }
 
 pub fn format_age(ms: i64) -> String {
@@ -743,14 +776,9 @@ fn targets(input: &Inputs<'_>) -> Vec<Target> {
 }
 
 fn newest_telemetry_ms(input: &Inputs<'_>) -> Option<i64> {
-    ITEMS
+    wanted_channels(input.bindings)
         .iter()
-        .filter_map(|item| match item.source {
-            Source::Telemetry { channels, .. } => Some(channels),
-            _ => None,
-        })
-        .flatten()
-        .filter_map(|(dt, sender, index)| (input.telemetry)(dt, *sender, *index).map(|(_, t)| t))
+        .filter_map(|(dt, sender, index)| (input.telemetry)(dt, sender.as_deref(), *index).map(|(_, t)| t))
         .max()
 }
 
@@ -806,14 +834,15 @@ fn item_value(def: &ItemDef, input: &Inputs<'_>, telemetry_age: Option<i64>, roc
             None => unknown(def.label),
         },
         Source::Telemetry {
-            channels,
             quantity,
             precision,
             stale_after_ms,
+            ..
         } => {
+            let channels = item_channels(def, input.bindings).unwrap_or_default();
             let newest = channels
                 .iter()
-                .filter_map(|(dt, sender, index)| (input.telemetry)(dt, *sender, *index))
+                .filter_map(|(dt, sender, index)| (input.telemetry)(dt, sender.as_deref(), *index))
                 .filter(|(v, _)| v.is_finite())
                 .max_by_key(|(_, at)| *at);
             let Some((raw, at)) = newest else {
@@ -910,28 +939,21 @@ fn launch_clock(msg: &crate::telemetry_db::LaunchClockMsg, now_ms: i64) -> Optio
 /// (newest rows last), in one reverse pass.
 fn latest_values(
     rows: &std::collections::VecDeque<crate::types::TelemetryRow>,
-) -> BTreeMap<(String, Option<String>, usize), (f64, i64)> {
-    let wanted: Vec<(&str, Option<&str>, usize)> = ITEMS
-        .iter()
-        .filter_map(|item| match item.source {
-            Source::Telemetry { channels, .. } => Some(channels),
-            _ => None,
-        })
-        .flatten()
-        .copied()
-        .collect();
+    bindings: &[crate::layout::WatchItemBinding],
+) -> BTreeMap<Channel, (f64, i64)> {
+    let wanted = wanted_channels(bindings);
     let mut found = BTreeMap::new();
     for row in rows.iter().rev() {
-        for (dt, sender, index) in &wanted {
-            if row.data_type != *dt || sender.is_some_and(|s| s != row.sender_id) {
+        for key in &wanted {
+            let (dt, sender, index) = key;
+            if row.data_type != *dt || sender.as_ref().is_some_and(|s| *s != row.sender_id) {
                 continue;
             }
-            let key = (dt.to_string(), sender.map(str::to_string), *index);
-            if found.contains_key(&key) {
+            if found.contains_key(key) {
                 continue;
             }
             if let Some(Some(value)) = row.values.get(*index) {
-                found.insert(key, (*value as f64, row.timestamp_ms));
+                found.insert(key.clone(), (*value as f64, row.timestamp_ms));
             }
         }
         if found.len() == wanted.len() {
@@ -973,7 +995,8 @@ async fn get_status(
         let list = state.board_status_snapshot(now_ms.max(0) as u64).boards;
         (!list.is_empty()).then(|| (list.iter().filter(|b| b.seen).count(), list.len()))
     };
-    let values = latest_values(&state.recent_telemetry_cache.lock().unwrap());
+    let bindings = crate::layout::load_layout().map(|layout| layout.watch_items).unwrap_or_default();
+    let values = latest_values(&state.recent_telemetry_cache.lock().unwrap(), &bindings);
     let telemetry = move |dt: &str, sender: Option<&str>, index: usize| {
         values
             .get(&(dt.to_string(), sender.map(str::to_string), index))
@@ -1008,6 +1031,7 @@ async fn get_status(
         metric: query.units.as_deref() != Some("imperial"),
         stale_after_s: query.stale_after_s.unwrap_or(30).clamp(5, 600),
         actions,
+        bindings: &bindings,
     };
     let mut status = build_status(&input);
     if let Some((lat, lon, alt, age_ms)) = crate::los_predict::watch_target() {
@@ -1098,6 +1122,7 @@ mod tests {
             metric: true,
             stale_after_s: 30,
             actions: BTreeMap::new(),
+            bindings: &[],
         }
     }
 
@@ -1236,6 +1261,44 @@ mod tests {
         assert_eq!(empty.items["station_link"].text, "OK");
     }
 
+    /// The shipped layouts name exactly the built-in channels, so a SEDS
+    /// watch shows what it did before the bindings moved to the layout.
+    #[test]
+    fn shipped_layouts_bind_the_built_in_watch_channels() {
+        let built_in = wanted_channels(&[]);
+        for file in ["layout/layout.json", "layout/layout_hitl.json", "layout/layout_test_fire.json"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
+            let layout: crate::layout::LayoutConfig = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            assert!(!layout.watch_items.is_empty(), "{file}");
+            for item in ITEMS {
+                assert_eq!(item_channels(item, &layout.watch_items), item_channels(item, &[]), "{file}: {}", item.id);
+            }
+            assert_eq!(wanted_channels(&layout.watch_items), built_in, "{file}");
+            assert_eq!(item_channels(ITEMS.iter().find(|i| i.id == "av_battery").unwrap(), &layout.watch_items).unwrap()[0], ("BATTERY_VOLTAGE".into(), Some("PB".into()), 0));
+        }
+    }
+
+    /// Another vehicle rebinds an item in its layout; the status reads it.
+    #[test]
+    fn a_layout_binding_replaces_an_items_channels() {
+        let bindings = vec![crate::layout::WatchItemBinding {
+            id: "tank_pressure".into(),
+            channels: vec![crate::layout::WatchChannel { data_type: "LOX_TANK_PSI".into(), sender_id: Some("EB".into()), index: 1 }],
+        }];
+        let telemetry = |dt: &str, sender: Option<&str>, index: usize| match (dt, sender, index) {
+            ("LOX_TANK_PSI", Some("EB"), 1) => Some((431.0, 99_900)),
+            ("OX_TANK_PRESSURE", None, 0) => Some((812.0, 99_900)),
+            _ => None,
+        };
+        let mut input = base_input(&telemetry);
+        input.bindings = &bindings;
+        assert_eq!(build_status(&input).items["tank_pressure"].text, "431");
+        assert!(wanted_channels(&bindings).contains(&("LOX_TANK_PSI".into(), Some("EB".into()), 1)));
+        assert!(!wanted_channels(&bindings).contains(&("OX_TANK_PRESSURE".into(), None, 0)));
+        input.bindings = &[];
+        assert_eq!(build_status(&input).items["tank_pressure"].text, "812");
+    }
+
     #[test]
     fn registry_mirror_matches_phone_ids() {
         // Keep in sync with the phone registry and watch/test-vectors.json
@@ -1295,7 +1358,7 @@ mod tests {
             row(5, "DESCENT_STATE", "FC", vec![None, None, Some(100.0), None]),
         ]
         .into();
-        let found = latest_values(&rows);
+        let found = latest_values(&rows, &[]);
         assert_eq!(found[&("OX_TANK_PRESSURE".into(), None, 0)], (20.0, 3));
         assert_eq!(found[&("BATTERY_VOLTAGE".into(), Some("PB".into()), 0)], (15.5, 4));
         assert_eq!(found[&("DESCENT_STATE".into(), None, 2)], (100.0, 5));

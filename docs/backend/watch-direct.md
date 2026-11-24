@@ -97,6 +97,9 @@ data keys in a few KiB:
 
 Read-only; it changes nothing. The item list mirrors the phone registry
 (`watch.rs ITEMS`; keep it in sync with the frontend
-`watch_companion/registry.rs`). `actions` reports only commands the caller
+`watch_companion/registry.rs`). A telemetry item's channels come from the
+layout's `watch_items` (`[{id, channels:[{data_type, sender_id?, index}]}]`)
+when it lists that item, as on the phone, else from `ITEMS`; the shipped
+layouts list exactly the built-in channels. `actions` reports only commands the caller
 may send. The watch takes pages, settings and the catalog from the phone's
 last snapshot.

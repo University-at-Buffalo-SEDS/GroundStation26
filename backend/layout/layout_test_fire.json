@@ -197,7 +197,35 @@
     "disable_actions_by_default": true,
     "show_flight_setup": false,
     "show_fill_targets": true,
-    "fill_targets_require_actions_enabled": true
+    "fill_targets_require_actions_enabled": true,
+    "controls": [
+      {
+        "cmd": "TogglePlumbingDelayInterlock",
+        "label": "Retraction minimum 45 seconds"
+      },
+      {
+        "cmd": "ToggleChecklistInterlock",
+        "label": "Checklist enforcement"
+      },
+      {
+        "cmd": "ToggleSupplyInterlock",
+        "label": "Nitrogen/nitrous one at a time"
+      },
+      {
+        "cmd": "ToggleBoardStateProofInterlock",
+        "label": "Board state checks"
+      }
+    ],
+    "fill_target_fluids": [
+      {
+        "id": "nitrogen",
+        "label": "Nitrogen"
+      },
+      {
+        "id": "nitrous",
+        "label": "Nitrous"
+      }
+    ]
   },
   "data_tab": {
     "sender_split_data_types": [
@@ -2797,5 +2825,119 @@
       }
     ]
   },
-  "flight_phase_version": 1
+  "flight_phase_version": 1,
+  "gps": {
+    "data_types": [
+      "GPS_DATA",
+      "GPS",
+      "ROCKET_GPS"
+    ],
+    "lat_index": 0,
+    "lon_index": 1,
+    "alt_index": 2
+  },
+  "watch_items": [
+    {
+      "id": "altitude",
+      "channels": [
+        {
+          "data_type": "ASCENT_STATE",
+          "index": 4
+        },
+        {
+          "data_type": "DESCENT_STATE",
+          "index": 2
+        },
+        {
+          "data_type": "BAROMETER_DATA",
+          "index": 0
+        }
+      ]
+    },
+    {
+      "id": "velocity",
+      "channels": [
+        {
+          "data_type": "ASCENT_STATE",
+          "index": 5
+        },
+        {
+          "data_type": "DESCENT_STATE",
+          "index": 3
+        }
+      ]
+    },
+    {
+      "id": "gps_altitude",
+      "channels": [
+        {
+          "data_type": "GPS_DATA",
+          "index": 2
+        },
+        {
+          "data_type": "GPS",
+          "index": 2
+        },
+        {
+          "data_type": "ROCKET_GPS",
+          "index": 2
+        }
+      ]
+    },
+    {
+      "id": "gps_sats",
+      "channels": [
+        {
+          "data_type": "GPS_SATELLITE_NUMBER",
+          "index": 0
+        }
+      ]
+    },
+    {
+      "id": "tank_pressure",
+      "channels": [
+        {
+          "data_type": "OX_TANK_PRESSURE",
+          "index": 0
+        }
+      ]
+    },
+    {
+      "id": "chamber_pressure",
+      "channels": [
+        {
+          "data_type": "COMBUSTION_CHAMBER_PRESSURE",
+          "index": 0
+        }
+      ]
+    },
+    {
+      "id": "loadcell_mass",
+      "channels": [
+        {
+          "data_type": "LOADCELL_WEIGHT_KG",
+          "index": 0
+        }
+      ]
+    },
+    {
+      "id": "fill_percent",
+      "channels": [
+        {
+          "data_type": "LOADCELL_FILL_PERCENT",
+          "index": 0
+        }
+      ]
+    },
+    {
+      "id": "av_battery",
+      "channels": [
+        {
+          "data_type": "BATTERY_VOLTAGE",
+          "sender_id": "PB",
+          "index": 0
+        }
+      ]
+    }
+  ]
 }

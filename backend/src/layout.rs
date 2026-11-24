@@ -30,6 +30,53 @@ pub struct LayoutConfig {
     pub state_tab: StateTabLayout,
     #[serde(default)]
     pub battery: BatteryLayoutConfig,
+    /// Which telemetry rows are GPS fixes and where latitude, longitude and
+    /// altitude sit in them (map tracking, vehicle view, replay track).
+    /// Omitted: the UI's built-in GPS types.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gps: Option<GpsLayout>,
+    /// Telemetry bindings of the watch companion's items, by item id
+    /// (`docs/backend/watch-direct.md`); an item not listed keeps its built-in
+    /// channels. The watch status (`/api/watch/status`) reads the same list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub watch_items: Vec<WatchItemBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GpsLayout {
+    /// Data types carrying a fix, in preference order.
+    pub data_types: Vec<String>,
+    #[serde(default)]
+    pub lat_index: usize,
+    #[serde(default = "default_gps_lon_index")]
+    pub lon_index: usize,
+    #[serde(default = "default_gps_alt_index")]
+    pub alt_index: usize,
+}
+
+fn default_gps_lon_index() -> usize {
+    1
+}
+
+fn default_gps_alt_index() -> usize {
+    2
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WatchItemBinding {
+    pub id: String,
+    /// The newest finite value of these channels is shown.
+    pub channels: Vec<WatchChannel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WatchChannel {
+    pub data_type: String,
+    /// Only rows from this board; omitted: any sender.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_id: Option<String>,
+    #[serde(default)]
+    pub index: usize,
 }
 
 fn default_main_tabs() -> Vec<String> {
@@ -477,6 +524,27 @@ pub struct ActionsTabLayout {
     #[serde(default = "default_fill_targets_require_actions_enabled")]
     pub fill_targets_require_actions_enabled: bool,
     pub actions: Vec<ActionSpec>,
+    /// Display names of controls that are not buttons in `actions` (the
+    /// HITL interlock toggles), by command name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub controls: Vec<ControlLabel>,
+    /// The fluids of `/api/fill_targets` the fill-target editors show, in
+    /// order, with their names. Omitted: the UI's built-in list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fill_target_fluids: Vec<FillTargetFluid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FillTargetFluid {
+    /// The fluid's key in the fill-targets document (`nitrogen`, `nitrous`).
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ControlLabel {
+    pub cmd: String,
+    pub label: String,
 }
 
 fn default_show_flight_setup() -> bool {
@@ -1272,5 +1340,73 @@ mod tests {
                 .iter()
                 .any(|action| action.cmd == "ResetSim")
         );
+    }
+}
+
+#[cfg(test)]
+mod vehicle_binding_tests {
+    use super::*;
+
+    /// The SEDS layouts name what the UI used to hard-code: the HITL
+    /// interlock labels, the GPS types and the fill-target fluids.
+    #[test]
+    fn shipped_layouts_name_the_seds_bindings() {
+        for file in [DEFAULT_LAYOUT_PATH, DEFAULT_HITL_LAYOUT_PATH, DEFAULT_TEST_FIRE_LAYOUT_PATH] {
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(file);
+            let layout: LayoutConfig = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            let labels: Vec<(&str, &str)> =
+                layout.actions_tab.controls.iter().map(|c| (c.cmd.as_str(), c.label.as_str())).collect();
+            assert_eq!(
+                labels,
+                [
+                    ("TogglePlumbingDelayInterlock", "Retraction minimum 45 seconds"),
+                    ("ToggleChecklistInterlock", "Checklist enforcement"),
+                    ("ToggleSupplyInterlock", "Nitrogen/nitrous one at a time"),
+                    ("ToggleBoardStateProofInterlock", "Board state checks"),
+                ],
+                "{file}"
+            );
+            assert_eq!(
+                layout.gps,
+                Some(GpsLayout {
+                    data_types: vec!["GPS_DATA".into(), "GPS".into(), "ROCKET_GPS".into()],
+                    lat_index: 0,
+                    lon_index: 1,
+                    alt_index: 2,
+                }),
+                "{file}"
+            );
+            let fluids: Vec<(&str, &str)> = layout
+                .actions_tab
+                .fill_target_fluids
+                .iter()
+                .map(|f| (f.id.as_str(), f.label.as_str()))
+                .collect();
+            assert_eq!(fluids, [("nitrogen", "Nitrogen"), ("nitrous", "Nitrous")], "{file}");
+        }
+    }
+
+    /// A layout without the optional bindings still loads and serves none of
+    /// them, so the UI keeps its built-in values.
+    #[test]
+    fn optional_bindings_are_omitted_when_absent() {
+        let mut value: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(DEFAULT_LAYOUT_PATH)).unwrap(),
+        )
+        .unwrap();
+        let root = value.as_object_mut().unwrap();
+        root.remove("gps");
+        root.remove("watch_items");
+        let actions = root["actions_tab"].as_object_mut().unwrap();
+        actions.remove("controls");
+        actions.remove("fill_target_fluids");
+        let layout: LayoutConfig = serde_json::from_value(value).unwrap();
+        let served = serde_json::to_value(&layout).unwrap();
+        for key in ["gps", "watch_items"] {
+            assert!(served.get(key).is_none(), "{key}");
+        }
+        for key in ["controls", "fill_target_fluids"] {
+            assert!(served["actions_tab"].get(key).is_none(), "{key}");
+        }
     }
 }

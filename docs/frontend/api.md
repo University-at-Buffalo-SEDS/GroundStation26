@@ -288,6 +288,15 @@ Critical expectations:
 - Frontend-specific action highlighting should not be hardcoded for particular commands; it should follow backend layout plus live `ActionPolicyMsg` updates.
 - Data tab channel labels and boolean label sets must line up with actual telemetry value ordering.
 - State widgets must reference valid data types and valid per-value indexes.
+- Optional vehicle bindings (`backend/src/layout.rs`; each is omitted when empty and the UI then
+  keeps its built-in SEDS value, which the shipped layouts name exactly):
+  - `gps: {data_types[], lat_index, lon_index, alt_index}`: the rows that are GPS fixes.
+  - `watch_items: [{id, channels:[{data_type, sender_id?, index}]}]`: watch item channels by id;
+    `/api/watch/status` reads the same list.
+  - `actions_tab.controls: [{cmd, label}]`: names of controls that are not layout buttons (the
+    HITL interlock toggles).
+  - `actions_tab.fill_target_fluids: [{id, label}]`: the `/api/fill_targets` fluids the UI edits,
+    in order, with their names.
 
 Failure impact:
 
@@ -307,7 +316,10 @@ Expected response:
 - The response includes `capture_target_samples`, top-level backend-supported `fit_modes`, and
   `sensors`.
 - Each sensor provides `id`, `label`, `data_type`, `channel`, `fit_color`, `raw_label`,
-  `expected_label`, optional `formatter`, and optional per-sensor `fit_modes`.
+  `expected_label`, optional `formatter`, optional per-sensor `fit_modes`, and optional
+  `sender_id`: the board the calibration tab reads the sensor from (only fresh rows from it).
+  The shipped config names `DAQ` for `KG1000` and `KG50` and none for the ox tank PT; without it
+  the UI reads a load cell from `DAQ` and any other sensor from any sender.
 - The frontend must render calibration channels, labels, colors, and regression choices from this
   response. These values are intentionally not hard-coded in the frontend so future sensors can be
   added by backend config.
