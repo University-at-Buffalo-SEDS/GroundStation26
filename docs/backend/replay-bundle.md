@@ -114,6 +114,13 @@ and ports the rest; its `scripts/check_review_port.py` checks the copies).
 Offline review exports carry no PNG charts or PDF report: they are this
 station's `?raster=false` answer. Excel/PDF reports and exports of
 SD-resolved recordings still need the station.
+CSV/TSV, and the default-window review exports with no station, byte for
+byte as this station would (UI `docs/replay-bundle.md`, "Exports offline").
+It builds the Excel and PDF reports itself with the same content as this
+station's (same sheets, cells, charts; same pages, text and plotted points),
+and hands out this station's own files for the standard selection when the
+bundle carries them (`?reports=true`). Review exports of a custom window and
+exports of SD-resolved recordings still need the station.
 
 `contract_fixtures` writes the station's reviews and review exports
 (`raster=false`, clock pinned) of custom windows of the bundled flight, a
@@ -198,6 +205,22 @@ refused: the query parser read only `true` and `false`.
   ten-minute capture with two cameras and 30 bursts: 32.9 MB of media at the
   defaults and 62.9 MB at the maximum. With every option at its maximum a
   bundle stays under the 192 MiB a reader (and the import) accepts.
+- `?reports=true` (or `1`) adds the report studio's standard reports, all
+  channels over the whole recording, as the report worker writes them
+  (`recording_report::standard`, queued behind a running report job):
+  `exports/report.xlsx`, `exports/report.pdf` and `exports/reports.json`
+  (each report's file name and size, or why it was left out: no openpyxl or
+  matplotlib, the PDF's 20,000-sample limit, the budget). Their document
+  time is the bundle's time, so the bundle stays reproducible.
+- `reports_max_mb` sets the reports' joint budget: 16 MiB by default, at
+  most 64. For the contract fixture's flight (601 rows, 16 channels) the
+  reports are 89 KB (Excel) and 234 KB (PDF).
+
+The report worker pins an Excel/PDF document's time (core properties, ZIP
+entry times, PDF `CreationDate`) to the request's `generated_ms` when given.
+It draws the PDF with the PDF base fonts (Helvetica, Courier), ASCII minus
+signs and unsimplified lines: the text is selectable and every recorded
+sample is plotted, and the UI can build the same pages offline.
 
 The ZIP writer is `flight_review::zip` (deflate, no ZIP64). Bundles are
 reproducible: the same recording and time give the same bytes.
@@ -266,6 +289,13 @@ Checks:
   its exports are the `sd` case of `exports/requests.json`.
 - `recording_bundle_records::tests` checks each record entry against its
   route byte for byte, the anonymous 403s and `records=false`.
+  recording with the report cases the flight lacks. With the report Python
+  packages (`GS_REPORT_PYTHON` pointing at an environment with
+  `backend/report-requirements.txt`) it writes the Excel and PDF reports of
+  both recordings (standard and custom selections, `generated_ms` pinned,
+  `exports/report-documents.json`) and checks that a `?reports=true` bundle
+  carries the standard ones byte for byte; without them it leaves those
+  files as they are and says so.
 - `recording_import::tests` builds bundles of recordings with every CSV rule
   (over-range markers, legacy type names, formula-like text, quoted line
   breaks, NULLs, the IGT provenance column), imports them into a fresh store

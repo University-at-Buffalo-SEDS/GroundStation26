@@ -742,6 +742,7 @@ async fn replay_bundle(root: &Path, state: &Arc<AppState>, app: &axum::Router, o
     bundle_exports(root, state, app, id, &bundle, out).await;
     review_windows(root, state, app, out).await;
     replay_bundle_media(state, app, &headers, id, out).await;
+    report_documents(state, app, id, &headers, out).await;
 }
 
 /// Custom-window motor/flight reviews and exports (`raster=false`) as the
@@ -771,14 +772,15 @@ async fn review_windows(root: &Path, state: &Arc<AppState>, app: &axum::Router, 
     let event = |name: &str| crate::recording_store::RecordingId::event_id(crate::recording_store::EventKind::Launch, name);
     let (flight_id, fire_id) = (event(flight_capture), event(fire_capture));
     for (id, file) in [(&flight_id, "review/flight_capture.gsreplay"), (&fire_id, "review/test_fire.gsreplay")] {
-        let options = crate::recording_bundle::Options::default();
+        // Station records are process-wide state other tests change.
+        let options = crate::recording_bundle::Options { records: Some(false), ..Default::default() };
         let bundle = crate::recording_bundle::build(state.clone(), &headers, id, &options, T0).await.unwrap();
         let again = crate::recording_bundle::build(state.clone(), &headers, id, &options, T0).await.unwrap();
         assert_eq!(bundle_manifest(&bundle), bundle_manifest(&again), "{id}: a bundle's entries are reproducible");
         assert!(bundle == again, "{id}: a bundle is reproducible");
         assert!(zip_entry(&bundle, crate::flight_review::offline::INPUTS_PATH).is_some(), "{id}: the bundle carries the review inputs");
         binary_fixture(&format!("replay-bundle/{file}"), &bundle);
-        let without = crate::recording_bundle::Options { review: Some(false), ..Default::default() };
+        let without = crate::recording_bundle::Options { review: Some(false), records: Some(false), ..Default::default() };
         let lean = crate::recording_bundle::build(state.clone(), &headers, id, &without, T0).await.unwrap();
         let listed = bundle_manifest(&lean)["entries"].as_array().unwrap().iter().filter(|e| crate::flight_review::offline::is_entry(e["path"].as_str().unwrap())).count();
         assert_eq!(listed, 0, "{id}: review=false leaves the review inputs out");
@@ -839,7 +841,7 @@ async fn replay_bundle_media(state: &Arc<AppState>, app: &axum::Router, headers:
         assert_eq!(app.clone().oneshot(request).await.unwrap().status(), StatusCode::FORBIDDEN, "{query}");
     }
     let media = crate::recording_bundle_media::tests::fixture(T0);
-    let options = crate::recording_bundle::Options { video: true, voice: true, media_dirs: Some(media.dirs.clone()), ..Default::default() };
+    let options = crate::recording_bundle::Options { video: true, voice: true, records: Some(false), media_dirs: Some(media.dirs.clone()), ..Default::default() };
     let bundle = crate::recording_bundle::build(state.clone(), headers, id, &options, T0 + 86_400_000).await.unwrap();
     let files: std::collections::BTreeMap<String, Vec<u8>> = crate::flight_review::zip::read(&bundle).into_iter().collect();
     let index: Value = serde_json::from_slice(&files["media/index.json"]).unwrap();
@@ -850,6 +852,63 @@ async fn replay_bundle_media(state: &Arc<AppState>, app: &axum::Router, headers:
     assert_eq!(bundle_manifest(&bundle)["media"], json!({"video": index["video"], "voice": index["voice"]}));
     out.add("replay-bundle/media.index", index);
     binary_fixture("replay-bundle/media.gsreplay", &bundle);
+}
+
+/// The report studio's Excel and PDF reports as the station's worker writes
+/// them (openpyxl, matplotlib), their document time pinned to `T0`:
+/// `exports/report-documents.json` lists each request and its file. The
+/// standard reports (all channels, whole recording) are what a bundle made
+/// with `?reports=1` carries; the custom ones (a window and a channel subset)
+/// the UI builds itself. Without the report Python packages
+/// (`GS_REPORT_PYTHON`, `backend/report-requirements.txt`) the existing
+/// files are left as they are.
+async fn report_documents(state: &Arc<AppState>, app: &axum::Router, id: &str, headers: &axum::http::HeaderMap, out: &mut Fixtures) {
+    let listing = "replay-bundle/exports/report-documents";
+    let standard = crate::recording_report::standard(state, id, "xlsx", T0).await;
+    if let Err((_, message)) = &standard {
+        eprintln!("contract_fixtures: Excel/PDF report fixtures not checked: {message}");
+        for name in [listing, "replay-bundle/exports/reports"] {
+            if let Ok(text) = std::fs::read_to_string(fixture_dir().join(format!("{name}.json"))) {
+                out.add(name, serde_json::from_str(&text).unwrap());
+            }
+        }
+        return;
+    }
+    // A bundle made with ?reports=1 carries the standard reports byte for byte.
+    let options = crate::recording_bundle::Options { reports: true, records: Some(false), ..Default::default() };
+    let bundle = crate::recording_bundle::build(state.clone(), headers, id, &options, T0).await.unwrap();
+    assert_eq!(zip_entry(&bundle, "exports/report.xlsx"), standard.ok(), "the bundle's Excel report is the standard report");
+    let index: Value = serde_json::from_slice(&zip_entry(&bundle, "exports/reports.json").unwrap()).unwrap();
+    assert_eq!(index["pdf"]["path"], "exports/report.pdf", "{index}");
+    out.add("replay-bundle/exports/reports", index);
+    let cases = "groundstation_recording_2026-01-02_00-00-00_000.db";
+    let t1 = T0 + 86_400_000;
+    let documents = [
+        ("flight", json!({"recording": id, "channels": null}), "flight-report"),
+        ("flight", json!({"recording": id, "start_ms": T0 + 10_000, "end_ms": T0 + 36_600,
+            "channels": ["[\"VB\",\"OX_TANK_PRESSURE\",0]", "[\"FC\",\"BAROMETER_DATA\",1]", "[\"VB\",\"VALVE_STATE\",3]"]}), "flight-report-custom"),
+        ("cases", json!({"recording": cases, "channels": null}), "cases-report"),
+        ("cases", json!({"recording": cases, "start_ms": t1 + 1_000, "end_ms": t1 + 6_000,
+            "channels": ["[\"DAQ\",\"DAQ_POWER_MONITOR\",2]", "[\"DAQ\",\"LOADCELL_FILL_PERCENT\",0]", "[\"DAQ\",\"KG50\",0]", "[\"VB\",\"VALVE_STATE\",2]", "[\"DAQ\",\"REC_BOARD_DIE_TEMPERATURE\",0]"]}), "cases-report-custom"),
+    ];
+    let mut listed = Vec::new();
+    for (case, selection, name) in documents {
+        for format in ["xlsx", "pdf"] {
+            let mut request = selection.clone();
+            request["format"] = format.into();
+            request["generated_ms"] = T0.into();
+            let path = report_route(request);
+            let (status, body) = get_bytes(app, &path).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {}", String::from_utf8_lossy(&body));
+            let file = format!("exports/{name}.{format}");
+            binary_fixture(&format!("replay-bundle/{file}"), &body);
+            if name == "flight-report" {
+                assert_eq!(zip_entry(&bundle, &format!("exports/report.{format}")), Some(body), "the bundle's {format} report is the route's standard report");
+            }
+            listed.push(json!({"case": case, "path": path, "file": file, "standard": !name.ends_with("custom")}));
+        }
+    }
+    out.add(listing, Value::Array(listed));
 }
 
 /// GET with the viewer's credentials; the report worker allows one job at a
