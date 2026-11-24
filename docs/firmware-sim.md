@@ -460,6 +460,23 @@ simclock).
   span) and the FC SD launch file downloaded (1.7 MB at about 10 KB/s); its attachment waits behind the DAQ launch
   fetch (open issue 1).
 
+### Verified on jupiter (r6b, 2026-11-24)
+
+With the fixes below, boards FC/FC-IGT ec999d7 (SD service in the ground-test image), AB 6e4a6b6 (launch refusal
+reasons), DAQ 76d6552 (auxiliary-sample clock) on a872b76, RF 728f4a0, PB 767d556, GB 1e01818, VB 6291c53, SEDSnet main
+882daa3, FirmwareSimulator e87c9aa; host load 20-35, up to four bays:
+
+* **Test fire** 19/19: the burn report goes final (DAQ SD launch file, 11.5 MB at about 70 kB/s, merged; 7.93 kN s,
+  3.96 kN peak); the station's settle re-send brings the DAQ to Idle after the rewind.
+* **IGT** 21/21: the FC SD launch file (3.0 MB) collected over the radio after the replayed landing and attached.
+* **Testing** 10/10: the station declares Startup, the DAQ allows the DAC; DAC sine and validation sweep pass.
+* **Normal** 24/24: DAC patch and sweep, GSE procedure, QD retract, Launch, flight (apogee about 1385 m, drogue and
+  main), Landed, map track (122 points, 661 m drift) and the FC SD launch file (1.7 MB) downloaded and attached; the
+  DAQ follows the station to Landed (cache value 13) and serves its launch file first.
+* **HITL** 17/17 (after the rebase and again on this stack).
+* The FC SD collection's optional 60 s lead-up stage then queues behind the DAQ's own lead-up transfer ("another SD
+  transfer is running"); the e2e counts the collection once the launch file is downloaded and attached.
+
 Issues these runs found, and their fixes (r6b):
 
 1. **The ground boards did not follow the station back to Idle, nor to Landed.** Reproduced in a few steps: eight
