@@ -280,14 +280,24 @@ mod tests {
             .await
             .unwrap();
         db.close().await;
-        let response = report(
-            State(state),
-            HeaderMap::new(),
-            Query(ReportQuery {
-                request: r#"{"root":"/does-not-exist","format":"preview"}"#.into(),
-            }),
-        )
-        .await;
+        // Other tests (contract fixtures) may hold the one report job; retry while busy.
+        let mut response = None;
+        for _ in 0..600 {
+            let answer = report(
+                State(state.clone()),
+                HeaderMap::new(),
+                Query(ReportQuery {
+                    request: r#"{"root":"/does-not-exist","format":"preview"}"#.into(),
+                }),
+            )
+            .await;
+            if answer.status() != StatusCode::TOO_MANY_REQUESTS {
+                response = Some(answer);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let response = response.expect("the report worker stayed busy");
         let status = response.status();
         let body = axum::body::to_bytes(response.into_body(), 1_000_000)
             .await
