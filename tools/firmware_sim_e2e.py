@@ -672,7 +672,9 @@ def fc_sd_collection(st: Station, check, result, timeout_s=1200):
             a = s.get("active") or {}
             st.log("FC SD collection", phase=job.get("phase"), file=job.get("launch_file"), done=a.get("bytes_done"),
                    total=a.get("total_bytes"), bps=a.get("bytes_per_second"), paused=a.get("paused_reason"), message=job.get("message"))
-        return job if job.get("done") and job.get("downloaded_at_ms") else None
+        # downloaded and attached to the capture; the optional 60 s lead-up stage that follows may wait behind
+        # other SD transfers (the DAQ's own lead-up) and is not part of this check
+        return job if job.get("downloaded_at_ms") and job.get("capture") else None
     job = st.wait(collected, timeout_s, "FC SD launch file collected", poll=5)
     s = status()
     result["fc_sd"] = s
