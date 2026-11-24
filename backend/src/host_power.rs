@@ -361,6 +361,14 @@ mod tests {
     /// One test: the host mechanism selection is process-global.
     #[tokio::test]
     async fn power_requests_are_refused_when_unsafe_and_close_recordings_before_the_mocked_host_action() {
+        // A normal station; an integrated ground test is a blocker of its own.
+        {
+            let _igt = crate::runtime_mode::test_support::thread_mode(crate::station_mode::Mode::IntegratedGroundTest);
+            let probe = crate::state::tests::test_app_state().await;
+            *probe.state.lock().unwrap() = FlightState::Idle;
+            assert!(blocker(&probe).unwrap().reason.contains("integrated ground test"));
+        }
+        let _mode = crate::runtime_mode::test_support::thread_mode(crate::station_mode::Mode::Normal);
         let root = crate::recording_export::tests::TestDirectory::new();
         let state = crate::recording_export::tests::export_state(&root.0, true).await;
         // A development machine without the helper: reported, never attempted.

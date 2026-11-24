@@ -141,6 +141,9 @@ class Formatter(unittest.TestCase):
         self.assertNotIn("fields",metadata)
         all_fields=data_rows(report.run(dict(self.request,channels=[one,two])))
         self.assertEqual(all_fields,[fields])
+        missing=[name for name in ("openpyxl","pypdf") if importlib.util.find_spec(name) is None]
+        if missing:
+            self.skipTest("CSV checks passed; XLSX/PDF checks need %s (%s)" % (", ".join(missing), "pip install -r tests/requirements.txt"))
         from openpyxl import load_workbook
         from pypdf import PdfReader
         book=load_workbook(io.BytesIO(report.run(dict(self.request,format="xlsx",channels=[one]))))

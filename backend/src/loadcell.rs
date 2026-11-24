@@ -514,7 +514,7 @@ fn calibration_path() -> PathBuf {
         return PathBuf::from(path);
     }
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    if crate::runtime_mode::is_testing() {
+    let path = if crate::runtime_mode::is_testing() {
         manifest_dir
             .join("calibration")
             .join(default_loadcell_calibration_filename())
@@ -522,7 +522,57 @@ fn calibration_path() -> PathBuf {
         manifest_dir
             .join("data")
             .join(default_loadcell_calibration_filename())
+    };
+    #[cfg(test)]
+    let path = test_calibration_copy(&manifest_dir, &path);
+    path
+}
+
+/// Unit tests never write the checkout's calibration (tracked fixtures under
+/// `calibration/`, the operator's file under `data/`). Each test process works
+/// on its own copy: tracked files are copied in once, so reads match the
+/// fixture; `data/` starts empty, as in a fresh checkout. Copies left by
+/// earlier test processes that have exited are removed.
+#[cfg(test)]
+fn test_calibration_copy(manifest_dir: &std::path::Path, path: &std::path::Path) -> PathBuf {
+    // One thread copies a fixture in while the others wait for it whole.
+    static COPYING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _copying = COPYING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let relative = path.strip_prefix(manifest_dir).unwrap_or(path);
+    let copy = test_scratch_root().join(relative);
+    if !copy.exists() {
+        std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        if relative.starts_with("calibration") && path.exists() {
+            std::fs::copy(path, &copy).unwrap();
+        }
     }
+    copy
+}
+
+/// This test process's private stand-in for `backend/` station files
+/// (calibration, zero captures). Roots left by exited test processes are
+/// removed when the first one is made.
+#[cfg(test)]
+pub(crate) fn test_scratch_root() -> PathBuf {
+    use std::sync::OnceLock;
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    const PREFIX: &str = "gs-test-calibration-";
+    ROOT.get_or_init(|| {
+        let temp = std::env::temp_dir();
+        if let Ok(entries) = std::fs::read_dir(&temp) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if let Some(pid) = name.strip_prefix(PREFIX)
+                    && std::path::Path::new("/proc/self").exists()
+                    && !std::path::Path::new("/proc").join(pid).exists()
+                {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+        }
+        temp.join(format!("{PREFIX}{}", std::process::id()))
+    })
+    .clone()
 }
 
 #[cfg(test)]

@@ -135,8 +135,12 @@ async fn actual_selected_virtual_pair_query_raw14_offset_replay_and_delayed_reco
             .expect("actual SDKraw14 owner effect");
         assert_eq!(owner.source_utc, source);
         assert!(
-            owner.start_model_ms >= before + 3500 && owner.start_model_ms <= after + 4251,
-            "networkUTC was compared directly with host/modelclock"
+            // The igniter starts LAUNCH_IGNITER_START_DELAY_MS after the
+            // original stamp (T-5 s, as the AB does), in local model time.
+            owner.start_model_ms >= before + LAUNCH_IGNITER_START_DELAY_MS - 750
+                && owner.start_model_ms <= after + LAUNCH_IGNITER_START_DELAY_MS + 1,
+            "networkUTC was compared directly with host/modelclock: start={} before={before} after={after}",
+            owner.start_model_ms
         );
         assert_eq!(owner.stop_model_ms - owner.start_model_ms, 10000);
         (owner.source_utc, owner.start_model_ms, owner.stop_model_ms)

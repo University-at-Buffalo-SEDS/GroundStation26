@@ -306,13 +306,16 @@ fn live_log_and_cache_feed_the_live_summary() {
             values: r.values.iter().map(|v| v.map(|x| x as f32)).collect(), over_range: 0, over_range_low: 0,
         })
         .collect();
-    let from = ms(-20.0) + 7_777; // a window this test alone uses
+    let from = ms(-20.0) + 7_777;
     let mut d = data::from_cache(rows.iter(), from);
     assert!(d.rows.iter().all(|r| r.t_ms >= from));
-    note(ms(f.drogue_t), LiveEntry::FcPhase(11));
-    note(ms(f.drogue_t) + 1, LiveEntry::FcPhase(11));
-    note(ms(f.drogue_t) + 5, LiveEntry::Message("FC: PD approx altitude: 2431".into()));
-    data::add_live_log(&mut d, from);
+    // A private log: the process-wide one also receives other tests' events.
+    let log = data::LiveLog::new();
+    log.note(from - 1, LiveEntry::Message("FC: PD approx altitude: 9999".into()));
+    log.note(ms(f.drogue_t), LiveEntry::FcPhase(11));
+    log.note(ms(f.drogue_t) + 1, LiveEntry::FcPhase(11));
+    log.note(ms(f.drogue_t) + 5, LiveEntry::Message("FC: PD approx altitude: 2431".into()));
+    log.add_to(&mut d, from);
     assert_eq!(
         d.rows
             .iter()

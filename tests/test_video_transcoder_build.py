@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # repo root: discovery from any cwd
 import build
 
 
@@ -56,6 +57,9 @@ class VideoTranscoderBuildTests(unittest.TestCase):
             root = Path(directory)
             script = root / "build.py"
             shutil.copyfile(build.__file__, script)
+            # build.py loads its remote-build helper from scripts/ at start.
+            (root / "scripts").mkdir()
+            shutil.copyfile(Path(build.__file__).resolve().parent / "scripts/remote_build.py", root / "scripts/remote_build.py")
             helper = root / "video_transcoder"
             helper.mkdir()
             # Real tracked manifest/lock, no fake package or target tree.

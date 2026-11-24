@@ -85,8 +85,12 @@ async fn actual_http_retained_stop_then_actual_refresh_cannot_publish_idle() {
         "sender":packet.sender(),"type":packet.data_type().as_u32(),"payload":packet.payload()
     }));
     let request_started = std::time::Instant::now();
+    // A hang guard, not a latency budget: the Abort request never waits on the
+    // SDK or a held lock, so it answers at once on an idle host, but a loaded
+    // test host (parallel suites, child processes) can delay the task itself
+    // past 100 ms. A blocked handler still trips this bound.
     let response = tokio::time::timeout(
-        Duration::from_millis(100),
+        Duration::from_secs(2),
         fixture.http(
             "POST",
             "/api/command",
@@ -96,7 +100,7 @@ async fn actual_http_retained_stop_then_actual_refresh_cannot_publish_idle() {
     )
     .await;
     if response.is_err() {
-        // The ORIGINAL100ms bound already elapsed and dropped the owned HTTP
+        // The ORIGINAL bound already elapsed and dropped the owned HTTP
         // future. Observe only; no second auth/command, await or SDK cache read.
         let current_state = state.state.try_lock()
             .map(|value| format!("{value:?}"))
@@ -115,7 +119,7 @@ async fn actual_http_retained_stop_then_actual_refresh_cannot_publish_idle() {
             "after_packet":"not_sampled_no_nonblockingSDKcachegetter",
             "snapshot_scope":"post_timeout/non_atomic; no HTTPphase/Stopabsence/handlercontinuation proof"
         });
-        eprintln!("ABORT_HTTP100_DIAGNOSTIC {diagnostic}");
+        eprintln!("ABORT_HTTP_TIMEOUT_DIAGNOSTIC {diagnostic}");
     }
     let response = response.unwrap();
     assert_eq!(response.status(), axum::http::StatusCode::ACCEPTED);

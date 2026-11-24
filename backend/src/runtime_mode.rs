@@ -122,6 +122,11 @@ fn load() -> u64 {
     if let Some(state) = test_support::override_state() {
         return state;
     }
+    load_process()
+}
+
+/// The process-wide state, ignoring a test thread's own mode.
+fn load_process() -> u64 {
     let state = STATE.load(Ordering::Acquire);
     if state != UNSET {
         return state;
@@ -156,6 +161,14 @@ pub fn init(mode: Mode) {
 #[inline]
 pub fn current() -> Mode {
     decode(load())
+}
+/// The mode a boot-time flag is computed from: the process's mode. Under
+/// test, a thread running in its own mode (`test_support::thread_mode`)
+/// models a station that booted in that mode; an in-process switch on that
+/// thread does not change it, as a switch never changes boot-time flags.
+#[cfg(test)]
+pub fn boot_flag_mode() -> Mode {
+    test_support::boot_override().unwrap_or_else(|| decode(load_process()))
 }
 /// Increases on every switch.
 #[inline]
@@ -296,9 +309,14 @@ pub(crate) mod test_support {
 
     thread_local! {
         static OVERRIDE: Cell<Option<u64>> = const { Cell::new(None) };
+        /// The mode `thread_mode` started this thread in (its modeled boot).
+        static BOOT: Cell<Option<Mode>> = const { Cell::new(None) };
     }
     pub(super) fn override_state() -> Option<u64> {
         OVERRIDE.with(Cell::get)
+    }
+    pub(super) fn boot_override() -> Option<Mode> {
+        BOOT.with(Cell::get)
     }
     pub(super) fn switch_override(
         target: Mode,
@@ -317,17 +335,18 @@ pub(crate) mod test_support {
         })
     }
     /// Restores the previous override when dropped.
-    pub(crate) struct ThreadMode(Option<u64>);
+    pub(crate) struct ThreadMode(Option<u64>, Option<Mode>);
     impl Drop for ThreadMode {
         fn drop(&mut self) {
             OVERRIDE.with(|cell| cell.set(self.0));
+            BOOT.with(|cell| cell.set(self.1));
         }
     }
     /// Run this thread in `mode` until the guard drops.
     pub(crate) fn thread_mode(mode: Mode) -> ThreadMode {
         let previous = override_state();
         OVERRIDE.with(|cell| cell.set(Some(pack(mode, 1))));
-        ThreadMode(previous)
+        ThreadMode(previous, BOOT.with(|cell| cell.replace(Some(mode))))
     }
 
     /// True when this test belongs to the suite of the mode in force, i.e.

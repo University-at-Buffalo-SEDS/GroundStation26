@@ -75,8 +75,12 @@ fn captures_record_their_provenance_and_older_ones_read_as_unknown() {
     };
     let _ = store.begin(request, 1_000, "hitl");
     let captures = store.captures();
-    // this process is neither the firmware nor the internal simulation
-    assert!(captures.iter().all(|c| c.provenance.as_deref() == Some("hardware")));
+    // A capture records where its data came from. The unit-test process is
+    // hardware unless it runs as a testing station with the internal flight
+    // model (GS_TEST_STATION_MODE=testing, GS_SIM_MODE on by default).
+    let expected = if crate::flight_sim::sim_mode_enabled() { "internal_flight_sim" } else { "hardware" };
+    assert_eq!(crate::firmware_sim_mode::provenance(), expected);
+    assert!(captures.iter().all(|c| c.provenance.as_deref() == Some(expected)));
     let mut old = serde_json::to_value(&captures[0]).unwrap();
     old.as_object_mut().unwrap().remove("provenance");
     let old: Capture = serde_json::from_value(old).unwrap();
@@ -381,20 +385,34 @@ async fn each_station_sequence_run_gets_its_own_capture_with_result() {
     assert_eq!(state.recording_status_snapshot().captures.len(), 8, "clients see captures in progress");
 }
 
+/// The capture kind a flight opens in the process's station mode.
+fn flight_capture_kind() -> EventKind {
+    if crate::runtime_mode::is_hitl() { EventKind::Hitl } else { EventKind::Launch }
+}
+
 #[tokio::test]
 async fn launch_and_abort_triggers_follow_the_flight_state() {
     use crate::types::FlightState as F;
     let state = crate::state::tests::test_app_state().await;
     state.recording_store.enable_rolling();
+    // The station mode decides the flight capture: HITL runs are kept apart
+    // from real launches. The suite runs under every GS_TEST_STATION_MODE.
+    let flight = flight_capture_kind();
     observe_flight_state(&state, F::Armed as i64);
     assert!(state.recording_store.captures().is_empty(), "arming alone is not a launch");
     observe_flight_state(&state, F::Launch as i64);
     observe_flight_state(&state, F::InFlight as i64);
-    assert!(state.recording_store.is_open(EventKind::Launch, "flight"));
+    assert!(state.recording_store.is_open(flight, "flight"));
+    assert_eq!(state.recording_store.captures().len(), 1, "one flight capture, of the mode's kind only");
     let launch = &state.recording_store.captures()[0];
-    assert_eq!(launch.event_start_ms - launch.window_start_ms, 600_000, "ten-minute pre-roll covers arming");
+    assert_eq!(launch.kind, flight);
+    let pre_roll_ms = i64::from(Settings::default().policy(flight).pre_roll_s) * 1000;
+    assert_eq!(launch.event_start_ms - launch.window_start_ms, pre_roll_ms);
+    if flight == EventKind::Launch {
+        assert_eq!(pre_roll_ms, 600_000, "ten-minute pre-roll covers arming");
+    }
     observe_flight_state(&state, F::Landed as i64);
-    assert!(!state.recording_store.is_open(EventKind::Launch, "flight"));
+    assert!(!state.recording_store.is_open(flight, "flight"));
     assert_eq!(state.recording_store.captures()[0].result.as_deref(), Some("Landed"));
     // Abort: always captured, open while aborted.
     observe_flight_state(&state, F::Aborted as i64);
@@ -405,7 +423,7 @@ async fn launch_and_abort_triggers_follow_the_flight_state() {
     observe_flight_state(&state, F::Launch as i64);
     observe_flight_state(&state, F::Aborted as i64);
     let kinds: Vec<_> = state.recording_store.captures().iter().map(|c| (c.kind, c.result.clone())).collect();
-    assert!(kinds.contains(&(EventKind::Launch, Some("Aborted".into()))), "{kinds:?}");
+    assert!(kinds.contains(&(flight, Some("Aborted".into()))), "{kinds:?}");
     assert!(state.recording_store.is_open(EventKind::Abort, "abort"));
 }
 
@@ -578,18 +596,25 @@ async fn actor_records_from_start_rotates_never_pauses_and_captures_a_launch() {
     let root = TestDirectory::new();
     let mut state = crate::state::tests::test_app_state().await;
     state.recording_store.enable_rolling();
-    // Launch with a short post-roll so the copy happens inside the test.
+    // The flight capture (a HITL run in HITL mode) with a short post-roll so
+    // the copy happens inside the test.
+    let flight = flight_capture_kind();
     let mut settings = Settings::default();
-    settings.events.get_mut(&EventKind::Launch).unwrap().post_roll_s = 0;
+    settings.events.get_mut(&flight).unwrap().post_roll_s = 0;
     save_settings(&root.0, &settings).unwrap();
     let owner = crate::telemetry_task::recording_owner::TestOwner::start(&mut state, &root.0);
-    wait_for(|| state.recording_status_snapshot().db_path.is_some(), "recording to start without any command").await;
+    // The actor opens the segment (publishing its path) and then, in the same
+    // start-up step, marks it ready for fill; neither needs a command.
+    wait_for(
+        || state.recording_status_snapshot().db_path.is_some() && state.fill_recording.ready_instance() != 0,
+        "recording to start, ready for fill, without any command",
+    )
+    .await;
     let status = state.recording_status_snapshot();
     assert_eq!(status.mode, crate::telemetry_db::RecordingModeWire::Recording);
     assert!(status.always_on);
     let first = status.db_path.clone().unwrap();
     assert!(first.contains("/recordings/rolling/segment_"));
-    assert!(state.fill_recording.ready_instance() != 0, "fill sees a ready recording at once");
 
     let now = now_ms();
     state.db_queue_tx.send(telemetry(now - 5_000, "PRE_LAUNCH")).await.unwrap();
@@ -598,7 +623,7 @@ async fn actor_records_from_start_rotates_never_pauses_and_captures_a_launch() {
     state.db_queue_tx.send(DbQueueItem::Control(RecordingCommand::Stop)).await.unwrap();
     state.db_queue_tx.send(telemetry(now - 4_000, "AFTER_PAUSE")).await.unwrap();
     state.db_queue_tx.send(DbQueueItem::Write(DbWrite::FlightState { timestamp_ms: now - 3_000, state_code: F::Launch as i64 })).await.unwrap();
-    wait_for(|| state.recording_store.is_open(EventKind::Launch, "flight"), "launch capture").await;
+    wait_for(|| state.recording_store.is_open(flight, "flight"), "launch capture").await;
     state.db_queue_tx.send(telemetry(now - 2_000, "IN_FLIGHT")).await.unwrap();
     // Rotation closes the segment cleanly and opens the next one.
     state.db_queue_tx.send(DbQueueItem::Control(RecordingCommand::RotateSegment)).await.unwrap();
@@ -606,7 +631,7 @@ async fn actor_records_from_start_rotates_never_pauses_and_captures_a_launch() {
     assert!(crate::telemetry_db::sqlite_sidecars_present(&first).is_empty(), "closed segment finalized");
     state.db_queue_tx.send(telemetry(now - 1_000, "LANDING")).await.unwrap();
     state.db_queue_tx.send(DbQueueItem::Write(DbWrite::FlightState { timestamp_ms: now, state_code: F::Landed as i64 })).await.unwrap();
-    let events = events_dir(&root.0).join("launch");
+    let events = events_dir(&root.0).join(flight.id());
     wait_for(
         || std::fs::read_dir(&events).into_iter().flatten().flatten().any(|e| e.path().join(MANIFEST_FILE).exists()),
         "launch capture saved",

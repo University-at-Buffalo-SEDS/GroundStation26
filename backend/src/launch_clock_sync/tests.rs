@@ -1,5 +1,14 @@
 use super::*;
 use crate::telemetry_db::{LaunchClockKind, LaunchClockMsg};
+
+/// The reset broker is one process-wide station resource that these tests
+/// reset, queue into and drive through observer runtimes. They take turns so
+/// one test's reset or intent never lands in another's.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn active() -> ClockRecord {
     let mut store = crate::launch_history::Store::ephemeral();
     store
@@ -16,6 +25,7 @@ fn active() -> ClockRecord {
 }
 #[test]
 fn current_session_challenge_required_and_queries_bound_legacy_peer() {
+    let _serial = serial();
     let clock = active();
     let mut rr = Runtime::new(None, true).unwrap();
     rr.connect(true, Some(42));
@@ -39,6 +49,7 @@ fn current_session_challenge_required_and_queries_bound_legacy_peer() {
 }
 #[test]
 fn unknown_trailing_oversized_and_unsigned_configured_frames_are_rejected() {
+    let _serial = serial();
     let clock = active();
     let query = seal(
         None,
@@ -62,6 +73,7 @@ fn unknown_trailing_oversized_and_unsigned_configured_frames_are_rejected() {
 }
 #[test]
 fn mesh_clock_extension_is_not_sdk_or_document_and_never_refreshes_lease() {
+    let _serial = serial();
     use crate::rrls::Role;
     let mut primary = crate::rrls::Mesh::new(Role::Primary, 42);
     let mut rr = crate::rrls::Mesh::new(Role::Rrls, 99);
@@ -95,6 +107,7 @@ fn paired(root: &std::path::Path, id: &str, seed: u8) -> Pairing {
 }
 #[test]
 fn paired_clock_requires_signature_primary_identity_and_current_challenge() {
+    let _serial = serial();
     let root = crate::recording_export::tests::TestDirectory::new();
     let primary = paired(&root.0, "gs", 7);
     let observer = paired(&root.0, "rrls", 7);
@@ -151,6 +164,7 @@ fn paired_clock_requires_signature_primary_identity_and_current_challenge() {
 #[tokio::test]
 async fn observer_reset_roundtrip_requires_expected_contract_durable_primary_and_keeps_offline_clock()
  {
+    let _serial = serial();
     *broker().lock().unwrap() = ResetBroker::default();
     let root = crate::recording_export::tests::TestDirectory::new();
     let primary = paired(&root.0, "gs", 7);
@@ -274,6 +288,7 @@ async fn observer_reset_roundtrip_requires_expected_contract_durable_primary_and
 }
 #[test]
 fn clock_query_and_hints_cannot_bypass_a_failed_reset_write() {
+    let _serial = serial();
     let mut journal = crate::launch_history::Store::ephemeral();
     journal
         .update_primary(
@@ -318,6 +333,7 @@ fn clock_query_and_hints_cannot_bypass_a_failed_reset_write() {
 
 #[test]
 fn a_new_health_session_or_changed_hint_requires_fresh_verification() {
+    let _serial = serial();
     let clock = active();
     let mut rr = Runtime::new(None, true).unwrap();
     rr.connect(true, Some(42));
@@ -359,6 +375,7 @@ fn a_new_health_session_or_changed_hint_requires_fresh_verification() {
 }
 #[test]
 fn negotiated_revision_survives_lost_hints_reply_and_busy_queue_then_goes_silent() {
+    let _serial = serial();
     let old = active();
     let mut gs = Runtime::new(None, false).unwrap();
     let mut rr = Runtime::new(None, true).unwrap();
@@ -491,6 +508,7 @@ fn negotiated_revision_survives_lost_hints_reply_and_busy_queue_then_goes_silent
 }
 #[test]
 fn old_profiles_and_unnegotiated_peers_have_no_endless_probe_or_stale_ack_override() {
+    let _serial = serial();
     let clock = active();
     let mut gs = Runtime::new(None, false).unwrap();
     gs.connect(true, Some(42));
@@ -558,6 +576,7 @@ fn old_profiles_and_unnegotiated_peers_have_no_endless_probe_or_stale_ack_overri
 }
 #[tokio::test]
 async fn revision_ack_waits_for_observer_durability_and_retries_same_snapshot() {
+    let _serial = serial();
     let root = crate::recording_export::tests::TestDirectory::new();
     let path = root.0.join("clock.json");
     let saved = root.0.join("saved.json");
@@ -607,6 +626,7 @@ async fn revision_ack_waits_for_observer_durability_and_retries_same_snapshot() 
 }
 #[test]
 fn negotiated_dirty_hint_crosses_real_direct_mesh_without_creating_a_lease() {
+    let _serial = serial();
     let clock = active();
     let mut runtime = Runtime::new(None, false).unwrap();
     runtime.connect(false, Some(42));
@@ -688,6 +708,7 @@ async fn authority_apply(
 }
 #[tokio::test]
 async fn authority_unsigned_remote_reset_changes_neither_ram_nor_real_journal() {
+    let _serial = serial();
     let (_root, state, path) = authority_fixture().await;
     let before = state.launch_history.lock().unwrap().snapshot();
     let disk_before = std::fs::read(&path).unwrap();
@@ -718,6 +739,7 @@ async fn authority_unsigned_remote_reset_changes_neither_ram_nor_real_journal() 
 }
 #[tokio::test]
 async fn authority_paired_retry_replay_and_invalid_contracts_preserve_real_journal() {
+    let _serial = serial();
     let (root, state, path) = authority_fixture().await;
     let mut primary_pairing = paired(&root.0, "gs", 7);
     let mut observer = paired(&root.0, "rrls", 7);
@@ -839,6 +861,7 @@ impl Drop for AuthorityBrokerCleanup {
 }
 #[tokio::test]
 async fn authority_unpaired_request_fails_before_wait_and_without_clock_change() {
+    let _serial = serial();
     use futures::FutureExt;
     let _cleanup = AuthorityBrokerCleanup;
     *broker().lock().unwrap() = ResetBroker::default();
@@ -866,6 +889,7 @@ async fn authority_unpaired_request_fails_before_wait_and_without_clock_change()
 }
 #[tokio::test]
 async fn authority_unpaired_offline_intent_finishes_visibly_without_sending() {
+    let _serial = serial();
     let _cleanup = AuthorityBrokerCleanup;
     *broker().lock().unwrap() = ResetBroker::default();
     let (_root, state, path) = authority_fixture().await;

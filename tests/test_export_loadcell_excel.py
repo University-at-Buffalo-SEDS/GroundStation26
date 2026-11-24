@@ -1,14 +1,24 @@
 import csv
+import importlib.util
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from openpyxl import load_workbook
-
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # repo root: discovery from any cwd
 from export_loadcell_excel import Sample, export_excel, extrema, parse_time, read_recording, recalculate_kg, select_window
+
+if importlib.util.find_spec("openpyxl") is not None:
+    from openpyxl import load_workbook
+else:
+    load_workbook = None
+
+
+NO_OPENPYXL = "openpyxl is not installed (pip install -r tests/requirements.txt)"
 
 
 class RecordingExportTests(unittest.TestCase):
+    @unittest.skipIf(load_workbook is None, NO_OPENPYXL)
     def test_regression_absolute_values_and_saved_coefficients(self):
         raw = [Sample(1000 + i, i, "DAQ", str(i), value)
                for i, value in enumerate((1.0, 2.0, 3.0, None))]
@@ -74,6 +84,7 @@ class RecordingExportTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 select_window(streams, 2000, 1000)
 
+    @unittest.skipIf(load_workbook is None, NO_OPENPYXL)
     def test_excel_preserves_times_values_and_numeric_chart_axis(self):
         timestamp = 1789794290932
         streams = {

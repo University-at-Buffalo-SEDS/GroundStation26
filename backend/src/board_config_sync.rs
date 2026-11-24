@@ -411,6 +411,15 @@ fn remember<T: PartialEq + Copy>(list: &mut Vec<T>, value: T) -> bool {
 fn router_key(router: &sedsnet::router::Router) -> usize {
     router as *const _ as usize
 }
+/// Routers are keyed by address, which a later router may reuse once the first
+/// is dropped. The station keeps one router for its life; tests build many and
+/// forget the address when they install a new one.
+#[cfg(test)]
+pub(crate) fn forget_router_for_test(router: &sedsnet::router::Router) {
+    with_known(|store| {
+        store.last_daq_publish.remove(&router_key(router));
+    });
+}
 /// This station published DAQ calibration with `identity` through `router`.
 pub(crate) fn note_daq_published(router: &sedsnet::router::Router, identity: u32) {
     with_known(|store| {

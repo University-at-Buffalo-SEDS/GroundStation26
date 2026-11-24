@@ -128,6 +128,10 @@ async fn sequences_are_refused_with_the_inline_reason_in_every_mode_and_restored
 
 #[tokio::test]
 async fn launch_abort_reset_recovery_and_manual_commands_are_unchanged_in_every_mode() {
+    // The armed rig is a hardware station in every mode (its Launch peers are
+    // real SDK routers), so a testing station here runs without the internal
+    // flight model.
+    let _sim = crate::flight_sim::test_support::thread_sim(false);
     for mode in MODES {
         let _mode = crate::runtime_mode::test_support::thread_mode(mode);
         for armed in [false, true] {
@@ -210,6 +214,10 @@ async fn launch_rig(
 
 #[tokio::test]
 async fn qd_and_retraction_launch_gates_are_untouched_and_abort_works_in_every_mode() {
+    // The armed rig is a hardware station in every mode (its Launch peers are
+    // real SDK routers), so a testing station here runs without the internal
+    // flight model.
+    let _sim = crate::flight_sim::test_support::thread_sim(false);
     for mode in MODES {
         let _mode = crate::runtime_mode::test_support::thread_mode(mode);
         let (state, path, _peers) = launch_rig(mode).await;

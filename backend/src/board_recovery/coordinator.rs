@@ -5626,11 +5626,13 @@ mod tests {
         // profiles below, never
         // inferred from net occupancy: priority16 metadata can be evicted by
         // priority200 commands after its original admission.
+        // Budgets just above the measured warm-up floor, which grows with the
+        // registered GS schema; never hard-coded, so adding a type keeps the
+        // same headroom search instead of starving the warm-up itself.
+        let floor=crate::ignition_pair::constrained_fixture::warm_floor().await;
         for admitted in 0..3usize {
             let mut seen=false;
-            // These budgets sit just above the warm-up floor, which grows with the
-            // registered GS schema; recalibrate them when a schema type is added.
-            'search: for budget in [20099usize,20151,20203] {for pressure in 0..7 {
+            'search: for budget in crate::ignition_pair::constrained_fixture::budgets_above_floor(floor) {for pressure in 0..7 {
                 let mut scene=crate::ignition_pair::constrained_fixture::Scene::new(budget).await;
                 scene.warm().await.unwrap();
                 // Fresh queried SAME Router scope; this does not claim the old

@@ -461,13 +461,17 @@ async fn root_profile_clock_and_catalog_share_ordinary_service() {
                     && u16::from_le_bytes(inner[26..28].try_into().unwrap()) as usize
                         == clock_fixture.as_ref().unwrap().original_reply.len()
                 {
+                    // The PROBE's physical UART frame: the 4-byte link header
+                    // and its mesh envelope (the envelope size follows the
+                    // RR mesh format, so it is read from the frame, not fixed).
+                    let encoded = format!("encoded_bytes={} ", 4 + body.len());
                     let entries = events.lock().unwrap();
                     let message = entries
                         .iter()
                         .rev()
                         .filter(|e| e["event"] == "actual_UART_capacity")
                         .filter_map(|e| e["fields"]["message"].as_str())
-                        .find(|m| m.contains("side=Some(0)") && m.contains("encoded_bytes=59 "))
+                        .find(|m| m.contains("side=Some(0)") && m.contains(&encoded))
                         .unwrap();
                     let stop: u64 = message
                         .split("stop_us=Some(")
@@ -593,7 +597,11 @@ async fn root_profile_clock_and_catalog_share_ordinary_service() {
                     ordinary_writes += 1;
                     assert_eq!(
                         cost as u64,
-                        fields["payload_bytes"].as_u64().unwrap() + 8 + 4 + 16,
+                        // Self-checked RR marker, UART link header, frame overhead.
+                        fields["payload_bytes"].as_u64().unwrap()
+                            + crate::rrls::RR_SELF_CHECKED_OVERHEAD as u64
+                            + 4
+                            + 16,
                         "actual completed SDK bytes must include RR, UART and configured per-frame overhead"
                     );
                     if fields["mesh_state"] == "Some(Ready)" {
@@ -668,7 +676,11 @@ async fn root_profile_clock_and_catalog_share_ordinary_service() {
                 .step_by(2)
                 .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
                 .collect();
-            wire[12..wire.len() - 4].to_vec()
+            // The fragment of a SEDSnet 7 chunk frame (header and CRC off).
+            sedsnet::side_peek::side_chunk_unchecked(&wire)
+                .expect("physical chunk frame")
+                .payload
+                .to_vec()
         })
         .collect();
     assert_eq!(

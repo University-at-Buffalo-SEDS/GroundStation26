@@ -8209,13 +8209,26 @@ mod tests {
         let (db_tx, _db_rx) = mpsc::channel(32);
         let state = test_app_state(db_tx.clone()).await;
         let overflow = test_db_overflow();
+        // Compact addresses the router never resolved and that are no board's
+        // deterministic wire identity (sender_address_u32 of its name): AB's is
+        // 483403151, which names AB before discovery (state.rs fallback) and is
+        // covered below. Command bytes cannot supply the missing owner.
+        let unowned = [483403152u32, 483403153];
+        for address in unowned {
+            assert!(
+                Board::ALL
+                    .iter()
+                    .all(|board| sedsnet::packet::sender_address_u32(board.sender_id()) != address),
+                "fixture address {address} must not be a board's wire identity"
+            );
+        }
         for key in [
             ActuatorBoardCommands::NitrogenOpen as u8,
             ActuatorBoardCommands::NitrousOpen as u8,
         ] {
-            // Neither address has retained owner identity in this fixture,
-            // including the default AB wire hash. Command bytes cannot supply it.
-            for (sender, on) in [("@addr:483403151", 1u8), ("@addr:483403152", 0u8)] {
+            for (address, on) in [(unowned[0], 1u8), (unowned[1], 0u8)] {
+                let sender = format!("@addr:{address}");
+                let sender = sender.as_str();
                 state.set_pending_umbilical_valve_state(key, on != 0);
                 let packet = Packet::new(
                     crate::telemetry_schema::data_type("UMBILICAL_STATUS"),
@@ -8231,6 +8244,35 @@ mod tests {
                 assert_eq!(state.get_pending_umbilical_valve_state(key), Some(on != 0));
             }
         }
+        // AB's own unresolved wire identity is AB: that sender, not the command
+        // byte, owns the report, so it confirms. A VB-range command from the
+        // same sender is still refused.
+        let ab = format!("@addr:{}", sedsnet::packet::sender_address_u32("AB"));
+        let key = ActuatorBoardCommands::NitrogenOpen as u8;
+        state.set_pending_umbilical_valve_state(key, true);
+        let packet = Packet::new(
+            crate::telemetry_schema::data_type("UMBILICAL_STATUS"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+            &ab,
+            1234,
+            Arc::from([key, 1u8]),
+        )
+        .unwrap();
+        assert!(!handle_packet(&state, &db_tx, &overflow, packet).await.is_empty());
+        assert_eq!(state.get_umbilical_valve_state(key), Some(true));
+        let vb_key = ValveBoardCommands::PilotOpen as u8;
+        state.set_pending_umbilical_valve_state(vb_key, true);
+        let packet = Packet::new(
+            crate::telemetry_schema::data_type("UMBILICAL_STATUS"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+            &ab,
+            1234,
+            Arc::from([vb_key, 1u8]),
+        )
+        .unwrap();
+        assert!(handle_packet(&state, &db_tx, &overflow, packet).await.is_empty());
+        assert_eq!(state.get_umbilical_valve_state(vb_key), None);
+        assert_eq!(state.get_pending_umbilical_valve_state(vb_key), Some(true));
     }
 
     #[tokio::test]

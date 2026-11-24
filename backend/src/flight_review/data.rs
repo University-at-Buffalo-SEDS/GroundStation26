@@ -238,38 +238,57 @@ pub(crate) enum LiveEntry {
     Station(u8),
 }
 
-static LIVE_LOG: std::sync::Mutex<std::collections::VecDeque<(i64, LiveEntry)>> = std::sync::Mutex::new(std::collections::VecDeque::new());
+/// A bounded, change-only event log. The station keeps one process-wide
+/// instance; tests use their own so concurrent tests' events never mix in.
+pub(crate) struct LiveLog(std::sync::Mutex<std::collections::VecDeque<(i64, LiveEntry)>>);
+
+impl LiveLog {
+    pub(crate) const fn new() -> Self {
+        Self(std::sync::Mutex::new(std::collections::VecDeque::new()))
+    }
+
+    pub(crate) fn note(&self, t_ms: i64, entry: LiveEntry) {
+        let mut log = self.0.lock().unwrap();
+        // States are logged on change only.
+        let same_kind = |e: &LiveEntry| std::mem::discriminant(e) == std::mem::discriminant(&entry);
+        if !matches!(entry, LiveEntry::Message(_)) && log.iter().rev().find(|(_, e)| same_kind(e)).is_some_and(|(_, e)| *e == entry) {
+            return;
+        }
+        log.push_back((t_ms, entry));
+        while log.len() > LIVE_LOG_MAX {
+            log.pop_front();
+        }
+    }
+
+    /// Adds the entries at or after `from_ms` to `data`.
+    pub(crate) fn add_to(&self, data: &mut Data, from_ms: i64) {
+        let log = self.0.lock().unwrap();
+        for (t, entry) in log.iter().filter(|(t, _)| *t >= from_ms) {
+            match entry {
+                LiveEntry::Message(text) => data.messages.push((*t, text.clone())),
+                LiveEntry::FcPhase(code) => data.rows.push(Row {
+                    t_ms: *t,
+                    data_type: "GS_FC_PHASE".into(),
+                    sender: "GS".into(),
+                    values: vec![Some(f64::from(*code))],
+                    payload: None,
+                }),
+                LiveEntry::Station(code) => data.station_states.push((*t, *code)),
+            }
+        }
+        drop(log);
+        data.sort();
+    }
+}
+
+static LIVE_LOG: LiveLog = LiveLog::new();
 const LIVE_LOG_MAX: usize = 1024;
 
 pub(crate) fn note(t_ms: i64, entry: LiveEntry) {
-    let mut log = LIVE_LOG.lock().unwrap();
-    // States are logged on change only.
-    let same_kind = |e: &LiveEntry| std::mem::discriminant(e) == std::mem::discriminant(&entry);
-    if !matches!(entry, LiveEntry::Message(_)) && log.iter().rev().find(|(_, e)| same_kind(e)).is_some_and(|(_, e)| *e == entry) {
-        return;
-    }
-    log.push_back((t_ms, entry));
-    while log.len() > LIVE_LOG_MAX {
-        log.pop_front();
-    }
+    LIVE_LOG.note(t_ms, entry);
 }
 
 /// Adds the live log entries at or after `from_ms` to `data`.
 pub(crate) fn add_live_log(data: &mut Data, from_ms: i64) {
-    let log = LIVE_LOG.lock().unwrap();
-    for (t, entry) in log.iter().filter(|(t, _)| *t >= from_ms) {
-        match entry {
-            LiveEntry::Message(text) => data.messages.push((*t, text.clone())),
-            LiveEntry::FcPhase(code) => data.rows.push(Row {
-                t_ms: *t,
-                data_type: "GS_FC_PHASE".into(),
-                sender: "GS".into(),
-                values: vec![Some(f64::from(*code))],
-                payload: None,
-            }),
-            LiveEntry::Station(code) => data.station_states.push((*t, *code)),
-        }
-    }
-    drop(log);
-    data.sort();
+    LIVE_LOG.add_to(data, from_ms);
 }

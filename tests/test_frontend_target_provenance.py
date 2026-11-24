@@ -11,6 +11,7 @@ import time
 import signal
 import unittest
 from unittest.mock import patch
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # repo root: discovery from any cwd
 import build
 
 
@@ -68,7 +69,9 @@ if os.environ.get('FIXTURE_FALLBACK'):
             root = Path(temporary); target = root / 'shared'
             with patch.dict(os.environ, {'CARGO_TARGET_DIR': str(target), 'CARGO_INCREMENTAL': '0'}):
                 a = self.source(root, 'a'); self.assertTrue(self.invoke(root, a).endswith('|BUILD=a|a'))
-                stable_before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in target.glob('debug/deps/libstable_external*')}
+                # Cargo's build-dir layout keeps dependency artifacts in
+                # debug/deps (older Cargo) or debug/build/<pkg>/<hash>/out.
+                stable_before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in (target / 'debug').rglob('libstable_external*') if p.is_file()}
                 b = self.source(root, 'b'); self.assertTrue(self.invoke(root, b).endswith('|BUILD=b|b'))
                 before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in build._frontend_source_files(a)}
                 dx = target / 'dx/renamed_app'; dx.mkdir(parents=True); (dx / 'stale').touch()

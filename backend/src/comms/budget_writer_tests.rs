@@ -202,8 +202,13 @@ fn writer_debt_case(path: &std::path::Path, wire_bytes: usize, start: u64) {
     let (mut uart, mut peer, shared) = pair(None);
     let mut relay = healthy_writer(&shared, start);
     clock(path, start + 2999);
-    uart.send_data_with_priority(&vec![0; wire_bytes - 12], 0)
-        .unwrap();
+    // A raw payload goes out in the CRC-form mesh envelope inside the link
+    // frame header; `wire_bytes` is the whole physical write.
+    uart.send_data_with_priority(
+        &vec![0; wire_bytes - RAW_UART_FRAME_HEADER_SIZE - crate::rrls::RR_CRC_OVERHEAD],
+        0,
+    )
+    .unwrap();
     let old = drain(&mut peer);
     assert_eq!(old.len(), wire_bytes);
     assert_eq!(
@@ -423,7 +428,8 @@ fn reserved_revoke_keeps_wire_context_after_actual_refusal(
     let (mut uart, mut peer, shared) = pair(None);
     uart.service_transmit().unwrap();
     let health0 = drain(&mut peer);
-    assert_eq!(health0[7], 0);
+    // After the 4-byte link header: a HEALTH (kind 0) mesh frame.
+    assert_eq!(health0[4..].rr_kind(), 0);
     clock(path, start + 65);
     uart.test_scalar_limit(Some(limit));
     let result = uart.service_paid_budget_transmit_counted();
@@ -446,7 +452,9 @@ fn reserved_revoke_keeps_wire_context_after_actual_refusal(
     clock(path, start + 500);
     uart.service_transmit().unwrap();
     let health1 = drain(&mut peer);
-    assert_eq!(u32::from_le_bytes(health1[12..16].try_into().unwrap()), 1);
+    assert_eq!(health1[4..].rr_kind(), 0);
+    // Its sequence, at the same body offset the writer-debt case reads.
+    assert_eq!(u32::from_le_bytes(health1[4 + 5..4 + 9].try_into().unwrap()), 1);
     let (after, ever) = shared.lock().unwrap().queued_budget_for_test().unwrap();
     assert!(ever);
     assert_eq!(

@@ -295,6 +295,8 @@ impl Fixture {
         ))
         .unwrap();
         assert!(state.topology_router.set(host.clone()).is_ok());
+        // A new router has published nothing, even at a freed router's address.
+        crate::board_config_sync::forget_router_for_test(&host);
         let requests = Arc::new(Mutex::new(Vec::new()));
         let tick = clock.clone();
         let board_wall = worker_wall.clone();

@@ -745,6 +745,11 @@ mod tests {
         )));
         rt.engine.config.maximum_zero_offset_psi = Some(5.0);
         rt.engine.config.dry_self_test_confirmed = true;
+        // The modeled readings stay current for the whole test: the sequence
+        // clock is held where they were observed. Real disk saves (fsync) on a
+        // loaded host can otherwise outlast the 2 s freshness window between
+        // setup and the check. Tests of real elapsed staleness release it.
+        rt.test_now_ms = Some(rt.now());
         rt.observe_pressure(Some(0.0));
         rt.observe_mass(Some(0.0));
         for (key, open) in KEYS.into_iter().zip(gse_sequence::CLOSED) {
@@ -756,6 +761,10 @@ mod tests {
         policy.software_buttons_enabled = true;
         state.set_action_policy(policy);
         state
+    }
+    /// Return the fixture to the real monotonic sequence clock.
+    fn real_clock(rt: &mut Runtime) {
+        rt.test_now_ms = None;
     }
     // Scenario-only factory: retain every modeled QD/operational prerequisite,
     // but install the real status ingress before the final independent SDK proof.
@@ -1292,6 +1301,8 @@ mod tests {
         let state = fixture().await;
         let original_pressure = {
             let mut rt = state.gse.lock().unwrap();
+            real_clock(&mut rt);
+            rt.observe_pressure(Some(0.0));
             assert!(rt.test_now_ms.is_none(), "negative must use real monotonic time");
             rt.operational.running = true;
             rt.engine.status.phase = Phase::Idle;
@@ -1993,6 +2004,7 @@ mod tests {
         async fn ready() -> Arc<AppState> {
             let state = fixture().await;
             let mut rt = state.gse.lock().unwrap();
+            real_clock(&mut rt);
             assert!(
                 rt.test_now_ms.is_none(),
                 "must exercise real monotonic clock"

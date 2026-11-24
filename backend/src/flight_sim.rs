@@ -1473,17 +1473,56 @@ fn sim() -> &'static Mutex<FlightSimState> {
 /// mode must be inside the cached value: a Normal -> Testing switch in process
 /// keeps the hardware links instead of starting the simulator.
 pub fn sim_mode_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        if crate::runtime_mode::current() != crate::station_mode::Mode::Testing {
-            return false;
+    // Under test the flag is computed per call from the test thread's modeled
+    // boot mode: a process-wide cache would keep whichever test thread called
+    // first, making every later test depend on test order.
+    #[cfg(test)]
+    {
+        if let Some(enabled) = test_support::sim_override() {
+            return enabled;
         }
-        std::env::var("GS_SIM_MODE")
-            .ok()
-            .as_deref()
-            .map(|v| !matches!(v, "0" | "false" | "FALSE" | "off" | "OFF"))
-            .unwrap_or(true)
-    })
+        crate::runtime_mode::boot_flag_mode() == crate::station_mode::Mode::Testing && sim_requested()
+    }
+    #[cfg(not(test))]
+    {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            crate::runtime_mode::current() == crate::station_mode::Mode::Testing && sim_requested()
+        })
+    }
+}
+
+/// `GS_SIM_MODE`, on unless explicitly off.
+fn sim_requested() -> bool {
+    std::env::var("GS_SIM_MODE")
+        .ok()
+        .as_deref()
+        .map(|v| !matches!(v, "0" | "false" | "FALSE" | "off" | "OFF"))
+        .unwrap_or(true)
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    //! A test models a testing station with or without the internal flight
+    //! model on its own thread, as `runtime_mode::test_support` does for modes.
+    use std::cell::Cell;
+    thread_local! {
+        static SIM: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+    pub(super) fn sim_override() -> Option<bool> {
+        SIM.with(Cell::get)
+    }
+    /// Restores the previous setting when dropped.
+    pub(crate) struct ThreadSim(Option<bool>);
+    impl Drop for ThreadSim {
+        fn drop(&mut self) {
+            SIM.with(|cell| cell.set(self.0));
+        }
+    }
+    /// Run this thread with the simulation flag fixed until the guard drops.
+    pub(crate) fn thread_sim(enabled: bool) -> ThreadSim {
+        ThreadSim(SIM.with(|cell| cell.replace(Some(enabled))))
+    }
 }
 
 pub fn handle_command(cmd: &TelemetryCommand) -> bool {

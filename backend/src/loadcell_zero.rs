@@ -304,7 +304,12 @@ impl Service {
         let dir = std::env::var_os("GS_ZERO_CAPTURE_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("calibration/zero_captures")
+                // Unit tests keep captures out of the checkout.
+                #[cfg(test)]
+                let base = crate::loadcell::test_scratch_root();
+                #[cfg(not(test))]
+                let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+                base.join("calibration/zero_captures")
             });
         self.start_in_dir_calibrated(sensor, duration_s, dir, cfg)
     }

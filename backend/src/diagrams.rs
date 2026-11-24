@@ -341,7 +341,8 @@ mod tests {
         for key in ["flight_state", "pyro_drogue", "pyro_main", "provenance", "topology"] {
             assert!(!inputs["status"][key].is_null(), "{key}");
         }
-        assert_eq!(inputs["status"]["igt"], false);
+        // The integrated ground test status follows the station mode.
+        assert_eq!(inputs["status"]["igt"], crate::igt::igt_active(&state));
     }
 
     #[test]

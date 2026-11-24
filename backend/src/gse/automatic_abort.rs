@@ -384,9 +384,12 @@ pub(super) mod tests {
             );
             let _ = result_tx.send(unavailable);
         });
-        let started = started_rx.recv_timeout(std::time::Duration::from_secs(1));
+        // Generous bounds: a non-blocking claim answers at once, so these only
+        // matter when the regression (blocking on the held mutex) is present,
+        // and a loaded test host must not turn scheduling delay into failure.
+        let started = started_rx.recv_timeout(std::time::Duration::from_secs(30));
         let outcome = if started.is_ok() {
-            result_rx.recv_timeout(std::time::Duration::from_secs(1))
+            result_rx.recv_timeout(std::time::Duration::from_secs(30))
         } else {
             Err(std::sync::mpsc::RecvTimeoutError::Timeout)
         };

@@ -6564,16 +6564,20 @@ mod raw_uart_tests {
             cap.drained_virtual(state.wire.stop_us());
             state.radio_capacity = Some(cap);
         }
-        assert_eq!(uart.command_batch_frame_len(255, &und), Some(55));
-        assert_eq!(uart.command_batch_frame_len(255, &fc), Some(62));
+        // Each captured SDK frame travels in the self-checked mesh envelope
+        // (one marker byte) inside the 4-byte link header: 48 + 55 UART bytes.
+        let frame_len = |p: &[u8]| p.len() + RAW_UART_FRAME_HEADER_SIZE + crate::rrls::RR_SELF_CHECKED_OVERHEAD;
+        let (und_len, fc_len) = (frame_len(&und), frame_len(&fc));
+        assert_eq!(uart.command_batch_frame_len(255, &und), Some(und_len));
+        assert_eq!(uart.command_batch_frame_len(255, &fc), Some(fc_len));
         set_clock(30001);
         uart.send_data_with_priority(&und, 255).unwrap();
-        let mut first = vec![0; 55];
+        let mut first = vec![0; und_len];
         peer.read_exact(&mut first).unwrap();
-        set_clock(30061);
+        set_clock(30060);
         assert!(!uart.transmit_ready_for(255, &fc));
         assert!(uart.send_data_with_priority(&fc, 255).is_err());
-        set_clock(30062);
+        set_clock(30061);
         assert!(uart.transmit_ready_for(255, &fc));
         assert!(!uart.transmit_ready_for(255, &und));
         let ordered = serialize::pack_packet_with_reliable(
@@ -6608,11 +6612,11 @@ mod raw_uart_tests {
                         )
                         .ok()?;
                         let bytes = serialize::pack_packet(&packet).to_vec();
-                        (uart.command_batch_frame_len(255, &bytes) == Some(74)).then_some(bytes)
+                        (uart.command_batch_frame_len(255, &bytes) == Some(129 - und_len)).then_some(bytes)
                     })
             })
-            .expect("valid canonical routed74B sibling fixture");
-        assert!(55 + uart.command_batch_frame_len(255, &oversized).unwrap() == 129);
+            .expect("valid canonical routed sibling fixture one byte over the pair limit");
+        assert!(und_len + uart.command_batch_frame_len(255, &oversized).unwrap() == 129);
         assert!(!uart.transmit_ready_for(255, &oversized));
         assert!(uart.send_data_with_priority(&oversized, 255).is_err());
         let mut probe = [0];
@@ -6623,7 +6627,7 @@ mod raw_uart_tests {
         let mut worker_tx = uart.try_clone_tx().unwrap().unwrap();
         assert!(worker_tx.transmit_ready_for(255, &fc));
         worker_tx.send_data_with_priority(&fc, 255).unwrap();
-        let mut second = vec![0; 62];
+        let mut second = vec![0; fc_len];
         peer.read_exact(&mut second).unwrap();
         let expected = |p: &[u8]| {
             let mesh = uart.recovery.as_ref().unwrap().lock().unwrap();
@@ -6634,9 +6638,12 @@ mod raw_uart_tests {
         assert_eq!(second, expected(&fc));
         assert!(!uart.transmit_ready_for(255, &und));
         assert!(!uart.transmit_ready_for(255, &fc));
-        set_clock(30155);
+        // The pair's air debt: (48+16) + (55+16) bytes at 15% of 64 kbit/s.
+        // (Under the 8-byte RR v1 envelope the same pair was 55+62 = 117 UART
+        // bytes and cleared at 30156.)
+        set_clock(30144);
         assert!(!uart.transmit_ready_for(255, &fc));
-        set_clock(30156);
+        set_clock(30145);
         assert!(uart.transmit_ready_for(255, &fc));
     }
 

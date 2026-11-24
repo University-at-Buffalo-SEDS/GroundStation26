@@ -276,3 +276,48 @@ impl Scene {
         self.host.tx_queue(packet).is_ok()&&self.scope_current()
     }
 }
+
+impl Scene {
+    /// Retire a scene's services before the next one is built.
+    pub(crate) async fn close(self) {
+        self.state.request_shutdown();
+        self.state.telemetry_db_pool().close().await;
+        self.state.auth_db.close().await;
+    }
+}
+
+/// Smallest SDK memory budget at which the genuine warm-up completes and
+/// drains. It grows with the registered GS schema, so constrained-queue tests
+/// derive their budgets from it rather than hard-coding numbers that drift
+/// whenever a telemetry type is added. Warm-up success is monotonic in the
+/// budget: a larger shared queue never refuses what a smaller one admitted.
+pub(crate) async fn warm_floor() -> usize {
+    async fn warms(budget: usize) -> bool {
+        let mut scene = Scene::new(budget).await;
+        let ok = scene.warm().await.is_ok();
+        scene.close().await;
+        ok
+    }
+    let (mut lower, mut upper) = (1024usize, 1024usize);
+    while !warms(upper).await {
+        lower = upper;
+        upper *= 2;
+        assert!(upper <= 1 << 22, "the constrained fixture must warm at a bounded budget");
+    }
+    while upper - lower > 1 {
+        let middle = lower + (upper - lower) / 2;
+        if warms(middle).await {
+            upper = middle;
+        } else {
+            lower = middle;
+        }
+    }
+    upper
+}
+
+/// Budgets from the warm-up floor upward, in fine steps, for tests that search
+/// for the exact queue headroom at which an SDK admission boundary appears.
+pub(crate) fn budgets_above_floor(floor: usize) -> impl Iterator<Item = usize> {
+    (0..=96).map(move |step| floor + step * 4)
+}
+

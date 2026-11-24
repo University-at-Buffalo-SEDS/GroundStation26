@@ -1,0 +1,5 @@
+# Python test environment for `python3 -m unittest discover -s tests`.
+# The standard library covers most tests; these enable the XLSX/PDF report
+# checks, which skip with a reason when a module is absent.
+-r ../backend/report-requirements.txt
+pypdf>=5,<7

@@ -5385,6 +5385,10 @@ fn armed_fixture_network_for_test(state:&Arc<AppState>,router:&Arc<sedsnet::rout
     let target = state.fill_targets_snapshot().nitrous.target_mass_kg;
     let mut rt = state.gse.lock().unwrap();
     rt.clock = Instant::now() - std::time::Duration::from_secs(10);
+    // A caller that holds the sequence clock keeps it held, on the new base.
+    if rt.test_now_ms.take().is_some() {
+        rt.test_now_ms = Some(rt.now());
+    }
     rt.operational.path = Some(path.clone());
     rt.operational.topology_stable = true;
     rt.operational.startup_configured = true;
@@ -6788,9 +6792,10 @@ mod final_launch_admission_tests {
         assert!(bare_partial,"the original bare SDK partial boundary remains exercised independently");
         let bare_zero=make_router(16);assert!(bare_zero.try_tx_queue(launch_packet()).is_err());assert!(!bare_zero.has_pending_reliable_tx_type(crate::telemetry_schema::data_type("FLIGHT_COMMAND")));
         let mut partial_seen=false;
-        // These budgets sit just above the warm-up floor, which grows with the
-        // registered GS schema; recalibrate them when a schema type is added.
-        for budget in [20099usize,20151,20203] {
+        // Budgets just above the measured warm-up floor, which grows with the
+        // registered GS schema; never hard-coded.
+        let floor=crate::ignition_pair::constrained_fixture::warm_floor().await;
+        for budget in crate::ignition_pair::constrained_fixture::budgets_above_floor(floor) {
             let mut scene=crate::ignition_pair::constrained_fixture::Scene::new(budget).await;
             scene.warm().await.unwrap();scene.preload_readonly_gps_pressure();
             assert!(scene.scope_current(),"pair and required scope must remain current at original offer");
@@ -6811,9 +6816,16 @@ mod final_launch_admission_tests {
         assert!(partial_seen,"actual SDK must retain the first admitted owner when second admission fails");
         // Additional readonly Ordered QUERY pressure is an actual retained
         // SDK owner; fresh proof remains valid and no queue is processed.
-        let mut scene=crate::ignition_pair::constrained_fixture::Scene::new(20151).await;
-        scene.warm().await.unwrap();scene.preload_readonly_gps_pressure();
-        assert!(scene.preload_readonly_query(crate::types::Board::RFBoard));
+        // The first budget above the floor that still admits the QUERY owner
+        // on top of the GPS pressure.
+        let mut queried=None;
+        for budget in crate::ignition_pair::constrained_fixture::budgets_above_floor(floor) {
+            let mut scene=crate::ignition_pair::constrained_fixture::Scene::new(budget).await;
+            scene.warm().await.unwrap();scene.preload_readonly_gps_pressure();
+            if scene.preload_readonly_query(crate::types::Board::RFBoard) {queried=Some(scene);break;}
+            scene.close().await;
+        }
+        let scene=queried.expect("a readonly QUERY owner must fit above the warm-up floor");
         let state=&scene.state;let ticket=inhibit_automatic_actions_for_launch(state).unwrap();
         let refused=queue_prepared_launch_packets(state,&scene.host,ticket,vec![launch_packet()],None).unwrap_err();
         assert!(refused.contains("accepted 0/1"));assert!(refused.contains("queue saturated"));

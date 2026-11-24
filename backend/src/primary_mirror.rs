@@ -1362,6 +1362,10 @@ mod tests {
     }
     #[tokio::test]
     async fn delayed_source_reports_expire_without_confirming_command_intent() {
+        // The relayed underglow/buzzer rows are process-wide; other tests
+        // write them. Expired controls must show no actuation of their own.
+        let _serial = relayed_outputs::TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        relayed_outputs::reset_for_test();
         let state = crate::state::tests::test_app_state().await;
         let mut snapshot = example();
         snapshot.valve_ages = [0, 1499, UNKNOWN, 0, 0];

@@ -126,25 +126,53 @@ pub fn is_rrls() -> bool {
 /// The primary has asked an RRLS to relay: its direct AV-bay path is lost.
 static PRIMARY_RELAYING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static RRLS_TAKEOVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// RRLS: an operator Abort opened the ABORT-only egress window.
-static RRLS_ABORT_EGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// A Mesh's window flags mirrored for the router task. The station runs one
+/// Mesh; tests run many at once, each on its own thread, so under test every
+/// thread keeps its own mirror instead of racing on a process-wide one.
+macro_rules! mesh_flag {
+    ($(#[$doc:meta])* $name:ident, $get:ident, $set:ident) => {
+        $(#[$doc])*
+        #[cfg(not(test))]
+        static $name: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        #[cfg(test)]
+        thread_local! {
+            static $name: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        fn $get() -> bool {
+            #[cfg(not(test))]
+            return $name.load(std::sync::atomic::Ordering::Acquire);
+            #[cfg(test)]
+            return $name.with(std::cell::Cell::get);
+        }
+        fn $set(value: bool) {
+            #[cfg(not(test))]
+            $name.store(value, std::sync::atomic::Ordering::Release);
+            #[cfg(test)]
+            $name.with(|flag| flag.set(value));
+        }
+    };
+}
+mesh_flag!(
+    /// RRLS: an operator Abort opened the ABORT-only egress window.
+    RRLS_ABORT_EGRESS, abort_egress_flag, set_abort_egress_flag
+);
 /// How long a listening RRLS may put ABORT frames on the air after its
 /// operator pressed Abort (covers the SDK's reliable retries and the
 /// station's Abort re-sends).
 const ABORT_EGRESS_MS: u64 = 10_000;
 /// RRLS: the router's radio side must be enabled for an operator Abort.
 pub(crate) fn abort_egress_open() -> bool {
-    RRLS_ABORT_EGRESS.load(std::sync::atomic::Ordering::Acquire)
+    abort_egress_flag()
 }
 /// After a hand-back the AV bay still addresses this RRLS for its route
 /// lifetime. For this long the listening RRLS still acknowledges what it is
 /// sent and puts its discovery leave on the air (nothing else), so the boards
 /// stop addressing it at once and no frame stalls waiting for it.
 const HANDBACK_GRACE_MS: u64 = 5_000;
-static RRLS_HANDBACK_GRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+mesh_flag!(RRLS_HANDBACK_GRACE, handback_grace_flag, set_handback_grace_flag);
 /// RRLS: the router's radio side must stay enabled for the hand-back grace.
 pub(crate) fn handback_grace_open() -> bool {
-    RRLS_HANDBACK_GRACE.load(std::sync::atomic::Ordering::Acquire)
+    handback_grace_flag()
 }
 /// A local frame's type, whatever its rocket-side framing. On that side the
 /// router sends side-transport full, compact and chunked frames as well as
@@ -2714,12 +2742,12 @@ impl Mesh {
         if self.takeover || self.handback_grace_until.is_some_and(|until| now >= until) {
             self.handback_grace_until = None;
         }
-        RRLS_HANDBACK_GRACE.store(self.handback_grace_until.is_some(), std::sync::atomic::Ordering::Release);
+        set_handback_grace_flag(self.handback_grace_until.is_some());
         RRLS_TAKEOVER.store(self.takeover, std::sync::atomic::Ordering::Release);
         if self.abort_egress_until.is_some_and(|until| now >= until) {
             self.abort_egress_until = None;
         }
-        RRLS_ABORT_EGRESS.store(self.abort_egress_until.is_some(), std::sync::atomic::Ordering::Release);
+        set_abort_egress_flag(self.abort_egress_until.is_some());
     }
     /// RRLS operator Abort: ABORT is the one command never refused for lack of
     /// authority. For ABORT_EGRESS_MS a listening RRLS puts its own ABORT frames
@@ -2741,7 +2769,7 @@ impl Mesh {
     pub fn open_abort_egress(&mut self, now: u64) {
         if self.role == Role::Rrls {
             self.abort_egress_until = Some(now.saturating_add(ABORT_EGRESS_MS));
-            RRLS_ABORT_EGRESS.store(true, std::sync::atomic::Ordering::Release);
+            set_abort_egress_flag(true);
         }
     }
     #[cfg(test)]

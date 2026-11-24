@@ -13,6 +13,11 @@ spec = importlib.util.spec_from_file_location("recording_report", Path(__file__)
 report = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(report)
 
+# XLSX/PDF output needs the report environment (backend/report-requirements.txt)
+# plus pypdf to read PDFs back; CSV/preview tests need only the standard library.
+MISSING_OPENPYXL = importlib.util.find_spec("openpyxl") is None
+MISSING_PYPDF = importlib.util.find_spec("pypdf") is None
+
 
 class Reports(unittest.TestCase):
     def setUp(self):
@@ -113,6 +118,7 @@ class Reports(unittest.TestCase):
         self.assertNotIn("abs(",epochs[0]["postprocess"])
         self.assertIn("abs(calibrated_kg)",epochs[1]["postprocess"])
 
+    @unittest.skipIf(MISSING_OPENPYXL, "openpyxl is not installed (%s)" % "pip install -r tests/requirements.txt")
     def test_real_excel_has_chart_and_regression(self):
         from openpyxl import load_workbook
         book=load_workbook(io.BytesIO(report.run(dict(self.request,format="xlsx"))))
@@ -141,6 +147,7 @@ class Reports(unittest.TestCase):
         finally:
             report.MAX_ROWS=old
 
+    @unittest.skipIf(MISSING_PYPDF, "pypdf is not installed (%s)" % "pip install -r tests/requirements.txt")
     def test_real_pdf_contains_graph_data_and_regression(self):
         from pypdf import PdfReader
         pdf=PdfReader(io.BytesIO(report.run(dict(self.request,format="pdf"))))

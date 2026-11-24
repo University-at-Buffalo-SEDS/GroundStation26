@@ -139,6 +139,44 @@ fn feed(state: &Arc<AppState>, hz: u64, raw: impl Fn(u64) -> f32 + Send + 'stati
     })
 }
 
+/// `feed`, held after `hold` samples until the test raises the hold again, so
+/// it can act while the zero is provably still capturing, however slowly the
+/// loaded host schedules the feeder. Returns the feeder and its sample count.
+fn feed_held(
+    state: &Arc<AppState>,
+    raw: f32,
+    hold: Arc<std::sync::atomic::AtomicU64>,
+) -> (tokio::task::JoinHandle<()>, Arc<std::sync::atomic::AtomicU64>) {
+    let state = state.clone();
+    let count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let fed = count.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            let id = fed.load(Ordering::SeqCst);
+            if id < hold.load(Ordering::SeqCst) {
+                state.auto_zero.lock().unwrap().observe_packet("KG1000", raw, id + 1);
+                fed.store(id + 1, Ordering::SeqCst);
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    });
+    (task, count)
+}
+
+/// Press Launch with the zero held part-way through its capture.
+async fn press_with_zero_held(rig: &Rig) -> (tokio::task::JoinHandle<()>, Arc<std::sync::atomic::AtomicU64>) {
+    let hold = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+    let (feeder, count) = feed_held(&rig.state, 0.25, hold.clone());
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    // Fewer new samples than any capture needs (MIN_SAMPLES).
+    hold.store(count.load(Ordering::SeqCst) + 50, Ordering::SeqCst);
+    assert!(press(rig));
+    while count.load(Ordering::SeqCst) < hold.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    (feeder, hold)
+}
+
 async fn released(state: &AppState) {
     tokio::time::timeout(Duration::from_secs(20), async {
         while before_launch::held(state) {
@@ -389,12 +427,10 @@ async fn board_abort_after_press_refuses_the_held_launch() {
 async fn launch_lock_set_during_zero_refuses_the_held_launch() {
     isolated!(launch_lock_set_during_zero_refuses_the_held_launch);
     let rig = rig(true).await;
-    let feeder = feed(&rig.state, 1_000, |_| 0.25);
-    tokio::time::sleep(Duration::from_millis(60)).await;
-    assert!(press(&rig));
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    let (feeder, hold) = press_with_zero_held(&rig).await;
     assert!(before_launch::held(&rig.state), "still zeroing");
     rig.state.launch_history.lock().unwrap().inhibit_automatic_actions().unwrap();
+    hold.store(u64::MAX, Ordering::SeqCst);
     released(&rig.state).await;
     feeder.abort();
     assert!(!sent(&rig.state));
@@ -406,12 +442,10 @@ async fn launch_lock_set_during_zero_refuses_the_held_launch() {
 async fn turbocharge_started_during_zero_refuses_the_held_launch() {
     isolated!(turbocharge_started_during_zero_refuses_the_held_launch);
     let rig = rig(true).await;
-    let feeder = feed(&rig.state, 1_000, |_| 0.25);
-    tokio::time::sleep(Duration::from_millis(60)).await;
-    assert!(press(&rig));
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    let (feeder, hold) = press_with_zero_held(&rig).await;
     assert!(before_launch::held(&rig.state), "still zeroing");
     rig.state.gse.lock().unwrap().engine.status.phase = gse_sequence::Phase::Turbocharge;
+    hold.store(u64::MAX, Ordering::SeqCst);
     released(&rig.state).await;
     feeder.abort();
     assert!(!sent(&rig.state));
