@@ -731,6 +731,68 @@ async fn replay_bundle(root: &Path, state: &Arc<AppState>, app: &axum::Router, o
     binary_fixture("replay-bundle/flight.csv", &csv);
 }
 
+/// Recovery search: start with a target area, a searcher's opt-in and track
+/// upload, the status with its `search_coverage` overlay, the refusals a
+/// client must handle, and an administrator's clear. Clock readings and the
+/// random session / opt-in ids are pinned.
+async fn recovery_search(app: &axum::Router, out: &mut Fixtures) {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    let frame = crate::recovery_search::coverage::Frame::new(31.758, -102.046);
+    let geo = |x: f64, y: f64| {
+        let (lat, lon) = frame.to_geo(x, y);
+        [(lat * 1e7).round() / 1e7, (lon * 1e7).round() / 1e7]
+    };
+    let target = json!({"polygon": [geo(0.0, 0.0), geo(200.0, 0.0), geo(200.0, 100.0), geo(0.0, 100.0)], "source": "los_prediction", "label": "95% landing area"});
+    let (status, refused) = call(app.clone(), "POST", "/api/recovery_search/start", Some("viewer"), Some(json!({}))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let mut fixtures: Vec<(&str, Value)> = vec![("recovery-search/refused-start-viewer", refused)];
+    let (status, started) = call(app.clone(), "POST", "/api/recovery_search/start", Some("operator"), Some(json!({"swath_width_m": 30, "target": target}))).await;
+    assert_eq!(status, StatusCode::OK, "{started}");
+    let session_id = started["session_id"].as_str().unwrap().to_owned();
+    fixtures.push(("recovery-search/started", started));
+    let opt = json!({"device_id": "fixture-phone", "device_name": "viewer's iPhone", "platform": "ios", "sharing": true});
+    let (status, opted) = call(app.clone(), "POST", "/api/recovery_search/opt_in", Some("viewer"), Some(opt)).await;
+    assert_eq!(status, StatusCode::OK, "{opted}");
+    let opt_in_id = opted["opt_in_id"].as_str().unwrap().to_owned();
+    fixtures.push(("recovery-search/opt-in", opted));
+    let points: Vec<Value> = (0..=24)
+        .map(|i| {
+            let p = geo(100.0, -10.0 + 5.0 * i as f64);
+            json!({"seq": i + 1, "t_ms": now + i * 1000, "lat": p[0], "lon": p[1], "acc_m": 4.0})
+        })
+        .collect();
+    let batch = json!({"v": 1, "session_id": session_id, "opt_in_id": opt_in_id, "device_id": "fixture-phone", "points": points});
+    let (status, accepted) = call(app.clone(), "POST", "/api/recovery_search/track", Some("viewer"), Some(batch.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{accepted}");
+    fixtures.push(("recovery-search/track-accepted", accepted));
+    let (_, duplicate) = call(app.clone(), "POST", "/api/recovery_search/track", Some("viewer"), Some(batch.clone())).await;
+    fixtures.push(("recovery-search/track-duplicate", duplicate));
+    let mut stranger = batch.clone();
+    stranger["device_id"] = "fixture-other".into();
+    let (status, not_opted) = call(app.clone(), "POST", "/api/recovery_search/track", Some("viewer"), Some(stranger)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    fixtures.push(("recovery-search/refused-not-opted-in", not_opted));
+    fixtures.push(("recovery-search/status", get_ok(app, "/api/recovery_search?device_id=fixture-phone", Some("viewer")).await));
+    let (status, stopped) = call(app.clone(), "POST", "/api/recovery_search/stop", Some("operator"), None).await;
+    assert_eq!(status, StatusCode::OK, "{stopped}");
+    fixtures.push(("recovery-search/stopped", stopped));
+    let (status, refused) = call(app.clone(), "DELETE", "/api/recovery_search/tracks", Some("operator"), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    fixtures.push(("recovery-search/refused-clear-operator", refused));
+    let (status, cleared) = call(app.clone(), "DELETE", "/api/recovery_search/tracks", Some("administrator"), None).await;
+    assert_eq!(status, StatusCode::OK, "{cleared}");
+    fixtures.push(("recovery-search/cleared", cleared));
+    // The clear forgot the stopped session's devices: a late batch is refused.
+    let (status, _) = call(app.clone(), "POST", "/api/recovery_search/track", Some("viewer"), Some(batch)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let pins = [(session_id.clone(), "rs-fixture-session"), (opt_in_id.clone(), "fixture-opt-in")];
+    for (name, mut value) in fixtures {
+        replace_text(&mut value, &pins);
+        pin_fields(&mut value, &["started_ms", "stopped_ms", "set_ms", "opted_in_ms", "opted_out_ms", "first_ms", "last_ms", "cleared_ms", "late_upload_until_ms"]);
+        out.add(name, value);
+    }
+}
+
 /// `manifest.json`, the first (deflated or stored) entry of a bundle.
 fn bundle_manifest(bundle: &[u8]) -> Value {
     let u16_at = |i: usize| u16::from_le_bytes([bundle[i], bundle[i + 1]]) as usize;
@@ -864,6 +926,7 @@ async fn contract_fixtures_match_the_backend() {
     replay_export(&app, &mut out).await;
     replay_bundle(&root.0, &state, &app, &mut out).await;
     flight_plans(&state, &app, &mut out).await;
+    recovery_search(&app, &mut out).await;
     drop(_mode);
     board_abort_hitl(&mut out).await;
     self_test_confirmation(&mut out).await;

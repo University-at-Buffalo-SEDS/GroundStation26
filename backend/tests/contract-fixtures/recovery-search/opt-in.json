@@ -1,0 +1,9 @@
+{
+  "device_id": "fixture-phone",
+  "max_seq": null,
+  "opt_in_id": "fixture-opt-in",
+  "opted_in_ms": 1,
+  "points": 0,
+  "session_id": "rs-fixture-session",
+  "sharing": true
+}

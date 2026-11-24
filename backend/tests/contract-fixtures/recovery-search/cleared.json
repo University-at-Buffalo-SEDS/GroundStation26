@@ -1,0 +1,102 @@
+{
+  "accepting_uploads": true,
+  "active": false,
+  "cleared_by": "administrator",
+  "cleared_ms": 1,
+  "format": "gs26.recovery_search",
+  "late_upload_until_ms": 1,
+  "limits": {
+    "late_upload_grace_s": 1800,
+    "max_accuracy_m": 100.0,
+    "max_batch_points": 500,
+    "max_devices": 64,
+    "max_points_per_device": 20000,
+    "max_points_total": 200000,
+    "polygon_max_points": 200,
+    "swath_width_m": [
+      2.0,
+      500.0
+    ]
+  },
+  "overlay": {
+    "areas": [
+      {
+        "id": "uncovered-0",
+        "kind": "uncovered",
+        "label": "Not yet searched",
+        "polygon": [
+          [
+            31.758,
+            -102.046
+          ],
+          [
+            31.758,
+            -102.0438979
+          ],
+          [
+            31.7589106,
+            -102.0438979
+          ],
+          [
+            31.7589106,
+            -102.046
+          ]
+        ]
+      }
+    ],
+    "id": "search_coverage:rs-fixture-session",
+    "kind": "search_coverage",
+    "label": "Search coverage 0%",
+    "markers": [],
+    "predicted": false,
+    "tracks": []
+  },
+  "searchers": [],
+  "session_id": "rs-fixture-session",
+  "settings": {
+    "swath_width_m": 30.0
+  },
+  "started_by": "operator",
+  "started_ms": 1,
+  "stats": {
+    "cell_m": null,
+    "covered_in_target_m2": 0.0,
+    "distance_m": 0.0,
+    "percent_covered": 0.0,
+    "points": 0,
+    "searchers": 0,
+    "sharing": 0,
+    "swath_m2": 0.0,
+    "target_cell_m": 3.75,
+    "target_m2": 20123.44,
+    "uncovered_m2": 20123.44
+  },
+  "stopped_by": "operator",
+  "stopped_ms": 1,
+  "target": {
+    "label": "95% landing area",
+    "polygon": [
+      [
+        31.758,
+        -102.046
+      ],
+      [
+        31.758,
+        -102.0438846
+      ],
+      [
+        31.7588993,
+        -102.0438846
+      ],
+      [
+        31.7588993,
+        -102.046
+      ]
+    ],
+    "set_by": "operator",
+    "set_ms": 1,
+    "source": "los_prediction"
+  },
+  "version": 1,
+  "you": null
+}

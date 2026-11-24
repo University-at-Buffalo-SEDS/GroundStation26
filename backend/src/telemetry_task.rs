@@ -6585,6 +6585,7 @@ mod tests {
             fc_estimator: Default::default(),
             igt: Default::default(),
             proximity: Default::default(),
+            recovery_search: Default::default(),
             hitl_button_interlock_enabled: Arc::new(AtomicBool::new(false)),
             hitl_launch_interlock_enabled: Arc::new(AtomicBool::new(false)),
             hitl_safety_interlocks: crate::state::default_hitl_safety_interlocks(),

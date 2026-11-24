@@ -358,6 +358,9 @@ pub struct AppState {
     /// Personnel proximity lockout: device flags, settings, override
     /// (proximity_lock, docs/proximity-lock.md).
     pub proximity: Arc<crate::proximity_lock::Tracker>,
+    /// Recovery search session and opted-in searchers' tracks
+    /// (recovery_search, docs/backend/recovery-search.md).
+    pub recovery_search: Arc<crate::recovery_search::Store>,
 
     pub hitl_button_interlock_enabled: Arc<AtomicBool>,
 
@@ -4610,6 +4613,7 @@ pub(crate) mod tests {
             fc_estimator: Default::default(),
             igt: Default::default(),
             proximity: Default::default(),
+            recovery_search: Default::default(),
             hitl_button_interlock_enabled: Arc::new(AtomicBool::new(false)),
             hitl_launch_interlock_enabled: Arc::new(AtomicBool::new(false)),
             hitl_safety_interlocks: default_hitl_safety_interlocks(),

@@ -1121,7 +1121,8 @@ pub(crate) fn load_persisted(state: &AppState) {
     crate::launch_site::load(state, dir.clone());
     crate::apogee_planner::load(state, dir.clone());
     crate::los_predict::load(dir.clone());
-    crate::proximity_lock::load(state, dir);
+    crate::proximity_lock::load(state, dir.clone());
+    crate::recovery_search::load(state, dir);
 }
 
 async fn get_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {

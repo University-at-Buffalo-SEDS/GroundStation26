@@ -97,6 +97,7 @@ mod fc_phase;
 mod fc_estimator;
 mod igt;
 mod proximity_lock;
+mod recovery_search;
 mod launch_site;
 mod apogee_planner;
 mod flight_plan;
@@ -1751,6 +1752,7 @@ async fn main() -> anyhow::Result<()> {
         fc_estimator: Default::default(),
         igt: Default::default(),
         proximity: Default::default(),
+        recovery_search: Default::default(),
         hitl_button_interlock_enabled: Arc::new(AtomicBool::new(false)),
         hitl_launch_interlock_enabled: Arc::new(AtomicBool::new(false)),
         hitl_safety_interlocks: state::default_hitl_safety_interlocks(),
@@ -2574,6 +2576,7 @@ async fn main() -> anyhow::Result<()> {
     crate::proximity_lock::spawn_tick(state.clone());
     // Loss-of-signal drift prediction (advisory).
     crate::los_predict::spawn_tick(state.clone());
+    crate::recovery_search::spawn_tick(state.clone());
     let _valve_report_health = tokio::spawn(crate::valve_report_health::service(
         state.clone(),
         state.shutdown_subscribe(),
