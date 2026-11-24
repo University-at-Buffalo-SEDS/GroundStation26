@@ -436,7 +436,11 @@ def scenario_testing(st, check, result):
     # testing mode's own logic against the simulated boards: the links and the fill rules (its launch flow is not
     # driven here)
     boards_up(st, check)
-    dac_patch(st, check, result)
+    # The DAC patch runs in Normal (the station publishes Idle there): in Testing the station stays in Startup without
+    # publishing a FLIGHT_STATE, and a DAQ with no stored state refuses DAC output (gate "flight state unknown").
+    code, body = st.api("/api/daq/dac/config", {"channel": 0, "waveform": "dc", "offset_v": 1.0})
+    st.log("Testing: DAC output request", http=code, body=body)
+    result["testing_dac_refusal"] = {"http": code, "body": body}
     fill(st, check)
 
 
@@ -444,9 +448,14 @@ def dac_patch(st: Station, check, result, frequency_hz=20.0):
     """The DAQ's DAC waveform engine through the simulated loopback cable: a sine on DAC channel 0 patched onto
     MCP3564R CH2, measured by the DAQ's frame engine and judged by the station's DAC validation."""
     st.api("/api/firmware-sim/control", {"patch": {"dac1": "mcp_ch2"}})
-    code, body = st.api("/api/daq/dac/config", {"channel": 0, "waveform": "sine", "amplitude_v": 1.0, "offset_v": 1.5,
-                                               "frequency_hz": frequency_hz})
-    st.log("DAC config", http=code, body=body)
+    config = {"channel": 0, "waveform": "sine", "amplitude_v": 1.0, "offset_v": 1.5, "frequency_hz": frequency_hz}
+
+    def configured():
+        # the DAQ refuses DAC output until it knows the flight state (shortly after the network comes up)
+        code, body = st.api("/api/daq/dac/config", config)
+        st.log("DAC config", http=code, body=body)
+        return code == 200
+    st.wait(configured, 90, "DAC output accepted", poll=5)
     code, body = st.api("/api/daq/dac/validation", {"target": "mcp_ch2", "channel": 0})
     st.log("DAC validation", http=code, body=body)
 
@@ -476,7 +485,7 @@ def dac_patch(st: Station, check, result, frequency_hz=20.0):
     rep = sw.get("report") or {}
     result["dac_sweep"] = {k: rep.get(k) for k in ("pass", "offset_error", "gain_error_pct", "max_nonlinearity_pct_fs", "noise_rms", "checks", "message")}
     check("the DAC validation sweep passes through the patch", rep.get("pass") is True, state=sw.get("state"),
-          message=sw.get("message"), **result["dac_sweep"])
+          sweep_message=sw.get("message"), **result["dac_sweep"])
     st.api("/api/daq/dac/disable", {"channel": 0})
     st.api("/api/firmware-sim/control", {"patch": {"dac1": None}})
 
@@ -685,6 +694,9 @@ def scenario_normal(st, check, result):
     check("RF NEO-M9N fix reaches the station (GPS gates)", rocket, fix=rocket)
     gps = st.latest("GPS_STATUS", "RF")
     result["normal"] = {"rocket_fix": rocket, "gps_status": gps}
+    # the DAQ DAC through the simulated loopback cable while the station is Idle (before the GSE procedure)
+    if os.environ.get("FIRMWARE_SIM_E2E_DAC", "1") != "0":
+        dac_patch(st, check, result)
     # the full launch procedure: the station's own GSE procedure to Armed, then QD retract and Launch
     gse_procedure(st, check, result)
     code, pol = st.api("/api/action_policy")
