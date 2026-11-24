@@ -356,6 +356,8 @@ pub(crate) struct Inner {
     shown: Option<(ImageNotice, Option<u64>)>,
     /// FC BOARD_HEALTH word 6 bits 30..31 and when they arrived.
     sd: Option<(u32, Instant)>,
+    /// Word 6 bit 29: the FC image serves the SD read service (port 4511).
+    sd_service: Option<(bool, Instant)>,
     sd_alert: Option<u64>,
     sd_last_retry: Option<Instant>,
     /// The FC has been in Sim since it last left Off/Validating: a Done that

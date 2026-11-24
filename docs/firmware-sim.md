@@ -353,6 +353,9 @@ Per mode (the e2e: `python3 tools/firmware_sim_e2e.py --out DIR --mode <mode>`):
   although the same files pass when the card holds them from power-on: the FC reads the new card through what it
   cached of the old one (FileX media not reopened on Retry SD; to confirm on hardware with a real card swap). The
   e2e therefore powers on with the dataset on the card (`FIRMWARE_SIM_CONTROL={"igt":{"dataset":...}}`).
+  After the replayed landing the station collects the FC's SD launch file over port 4511 as after a flight (the
+  ground-test variant carries the SD read service) and records which `test-data/igt` dataset was on the card
+  (`docs/data-pipeline.md` §3.4a).
 * **Testing**: the mode's own logic against the simulated boards (the e2e checks the links, the DAC waveform engine
   through the simulated loopback cable (a 20 Hz sine on DAC1 patched onto MCP3564R CH2, judged by the station's DAC
   validation) and the fill rules).

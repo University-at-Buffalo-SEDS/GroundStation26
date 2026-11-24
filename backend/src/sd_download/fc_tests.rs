@@ -115,7 +115,9 @@ fn env(manager: &'static Manager, router: Arc<Router>, root: &FsPath, rate: u64,
         backoff_unit_ms: 10,
         capture_wait_ms: 0,
         igt: false,
-        igt_list_timeout: Duration::from_secs(2),
+        igt_sets: root.join("no-igt-sets"),
+        service: Arc::new(|| None),
+        no_service_list_timeout: Duration::from_secs(2),
         outbox: false,
     };
     (env, Fakes { signals, blocked, notes })
@@ -362,6 +364,116 @@ async fn the_worker_collects_attaches_with_provenance_and_cuts_the_lead_up() {
     task.await.unwrap();
 }
 
+/// The ground-test image's card: its logs at the root (dir 0) and the replay
+/// dataset in `/IGT` (dir 1), as the firmware serves them.
+fn igt_card(files: Vec<CardFile>, dataset: &[(&str, &[u8])]) -> MockCard {
+    let card = mock_fc(files);
+    card.files.lock().unwrap().extend(dataset.iter().map(|(n, b)| (FC_IGT_DIR, n.to_string(), b.to_vec(), false)));
+    card
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn igt_landing_collects_and_attaches_with_the_dataset_provenance() {
+    let root = TestDirectory::new();
+    let folder = capture(&root.0, EventKind::GroundTest).await;
+    let (launch, _, files) = flight_files();
+    let imu: &[u8] = b"t_ms,ax_mps2,ay_mps2,az_mps2,gx_dps,gy_dps,gz_dps\n0,0,0,9.8,0,0,0\n";
+    let baro: &[u8] = b"t_ms,alt_m,pressure_pa,temp_c\n0,0,101000,20\n";
+    let dataset = [("IMU0.CSV", imu), ("BARO0.CSV", baro)];
+    // A committed set with the same files (another one differs).
+    let sets = root.0.join("igt-sets");
+    for (set, files) in [("nominal_10k", &dataset[..]), ("high_wind", &dataset[..1])] {
+        std::fs::create_dir_all(sets.join(set).join("IGT")).unwrap();
+        for (name, bytes) in files {
+            std::fs::write(sets.join(set).join("IGT").join(name), bytes).unwrap();
+        }
+    }
+    let (gs, fc) = link();
+    serve(&fc, Arc::new(igt_card(files, &dataset)));
+    let (running, task) = pump(gs.clone(), fc.clone());
+    let manager: &'static Manager = Box::leak(Box::new(Manager::default()));
+    let (mut env, fakes) = env(manager, gs.clone(), &root.0, 10_000_000, false);
+    env.igt = true;
+    env.igt_sets = sets;
+    env.service = Arc::new(|| Some(true));
+    // The simulated flight lands; Landed held 5 s starts the collection.
+    observe_at(&root.0, FlightState::InFlight, 1_000);
+    observe_at(&root.0, FlightState::Landed, 10_000);
+    assert!(evaluate_at(&root.0, true, Some(T0), Link::Radio, 14_999).is_none());
+    let job = evaluate_at(&root.0, true, Some(T0), Link::Radio, 15_000).expect("IGT landing starts the collection");
+    assert_eq!(job.trigger, "landed_confirmed");
+    tokio::time::timeout(Duration::from_secs(60), run(env)).await.unwrap();
+    let job = load(&root.0).jobs.pop().unwrap();
+    assert_eq!((job.done, job.phase.as_str()), (true, "complete"), "{job:?}");
+    let recorded = job.igt_dataset.clone().expect("dataset recorded");
+    assert_eq!(recorded.matched.as_deref(), Some("nominal_10k"));
+    let manifest = crate::recording_store::read_manifest(&folder).unwrap();
+    assert_eq!(manifest.event_type, EventKind::GroundTest);
+    let entry = manifest.board_sd.iter().find(|e| e.board == "FC").unwrap();
+    assert_eq!((entry.source.as_str(), entry.link.as_deref(), entry.bytes), ("network_download", Some("radio"), launch.len() as u64));
+    assert_eq!(std::fs::read(folder.join("board_sd/FC").join(launch_name())).unwrap(), launch);
+    let provenance = entry.igt_dataset.as_ref().expect("IGT dataset provenance");
+    assert_eq!(provenance, &recorded);
+    let names: Vec<&str> = provenance.files.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["IMU0.CSV", "BARO0.CSV"]);
+    for (file, (_, bytes)) in provenance.files.iter().zip(dataset) {
+        assert_eq!(file.size, bytes.len() as u64);
+        let sha: String = ring::digest::digest(&ring::digest::SHA256, bytes).as_ref().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(file.sha256, sha);
+    }
+    // Nothing but the launch file was downloaded.
+    assert!(!root.0.join("sd-downloads/FC/IGT").exists());
+    let notes = fakes.notes.lock().unwrap().join("\n");
+    assert!(notes.contains("attached to the Integrated ground test capture (IGT dataset nominal_10k (IMU0.CSV, BARO0.CSV))"), "{notes}");
+    assert!(!notes.contains("not available"), "{notes}");
+    running.store(false, Ordering::Relaxed);
+    task.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn igt_collection_against_an_image_without_the_igt_directory_attaches_without_a_dataset() {
+    let root = TestDirectory::new();
+    let folder = capture(&root.0, EventKind::GroundTest).await;
+    let (_, _, files) = flight_files();
+    let (gs, fc) = link();
+    // The mock answers an unknown directory with END: an empty dataset.
+    serve(&fc, Arc::new(mock_fc(files)));
+    let (running, task) = pump(gs.clone(), fc.clone());
+    let manager: &'static Manager = Box::leak(Box::new(Manager::default()));
+    let (mut env, _) = env(manager, gs.clone(), &root.0, 10_000_000, false);
+    env.igt = true;
+    new_job(&root.0);
+    tokio::time::timeout(Duration::from_secs(60), run(env)).await.unwrap();
+    let job = load(&root.0).jobs.pop().unwrap();
+    assert_eq!((job.done, job.phase.as_str()), (true, "complete"), "{job:?}");
+    let manifest = crate::recording_store::read_manifest(&folder).unwrap();
+    let entry = manifest.board_sd.iter().find(|e| e.board == "FC").unwrap();
+    let provenance = entry.igt_dataset.as_ref().unwrap();
+    assert!(provenance.files.is_empty() && provenance.matched.is_none());
+    running.store(false, Ordering::Relaxed);
+    task.await.unwrap();
+}
+
+#[test]
+fn igt_dataset_names_and_matching() {
+    for ok in ["IMU0.CSV", "baro9.csv", "GPS3.CSV"] {
+        assert!(igt_dataset_name(ok), "{ok}");
+    }
+    for bad in ["IMU10.CSV", "IMU.CSV", "IMUA.CSV", "IMU0.TXT", "XIMU0.CSV", "irec-1-000.csv"] {
+        assert!(!igt_dataset_name(bad), "{bad}");
+    }
+    let root = TestDirectory::new();
+    std::fs::create_dir_all(root.0.join("set/IGT")).unwrap();
+    std::fs::write(root.0.join("set/IGT/IMU0.CSV"), b"a").unwrap();
+    std::fs::write(root.0.join("set/README.md"), b"x").unwrap();
+    let sha = board_sd::sha256_hex(&root.0.join("set/IGT/IMU0.CSV")).unwrap();
+    let file = |name: &str, sha: &str| IgtDatasetFile { name: name.into(), size: 1, sha256: sha.into() };
+    assert_eq!(match_igt_dataset(&[file("imu0.csv", &sha)], &root.0).as_deref(), Some("set"), "names are case-insensitive");
+    assert!(match_igt_dataset(&[file("IMU0.CSV", "00")], &root.0).is_none(), "content differs");
+    assert!(match_igt_dataset(&[file("IMU0.CSV", &sha), file("BARO0.CSV", &sha)], &root.0).is_none(), "extra file");
+    assert!(match_igt_dataset(&[], &root.0).is_none());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_rrls_keeps_verified_files_in_its_outbox_and_reports_power_off_ready() {
     let root = TestDirectory::new();
@@ -399,7 +511,7 @@ async fn attachment_follows_ground_test_and_hitl_captures_too() {
         let path = root.0.join("sd-downloads/FC/ROOT").join(launch_name());
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, fc_csv(T0 - 10_000, T0 + 20_000, 100)).unwrap();
-        let provenance = board_sd::Provenance { source: "network_download".into(), link: Some("wired".into()), relay: None };
+        let provenance = board_sd::Provenance { source: "network_download".into(), link: Some("wired".into()), relay: None, igt_dataset: None };
         let outcome = board_sd::offer_file_with(&root.0, &path, &launch_name(), &provenance).unwrap();
         assert_eq!(outcome, vec![board_sd::Outcome::Attached(folder.clone())], "{kind:?}");
         let manifest = crate::recording_store::read_manifest(&folder).unwrap();
@@ -528,21 +640,48 @@ async fn a_link_drop_and_a_restart_resume_from_the_persisted_offset() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_ground_test_image_without_the_service_ends_with_a_clear_status() {
+async fn an_fc_image_reporting_no_service_ends_with_a_clear_status() {
     let root = TestDirectory::new();
-    // The FC answers discovery but serves nothing on port 4511.
+    // The FC answers discovery but serves nothing on port 4511, and its
+    // BOARD_HEALTH says so (word 6 bit 29 clear). IGT mode or not.
     let (gs, fc) = link();
     let (running, task) = pump(gs.clone(), fc.clone());
     let manager: &'static Manager = Box::leak(Box::new(Manager::default()));
     let (mut env, fakes) = env(manager, gs.clone(), &root.0, 10_000_000, false);
     env.igt = true;
+    env.service = Arc::new(|| Some(false));
     new_job(&root.0);
     let finished = tokio::time::timeout(Duration::from_secs(60), run(env)).await;
     let job = load(&root.0).jobs.pop().unwrap();
     assert!(finished.is_ok(), "{job:?}");
     assert_eq!((job.done, job.phase.as_str()), (true, "unavailable"), "{job:?}");
-    assert!(job.message.contains("not available in the ground-test image"), "{job:?}");
+    assert!(job.message.contains("FC SD service not available in this FC image"), "{job:?}");
     assert_eq!(fakes.notes.lock().unwrap().len(), 1, "one clear notice");
+    running.store(false, Ordering::Relaxed);
+    task.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn igt_no_longer_gives_up_on_an_fc_that_reports_the_service() {
+    let root = TestDirectory::new();
+    // Silent on 4511 for now, but the ground-test image reports the service
+    // (or no fresh report yet): well past the 2 s no-service bound the job is
+    // still listing or retrying, as in flight; no "not available" notice.
+    let (gs, fc) = link();
+    let (running, task) = pump(gs.clone(), fc.clone());
+    let manager: &'static Manager = Box::leak(Box::new(Manager::default()));
+    for service in [Some(true), None] {
+        let root = TestDirectory::new();
+        let (mut env, fakes) = env(manager, gs.clone(), &root.0, 10_000_000, false);
+        env.igt = true;
+        env.service = Arc::new(move || service);
+        new_job(&root.0);
+        let _ = tokio::time::timeout(Duration::from_secs(6), run(env)).await;
+        let job = load(&root.0).jobs.pop().unwrap();
+        assert!(!job.done && job.phase != "unavailable", "{service:?}: {job:?}");
+        assert!(fakes.notes.lock().unwrap().iter().all(|n| !n.contains("not available")), "{service:?}");
+    }
+    drop(root);
     running.store(false, Ordering::Relaxed);
     task.await.unwrap();
 }

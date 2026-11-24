@@ -30,6 +30,13 @@ Status codes are those of v1: OK 0, BAD_MESSAGE 1, BAD_STATE 2, BUSY 3,
 NOT_FOUND 4, IO_ERROR 5, END 6, BAD_OFFSET 7. READ (`0x22`) is gone; a board
 answers it BAD_MESSAGE.
 
+Directories (`dir`): the DAQ serves 0 `/LAUNCH`, 1 `/UTC`, 2 `/NO_UTC`. The
+FC serves 0 = card root (`irec*.csv` only); its ground-test image also serves
+1 = `/IGT`, the integrated ground test's replay dataset
+(`(IMU|BARO|GPS)<digit>.CSV`, never flagged open). The flight image answers
+any directory but 0 with BAD_MESSAGE, which the station reads as "this image
+has no such directory".
+
 ### OPEN
 
 - `xfer` (1..255) names the transfer. Every DATA and ACK carries it; anything

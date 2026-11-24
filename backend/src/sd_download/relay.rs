@@ -498,7 +498,7 @@ async fn attach(env: &PullEnv, meta: &OutboxEntry, path: &FsPath, crc_errors: u6
             ],
         };
         let folder = if meta.kind == "launch" {
-            let provenance = board_sd::Provenance { source: "network_download".into(), link: Some("radio".into()), relay: Some(relay) };
+            let provenance = board_sd::Provenance { source: "network_download".into(), link: Some("radio".into()), relay: Some(relay), igt_dataset: None };
             board_sd::offer_file_with(&root, &path, &meta.name, &provenance).ok()?.into_iter().find_map(|o| match o {
                 board_sd::Outcome::Attached(folder) => Some(folder),
                 _ => None,

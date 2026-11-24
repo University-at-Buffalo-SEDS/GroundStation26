@@ -783,6 +783,26 @@ async fn hitl_replay_routes_launch_to_the_fc_and_holds_phase_steps_during_sim() 
 }
 
 #[tokio::test]
+async fn fc_sd_service_bit_from_board_health() {
+    use crate::igt::fc_sd;
+    let state = crate::state::tests::test_app_state().await;
+    assert_eq!(fc_sd::service(&state), None, "no report yet");
+    let mut words = [0u32; 24];
+    assert_eq!(fc_sd::service_from_health(&words), Some(false));
+    words[6] = (1 << 29) | (1 << 30) | 0x1F00_0000;
+    assert_eq!(fc_sd::service_from_health(&words), Some(true));
+    assert_eq!(fc_sd::bits_from_health(&words), Some(fc_sd::NOT_READY), "bit 29 is not an SD state bit");
+    assert_eq!(crate::fc_command_gate::bits_from_word6(words[6]), 0x1F, "nor a gate bit");
+    assert_eq!(fc_sd::service_from_health(&words[..7]), None);
+    fc_sd::observe_service_for_test(&state, true, Instant::now());
+    assert_eq!(fc_sd::service(&state), Some(true));
+    fc_sd::observe_service_for_test(&state, false, Instant::now());
+    assert_eq!(fc_sd::service(&state), Some(false));
+    fc_sd::observe_service_for_test(&state, true, Instant::now() - crate::igt::REPORT_FRESH - Duration::from_secs(1));
+    assert_eq!(fc_sd::service(&state), None, "a stale report says nothing");
+}
+
+#[tokio::test]
 async fn fc_sd_alert_and_retry_gate() {
     use crate::igt::fc_sd;
     let _mode = thread_mode(Mode::Normal);

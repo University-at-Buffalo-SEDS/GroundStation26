@@ -253,15 +253,18 @@ A change sends BOARD_HEALTH at once (at most every 250 ms) and again 1 s
 later, the same as an estimator phase change. Detail, such as the file and
 line of a CSV error, comes as ordered messages beginning `IGT `.
 
-### 6.1a FC SD state: BOARD_HEALTH word 6 bits 30..31 (both images)
+### 6.1a FC SD state: BOARD_HEALTH word 6 bits 29..31 (both images)
 
 | Bit | Meaning |
 | --- | --- |
+| 29 | the image serves the SD read service (P2P port 4511); both images set it now |
 | 30 | SD not ready: the card is not mounted, or the log file cannot be opened or written |
 | 31 | an `FcSdRetry` is pending, not yet taken by the SD task |
 
 The FC uses bits 0..23 for the watchdog task mask and bits 24..28 for the command
-gate. Bits 29..31 were unused.
+gate. Bits 29..31 were unused before. With bit 29 clear (older firmware, or an
+image built without the service) the automatic FC SD collection ends with a
+"not available" notice instead of retrying (`docs/data-pipeline.md` §3.4a).
 
 ### 6.1b Launch site: `LAUNCH_SITE`
 
@@ -445,6 +448,18 @@ This mirrors the DAQ's SD health and `DaqSdRetry`.
   so the motor fire can be reviewed as in a test fire.
 - **SD card:** the FC SD card holds the real raw sensor rows next to the `SIM`
   rows and the `pyro_dry_run` / `pyro_gpio_*` events.
+- **FC SD collection:** after the simulated landing (Landed held 5 s, or
+  Recovery) the station collects the FC's launch file over P2P port 4511, as
+  after a flight, and attaches it to the `ground_test` capture
+  (`board_sd/FC/<file>`, provenance `network_download` and the link). It also
+  records the `/IGT` dataset that was on the card: the FC lists it read-only
+  (SD directory 1) and answers each file's SHA-256; the station matches it
+  against `test-data/igt` and stores names, sizes, SHA-256 and the matched
+  set in the manifest entry (`igt_dataset`) and the job. The ground-test
+  image serves the card only in its allowed states (pad Startup/Idle,
+  Landed, Recovery), never during the replayed flight, and the service and
+  the replay share the FC's SD thread (FC `docs/data-pipeline.md` 8.2).
+  Copying the card by hand still works.
 
 ## 9. Interactions
 

@@ -55,6 +55,21 @@ pub struct BoardSdEntry {
     /// Store-and-forward through the RRLS: who carried it and each hop's check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay: Option<RelayProvenance>,
+    /// FC files collected in integrated ground test: the `/IGT` replay
+    /// dataset that was on the card (as the FC reported it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub igt_dataset: Option<IgtDatasetProvenance>,
+}
+
+/// The FC card's `/IGT` replay dataset when its files were collected
+/// (ground-test image, FC SD directory 1): names, sizes and the FC's SHA-256.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IgtDatasetProvenance {
+    /// The `test-data/igt/<set>` whose `IGT/*.CSV` match these files exactly
+    /// (names and SHA-256); absent for a dataset made elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched: Option<String>,
+    pub files: Vec<crate::sd_download::IgtDatasetFile>,
 }
 
 /// How a relayed board file reached the station.
@@ -135,11 +150,12 @@ pub(crate) struct Provenance {
     /// `radio` or `wired` for network downloads.
     pub link: Option<String>,
     pub relay: Option<RelayProvenance>,
+    pub igt_dataset: Option<IgtDatasetProvenance>,
 }
 
 impl Provenance {
     pub(crate) fn new(source: &str) -> Self {
-        Self { source: source.into(), link: None, relay: None }
+        Self { source: source.into(), link: None, relay: None, igt_dataset: None }
     }
 }
 
@@ -385,6 +401,9 @@ pub(crate) fn offer_file_with(root: &Path, path: &Path, name: &str, provenance: 
             if e.relay.is_none() {
                 e.relay = provenance.relay.clone();
             }
+            if e.igt_dataset.is_none() {
+                e.igt_dataset = provenance.igt_dataset.clone();
+            }
             true
         })?;
     }
@@ -409,6 +428,7 @@ pub(crate) fn offer_file_with(root: &Path, path: &Path, name: &str, provenance: 
             link: provenance.link.clone(),
             sd_format: read_sd_format(&target),
             relay: provenance.relay.clone(),
+            igt_dataset: provenance.igt_dataset.clone(),
         };
         update_manifest(&folder, |m| {
             if m.board_sd.iter().any(|e| e.sha256 == sha) {

@@ -3,8 +3,9 @@
 //!
 //! FC BOARD_HEALTH word 6: bits 0..23 are the FC's watchdog task mask, bits
 //! 24..28 its command gate (crate::fc_command_gate masks exactly those), bit
-//! 30 "SD not ready" and bit 31 "an FcSdRetry is pending". Both images report
-//! them; older FC firmware leaves them clear.
+//! 29 "this image serves the SD read service (P2P port 4511)", bit 30 "SD not
+//! ready" and bit 31 "an FcSdRetry is pending". Both images report them; older
+//! FC firmware leaves them clear (bit 29 clear then reads as "no service").
 use super::*;
 
 /// Word 6 bit 30, shifted down by 30.
@@ -19,6 +20,22 @@ pub(crate) const COOLDOWN: Duration = Duration::from_secs(5);
 /// The FC's SD bits (word 6 bits 30..31, shifted down) of a BOARD_HEALTH.
 pub(crate) fn bits_from_health(words: &[u32]) -> Option<u32> {
     (words.len() == 24).then(|| words[6] >> 30)
+}
+
+/// Word 6 bit 29 of an FC BOARD_HEALTH: the image serves SD reads.
+pub(crate) fn service_from_health(words: &[u32]) -> Option<bool> {
+    (words.len() == 24).then(|| words[6] & SERVICE_BIT != 0)
+}
+const SERVICE_BIT: u32 = 1 << 29;
+
+/// Whether the FC's image serves the SD read service (port 4511), from a
+/// fresh FC BOARD_HEALTH; `None` without one.
+pub(crate) fn service(state: &AppState) -> Option<bool> {
+    let inner = state.igt.inner.lock().unwrap();
+    inner
+        .sd_service
+        .filter(|(_, at)| Instant::now().saturating_duration_since(*at) <= REPORT_FRESH)
+        .map(|(service, _)| service)
 }
 
 /// The SD bits of a fresh FC report.
@@ -40,6 +57,7 @@ pub(super) fn observe_at(state: &AppState, words: &[u32], now: Instant) {
     };
     let mut inner = state.igt.inner.lock().unwrap();
     inner.sd = Some((bits, now));
+    inner.sd_service = service_from_health(words).map(|service| (service, now));
     let raised = inner.sd_alert.is_some();
     let not_ready = bits & NOT_READY != 0 && !quiet();
     if not_ready == raised {
@@ -114,6 +132,14 @@ pub(crate) fn send(state: &AppState, router: &sedsnet::router::Router) -> Result
 pub(crate) fn observe_for_test(state: &AppState, bits: u32, at: Instant) {
     let mut words = [0u32; 24];
     words[6] = bits << 30;
+    observe_at(state, &words, at);
+}
+
+/// Test fixtures: the FC reported (or not) the SD read service at `at`.
+#[cfg(test)]
+pub(crate) fn observe_service_for_test(state: &AppState, service: bool, at: Instant) {
+    let mut words = [0u32; 24];
+    words[6] = if service { SERVICE_BIT } else { 0 };
     observe_at(state, &words, at);
 }
 

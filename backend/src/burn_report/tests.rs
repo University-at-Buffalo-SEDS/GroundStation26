@@ -455,6 +455,7 @@ fn add_daq_file(folder: &Path, m: &mut Manifest, stand: &Stand, profile: impl Fn
             link: None,
             sd_format: None,
             relay: None,
+            igt_dataset: None,
         });
 }
 

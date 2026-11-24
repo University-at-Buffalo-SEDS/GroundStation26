@@ -10,11 +10,19 @@
 //!    flight ([`choose_launch_file`]);
 //! 2. downloads it into `sd-downloads/FC/ROOT/<name>.part` (resumable by
 //!    offset across link drops and station restarts);
-//! 3. attaches it to the matching launch, HITL or ground-test capture
-//!    (`board_sd/FC/<name>`, provenance `network_download` + link), notifies
-//!    the operator and queues the burn-report recompute;
-//! 4. optionally (admin setting `fc_sd_leadup`, default on) reads the 60 s
+//! 3. in integrated ground test, records which `/IGT` replay dataset was on
+//!    the card (FC directory 1: names, sizes and the FC's SHA-256, matched
+//!    against `test-data/igt`; nothing else is downloaded);
+//! 4. attaches it to the matching launch, HITL or ground-test capture
+//!    (`board_sd/FC/<name>`, provenance `network_download` + link, plus the
+//!    IGT dataset), notifies the operator and queues the burn-report
+//!    recompute;
+//! 5. optionally (admin setting `fc_sd_leadup`, default on) reads the 60 s
 //!    lead-up window from the same boot's ordinary file (`leadup.rs`).
+//!
+//! Flight and ground-test images both serve the SD read service; an FC whose
+//! BOARD_HEALTH reports none (word 6 bit 29 clear) gets one bounded listing
+//! and then a clear "not available" notice instead of endless retries.
 //!
 //! It is the lowest-priority user of the link: a streamed transfer whose
 //! window and rate the station sets ([`profile`], [`rate`]: radio 460-byte
@@ -27,7 +35,7 @@
 //! to 60 s and are retried until the job completes; nothing gives up after a
 //! deadline.
 use super::*;
-use crate::recording_store::board_sd;
+use crate::recording_store::board_sd::{self, IgtDatasetProvenance};
 use std::collections::{HashSet, VecDeque};
 
 /// The FC Landed report must hold this long before the fetch starts.
@@ -360,6 +368,8 @@ pub enum Stage {
     #[default]
     List,
     Launch,
+    /// Integrated ground test: the `/IGT` dataset's names and SHA-256.
+    Dataset,
     Attach,
     LeadUp,
     Done,
@@ -375,7 +385,7 @@ pub struct FcJob {
     /// Start of the flight capture open at the trigger (launch file choice).
     pub flight_from_ms: Option<i64>,
     pub stage: Stage,
-    /// waiting, paused, listing, transferring, attaching, waiting_capture,
+    /// waiting, paused, listing, transferring, dataset, attaching, waiting_capture,
     /// lead_up, retrying, complete, unavailable.
     pub phase: String,
     pub message: String,
@@ -395,6 +405,9 @@ pub struct FcJob {
     pub sha256: Option<String>,
     pub capture: Option<String>,
     pub lead_up_rows: u64,
+    /// Integrated ground test: the card's `/IGT` replay dataset.
+    pub igt_dataset: Option<IgtDatasetProvenance>,
+    pub dataset_attempts: u32,
     pub done: bool,
     pub completed_at_ms: Option<u64>,
 }
@@ -580,13 +593,18 @@ pub(crate) struct Env {
     pub backoff_unit_ms: u64,
     /// A downloaded file without a matching capture waits this long for one.
     pub capture_wait_ms: u64,
-    /// Integrated ground test: the FC runs its `--ground-test` image, which
-    /// has no SD read service (flash), so a refused or silent stream ends
-    /// the job with a clear status instead of retrying forever.
+    /// Integrated ground test (the FC runs its `--ground-test` image): the
+    /// collection also records the card's `/IGT` replay dataset.
     pub igt: bool,
-    /// In IGT, a listing that has not answered within this long counts as
-    /// "no service" (a silent stream would otherwise retry for minutes).
-    pub igt_list_timeout: Duration,
+    /// The committed IGT datasets the card's is matched against.
+    pub igt_sets: PathBuf,
+    /// Whether the FC's image serves the SD read service, from its last fresh
+    /// BOARD_HEALTH (word 6 bit 29); `None` without one.
+    pub service: Arc<dyn Fn() -> Option<bool> + Send + Sync>,
+    /// For an FC reporting no service, a listing that has not answered within
+    /// this long ends the job "unavailable" (a silent stream would otherwise
+    /// retry for minutes).
+    pub no_service_list_timeout: Duration,
     /// RRLS role: keep each verified file in the relay outbox for the GS.
     pub outbox: bool,
 }
@@ -658,6 +676,7 @@ pub(crate) async fn run(env: Env) {
             None => match job.stage {
                 Stage::List => list_step(&env, &job).await,
                 Stage::Launch => launch_step(&env, &job).await,
+                Stage::Dataset => dataset_step(&env, &job).await,
                 Stage::Attach => attach_step(&env, &job).await,
                 Stage::LeadUp => leadup_step(&env, &job).await,
                 Stage::Done => {
@@ -710,8 +729,11 @@ async fn list_step(env: &Env, job: &FcJob) -> Step {
         j.message = "listing the FC SD card".into();
     });
     let listing = refresh_listing(env.manager, env.router.clone(), Board::FlightComputer, env.gate(Stage::List));
-    let listing = if env.igt {
-        tokio::time::timeout(env.igt_list_timeout, listing)
+    // Only an FC that reports no SD read service gets a bounded try and the
+    // notice; without a fresh report (or with the service) failures retry.
+    let no_service = (env.service)() == Some(false);
+    let listing = if no_service {
+        tokio::time::timeout(env.no_service_list_timeout, listing)
             .await
             .unwrap_or_else(|_| Err("no answer on the SD stream".into()))
     } else {
@@ -720,8 +742,8 @@ async fn list_step(env: &Env, job: &FcJob) -> Step {
     let listing = match listing {
         Ok(listing) => listing,
         Err(error) if env.reason(Stage::List).is_some() => return Step::Paused(error),
-        Err(error) if env.igt => {
-            let message = format!("FC SD service not available in the ground-test image ({error}); import the card by hand");
+        Err(error) if no_service => {
+            let message = format!("FC SD service not available in this FC image ({error}); import the card by hand");
             complete(env, job.id, "unavailable", &message);
             (env.notify)(format!("FC SD collection: {message}."));
             return Step::Progress;
@@ -810,16 +832,93 @@ async fn launch_step(env: &Env, job: &FcJob) -> Step {
                 .and_then(|p| std::fs::metadata(p).ok())
                 .map_or(0, |m| m.len());
             update_job(&env.root, job.id, |j| {
-                j.stage = Stage::Attach;
+                j.stage = if env.igt { Stage::Dataset } else { Stage::Attach };
                 j.downloaded_at_ms = Some(now_ms());
                 j.launch_size = size;
-                j.phase = "attaching".into();
+                j.phase = if env.igt { "dataset" } else { "attaching" }.into();
                 j.message = format!("{name} received ({size} bytes)");
             });
             Step::Progress
         }
         Err(error) => error.into(),
     }
+}
+
+/// The committed set (`<sets>/<set>/IGT/*.CSV`) whose files are exactly
+/// `files`: the same names (case-insensitive) and SHA-256.
+pub(crate) fn match_igt_dataset(files: &[IgtDatasetFile], sets: &FsPath) -> Option<String> {
+    if files.is_empty() {
+        return None;
+    }
+    let mut card: Vec<(String, String)> = files.iter().map(|f| (f.name.to_ascii_uppercase(), f.sha256.clone())).collect();
+    card.sort();
+    let mut names: Vec<String> = std::fs::read_dir(sets).ok()?.flatten().filter_map(|e| e.file_name().into_string().ok()).collect();
+    names.sort();
+    names.into_iter().find(|set| {
+        let Ok(entries) = std::fs::read_dir(sets.join(set).join("IGT")) else { return false };
+        let mut local: Vec<(String, String)> = entries
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                igt_dataset_name(&name).then_some(())?;
+                Some((name.to_ascii_uppercase(), board_sd::sha256_hex(&e.path()).ok()?))
+            })
+            .collect();
+        local.sort();
+        local == card
+    })
+}
+
+fn describe_dataset(dataset: Option<&IgtDatasetProvenance>) -> String {
+    match dataset {
+        None => "IGT dataset not recorded".into(),
+        Some(d) if d.files.is_empty() => "no IGT dataset on the card".into(),
+        Some(d) => {
+            let names = d.files.iter().map(|f| f.name.as_str()).collect::<Vec<_>>().join(", ");
+            match &d.matched {
+                Some(set) => format!("IGT dataset {set} ({names})"),
+                None => format!("IGT dataset ({names}; not a committed set)"),
+            }
+        }
+    }
+}
+
+/// Integrated ground test: which `/IGT` replay dataset was on the card, as
+/// the FC reports it (FC directory 1: names, sizes, SHA-256; nothing is
+/// downloaded). Best effort: an image without the directory, or three
+/// failed attempts, attach the launch file without it.
+async fn dataset_step(env: &Env, job: &FcJob) -> Step {
+    update_job(&env.root, job.id, |j| {
+        j.phase = "dataset".into();
+        j.message = "reading the FC's IGT dataset (names and SHA-256)".into();
+    });
+    let dataset = match fc_igt_dataset(env.manager, env.router.clone(), env.gate(Stage::Dataset)).await {
+        Ok(Some(files)) => {
+            let (sets, lookup) = (env.igt_sets.clone(), files.clone());
+            let matched = tokio::task::spawn_blocking(move || match_igt_dataset(&lookup, &sets)).await.ok().flatten();
+            Some(IgtDatasetProvenance { matched, files })
+        }
+        Ok(None) => None,
+        Err(StreamError::Gate(reason)) => return Step::Paused(reason),
+        Err(StreamError::Cancelled) => return Step::Paused("cancelled".into()),
+        Err(StreamError::Other(error)) => {
+            let attempts = job.dataset_attempts + 1;
+            update_job(&env.root, job.id, |j| j.dataset_attempts = attempts);
+            if attempts < 3 {
+                return Step::Failed(format!("FC IGT dataset not read: {error}"));
+            }
+            log::warn!("FC IGT dataset not recorded after {attempts} attempts: {error}");
+            None
+        }
+    };
+    let message = describe_dataset(dataset.as_ref());
+    update_job(&env.root, job.id, |j| {
+        j.igt_dataset = dataset;
+        j.stage = Stage::Attach;
+        j.phase = "attaching".into();
+        j.message = message;
+    });
+    Step::Progress
 }
 
 async fn attach_step(env: &Env, job: &FcJob) -> Step {
@@ -835,7 +934,12 @@ async fn attach_step(env: &Env, job: &FcJob) -> Step {
         (env.notify)(format!("FC SD launch file {name} received by the RRLS, checksums verified; forwarding it to the GS when the link allows."));
     }
     let root = env.root.clone();
-    let provenance = board_sd::Provenance { source: "network_download".into(), link: Some(env.link.as_str().into()), relay: None };
+    let provenance = board_sd::Provenance {
+        source: "network_download".into(),
+        link: Some(env.link.as_str().into()),
+        relay: None,
+        igt_dataset: job.igt_dataset.clone(),
+    };
     let (offer_name, offer_path) = (name.clone(), path.clone());
     let outcome = tokio::task::spawn_blocking(move || board_sd::offer_file_with(&root, &offer_path, &offer_name, &provenance)).await;
     let outcomes = match outcome {
@@ -853,8 +957,9 @@ async fn attach_step(env: &Env, job: &FcJob) -> Step {
         let capture = folder.strip_prefix(&env.root).unwrap_or(&folder).to_string_lossy().into_owned();
         let label = manifest.as_ref().map_or_else(|| capture.clone(), |m| m.label.clone());
         let has_lead_up = entry.as_ref().is_some_and(|e| e.lead_up_file.is_some());
+        let dataset = if env.igt { format!(" ({})", describe_dataset(job.igt_dataset.as_ref())) } else { String::new() };
         (env.notify)(format!(
-            "FC SD launch file {name} ({size} bytes) collected over the {} link and attached to the {label} capture{}.",
+            "FC SD launch file {name} ({size} bytes) collected over the {} link and attached to the {label} capture{dataset}{}.",
             env.link.as_str(),
             if env.leadup && !has_lead_up { "; fetching its 60 s lead-up next" } else { "" }
         ));
@@ -1052,6 +1157,7 @@ fn production_env(state: &Arc<AppState>, root: &FsPath, router: Arc<Router>) -> 
     });
     let captures = Arc::downgrade(state);
     let notifier = Arc::downgrade(state);
+    let health = Arc::downgrade(state);
     let alive = Arc::downgrade(state);
     Env {
         manager: &MANAGER,
@@ -1085,7 +1191,9 @@ fn production_env(state: &Arc<AppState>, root: &FsPath, router: Arc<Router>) -> 
         backoff_unit_ms: 1000,
         capture_wait_ms: 120_000,
         igt: crate::runtime_mode::is_igt(),
-        igt_list_timeout: Duration::from_secs(30),
+        igt_sets: crate::firmware_sim_mode::igt_data_dir(),
+        service: Arc::new(move || health.upgrade().and_then(|s| crate::igt::fc_sd::service(&s))),
+        no_service_list_timeout: Duration::from_secs(30),
         outbox: crate::rrls::is_rrls(),
     }
 }

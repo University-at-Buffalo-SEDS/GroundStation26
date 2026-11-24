@@ -131,11 +131,17 @@ fn read_json(path: PathBuf) -> Option<Value> {
     serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
 
+/// Where the committed IGT replay datasets live (`GS_IGT_DATA_DIR`, else
+/// `test-data/igt`).
+pub(crate) fn igt_data_dir() -> PathBuf {
+    std::env::var_os("GS_IGT_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../test-data/igt"))
+}
+
 /// IGT replay datasets (`test-data/igt/<set>/IGT/*.CSV`) the simulated FC SD card can carry.
 pub(crate) fn igt_datasets() -> Vec<String> {
-    let dir = std::env::var_os("GS_IGT_DATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../test-data/igt"));
+    let dir = igt_data_dir();
     let mut sets: Vec<String> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()

@@ -15,9 +15,10 @@
 //! "SD rows win" merge rules apply.
 //!
 //! The DAQ serves `/LAUNCH`, `/UTC` and `/NO_UTC` (directories 0..2); the
-//! Flight Computer serves only its card root (directory 0, `ROOT` here,
-//! listing `irec*.csv`). The FC is collected automatically after landing by
-//! [`fc`].
+//! Flight Computer serves its card root (directory 0, `ROOT` here, listing
+//! `irec*.csv`), and its ground-test image also the IGT replay dataset
+//! (directory 1, `/IGT`, read by [`fc_igt_dataset`] for provenance only). The
+//! FC is collected automatically after landing by [`fc`].
 use crate::{
     auth::Permission,
     state::AppState,
@@ -41,6 +42,7 @@ use tokio::sync::mpsc;
 
 pub const SD_FILE_STREAM_PORT: u16 = 4511;
 use xfer::{OP_CANCEL, OP_CONFIRM, OP_LIST, RESPONSE as RESPONSE_FLAG, STATUS_BUSY, STATUS_END, STATUS_OK};
+const STATUS_BAD_MESSAGE: u8 = 1;
 const STATUS_BAD_STATE: u8 = 2;
 const LIST_HEADER: usize = 12;
 const ENTRY_OPEN: u8 = 0x01;
@@ -650,67 +652,154 @@ async fn list_dirs(
 ) -> Result<Vec<RemoteFile>, StreamError> {
     let mut files = Vec::new();
     for (dir, dir_name) in dirs.iter().enumerate() {
-        let mut index = 0_u16;
-        let mut attempts = 0_u32;
-        while index < MAX_ENTRIES_PER_DIR {
-            stream.send(&encode_list(dir as u8, index))?;
-            let deadline = Instant::now() + RESPONSE_TIMEOUT;
-            let frame = loop {
-                match stream.next_frame(deadline, gate, cancel).await {
-                    Ok(Frame::List(frame))
-                        if frame.status != STATUS_OK
-                            || (frame.dir == dir as u8 && frame.index == index) =>
-                    {
-                        break Ok(frame);
-                    }
-                    Ok(_) => {}
-                    Err(StreamError::Other(e)) if e.starts_with("timed out") => break Err(e),
-                    Err(e) => return Err(e),
-                }
-            };
-            let frame = match frame {
-                Ok(frame) => frame,
-                Err(e) => {
-                    attempts += 1;
-                    if attempts > MAX_RETRIES {
-                        return Err(StreamError::Other(e));
-                    }
-                    continue;
-                }
-            };
-            match frame.status {
-                STATUS_OK => {
-                    // The FC lists only `irec*.csv`; anything else is ignored.
-                    let wanted = !fc_names_only
-                        || crate::recording_store::board_sd::classify_name(&frame.name)
-                            .is_some_and(|(b, _)| b == "FC");
-                    if wanted && valid_name(&frame.name) {
-                        files.push(RemoteFile {
-                            dir: (*dir_name).into(),
-                            name: frame.name,
-                            size: u64::from(frame.size),
-                            open: frame.flags & ENTRY_OPEN != 0,
-                        });
-                    }
-                    index += 1;
-                    attempts = 0;
-                }
-                STATUS_END => break,
-                STATUS_BUSY => {
-                    attempts += 1;
-                    if attempts > 400 {
-                        return Err(StreamError::Other("board stayed busy while listing".into()));
-                    }
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-                STATUS_BAD_STATE => {
-                    return Err(StreamError::Gate(status_text(STATUS_BAD_STATE).into()));
-                }
-                other => return Err(StreamError::Other(status_text(other).into())),
-            }
+        // The FC lists only `irec*.csv`; anything else is ignored.
+        let keep = |name: &str| {
+            !fc_names_only
+                || crate::recording_store::board_sd::classify_name(name).is_some_and(|(b, _)| b == "FC")
+        };
+        match list_dir(stream, dir as u8, dir_name, keep, gate, cancel).await? {
+            Some(entries) => files.extend(entries),
+            None => return Err(StreamError::Other(status_text(STATUS_BAD_MESSAGE).into())),
         }
     }
     Ok(files)
+}
+
+/// One directory's entries whose names `keep` accepts. `Ok(None)`: the board
+/// refused the directory as a bad message (it does not serve it).
+async fn list_dir(
+    stream: &mut BoardStream,
+    dir: u8,
+    dir_name: &str,
+    keep: impl Fn(&str) -> bool,
+    gate: &Gate,
+    cancel: &AtomicBool,
+) -> Result<Option<Vec<RemoteFile>>, StreamError> {
+    let mut files = Vec::new();
+    let mut index = 0_u16;
+    let mut attempts = 0_u32;
+    while index < MAX_ENTRIES_PER_DIR {
+        stream.send(&encode_list(dir, index))?;
+        let deadline = Instant::now() + RESPONSE_TIMEOUT;
+        let frame = loop {
+            match stream.next_frame(deadline, gate, cancel).await {
+                Ok(Frame::List(frame)) if frame.status != STATUS_OK || (frame.dir == dir && frame.index == index) => {
+                    break Ok(frame);
+                }
+                Ok(_) => {}
+                Err(StreamError::Other(e)) if e.starts_with("timed out") => break Err(e),
+                Err(e) => return Err(e),
+            }
+        };
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(e) => {
+                attempts += 1;
+                if attempts > MAX_RETRIES {
+                    return Err(StreamError::Other(e));
+                }
+                continue;
+            }
+        };
+        match frame.status {
+            STATUS_OK => {
+                if keep(&frame.name) && valid_name(&frame.name) {
+                    files.push(RemoteFile {
+                        dir: dir_name.into(),
+                        name: frame.name,
+                        size: u64::from(frame.size),
+                        open: frame.flags & ENTRY_OPEN != 0,
+                    });
+                }
+                index += 1;
+                attempts = 0;
+            }
+            STATUS_END => break,
+            STATUS_BUSY => {
+                attempts += 1;
+                if attempts > 400 {
+                    return Err(StreamError::Other("board stayed busy while listing".into()));
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            STATUS_BAD_STATE => {
+                return Err(StreamError::Gate(status_text(STATUS_BAD_STATE).into()));
+            }
+            STATUS_BAD_MESSAGE => return Ok(None),
+            other => return Err(StreamError::Other(status_text(other).into())),
+        }
+    }
+    Ok(Some(files))
+}
+
+// ------------------------------------------------------- FC IGT dataset
+
+/// FC directory 1: the integrated ground test's replay dataset (`/IGT`),
+/// served read-only by the ground-test image only.
+pub(crate) const FC_IGT_DIR: u8 = 1;
+
+/// One file of the FC's `/IGT` replay dataset as the FC reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IgtDatasetFile {
+    pub name: String,
+    pub size: u64,
+    /// The FC's SHA-256 of the file on the card (hex).
+    pub sha256: String,
+}
+
+/// The replay's file names: `IMU|BARO|GPS<digit>.CSV`.
+pub(crate) fn igt_dataset_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    ["IMU", "BARO", "GPS"].iter().any(|stem| {
+        upper
+            .strip_prefix(stem)
+            .and_then(|rest| rest.strip_suffix(".CSV"))
+            .is_some_and(|digit| digit.len() == 1 && digit.as_bytes()[0].is_ascii_digit())
+    })
+}
+
+/// Lists the FC's `/IGT` dataset (directory 1) and asks the FC for each
+/// file's SHA-256 (39-byte answers; nothing is downloaded). `Ok(None)`: the
+/// FC image does not serve the directory (a flight image).
+pub(crate) async fn fc_igt_dataset(
+    manager: &'static Manager,
+    router: Arc<Router>,
+    gate: Gate,
+) -> Result<Option<Vec<IgtDatasetFile>>, StreamError> {
+    if let Some(reason) = gate() {
+        return Err(StreamError::Gate(reason));
+    }
+    if manager.listing_busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return Err(StreamError::Other("SD file listing is already active".into()));
+    }
+    struct Busy(&'static Manager);
+    impl Drop for Busy {
+        fn drop(&mut self) {
+            self.0.listing_busy.store(false, Ordering::Release);
+        }
+    }
+    let _busy = Busy(manager);
+    let never = AtomicBool::new(false);
+    let mut stream = BoardStream::open(manager, router, Board::FlightComputer, &gate, &never).await?;
+    let result = async {
+        let Some(files) = list_dir(&mut stream, FC_IGT_DIR, "IGT", igt_dataset_name, &gate, &never).await? else {
+            return Ok(None);
+        };
+        let mut dataset = Vec::with_capacity(files.len());
+        for file in files {
+            let req = TransferRequest::new(0, Board::FlightComputer, FC_IGT_DIR, &file.name, PathBuf::new(), xfer::RATE_UNIT);
+            let answer = board_hash(&mut stream, &req, &gate, &never).await?;
+            dataset.push(IgtDatasetFile {
+                name: file.name,
+                size: u64::from(answer.size),
+                sha256: answer.sha256.iter().map(|b| format!("{b:02x}")).collect(),
+            });
+        }
+        Ok(Some(dataset))
+    }
+    .await;
+    stream.finish(result.is_err());
+    result
 }
 
 // ------------------------------------------------------------ local files
