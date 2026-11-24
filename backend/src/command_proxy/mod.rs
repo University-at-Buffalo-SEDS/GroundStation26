@@ -961,6 +961,54 @@ mod tests {
         };
         assert!(matches!(rr.receive(&r, later, Mode::Normal, &fresh).unwrap(), Received::Capability { .. }));
     }
+    /// Native pyro_paths/rrls_relay (2026-11-23): the primary queued an RRLS
+    /// toggle, but the RRLS had already sealed and sent its next copy when the
+    /// result came back. The result (and every replay of it) carries the
+    /// executed first copy's digest, so matching only the latest copy ended
+    /// the request "outcome unknown" (about 1 in 25 RRLS commands).
+    #[test]
+    fn a_result_for_an_earlier_copy_answers_the_request() {
+        let (_root, p, r, mut primary, mut rr, pview, rview) = connected();
+        let id = [9; 16];
+        let operation = Operation::Command("ToggleAvBayUnderglow".into());
+        let first = rr.request(&r, rview, Mode::Hitl, id, "operator".into(), operation.clone()).unwrap();
+        let next_view = Transport { sequence: rview.sequence + 1, ..rview };
+        let second = rr.request(&r, next_view, Mode::Hitl, id, "operator".into(), operation.clone()).unwrap();
+        assert_ne!(wire::contract_digest(&first), wire::contract_digest(&second), "each copy is sealed afresh");
+        let Received::Execute(work) = primary.receive(&p, pview, Mode::Hitl, &first).unwrap() else {
+            panic!("the first copy runs")
+        };
+        let reply = primary.finish(&p, work, Outcome::Queued).unwrap();
+        let later = Transport { sequence: pview.sequence + 1, ..pview };
+        let Received::Reply(replayed) = primary.receive(&p, later, Mode::Hitl, &second).unwrap() else {
+            panic!("the second copy gets the cached result")
+        };
+        assert_eq!(replayed, reply);
+        let Received::Result { request, digest, outcome, .. } = rr.receive(&r, next_view, Mode::Normal, &reply).unwrap() else {
+            panic!("result")
+        };
+        assert_eq!(outcome, Outcome::Queued);
+        let pending = Pending {
+            id,
+            actor: "operator".into(),
+            token: String::new(),
+            operation,
+            plumbing_origin_utc_ms: None,
+            launch_origin: None,
+            session: rview.session,
+            sequence: rview.sequence,
+            wire: Some(second.clone()),
+            copy_digests: vec![wire::contract_digest(&first), wire::contract_digest(&second)],
+            last_sent: Some(450),
+            attempts: 2,
+            created_at: 0,
+        };
+        assert_ne!(digest, wire::contract_digest(&second), "the result names the executed copy, not the latest");
+        assert!(result_answers(&pending, request, &digest));
+        // Another request's result, or a digest this RRLS never sent, does not.
+        assert!(!result_answers(&pending, [8; 16], &digest));
+        assert!(!result_answers(&pending, request, &[0; 16]));
+    }
     #[test]
     fn capability_exchange_survives_a_lagging_health_view() {
         let (_root, p, r) = fixtures();
@@ -1587,6 +1635,19 @@ struct Pending {
     last_sent: Option<u64>,
     attempts: u8,
     created_at: u64,
+}
+/// Whether a signed primary result answers this pending request: its ID, and
+/// the digest of any copy this RRLS sent. Every copy is sealed afresh
+/// (`request_copy_sequence`), so each has its own digest; the primary runs the
+/// first copy it hears and answers every later copy with that cached result,
+/// whose digest is the executed copy's. Matching only the latest copy dropped
+/// the result whenever a resend went out before it arrived (a relayed round
+/// trip is about the resend delay), and the request ended "outcome unknown"
+/// although the primary had queued it.
+fn result_answers(pending: &Pending, request: [u8; 16], digest: &[u8; 16]) -> bool {
+    pending.id == request
+        && (pending.copy_digests.contains(digest)
+            || pending.wire.as_ref().is_some_and(|wire| wire::contract_digest(wire) == *digest))
 }
 #[derive(Default)]
 struct Broker {
@@ -2316,11 +2377,8 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
                                 .pending
                                 .as_ref()
                                 .and_then(|pending| {
-                                    (pending.id == request
-                                        && pending.wire.as_ref().is_some_and(|wire| {
-                                            wire::contract_digest(wire) == digest
-                                        }))
-                                    .then_some(pending.created_at)
+                                    result_answers(pending, request, &digest)
+                                        .then_some(pending.created_at)
                                 });
                         if let Some(created) = created {
                             accept_presentation(
