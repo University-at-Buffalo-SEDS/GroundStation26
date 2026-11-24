@@ -439,10 +439,24 @@ def export_daq_sd_rows(samples, delimiter=","):
     return "".join(out).encode()
 
 
-def export_xlsx(streams, regressions, provenance=None):
+def generated_at(request):
+    """The document time (UTC, whole seconds) when the request pins it with
+    `generated_ms`: a replay bundle pins its reports to the bundle's time so
+    they are reproducible. None: the time of writing."""
+    import datetime
+    ms = request.get("generated_ms")
+    if isinstance(ms, int) and not isinstance(ms, bool) and 0 <= ms < 253402300800000:
+        return datetime.datetime.fromtimestamp(ms // 1000, datetime.timezone.utc)
+    return None
+
+
+def export_xlsx(streams, regressions, provenance=None, generated=None):
     from openpyxl import Workbook
     from openpyxl.chart import ScatterChart, Reference, Series
+    import zipfile
     book = Workbook()
+    if generated is not None:
+        book.properties.created = generated.replace(tzinfo=None)
     meta = book.active
     meta.title = "Regression metadata"
     meta.append(["Channel", "Regression / provenance"])
@@ -474,12 +488,33 @@ def export_xlsx(streams, regressions, provenance=None):
     out = io.BytesIO()
     book.save(out)
     book.close()
-    return out.getvalue()
+    if generated is None:
+        return out.getvalue()
+    # Saving stamps the modified property and the ZIP entry times with the
+    # save time; give them the document time too.
+    stamp = generated.strftime("%Y-%m-%dT%H:%M:%SZ")
+    packed = io.BytesIO()
+    with zipfile.ZipFile(out) as source, zipfile.ZipFile(packed, "w", zipfile.ZIP_DEFLATED) as target:
+        for info in source.infolist():
+            body = source.read(info)
+            if info.filename == "docProps/core.xml":
+                body = re.sub(rb"(<dcterms:modified[^>]*>)[^<]*", lambda m: m.group(1) + stamp.encode(), body)
+            entry = zipfile.ZipInfo(info.filename, generated.timetuple()[:6])
+            entry.compress_type = zipfile.ZIP_DEFLATED
+            target.writestr(entry, body)
+    return packed.getvalue()
 
 
-def export_pdf(streams, regressions, provenance=None):
+def export_pdf(streams, regressions, provenance=None, generated=None):
     import matplotlib
     matplotlib.use("Agg")
+    # The PDF base fonts (Helvetica, Courier) keep the text selectable and
+    # searchable and the file small; ASCII minus signs and unsimplified lines
+    # keep every recorded sample and label as recorded. Clients that build the
+    # same report offline (the UI's replay bundles) draw the same pages.
+    matplotlib.rcParams.update({"pdf.use14corefonts": True, "axes.unicode_minus": False, "path.simplify": False})
+    import logging
+    logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
     import matplotlib.pyplot as plt
     from matplotlib.backends.backend_pdf import PdfPages
     import textwrap
@@ -487,7 +522,7 @@ def export_pdf(streams, regressions, provenance=None):
     if sum(len(v) for v in streams.values()) > 20_000:
         raise ValueError("PDF raw-data appendix exceeds 20,000 samples. Narrow the selection or use CSV/Excel.")
     out = io.BytesIO()
-    with PdfPages(out) as pdf:
+    with PdfPages(out, metadata={"CreationDate": generated} if generated is not None else None) as pdf:
         for key, samples in streams.items():
             fig, ax = plt.subplots(figsize=(11.7, 8.3))
             start = samples[0][0]
@@ -557,9 +592,9 @@ def run(request):
             raise ValueError("Select one recording before choosing DAQ SD layout.")
         return export_daq(streams, metadata, request, chr(9) if fmt == "daq_tsv" else ",", provenance, all_streams)
     if fmt == "xlsx":
-        return export_xlsx(streams, metadata, provenance)
+        return export_xlsx(streams, metadata, provenance, generated_at(request))
     if fmt == "pdf":
-        return export_pdf(streams, metadata, provenance)
+        return export_pdf(streams, metadata, provenance, generated_at(request))
     raise ValueError("Choose CSV, DAQ SD CSV/TSV, Excel or PDF.")
 
 
