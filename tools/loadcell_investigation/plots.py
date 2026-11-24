@@ -84,7 +84,34 @@ def fire_ignition(d, out):
         for r in sorted(rows, key=lambda r: r[0]):
             w.writerow([f'{r[0]:.3f}', r[1], r[2], f'{r[3]:.4f}', r[4]])
 
+def write_wide_csv(path, t_ref, series):
+    """Write series of different rates to one wide CSV: a row per receive timestamp
+    (t_s relative to t_ref, utc_ms, utc_iso) and a column per series, blank where that
+    series has no sample at that timestamp. series: [(column, t_ms, values)]. A series
+    with several samples in the same millisecond gets one row per sample, so no sample
+    is merged or dropped."""
+    import csv
+    from datetime import datetime, timezone
+    rows = {}
+    for j, (_, t, v) in enumerate(series):
+        occ = {}
+        for tt, vv in zip(t.tolist(), v.tolist()):
+            n = occ.get(tt, 0); occ[tt] = n + 1
+            rows.setdefault((tt, n), [''] * len(series))[j] = '' if vv != vv else f'{vv:.7g}'
+    with open(path, 'w', newline='') as f:
+        w = csv.writer(f, lineterminator='\n')
+        w.writerow(['t_s', 'utc_ms', 'utc_iso'] + [c for c, _, _ in series])
+        for (tt, _), vals in sorted(rows.items()):
+            iso = datetime.fromtimestamp(tt / 1000, timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+            w.writerow([f'{(tt - t_ref) / 1000:.3f}', tt, iso] + vals)
+
 def fire_overview(d, out):
+    """Whole 11-16 fire recording: KG1000, DAQ VMAIN, KG50 and the ADC die temperature on
+    one minutes axis from the first KG1000 sample. Also writes every plotted sample to
+    fire-20261116-overview.csv (wide, full resolution; see write_wide_csv): kg1000_adc_pin_v,
+    vmain_v, kg50_p6_input_mv (only after 0.4 min, as plotted; the panel's y-limits
+    3.6-3.95 mV clip a few points that are still in the CSV) and adc_die_temp_c. The
+    dashed 0.2126 V calibrated-zero line is a constant and not a CSV column."""
     z = load(d, '2026-11-17_00-59-46_065')
     t1, k1 = s(z, 'DAQ|KG1000'); t0 = t1[0]
     mins = lambda t: (t - t0) / 60000.0
@@ -98,6 +125,9 @@ def fire_overview(d, out):
     tt, tc = s(z, 'DAQ|DAQ_ADC_TEMPERATURE')
     ax[3].plot(mins(tt), tc, color=YELLOW, lw=0.8); ax[3].set_ylabel('ADC die °C'); ax[3].set_xlabel('minutes')
     fig.tight_layout(); fig.savefig(os.path.join(out, 'fire-20261116-overview.png'), dpi=110); plt.close(fig)
+    write_wide_csv(os.path.join(out, 'fire-20261116-overview.csv'), t0,
+                   [('kg1000_adc_pin_v', t1, k1 * K), ('vmain_v', tp, vm),
+                    ('kg50_p6_input_mv', t5[g], k5[g] * 1000), ('adc_die_temp_c', tt, tc)])
 
 def rail_1106(d, out):
     z = load(d, '2026-11-06_22-51-01_544')

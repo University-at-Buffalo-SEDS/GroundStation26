@@ -236,6 +236,14 @@ Other calibration-handling problems:
 
 ![Fire overview](loadcell-investigation-2026-11/fire-20261116-overview.png)
 
+Data for the figure: `fire-20261116-overview.csv`, every plotted sample at full
+resolution. It is wide: `t_s` (seconds from the first KG1000 sample, the figure's
+minute 0), `utc_ms` and `utc_iso` (GS receive time), then one column per series:
+`kg1000_adc_pin_v`, `vmain_v`, `kg50_p6_input_mv` (after 0.4 min only, as plotted) and
+`adc_die_temp_c`. The series run at different rates (KG1000/KG50 ≈ 27 Hz, VMAIN and die
+temperature ≈ 2.7 Hz), so a cell is blank where that series has no sample at that time.
+The 0.2126 V calibrated-zero line is a constant and is not a column.
+
 - **KG1000 zero.** It varied 0.2068–0.2134 V across site days, ±1.8 kg. It is flat before
   launch apart from the supply-dip clamps. There are no intermittent contact spikes that
   would suggest the gap closing (valve steps ≤0.4 kg).
