@@ -38,6 +38,7 @@ HERE = Path(__file__).resolve().parent
 GS_ROOT = HERE.parent
 USER, PASSWORD = "simadmin", "firmware-sim-e2e"
 BOARDS = ["FC", "RF", "PB", "GB", "AB", "VB", "DAQ"]
+BAY_STALL_S = 60.0
 
 
 def fixture_users():
@@ -54,12 +55,45 @@ class Station:
         self.origin, self.key, self.out, self.token = origin, key, out, None
         self.timeline = (out / "timeline.jsonl").open("a")
         self.t0 = time.monotonic()
+        self.bay_status = out / "station-mode" / "firmware-sim" / "run" / "status.json"
+        self.v0 = None
+
+    def now(self) -> float:
+        """Seconds on the station's clock: the bay's virtual time when the station follows it (a bay slowed by host
+        load then slows every wait and pause of this check with it), else the wall clock. Continuous across the
+        switch from the wall (no bay status yet) to the bay's clock."""
+        wall = time.monotonic()
+        try:
+            st = self.bay_status.stat()
+            status = json.loads(self.bay_status.read_text())
+        except (OSError, ValueError):
+            status = None
+        if not status or status.get("station_clock") != "bay":
+            return wall if self.v0 is None else self.v0[0] + self.v0[1]
+        # the status is written once per virtual second: interpolate at most one second past it
+        v = status.get("virtual_ms", 0) / 1000.0 + min(max(time.time() - st.st_mtime, 0.0), 1.0)
+        if self.v0 is None:
+            self.v0 = (wall - v, v)  # (offset onto the wall scale at the switch, latest virtual seconds)
+            self.v_moved = wall
+        if v > self.v0[1]:
+            self.v0 = (self.v0[0], v)  # never backwards
+            self.v_moved = wall
+        # a bay that stopped (crashed, or stalled for over a minute) must not hang the check: the wall takes over
+        return self.v0[0] + self.v0[1] + max(0.0, wall - self.v_moved - BAY_STALL_S)
+
+    def sleep(self, seconds: float):
+        end = self.now() + seconds
+        while self.now() < end:
+            time.sleep(min(0.2, seconds))
 
     def log(self, what: str, **extra):
         row = {"t_s": round(time.monotonic() - self.t0, 2), "event": what, **extra}
+        if self.v0 is not None:
+            row["virtual_s"] = round(self.v0[1], 1)
         self.timeline.write(json.dumps(row, default=str) + "\n")
         self.timeline.flush()
-        print(f"[e2e {row['t_s']:7.1f}] {what} {json.dumps(extra, default=str)[:300] if extra else ''}", flush=True)
+        print(f"[e2e {row['t_s']:7.1f}{' v' + format(row['virtual_s'], '7.1f') if 'virtual_s' in row else ''}] {what} "
+              f"{json.dumps(extra, default=str)[:300] if extra else ''}", flush=True)
 
     def api(self, path, body=None, timeout=15):
         headers = {"Content-Type": "application/json"}
@@ -117,9 +151,9 @@ class Station:
         return best
 
     def wait(self, pred, timeout_s, label, poll=0.5):
-        end = time.monotonic() + timeout_s
+        end = self.now() + timeout_s
         last = None
-        while time.monotonic() < end:
+        while self.now() < end:
             try:
                 last = pred()
                 if last:
@@ -171,9 +205,8 @@ def main() -> int:
     out = a.out.resolve()
     out.mkdir(parents=True, exist_ok=True)
     if a.mode == "integrated_ground_test" and "FIRMWARE_SIM_CONTROL" not in os.environ:
-        # the IGT card goes in with its dataset before power-on. Swapping the card's contents while the FC runs (card
-        # out, dataset, card in, Retry SD) currently ends in an FC CSV parse fault: docs/firmware-sim.md, IGT
-        os.environ["FIRMWARE_SIM_CONTROL"] = json.dumps({"igt": {"dataset": "nominal_10k"}})
+        # the IGT card goes in with a dataset before power-on; the scenario then swaps it for another (Retry SD)
+        os.environ["FIRMWARE_SIM_CONTROL"] = json.dumps({"igt": {"dataset": IGT_POWER_ON_DATASET}})
     proc, key = start_station(out, a.mode, a.port)
     st = Station(f"http://127.0.0.1:{a.port}", key, out)
     st.mode = a.mode
@@ -251,13 +284,13 @@ def fill(st: Station, check, nitrous_kg=5.0):
     p0 = st.wait(lambda: vb_psi(st) is not None and vb_psi(st) + 0.001, 10, "VB pressure") or 0
     st.command("Nitrogen")
     st.wait(lambda: st.plant().get("valves", {}).get("nitrogen"), 10, "AB nitrogen valve open")
-    time.sleep(6)
+    st.sleep(6)
     p1 = vb_psi(st)
     check("VB tank PT rises with the AB nitrogen valve open and the QD connected", p1 is not None and p1 > p0 + 50, before=p0, after=p1)
     code, _ = st.api("/api/firmware-sim/control", {"plant": {"qd_connected": False}})
-    time.sleep(1.5)
+    st.sleep(1.5)
     q0 = vb_psi(st)
-    time.sleep(5)
+    st.sleep(5)
     q1 = vb_psi(st)
     check("VB tank PT does not rise with the QD disconnected (valve still open)", code == 200 and q1 is not None and abs(q1 - q0) < 8,
           before=q0, after=q1, ab_valve_open=st.plant().get("valves", {}).get("nitrogen"))
@@ -279,7 +312,7 @@ def fill(st: Station, check, nitrous_kg=5.0):
     st.command("NitrousClose")
     set_valve(st, "vent", False, "NormallyOpen")
     st.wait(lambda: not st.plant().get("valves", {}).get("nitrous"), 10, "AB nitrous valve closed")
-    time.sleep(2)
+    st.sleep(2)
     m1 = (st.latest("LOADCELL_50_WEIGHT_KG", "DAQ") or {}).get("values", [0])[0] or 0
     check("nitrous fill: DAQ load cell and VB tank PT follow the fill", filled and m1 > m0 + 1 and (vb_psi(st) or 0) > 300,
           load_cell_before=m0, load_cell_after=m1, tank_psi=vb_psi(st), plant=st.plant().get("tank"))
@@ -298,20 +331,20 @@ def arm_and_launch(st: Station, check):
             break
         # HITL steps the flight state; other modes reach Armed from the fill itself
         code, _ = st.command("AdvanceFlightState") if st.mode == "hitl" else (0, None)
-        time.sleep(3)
+        st.sleep(3)
     if st.mode != "test_fire":
         check("station and boards reach Armed", state == "Armed", state=state, fc=fc_phase(st))
     launched = False
     for _ in range(8):
         st.api("/api/board_abort/refresh", {})
-        time.sleep(2)
+        st.sleep(2)
         code, body = st.command("Launch")
         if code == 200:
             launched = True
             break
         if "etract" in str(body):
             st.command("RetractPlumbing")
-            time.sleep(6)
+            st.sleep(6)
     check("Launch accepted by the station", launched)
     return launched
 
@@ -331,7 +364,7 @@ def flight(st: Station, check, result):
     landed = st.wait(track, 420, "landed", poll=1)
     for _ in range(10):
         track()
-        time.sleep(1)
+        st.sleep(1)
     flight = st.plant().get("flight", {})
     result["fc_phases"] = phases
     result["flight"] = flight
@@ -383,18 +416,33 @@ def dac_patch(st: Station, check, result, frequency_hz=20.0):
           abs(f - frequency_hz) < 0.05 * frequency_hz and want and abs(amp - want) < 0.1 * want,
           analysis=a, warnings=v.get("warnings"))
     st.api("/api/daq/dac/disable", {"channel": 0})
+    # the station's validation sweep (linearity: DC steps through the patch, judged against the target's model)
+    code, body = st.api("/api/daq/dac/sweep", {"target": "mcp_ch2", "channel": 0, "steps": 11, "dwell_ms": 1000})
+    st.log("DAC sweep", http=code, body=body)
+
+    def swept():
+        code, v = st.api("/api/daq/dac/sweep")
+        if code != 200 or not isinstance(v, dict):
+            return None
+        return v if str(v.get("state", "")).lower() in ("done", "failed", "cancelled") else None
+    sw = st.wait(swept, 180, "DAC validation sweep", poll=3) or {}
+    rep = sw.get("report") or {}
+    result["dac_sweep"] = {k: rep.get(k) for k in ("pass", "offset_error", "gain_error_pct", "max_nonlinearity_pct_fs", "noise_rms", "checks", "message")}
+    check("the DAC validation sweep passes through the patch", rep.get("pass") is True, state=sw.get("state"),
+          message=sw.get("message"), **result["dac_sweep"])
+    st.api("/api/daq/dac/disable", {"channel": 0})
     st.api("/api/firmware-sim/control", {"patch": {"dac1": None}})
 
 
 def peak(st: Station, data_type: str, seconds: float, index=0):
     best = None
-    end = time.monotonic() + seconds
-    while time.monotonic() < end:
+    end = st.now() + seconds
+    while st.now() < end:
         for r in st.recent():
             if r.get("data_type") == data_type and r.get("values") and r["values"][index] is not None:
                 v = r["values"][index]
                 best = v if best is None else max(best, v)
-        time.sleep(1)
+        st.sleep(1)
     return best
 
 
@@ -433,7 +481,7 @@ def gse_procedure(st: Station, check, result):
     ok = st.wait(n2, 400, "nitrogen test", poll=2)
     check("nitrogen test passes (pressure steps on the plant, dump at the hold)", ok, phase=gse(st).get("phase"), message=gse(st).get("message"))
     command_accepted(st, "StartFill")
-    last_resume = [time.monotonic()]
+    last_resume = [st.now()]
     def filled():
         g = gse(st)
         if (g.get("qualification") or {}).get("fill_target"):
@@ -442,8 +490,8 @@ def gse_procedure(st: Station, check, result):
         # Start fill first zeroes the fill load cell; a preparation that expired (a notification asks to press Fill
         # again) leaves the sequence where it was, so press it again
         not_started = g.get("phase") == "passed" and not (g.get("qualification") or {}).get("filling_started")
-        if (stalled and time.monotonic() - last_resume[0] > 5) or (not_started and time.monotonic() - last_resume[0] > 30):
-            last_resume[0] = time.monotonic()
+        if (stalled and st.now() - last_resume[0] > 5) or (not_started and st.now() - last_resume[0] > 30):
+            last_resume[0] = st.now()
             st.command("StartFill")
         return None
     ok = st.wait(filled, 600, "fill target", poll=2)
@@ -452,20 +500,46 @@ def gse_procedure(st: Station, check, result):
     result["gse"] = gse(st)
 
 
+def extremes(st: Station, seconds: float, specs: dict) -> dict:
+    """Over `seconds` of station time, the extreme of each DAQ series in `specs` ({data_type: max|min}) among the
+    station's recent rows (the recent window holds the whole burn)."""
+    out = {k: None for k in specs}
+    end = st.now() + seconds
+    while True:
+        for r in st.recent():
+            k = r.get("data_type")
+            if k in specs and r.get("values") and r["values"][0] is not None:
+                v = r["values"][0]
+                out[k] = v if out[k] is None else specs[k](out[k], v)
+        if st.now() >= end:
+            return out
+        st.sleep(1)
+
+
 def scenario_test_fire(st, check, result):
     # test fire uses the fill-side boards on the umbilical (the AV bay is not on the stand's radio)
     boards_up(st, check, ["GB", "AB", "VB", "DAQ"])
     # the operator's procedure from an empty tank (the manual fill rules are checked in the other modes)
     gse_procedure(st, check, result)
     kg1000_rest = (st.latest("KG1000", "DAQ") or {}).get("values", [None])[0]
+    kg50_rest = (st.latest("LOADCELL_50_WEIGHT_KG", "DAQ") or {}).get("values", [None])[0]
     arm_and_launch(st, check)
+    fired = st.wait(lambda: st.plant().get("igniter_fired"), 60, "AB igniter (PB7)")
+    check("the AB fires the igniter on its drive enable (PB7)", fired,
+          events=[e["event"] for e in st.plant().get("events", [])][-6:])
     lit = st.wait(lambda: st.plant().get("motor", {}).get("burning") or st.plant().get("motor", {}).get("burned_out"), 90, "ignition on the stand")
-    check("igniter and pilot light the motor on the stand", lit, events=[e["event"] for e in st.plant().get("events", [])][-6:])
-    chamber = peak(st, "COMBUSTION_CHAMBER_PRESSURE", 12)
-    kg1000 = peak(st, "KG1000", 1)
+    check("igniter and pilot light the hybrid motor on the stand", lit, model=st.plant().get("motor", {}).get("model"),
+          events=[e["event"] for e in st.plant().get("events", [])][-6:])
+    ex = extremes(st, 12, {"COMBUSTION_CHAMBER_PRESSURE": max, "KG1000": max, "LOADCELL_50_WEIGHT_KG": min})
+    chamber, kg1000, kg50_min = ex["COMBUSTION_CHAMBER_PRESSURE"], ex["KG1000"], ex["LOADCELL_50_WEIGHT_KG"]
     plant = st.plant()
-    result["test_fire"] = {"chamber_psi_peak": chamber, "kg1000_v_peak": kg1000, "kg1000_v_rest": kg1000_rest, "motor": plant.get("motor")}
-    check("DAQ reports the chamber pressure of the burn", (chamber or 0) > 100, chamber_psi_peak=chamber)
+    result["test_fire"] = {"chamber_psi_peak": chamber, "kg1000_v_peak": kg1000, "kg1000_v_rest": kg1000_rest,
+                           "kg50_kg_rest": kg50_rest, "kg50_kg_min": kg50_min, "motor": plant.get("motor")}
+    check("DAQ reports the chamber pressure of the burn (chamber PT)", (chamber or 0) > 100, chamber_psi_peak=chamber)
+    # the stand: thrust first unloads the KG50 (the hanging rocket and its propellant) ...
+    check("the KG50 unloads as the motor lifts the rocket", kg50_min is not None and kg50_rest is not None and kg50_min < kg50_rest - 2,
+          rest_kg=kg50_rest, min_kg=kg50_min)
+    # ... then the gap closes and the KG1000 carries the thrust
     check("the KG1000 sees the thrust once the gap closes", kg1000 is not None and kg1000_rest is not None and kg1000 > kg1000_rest + 0.5,
           rest_v=kg1000_rest, peak_v=kg1000)
     check("the rocket stays on the stand", plant.get("flight", {}).get("phase") == "pad", phase=plant.get("flight", {}).get("phase"))
@@ -474,15 +548,65 @@ def scenario_test_fire(st, check, result):
 
 
 def burn_report(st: Station, check, result):
-    """The station's burn report (thrust, impulse) from the capture of the burn (provisional 40 s after the start)."""
-    def report():
+    """The station's burn report (thrust, impulse): provisional from the capture of the burn, final once the DAQ's SD
+    launch file is merged (the station fetches it after the burn)."""
+    def report(final=False):
         code, r = st.api("/api/burn_reports")
         reports = r.get("reports") if code == 200 and isinstance(r, dict) else None
-        return reports[0] if reports else None
+        if not reports:
+            return None
+        return reports[0] if not final or reports[0].get("status") == "final" else None
     r = st.wait(report, 240, "burn report", poll=5)
-    result["burn_report"] = r
     check("the station computes the burn report (thrust and impulse)",
-          r and (r.get("peak_thrust_n") or 0) > 100 and (r.get("total_impulse_ns") or 0) > 100, report=r)
+          r and (r.get("peak_thrust_n") or 0) > 100 and (r.get("total_impulse_ns") or 0) > 100,
+          report={k: (r or {}).get(k) for k in ("status", "peak_thrust_n", "total_impulse_ns", "burn_time_s", "isp_s", "flags")})
+    final = st.wait(lambda: report(True), 600, "final burn report (DAQ SD launch file merged)", poll=10)
+    code, daq = st.api("/api/sd_download")
+    result["burn_report"] = final or report()
+    check("the burn report goes final (DAQ SD launch file merged)", final,
+          status=(final or report() or {}).get("status"), coverage=(final or report() or {}).get("coverage"),
+          daq_sd=daq if code == 200 else code)
+
+
+def fc_sd_collection(st: Station, check, result, timeout_s=1200, ground_test=False):
+    """The station's automatic FC SD collection after landing (Landed held 5 s or Recovery): a job is queued, the
+    newest irec_LAUNCH file of the flight is listed and downloaded over the link and attached to the capture."""
+    def status():
+        code, s = st.api("/api/sd_download/fc")
+        return s if code == 200 and isinstance(s, dict) else {}
+    queued = st.wait(lambda: status().get("jobs") and status(), 90, "FC SD collection job queued", poll=3)
+    s = status()
+    check("FC SD auto-collection queues a job after landing", queued, enabled=s.get("enabled"),
+          job={k: ((s.get("jobs") or [{}])[0]).get(k) for k in ("trigger", "phase", "message", "launch_file")})
+    if not queued:
+        result["fc_sd"] = s
+        return
+    last = [st.now() - 60]
+
+    def collected():
+        s = status()
+        job = (s.get("jobs") or [{}])[0]
+        if st.now() - last[0] >= 60:
+            last[0] = st.now()
+            a = s.get("active") or {}
+            st.log("FC SD collection", phase=job.get("phase"), file=job.get("launch_file"), done=a.get("bytes_done"),
+                   total=a.get("total_bytes"), bps=a.get("bytes_per_second"), paused=a.get("paused_reason"), message=job.get("message"))
+        if ground_test and job.get("done") and job.get("phase") == "unavailable":
+            return job
+        return job if job.get("done") and job.get("downloaded_at_ms") else None
+    job = st.wait(collected, timeout_s, "FC SD launch file collected", poll=5)
+    s = status()
+    result["fc_sd"] = s
+    j = job or (s.get("jobs") or [{}])[0]
+    if ground_test and j.get("phase") == "unavailable":
+        # FlightComputer26 builds the SD read service into the flight image only (CMakeLists FC_SD_SERVICE): the
+        # station must say so instead of retrying forever
+        check("FC SD collection in IGT: the ground-test image has no SD service and the station says so",
+              "ground-test image" in str(j.get("message")), phase=j.get("phase"), message=j.get("message"))
+        return
+    check("FC SD auto-collection downloads the flight's launch file and attaches it", job and job.get("capture"),
+          file=j.get("launch_file"), size=j.get("launch_size"), capture=j.get("capture"), crc_errors=j.get("crc_errors"),
+          phase=j.get("phase"), message=j.get("message"), active=s.get("active"))
 
 
 def scenario_normal(st, check, result):
@@ -539,27 +663,38 @@ def scenario_normal(st, check, result):
     check("the map track follows the flight (RF GPS positions at the station)",
           len(track) >= 20 and drift > 50 and (not alts or max(alts) - min(alts) > 300),
           points=len(track), drift_m=round(drift), alt_span_m=round(max(alts) - min(alts)) if alts else None)
+    fc_sd_collection(st, check, result)
+
+
+IGT_POWER_ON_DATASET = "measured_motor"
+IGT_SWAP_DATASET = "nominal_10k"
 
 
 def scenario_igt(st, check, result):
     boards_up(st, check)
     datasets = st.sim().get("igt_datasets") or []
-    check("IGT datasets offered", "nominal_10k" in datasets, datasets=datasets)
-    # swap the card: out, choose the dataset, in, Retry SD
-    st.api("/api/firmware-sim/control", {"faults": {"fc_sd_missing": True}})
-    time.sleep(2)
-    st.api("/api/firmware-sim/control", {"igt": {"dataset": "nominal_10k"}})
-    loaded = st.wait(lambda: (st.sim().get("sd_card") or {}).get("dataset") == "nominal_10k" and st.sim()["sd_card"], 20, "card rewritten")
-    check("the simulated card carries the dataset", loaded, sd_card=st.sim().get("sd_card"))
-    st.api("/api/firmware-sim/control", {"faults": {}})
-    time.sleep(2)
-    st.command("FcSdRetry")
-    def igt(k=None):
+    check("IGT datasets offered", {IGT_POWER_ON_DATASET, IGT_SWAP_DATASET} <= set(datasets), datasets=datasets)
+
+    def igt():
         code, g = st.api("/api/igt")
         return g if code == 200 and isinstance(g, dict) else {}
-    ready = st.wait(lambda: igt().get("sd_ready") is True and igt(), 60, "FC SD ready", poll=2)
-    check("the FC mounts the simulated SD card", ready, igt=igt())
+    # the card holds a dataset from power-on (FIRMWARE_SIM_CONTROL, set by main)
+    ready = st.wait(lambda: igt().get("sd_ready") is True and igt(), 90, "FC SD ready at power-on", poll=2)
+    check("the FC mounts the card it powered on with", ready, sd_card=st.sim().get("sd_card"), igt=igt())
     check("the FC runs the ground-test image", igt().get("fc_image") == "ground_test", fc_image=igt().get("fc_image"))
+    # swap the card for another dataset while the FC runs: out, choose, in, Retry SD (the FC mounts the new card
+    # fresh, FlightComputer26 34c7835; Enter then loads its CSVs)
+    st.api("/api/firmware-sim/control", {"faults": {"fc_sd_missing": True}})
+    st.wait(lambda: igt().get("sd_ready") is False, 20, "FC sees the card out", poll=1)
+    st.api("/api/firmware-sim/control", {"igt": {"dataset": IGT_SWAP_DATASET}})
+    loaded = st.wait(lambda: (st.sim().get("sd_card") or {}).get("dataset") == IGT_SWAP_DATASET and st.sim()["sd_card"], 20, "card rewritten")
+    check("the swapped card carries the other dataset", loaded, sd_card=st.sim().get("sd_card"))
+    st.api("/api/firmware-sim/control", {"faults": {}})
+    st.sleep(2)
+    st.command("FcSdRetry")
+    ready = st.wait(lambda: igt().get("sd_ready") is True and not igt().get("sd_retry_pending") and igt(), 60, "FC SD ready after Retry SD", poll=2)
+    check("Retry SD mounts the swapped card", ready, igt=igt())
+
     def enter():
         code, challenge = st.api("/api/igt/prepare", {"action": "enter"})
         ticket = challenge.get("ticket") if isinstance(challenge, dict) else None
@@ -573,25 +708,48 @@ def scenario_igt(st, check, result):
                     20, "FC answers Enter", poll=2) or {}
         if str(g.get("fc_mode", "")).lower() != "off":
             break
-        time.sleep(5)
+        st.sleep(5)
         enter()
-    fc_ready = st.wait(lambda: str(igt().get("fc_mode", "")).lower() == "ready" and igt(), 60, "FC IGT Ready", poll=2)
-    check("FC IGT reaches Ready (CSV replay loaded)", fc_ready, igt=igt())
+    fc_ready = st.wait(lambda: str(igt().get("fc_mode", "")).lower() in ("ready", "fault") and igt(), 60, "FC IGT Ready", poll=2)
+    check("FC IGT reaches Ready with the swapped card's CSVs (no parse fault)", fc_ready and str(fc_ready.get("fc_mode")).lower() == "ready",
+          igt=igt())
     result["igt"] = igt()
+    if not fc_ready or str(fc_ready.get("fc_mode")).lower() != "ready":
+        return
     # the stand body: the station's own GSE procedure to Armed (as in test fire)
     gse_procedure(st, check, result)
-    if arm_and_launch(st, check):
-        phases = []
-        def track():
-            ph = fc_phase(st)
-            if ph and (not phases or phases[-1] != ph):
-                phases.append(ph)
-                st.log("FC phase", phase=ph)
-            return any(p in ("Landed", "Recovery") for p in phases)
-        st.wait(track, 400, "replayed flight landed", poll=1)
-        result["igt_phases"] = phases
-        check("the FC replays the flight from the CSV (Ascent, Apogee, Landed)",
-              any("Ascent" in p or "Coast" in p for p in phases) and any(p in ("Landed", "Recovery") for p in phases), phases=phases)
+    if not arm_and_launch(st, check):
+        return
+    phases, seen = [], {"gps_simulated": False, "dry_run": None, "live_pyro": False}
+
+    def track():
+        ph = fc_phase(st)
+        g = igt()
+        if g.get("gps_simulated"):
+            seen["gps_simulated"] = True
+        if str(g.get("fc_mode", "")).lower() == "sim":
+            dry = bool(g.get("drogue_dry_run") and g.get("main_dry_run"))
+            seen["dry_run"] = dry if seen["dry_run"] is None else (seen["dry_run"] and dry)
+        seen["live_pyro"] |= bool(g.get("live_pyro"))
+        if ph and (not phases or phases[-1] != ph):
+            phases.append(ph)
+            st.log("FC phase", phase=ph, fc_mode=g.get("fc_mode"), gps_simulated=g.get("gps_simulated"))
+        return any(p in ("Landed", "Recovery") for p in phases)
+    st.wait(track, 500, "replayed flight landed", poll=1)
+    result["igt_phases"] = phases
+    check("the FC replays the flight from the CSV (Ascent, Apogee, Landed)",
+          any("Ascent" in p or "Coast" in p for p in phases) and any(p in ("Landed", "Recovery") for p in phases), phases=phases)
+    flight = st.plant().get("flight", {})
+    check("the replay flies with dry-run pyros: no deployment reaches the plant", seen["dry_run"] and not seen["live_pyro"]
+          and flight.get("drogue_at_s") is None and flight.get("main_at_s") is None,
+          dry_run=seen["dry_run"], live_pyro=seen["live_pyro"], drogue_at_s=flight.get("drogue_at_s"), main_at_s=flight.get("main_at_s"))
+    real = st.wait(lambda: seen["gps_simulated"] and not igt().get("gps_simulated") and igt(), 120, "GPS back to real", poll=2)
+    check("the FC flew replayed GPS and switches back to real GPS after the replay", real,
+          replayed=seen["gps_simulated"], igt=igt())
+    fc_sd_collection(st, check, result, ground_test=True)
+    st.command("IgtExit")
+    off = st.wait(lambda: str(igt().get("fc_mode", "")).lower() == "off" and igt(), 60, "IGT exit", poll=2)
+    check("IGT exit: the FC leaves ground test (mode Off)", off, igt=igt())
 
 
 SCENARIOS = {"hitl": scenario_hitl, "testing": scenario_testing, "test_fire": scenario_test_fire, "normal": scenario_normal,

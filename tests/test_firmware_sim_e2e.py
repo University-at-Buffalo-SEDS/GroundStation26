@@ -33,6 +33,36 @@ class FakeStation:
 
     wait = e2e.Station.wait
 
+    def now(self):
+        # a fake station clock: every look advances it half a second, so the waits end quickly
+        self.clock = getattr(self, "clock", 0.0) + 0.5
+        return self.clock
+
+    def sleep(self, seconds):
+        e2e.time.sleep(seconds)
+
+
+class StationClock(unittest.TestCase):
+    """The check's waits run on the bay's virtual clock when the station follows it, continuous with the wall."""
+
+    def test_now_follows_the_bay_status_and_never_runs_backwards(self):
+        import json, tempfile, time
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as d:
+            st = e2e.Station("http://127.0.0.1:1", b"", Path(d))
+            before = st.now()
+            self.assertLess(abs(before - time.monotonic()), 1.0, "no bay status yet: the wall clock")
+            st.bay_status.parent.mkdir(parents=True)
+            st.bay_status.write_text(json.dumps({"virtual_ms": 10_000, "station_clock": "bay"}))
+            first = st.now()
+            self.assertGreaterEqual(first, before)
+            self.assertLess(first - before, 2.0)
+            st.bay_status.write_text(json.dumps({"virtual_ms": 40_000, "station_clock": "bay"}))
+            self.assertAlmostEqual(st.now() - first, 30.0, delta=1.5)
+            st.bay_status.write_text(json.dumps({"virtual_ms": 5_000, "station_clock": "bay"}))
+            self.assertGreaterEqual(st.now() - first, 29.0)
+            st.timeline.close()
+
 
 class Helpers(unittest.TestCase):
     def setUp(self):
@@ -52,19 +82,20 @@ class Helpers(unittest.TestCase):
         self.assertFalse(e2e.command_accepted(st, "NitrogenTest", timeout_s=0.01))
         self.assertIn("timeout", [w for w, _ in st.logged])
 
-    def test_burn_report_check_needs_thrust_and_impulse(self):
+    def test_burn_report_check_needs_thrust_and_impulse_and_waits_for_final(self):
         checks = []
         result = {}
-        report = {"id": "r1", "peak_thrust_n": 1800.0, "total_impulse_ns": 9000.0}
-        st = FakeStation(reports=[[], [report]])
+        provisional = {"id": "r1", "status": "provisional", "peak_thrust_n": 1800.0, "total_impulse_ns": 9000.0}
+        final = {**provisional, "status": "final"}
+        st = FakeStation(reports=[[], [provisional], [provisional], [final]])
         e2e.burn_report(st, lambda name, ok, **kw: checks.append((name, bool(ok))), result)
-        self.assertEqual(result["burn_report"], report)
-        self.assertEqual(checks, [("the station computes the burn report (thrust and impulse)", True)])
+        self.assertEqual(result["burn_report"], final)
+        self.assertEqual(checks, [("the station computes the burn report (thrust and impulse)", True),
+                                  ("the burn report goes final (DAQ SD launch file merged)", True)])
         checks.clear()
-        st = FakeStation(reports=[[{"id": "r2", "peak_thrust_n": 0.0, "total_impulse_ns": 0.0}]])
+        st = FakeStation(reports=[[{"id": "r2", "status": "provisional", "peak_thrust_n": 0.0, "total_impulse_ns": 0.0}]])
         e2e.burn_report(st, lambda name, ok, **kw: checks.append((name, bool(ok))), {})
-        self.assertEqual(checks[0][1], False)
-
+        self.assertEqual([ok for _, ok in checks], [False, False])
 
 if __name__ == "__main__":
     unittest.main()

@@ -124,7 +124,7 @@ def firmware_sim_env(base: Mapping[str, str], root: Path, endpoints: dict | None
     env["GS_AV_BAY_SERIAL_PORT"] = links.get("GS_AV_BAY_SERIAL_PORT", "/dev/null")
     # a closed loopback port: discovery finds no Pico-Fi when the bay is not running
     env["GS_FILL_PICO_DISCOVERY_PORT"] = links.get("GS_FILL_PICO_DISCOVERY_PORT", "9")
-    return env
+    return station_clock_env(env, endpoints)
 
 
 def prepare_firmware_sim_state(root: Path) -> None:
@@ -289,8 +289,40 @@ def choose(selection: dict | None, installed: list[str], default_mode: str, rrls
     return Choice(default_mode, bool(default_simulation), "default")
 
 
+SIMCLOCK_KEYS = ("SIMCLOCK_FILE", "SIMCLOCK_EPOCH_MS", "SIMCLOCK_ACCT_FILE", "SIMCLOCK_SLOT")
+
+
+def without_station_clock(base: Mapping[str, str]) -> dict[str, str]:
+    """``base`` with no simclock preload or page: only a firmware-sim start may put the station on the bay's clock
+    (``firmware_sim_env``); every other start runs on the wall clock whatever this supervisor inherited."""
+    env = {k: v for k, v in base.items() if k not in SIMCLOCK_KEYS and k != "GS_STATION_CLOCK"}
+    if "LD_PRELOAD" in env:
+        kept = [lib for lib in env["LD_PRELOAD"].replace(":", " ").split() if "simclock" not in Path(lib).name]
+        if kept:
+            env["LD_PRELOAD"] = " ".join(kept)
+        else:
+            del env["LD_PRELOAD"]
+    return env
+
+
+def station_clock_env(env: dict[str, str], endpoints: dict | None) -> dict[str, str]:
+    """Firmware sim: the station follows the bay's virtual clock when the bay publishes one (FirmwareSimulator
+    ``native/simclock``): every clock the backend reads and every timed wait it makes run on virtual time, so a bay
+    slowed by host load slows the station with it and the boards' time stamps stay fresh. Without it (an older bay,
+    no simclock library) the station stays on the wall clock."""
+    env = without_station_clock(env)
+    clock = (endpoints or {}).get("station_clock") or {}
+    page, library, epoch = clock.get("page"), clock.get("library"), clock.get("epoch_ms")
+    if page and library and isinstance(epoch, int) and Path(page).exists() and Path(library).exists():
+        env["LD_PRELOAD"] = " ".join([library] + ([env["LD_PRELOAD"]] if env.get("LD_PRELOAD") else []))
+        env["SIMCLOCK_FILE"] = page
+        env["SIMCLOCK_EPOCH_MS"] = str(epoch)
+        env["GS_STATION_CLOCK"] = "firmware_sim_bay"
+    return env
+
+
 def child_env(base: Mapping[str, str], choice: Choice, rrls: bool, installed: list[str], directory: Path, sim_root: Path) -> dict[str, str]:
-    env = dict(base)
+    env = without_station_clock(base)
     env["GS_STATION_MODE_SUPERVISOR"] = "1"
     env["GS_STATION_MODE"] = choice.mode
     env.pop("GS_STATION_MODE_AVAILABLE", None)

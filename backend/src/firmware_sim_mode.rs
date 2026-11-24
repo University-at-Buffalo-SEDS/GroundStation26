@@ -39,6 +39,50 @@ pub(crate) fn enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var(ENV).as_deref() == Ok("1"))
 }
 
+/// Set by the supervisor (`station_modes.py`) when the bay publishes its virtual clock and the backend preloads
+/// FirmwareSimulator's simclock to follow it.
+pub(crate) const CLOCK_ENV: &str = "GS_STATION_CLOCK";
+pub(crate) const CLOCK_BAY: &str = "firmware_sim_bay";
+
+/// The clock this process runs on: `firmware_sim_bay` (every clock read and timed wait follows the simulated bay's
+/// virtual clock, so network time and report freshness are judged on the boards' own time base and a bay slowed by
+/// host load slows the station with it) or `wall`.
+pub(crate) fn clock_source() -> &'static str {
+    clock_source_for(enabled(), std::env::var(CLOCK_ENV).ok().as_deref(), std::env::var("SIMCLOCK_FILE").ok().as_deref())
+}
+
+pub(crate) fn clock_source_for(firmware_sim: bool, declared: Option<&str>, simclock_file: Option<&str>) -> &'static str {
+    if firmware_sim && declared == Some(CLOCK_BAY) && simclock_file.is_some_and(|f| !f.is_empty()) { CLOCK_BAY } else { "wall" }
+}
+
+/// Why this process must not start: a simulated clock outside firmware simulation (a preload or page inherited by
+/// a hardware station). Only the firmware-sim start may follow the bay's clock; every other mode is on the wall.
+pub(crate) fn foreign_clock_reason(firmware_sim: bool, simclock_file: Option<&str>, ld_preload: Option<&str>) -> Option<String> {
+    if firmware_sim {
+        return None;
+    }
+    let preloaded = ld_preload.is_some_and(|p| p.split([' ', ':']).any(|lib| lib.rsplit('/').next().is_some_and(|n| n.contains("simclock"))));
+    let page = simclock_file.is_some_and(|f| !f.is_empty());
+    (preloaded || page).then(|| {
+        "the simulated-firmware station clock (simclock) is set but this station is not in firmware simulation; \
+         refusing to run a hardware station on a simulated clock"
+            .to_string()
+    })
+}
+
+/// Startup check: exit before touching any link when [`foreign_clock_reason`] applies.
+pub(crate) fn refuse_foreign_clock() {
+    if let Some(reason) = foreign_clock_reason(
+        enabled(),
+        std::env::var("SIMCLOCK_FILE").ok().as_deref(),
+        std::env::var("LD_PRELOAD").ok().as_deref(),
+    ) {
+        log::error!("{reason}");
+        eprintln!("{reason}");
+        std::process::exit(2);
+    }
+}
+
 /// Recording provenance for captures and exports.
 pub(crate) fn provenance() -> &'static str {
     if enabled() {
@@ -176,6 +220,7 @@ pub(crate) fn status_json() -> Value {
         "bay": status,
         "bay_status_age_ms": age_ms,
         "bay_running": age_ms.is_some_and(|age| age < 5_000),
+        "station_clock": clock_source(),
         "control": dir.as_ref().and_then(|d| read_json(d.join("control.json"))).unwrap_or_else(|| json!({})),
         "igt_datasets": igt_datasets(),
         "sd_card": dir.as_ref().and_then(|d| read_json(d.join("sdcard.json"))),
@@ -387,6 +432,25 @@ pub(crate) fn routes() -> Router<Arc<AppState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Outside firmware simulation the station is on the wall clock, whatever the environment says; a simclock
+    /// preload or page there refuses the start.
+    #[test]
+    fn only_firmware_simulation_follows_the_bay_clock() {
+        assert_eq!(clock_source_for(false, None, None), "wall");
+        assert_eq!(clock_source_for(false, Some(CLOCK_BAY), Some("/dev/shm/x/station-clock.page")), "wall");
+        assert_eq!(clock_source_for(true, None, None), "wall", "a bay without a clock page: wall");
+        assert_eq!(clock_source_for(true, Some(CLOCK_BAY), Some("/dev/shm/x/station-clock.page")), CLOCK_BAY);
+        assert_eq!(foreign_clock_reason(false, None, None), None);
+        assert_eq!(foreign_clock_reason(false, None, Some("/usr/lib/libjemalloc.so")), None);
+        assert!(foreign_clock_reason(false, None, Some("/cache/bin/simclock.so")).is_some());
+        assert!(foreign_clock_reason(false, Some("/dev/shm/page"), None).is_some());
+        assert_eq!(foreign_clock_reason(true, Some("/dev/shm/page"), Some("/cache/bin/simclock.so")), None);
+        // this test process itself: not firmware sim, so the wall clock
+        assert_eq!(clock_source(), "wall");
+        let wall = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        assert!(crate::telemetry_task::get_current_timestamp_ms().abs_diff(wall) < 5_000);
+    }
 
     #[test]
     fn control_sections_merge() {

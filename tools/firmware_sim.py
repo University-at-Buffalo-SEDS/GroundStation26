@@ -196,6 +196,22 @@ def build_firmware_simulator(cache: Path, fs_src: Path, jobs: int) -> Path:
     return out
 
 
+def build_simclock(cache: Path, fs_src: Path) -> Path | None:
+    """The station clock library (FirmwareSimulator native/simclock) for the station's own ABI, into <cache>/bin: a
+    firmware-sim station preloads it to follow the bay's virtual clock (docs/firmware-sim.md)."""
+    src = fs_src / "native" / "simclock" / "simclock.c"
+    cc = os.environ.get("FIRMWARE_SIM_STATION_CC", "gcc")
+    if not src.exists() or not shutil.which(cc):
+        log("simclock not built (no source or compiler): a firmware-sim station keeps its wall clock")
+        return None
+    out = cache / "bin" / "simclock.so"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_name(f"{out.name}.{os.getpid()}")
+    subprocess.run([cc, "-O2", "-shared", "-fPIC", "-o", str(tmp), str(src), "-ldl", "-lpthread"], check=True)
+    tmp.replace(out)  # a running station keeps the library it mapped
+    return out
+
+
 def cmd_build(a) -> int:
     if a.sources:
         STAGED.update(json.loads((Path(a.sources) / "sources.json").read_text()), dir=str(Path(a.sources).resolve()))
@@ -235,6 +251,7 @@ def cmd_build(a) -> int:
         fs_src = fs_cache
     if not a.no_coordinator:
         build_firmware_simulator(cache, fs_src, a.jobs)
+    simclock = build_simclock(cache, fs_src)
     manifest["firmware_simulator"] = fs_info
 
     sdk_repo = resolve_repo("SEDSnet", workspace, cache, not a.no_fetch)
@@ -303,6 +320,10 @@ def cmd_build(a) -> int:
     manifest["host_abi"] = os.environ.get("FIRMWARE_SIM_HOST", "i686")
     manifest["engine_dir"] = str(fs_src)
     manifest["coordinator"] = str(cache / "bin" / "firmware-sim")
+    if simclock:
+        manifest["simclock"] = str(simclock)
+    else:
+        manifest.pop("simclock", None)
     write_manifest(cache, manifest)
     if not a.keep_work:
         shutil.rmtree(work, ignore_errors=True)
@@ -382,6 +403,8 @@ def cmd_bundle(a) -> int:
             subprocess.run(["strip", "--strip-debug", str(exe)], check=False)
     (staging / "bin").mkdir()
     shutil.copy2(cache / "bin" / "firmware-sim", staging / "bin" / "firmware-sim")
+    if (cache / "bin" / "simclock.so").exists():
+        shutil.copy2(cache / "bin" / "simclock.so", staging / "bin" / "simclock.so")
     engine = Path(manifest["engine_dir"])
     for name in ("gs_bay.py", "native_engine.py", "fat32_image.py"):
         shutil.copy2(engine / "scripts" / name, staging / "engine" / "scripts" / name)
@@ -390,6 +413,10 @@ def cmd_bundle(a) -> int:
         b["exe"] = f"boards/{node}/{node}.native"
         if b.get("factory_bin"):
             b["factory_bin"] = f"boards/{node}/factory.bin"
+    if (staging / "bin" / "simclock.so").exists():
+        rel["simclock"] = "bin/simclock.so"
+    else:
+        rel.pop("simclock", None)
     rel.update(engine_dir="engine", coordinator="bin/firmware-sim", bundle={"host": os.uname().machine, "created": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")})
     (staging / MANIFEST).write_text(json.dumps(rel, indent=2) + "\n")
     out = Path(a.out).resolve()
@@ -418,6 +445,8 @@ def cmd_install(a) -> int:
             b["factory_bin"] = str(cache / b["factory_bin"])
     manifest["engine_dir"] = str(cache / manifest["engine_dir"])
     manifest["coordinator"] = str(cache / manifest["coordinator"])
+    if manifest.get("simclock"):
+        manifest["simclock"] = str(cache / manifest["simclock"])
     for exe in [*cache.glob("boards/*/*.native"), cache / "bin" / "firmware-sim"]:
         exe.chmod(0o755)
     write_manifest(cache, manifest)

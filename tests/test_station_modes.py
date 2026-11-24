@@ -235,6 +235,36 @@ class FirmwareSimTests(unittest.TestCase):
             env = sm.firmware_sim_env(base, root, None)
             self.assertEqual(env["GS_AV_BAY_SERIAL_PORT"], "/dev/null")
 
+    def test_firmware_sim_follows_the_bay_clock_and_no_other_start_does(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "firmware-sim"
+            page, lib = Path(tmp) / "station-clock.page", Path(tmp) / "simclock.so"
+            page.write_bytes(b"\0" * 4096)
+            lib.write_bytes(b"")
+            endpoints = {"hosts": {"groundstation": {"GS_AV_BAY_SERIAL_PORT": "/dev/pts/7"}},
+                         "station_clock": {"page": str(page), "epoch_ms": 1_790_000_000_000, "library": str(lib)}}
+            env = sm.firmware_sim_env({"LD_PRELOAD": "/usr/lib/libother.so"}, root, endpoints)
+            self.assertEqual(env["SIMCLOCK_FILE"], str(page))
+            self.assertEqual(env["SIMCLOCK_EPOCH_MS"], "1790000000000")
+            self.assertEqual(env["LD_PRELOAD"].split(), [str(lib), "/usr/lib/libother.so"])
+            self.assertEqual(env["GS_STATION_CLOCK"], "firmware_sim_bay")
+            # a bay without a clock (older engine, no simclock library): the wall clock
+            for clockless in ({"hosts": {}}, None, {"station_clock": {"page": str(page), "epoch_ms": 1, "library": str(Path(tmp) / "missing.so")}}):
+                env = sm.firmware_sim_env({}, root, clockless)
+                self.assertNotIn("SIMCLOCK_FILE", env)
+                self.assertNotIn("LD_PRELOAD", env)
+            # every other start runs on the wall clock, even from a supervisor that inherited the bay's clock
+            inherited = {"LD_PRELOAD": f"{lib} /usr/lib/libother.so", "SIMCLOCK_FILE": str(page), "SIMCLOCK_EPOCH_MS": "1",
+                         "GS_STATION_CLOCK": "firmware_sim_bay"}
+            for mode in sm.MODES:
+                for simulation in (False, True):
+                    env = sm.child_env(inherited, sm.Choice(mode, simulation, "selection"), False, list(sm.MODES), Path(tmp), Path(tmp) / "sim")
+                    self.assertFalse([k for k in env if k.startswith("SIMCLOCK_")], mode)
+                    self.assertEqual(env["LD_PRELOAD"], "/usr/lib/libother.so")
+                    self.assertNotIn("GS_STATION_CLOCK", env)
+            env = sm.child_env({"LD_PRELOAD": str(lib)}, sm.Choice("normal", False, "default"), True, list(sm.MODES), Path(tmp), Path(tmp) / "sim")
+            self.assertNotIn("LD_PRELOAD", env, "RRLS too")
+
     def test_supervisor_starts_the_bay_before_the_backend_and_stops_it_after(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)

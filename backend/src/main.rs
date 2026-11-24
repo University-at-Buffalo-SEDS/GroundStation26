@@ -1477,7 +1477,12 @@ async fn main() -> anyhow::Result<()> {
         cfg!(feature = "firmware_sim")
     );
 
+    firmware_sim_mode::refuse_foreign_clock();
     if firmware_sim_mode::enabled() {
+        log::warn!(
+            "station clock: {} (firmware_sim_bay: every clock follows the bay's virtual clock)",
+            firmware_sim_mode::clock_source()
+        );
         log::warn!(
             "SIMULATED FIRMWARE: every board is its real firmware built for this machine (FirmwareSimulator native SITL); run dir {:?}",
             std::env::var_os(firmware_sim_mode::DIR_ENV)

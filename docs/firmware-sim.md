@@ -19,7 +19,7 @@ Yes, on a development machine. The comparison:
 |---|---|---|---|
 | Board logic | none: the station fabricates telemetry and acks | the real firmware | the real firmware |
 | Who drives | the operator in the UI | a scripted scenario controller that owns the station | the operator in the UI (or any API client) |
-| Station clock | wall | the bay's virtual clock (simclock), up to ~10x | wall (the bay runs at 1x) |
+| Station clock | wall | the bay's virtual clock (simclock), up to ~10x | the bay's virtual clock (simclock), the bay paced at 1x |
 | Plant | `flight_sim/ground_plant.rs` from the station's own valve state | scenario stimulus files, plant from the station's reported valves | plant from the boards' own output pins and servo registers |
 | Flight | open-loop profile in the station | FC sensors at rest natively (Renode replays a fixed profile) | 1-D flight driven into the FC's real baro/IMU; descent follows the FC's real pyro outputs |
 | Setup cost | none | a cohort, a station image, a scenario | one `tools/firmware_sim.py build` (about 2.5 min), then a mode switch |
@@ -31,8 +31,8 @@ What it catches that the existing paths do not:
   timing, the FC's state machine, Kalman filter and deployment logic, DAQ input-health faults. `flight_sim` only
   shows what the station believes the boards would do.
 * Wire-level integration with the station: the real SEDSnet protocol, router, timesync, discovery, bundles and
-  config sync over the same radio PTY and Pico-Fi umbilical transports the native fullnet uses, but with the
-  station on its normal wall clock, as on the pad.
+  config sync over the same radio PTY and Pico-Fi umbilical transports the native fullnet uses, with the bay paced
+  at real time and the station following its virtual clock (section 2, "Station clock").
 * Physical consistency failures: a pressure that cannot rise with the QD off, a fill that never reaches its
   target with a stuck valve, a flight with no deployment (ballistic), a dead chamber PT during the burn.
 * Exploratory testing with the real UI by people who do not write scenario scripts.
@@ -85,7 +85,8 @@ station mode switch (admin)  --"hitl-firmware-sim" selection, exit 75-->  statio
         -> FirmwareSimulator scripts/gs_bay.py -> firmware-sim native-bay (pace 1, external station)
               7 native boards + CAN buses + RFD radio medium + Pico-Fi model + plant
               writes endpoints.json (radio PTY, Pico-Fi discovery port), status.json (1/s); reads control.json
-    supervisor: backend with GS_FIRMWARE_SIM=1, the bay's endpoints, isolated paths
+    supervisor: backend with GS_FIRMWARE_SIM=1, the bay's endpoints, isolated paths, simclock preloaded on the
+                bay's clock page (endpoints.json station_clock)
     backend exits -> supervisor stops the bay (SIGTERM)
 ```
 
@@ -108,6 +109,36 @@ a version manifest:
 
 The UI shows the manifest (`GET /api/firmware-sim`: `manifest`, and `bay.firmware` for the running bay), so
 operators see exactly which firmware revisions are being simulated.
+
+### Station clock
+
+In firmware-sim mode the station runs on the **bay's virtual clock**, so host load can slow the whole simulation but
+cannot skew its clocks. The bay (`scripts/gs_bay.py`, `--station-clock follow`, the default) publishes its clock page
+(FirmwareSimulator `native/simclock`: the current lockstep window and its measured rate) and names the page, its epoch
+(the wall clock at virtual 0) and the simclock library in `endpoints.json`. The supervisor preloads the library into
+the backend (`LD_PRELOAD`, `SIMCLOCK_FILE`, `SIMCLOCK_EPOCH_MS`, `GS_STATION_CLOCK=firmware_sim_bay`). Every clock the
+backend reads (`Instant`, `SystemTime`, tokio timers) and every timed wait it makes then follow virtual time, without
+station code changes:
+
+* network time, valve-report freshness, heartbeats, acknowledgement timeouts and the GSE sequence timers are judged
+  on the boards' own time base. A bay that slips under load stops the station's clock with it, so no report looks
+  stale or ahead;
+* the bay still drops lag beyond 20 ms instead of racing to catch up (`slipped_ms`), which spares the host the
+  catch-up burst. The station's dates fall behind the wall by the slipped time (the UI accepts rows up to 20 min old);
+* when the bay stops or crashes, `gs_bay.py` releases the page and the station's clock runs on at the wall rate from
+  where it stood, so the backend never freezes;
+* `tools/firmware_sim.py build` builds `bin/simclock.so` into the cache (bundles carry it); without it the bay builds
+  one from the engine sources, and without a compiler the station stays on the wall clock;
+* only a firmware-sim start can do this. The supervisor strips any simclock preload or page from every other start
+  (`station_modes.without_station_clock`), and a backend that is not in firmware-sim mode refuses to start with one
+  (`firmware_sim_mode::refuse_foreign_clock`). `GET /api/firmware-sim` reports `station_clock` (`firmware_sim_bay` or
+  `wall`), and the bay's `status.json` stamps `updated_unix_ms` on the station's clock.
+
+Tests: `tests/test_station_modes.py` (only firmware-sim follows the bay; every other mode, RRLS included, gets the
+wall clock), `firmware_sim_mode::tests::only_firmware_simulation_follows_the_bay_clock`, and FirmwareSimulator
+`tests/test_gs_bay_station_clock.py` (simclock passes the wall clock through without a page, holds a stalled bay's
+time, runs on after release). `tools/firmware_sim_e2e.py` waits on the same clock (its pauses and timeouts are virtual
+seconds read from `status.json`, with a wall fallback once the bay has stalled for a minute).
 
 ### Station side
 
