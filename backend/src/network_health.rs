@@ -581,7 +581,12 @@ impl Tracker {
                         status.overlay(&mut report, elapsed(now, *received));
                     }
                     if let Some((input, received)) = &r.input_health {
-                        report.daq_input = Some(input.status(elapsed(now, *received), chamber_pt_installed));
+                        let mut status = input.status(elapsed(now, *received), chamber_pt_installed);
+                        status.adc_channels = crate::daq_input_health::adc_channels(
+                            sender,
+                            crate::telemetry_task::get_current_timestamp_ms() as i64,
+                        );
+                        report.daq_input = Some(status);
                     }
                     if let Some((status, received)) = &r.dac_status {
                         status.overlay(&mut report, elapsed(now, *received));
