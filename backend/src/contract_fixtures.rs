@@ -712,6 +712,7 @@ async fn replay_bundle(root: &Path, state: &Arc<AppState>, app: &axum::Router, o
     let options = crate::recording_bundle::Options { tiles: true, tiles_max_mb: Some(1), ..Default::default() };
     let bundle = crate::recording_bundle::build(state.clone(), &headers, id, &options, T0).await.unwrap();
     let again = crate::recording_bundle::build(state.clone(), &headers, id, &options, T0).await.unwrap();
+    assert_eq!(bundle_manifest(&bundle), bundle_manifest(&again), "a bundle's entries are reproducible");
     assert_eq!(bundle, again, "a bundle is reproducible");
     let request = Request::builder().uri(format!("/api/recordings/{id}/csv")).header("Authorization", "Bearer viewer-token").body(Body::empty()).unwrap();
     let response = app.clone().oneshot(request).await.unwrap();

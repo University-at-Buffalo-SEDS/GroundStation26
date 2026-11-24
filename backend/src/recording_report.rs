@@ -14,7 +14,7 @@ pub struct ReportQuery {
     pub request: String,
 }
 
-fn valve_labels(layout: &serde_json::Value) -> serde_json::Value {
+pub(crate) fn valve_labels(layout: &serde_json::Value) -> serde_json::Value {
     fn walk(value: &serde_json::Value, labels: &mut std::collections::BTreeMap<u64, serde_json::Value>) {
         if value["data_type"] == "VALVE_STATE"
             && let Some(items)=value["valves"].as_array().or_else(||value["items"].as_array()) {

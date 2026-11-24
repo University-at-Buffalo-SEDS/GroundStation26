@@ -748,7 +748,7 @@ async fn control_broadcast_inner(
 }
 
 #[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
-async fn vehicle(State(state): State<Arc<MediaState>>, headers: HeaderMap) -> ApiResult<Response> {
+pub(super) async fn vehicle(State(state): State<Arc<MediaState>>, headers: HeaderMap) -> ApiResult<Response> {
     let vehicle = load_vehicle(state, headers).await?;
     Ok(([(header::CACHE_CONTROL, "no-store")], axum::Json(vehicle)).into_response())
 }

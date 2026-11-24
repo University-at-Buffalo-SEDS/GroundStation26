@@ -12,7 +12,9 @@
 //! (`docs/backend/replay-bundle.md` and the UI's `docs/replay-bundle.md`).
 //! `data/telemetry.csv` is byte for byte the recording's
 //! `GET /api/recordings/{id}/csv`, so a client can hand it out as the CSV
-//! export with no station.
+//! export with no station. Each manifest entry names the `route` (path and
+//! query, as a client requests it) whose body it is, so a client can answer
+//! those requests from the bundle; JSON bodies are stored with sorted keys.
 use crate::{auth::Permission, state::AppState};
 use axum::{
     Router,
@@ -32,11 +34,15 @@ pub(crate) const VERSION: u64 = 1;
 pub(crate) const MEDIA_TYPE: &str = "application/vnd.seds.gsreplay+zip";
 const DEFAULT_TILE_BUDGET_MB: u32 = 8;
 const MAX_TILE_BUDGET_MB: u32 = 32;
-/// The terrain heightmap entry is at most this large (a 129 x 129 grid is about 45 KB).
-const MAX_TERRAIN_BYTES: usize = 1 << 20;
-const TERRAIN_GRID_SIZE: u32 = 129;
 /// Largest body read from one internal route (the replay export caps itself at 64 MiB).
 const MAX_ENTRY_BYTES: usize = 96 << 20;
+/// The views the replay page offers (`/replay/layout?view=`).
+const REPLAY_VIEWS: [&str; 5] = ["normal", "test_fire", "testing", "hitl", "integrated_ground_test"];
+
+/// An id usable as one route segment and one entry-path segment.
+fn safe_segment(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 128 && id != "." && id != ".." && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+}
 
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct Options {
@@ -45,8 +51,6 @@ pub(crate) struct Options {
     pub tiles: bool,
     /// Tile budget in MiB (default 8, at most 32).
     pub tiles_max_mb: Option<u32>,
-    /// Include the cached DEM heightmap around the track (default: with tiles).
-    pub terrain: Option<bool>,
 }
 
 pub(crate) fn routes() -> Router<Arc<AppState>> {
@@ -83,13 +87,13 @@ async fn download(
 fn sources(state: Arc<AppState>) -> Router {
     Router::new()
         .merge(crate::recording_export::routes())
+        .merge(crate::media::view_config_routes(state.clone()))
         .merge(crate::diagrams::routes())
         .merge(crate::vehicle_geometry::routes())
         .merge(crate::flight_review::routes())
         .merge(crate::burn_report::routes())
         .merge(crate::fire_archive::routes())
         .merge(crate::apogee_planner::routes())
-        .merge(crate::recovery_search::routes())
         .merge(crate::web::bundle_config_routes())
         .with_state(state)
 }
@@ -118,40 +122,36 @@ fn tile_of(lat: f64, lon: f64, z: u32) -> (u32, u32) {
     (x, y)
 }
 
-/// The heightmap request for a track: centred on its first fix (the pad),
-/// wide enough for the whole track plus a margin, 2..30 km.
-fn terrain_route(points: &[Value]) -> Option<(String, f64)> {
-    let fix = |p: &Value| Some((p["latitude"].as_f64()?, p["longitude"].as_f64()?));
-    let (lat0, lon0) = points.iter().find_map(fix)?;
-    let mut reach = 0.0f64;
-    for (lat, lon) in points.iter().filter_map(fix) {
-        let north = (lat - lat0).to_radians() * crate::terrain::EARTH_RADIUS_M;
-        let east = (lon - lon0).to_radians() * crate::terrain::EARTH_RADIUS_M * lat0.to_radians().cos();
-        reach = reach.max(north.abs()).max(east.abs());
-    }
-    let extent = ((reach * 2.0 + 2_000.0) / 1_000.0).ceil() * 1_000.0;
-    let extent = extent.clamp(2_000.0, 30_000.0);
-    Some((format!("/api/terrain/heightmap?lat={lat0}&lon={lon0}&extent_m={extent}&size={TERRAIN_GRID_SIZE}"), extent))
+struct Entry {
+    path: String,
+    bytes: Vec<u8>,
+    media_type: &'static str,
+    /// The station route (path and query, as a client requests it) whose
+    /// response body this entry is; `None` for entries that are no route's body.
+    route: Option<String>,
 }
 
 struct Entries {
-    files: Vec<(String, Vec<u8>, &'static str)>,
+    files: Vec<Entry>,
     missing: Vec<Value>,
 }
 
 impl Entries {
-    fn add(&mut self, path: &str, bytes: Vec<u8>, media_type: &'static str) {
-        self.files.push((path.to_owned(), bytes, media_type));
+    fn add(&mut self, path: &str, bytes: Vec<u8>, media_type: &'static str, route: Option<&str>) {
+        self.files.push(Entry { path: path.to_owned(), bytes, media_type, route: route.map(str::to_owned) });
     }
     fn add_json(&mut self, path: &str, value: &Value) {
-        self.add(path, serde_json::to_vec_pretty(value).unwrap_or_default(), "application/json");
+        self.add(path, serde_json::to_vec_pretty(value).unwrap_or_default(), "application/json", None);
     }
     /// An optional resource: kept when the station serves it, listed as missing otherwise.
     async fn optional(&mut self, router: &Router, headers: &HeaderMap, route: &str, path: &str) -> Option<Value> {
         match fetch(router, headers, route).await {
             Ok(bytes) => {
                 let value = serde_json::from_slice::<Value>(&bytes).ok();
-                self.add(path, bytes, "application/json");
+                // The route's JSON value with its keys sorted: some routes
+                // serialize hash maps, whose order varies between calls.
+                let bytes = value.as_ref().and_then(|v| serde_json::to_vec(v).ok()).unwrap_or(bytes);
+                self.add(path, bytes, "application/json", Some(route));
                 value
             }
             Err(status) => {
@@ -169,7 +169,6 @@ pub(crate) async fn build(
     options: &Options,
     now_ms: i64,
 ) -> Result<Vec<u8>, (StatusCode, String)> {
-    let state_for_plans = state.clone();
     let router = sources(state);
     let required = |route: String| {
         let router = router.clone();
@@ -184,15 +183,37 @@ pub(crate) async fn build(
     let csv = required(format!("/api/recordings/{id}/csv")).await?;
     let mut entries = Entries { files: Vec::new(), missing: Vec::new() };
 
-    let context = match replay.get("replay_context").filter(|c| c.is_object()) {
-        Some(context) => Some(context.clone()),
-        None => entries.optional(&router, headers, &format!("/api/recordings/{id}/replay/context"), "derived/context.json").await,
-    };
+    let fetched_context = entries.optional(&router, headers, &format!("/api/recordings/{id}/replay/context"), "derived/context.json").await;
+    let context = replay.get("replay_context").filter(|c| c.is_object()).cloned().or(fetched_context);
     let view = context.as_ref().and_then(|c| c["default_view"].as_str()).unwrap_or("normal").to_owned();
     let layout = match entries.optional(&router, headers, &format!("/api/recordings/{id}/replay/layout?view={view}"), "config/layout.json").await {
         Some(layout) => Some(layout),
         None => entries.optional(&router, headers, "/api/layout", "config/layout.json").await,
     };
+    // The replay page's other views, and the station layout the 3D player reads.
+    for other in REPLAY_VIEWS.iter().filter(|v| **v != view) {
+        entries.optional(&router, headers, &format!("/api/recordings/{id}/replay/layout?view={other}"), &format!("config/layout/{other}.json")).await;
+    }
+    if !entries.files.iter().any(|e| e.route.as_deref() == Some("/api/layout")) {
+        entries.optional(&router, headers, "/api/layout", "config/station_layout.json").await;
+    }
+    let view_config = entries.optional(&router, headers, "/api/vehicle_visualization", "config/vehicle_visualization.json").await;
+    entries.optional(&router, headers, &format!("/api/recordings/{id}/replay"), "derived/snapshot.json").await;
+    entries.optional(&router, headers, &format!("/api/recordings/{id}/replay/flight"), "derived/flight_snapshot.json").await;
+    entries.optional(&router, headers, &format!("/api/recordings/{id}/replay/overlays"), "derived/overlays.json").await;
+    entries.optional(&router, headers, &format!("/api/recordings/{id}/sd/sources"), "derived/sd_sources.json").await;
+    // The listing as a station holding only this recording would answer it.
+    if let Ok(bytes) = fetch(&router, headers, "/api/recordings").await
+        && let Ok(Value::Array(list)) = serde_json::from_slice::<Value>(&bytes)
+    {
+        let own: Vec<Value> = list.into_iter().filter(|r| r["id"] == id).map(|mut r| {
+            r["active"] = false.into();
+            r
+        }).collect();
+        if !own.is_empty() {
+            entries.add("derived/recordings.json", serde_json::to_vec(&own).unwrap_or_default(), "application/json", Some("/api/recordings"));
+        }
+    }
     let boards = entries.optional(&router, headers, "/api/boards", "config/boards.json").await;
     let geometry = entries.optional(&router, headers, crate::vehicle_geometry::PATH, "models/vehicle_geometry.json").await;
     entries.optional(&router, headers, "/api/calibration", "config/calibration.json").await;
@@ -214,19 +235,19 @@ pub(crate) async fn build(
         {
             let items = list.as_array().cloned().or_else(|| list.as_object().and_then(|o| o.values().find_map(|v| v.as_array().cloned()))).unwrap_or_default();
             let related: Vec<Value> = items.into_iter().filter(|item| item.to_string().contains(stem)).collect();
+            // Each related report's detail (`/api/burn_reports/{id}`) or thrust
+            // curve (`/api/fire_archive/{id}/thrust`), as the review pages read them.
+            for item_id in related.iter().filter_map(|item| item["id"].as_str()).filter(|i| safe_segment(i)) {
+                let (item_route, item_path) = if route == "/api/burn_reports" {
+                    (format!("/api/burn_reports/{item_id}"), format!("derived/burn_reports/{item_id}.json"))
+                } else {
+                    (format!("/api/fire_archive/{item_id}/thrust"), format!("derived/fire_archive/{item_id}/thrust.json"))
+                };
+                entries.optional(&router, headers, &item_route, &item_path).await;
+            }
             if !related.is_empty() {
                 entries.add_json(path, &Value::Array(related));
             }
-        }
-    }
-
-    // Recovery search tracks from the recording's start until a few hours
-    // after its last row (searches often outlast the capture). Only when
-    // there are any: an empty search adds nothing to the bundle.
-    if let Some(start) = replay["snapshot"]["start_ms"].as_i64() {
-        let end = replay["snapshot"]["end_ms"].as_i64().unwrap_or(start) + crate::recovery_search::BUNDLE_AFTER_END_MS;
-        if let Ok(bytes) = fetch(&router, headers, &format!("/api/recovery_search/export?from_ms={start}&to_ms={end}")).await {
-            entries.add("derived/recovery_search.json", bytes, "application/json");
         }
     }
 
@@ -236,6 +257,17 @@ pub(crate) async fn build(
     }
     if replay["boards"].is_null() && let Some(boards) = &boards {
         replay["boards"] = boards["boards"].clone();
+    }
+    if replay["view_config"].is_null() && let Some(view_config) = &view_config {
+        replay["view_config"] = view_config.clone();
+    }
+    if replay["valve_mappings"].is_null() && replay["layout"].is_object() {
+        // The portable replay format's mapping (each names its VALVE_STATE index).
+        let mut mappings = crate::recording_report::valve_labels(&replay["layout"]);
+        for mapping in mappings.as_array_mut().into_iter().flatten() {
+            mapping["data_type"] = "VALVE_STATE".into();
+        }
+        replay["valve_mappings"] = mappings;
     }
     if replay["vehicle_geometry"].is_null() && let Some(geometry) = &geometry {
         replay["vehicle_geometry"] = geometry.clone();
@@ -255,41 +287,45 @@ pub(crate) async fn build(
         && let Some(points) = trajectory.as_ref().and_then(|t| t["points"].as_array())
         && !points.is_empty()
     {
-        let track: Vec<(f64, f64)> = points.iter().filter_map(|p| Some((p["latitude"].as_f64()?, p["longitude"].as_f64()?))).collect();
-        tiles = add_tiles(&mut entries, &router, headers, &track, map_config.as_ref(), options.tiles_max_mb).await;
-    }
-    // The station's most recent flight plans, for a predicted-vs-actual overlay offline.
-    let plans = crate::flight_plan::list(&crate::flight_plan::directory(&state_for_plans));
-    if !plans.is_empty() {
-        entries.add_json("derived/flight_plans.json", &json!({"plans": plans.into_iter().take(5).collect::<Vec<_>>()}));
-    }
-
-    // Optional DEM heightmap around the pad, covering the track.
-    let mut terrain = json!({"included": false});
-    if options.terrain.unwrap_or(options.tiles)
-        && let Some(points) = trajectory.as_ref().and_then(|t| t["points"].as_array())
-        && let Some((route, extent_m)) = terrain_route(points)
-    {
-        match fetch(&router, headers, &route).await {
-            Ok(bytes) if bytes.len() <= MAX_TERRAIN_BYTES => {
-                let value = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
-                if value["available"] == true {
-                    terrain = json!({
-                        "included": true, "bytes": bytes.len(), "extent_m": extent_m, "size": value["size"],
-                        "zoom": value["zoom"], "source": value["source"], "attribution": value["attribution"],
-                    });
-                    entries.add("terrain/heightmap.json", bytes, "application/json");
-                } else {
-                    terrain = json!({"included": false, "reason": value["reason"]});
+        let budget = (options.tiles_max_mb.unwrap_or(DEFAULT_TILE_BUDGET_MB).min(MAX_TILE_BUDGET_MB) as usize) << 20;
+        let max_zoom = map_config.as_ref().and_then(|m| m["max_native_zoom"].as_u64()).unwrap_or(16).min(17) as u32;
+        let (mut la0, mut la1, mut lo0, mut lo1) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+        for p in points {
+            let (Some(la), Some(lo)) = (p["latitude"].as_f64(), p["longitude"].as_f64()) else { continue };
+            (la0, la1, lo0, lo1) = (la0.min(la), la1.max(la), lo0.min(lo), lo1.max(lo));
+        }
+        let (mut used, mut count, mut complete) = (0usize, 0u64, true);
+        'zoom: for z in 10..=max_zoom {
+            let (x0, y0) = tile_of(la1, lo0, z);
+            let (x1, y1) = tile_of(la0, lo1, z);
+            for x in x0.saturating_sub(1)..=x1 + 1 {
+                for y in y0.saturating_sub(1)..=y1 + 1 {
+                    let Ok(bytes) = fetch(&router, headers, &format!("/tiles/{z}/{x}/{y}.jpg")).await else { continue };
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    if used + bytes.len() > budget {
+                        complete = false;
+                        break 'zoom;
+                    }
+                    used += bytes.len();
+                    count += 1;
+                    let route = format!("/tiles/{z}/{x}/{y}.jpg");
+                    entries.add(&route[1..], bytes, "image/jpeg", Some(&route));
                 }
             }
-            Ok(bytes) => terrain = json!({"included": false, "reason": format!("heightmap of {} bytes exceeds the {MAX_TERRAIN_BYTES}-byte cap", bytes.len())}),
-            Err(status) => entries.missing.push(json!({"path": "terrain/heightmap.json", "route": route, "status": status})),
         }
+        tiles = json!({"included": count, "bytes": used, "budget_bytes": budget, "complete": complete});
     }
 
-    entries.files.insert(0, ("data/telemetry.csv".to_owned(), csv, "text/csv"));
-    entries.files.insert(0, ("replay.json".to_owned(), serde_json::to_vec(&replay).unwrap_or_default(), "application/json"));
+    let csv_entry = Entry { path: "data/telemetry.csv".into(), bytes: csv, media_type: "text/csv", route: Some(format!("/api/recordings/{id}/csv")) };
+    let replay_entry = Entry {
+        path: "replay.json".into(),
+        bytes: serde_json::to_vec(&replay).unwrap_or_default(),
+        media_type: "application/json",
+        route: Some(format!("/api/recordings/{id}/replay/export")),
+    };
+    entries.files.splice(0..0, [replay_entry, csv_entry]);
     let manifest = json!({
         "format": FORMAT,
         "version": VERSION,
@@ -301,109 +337,21 @@ pub(crate) async fn build(
         "time_range": {"start_ms": replay["snapshot"]["start_ms"], "end_ms": replay["snapshot"]["end_ms"]},
         "rows": rows,
         "tiles": tiles,
-        "terrain": terrain,
         "missing": entries.missing,
-        "entries": entries.files.iter().map(|(path, bytes, media_type)| json!({
-            "path": path, "bytes": bytes.len(), "sha256": sha256_hex(bytes), "media_type": media_type,
-        })).collect::<Vec<_>>(),
-    });
-    let mut zip = crate::flight_review::zip::Zip::new(now_ms);
-    zip.add("manifest.json", &serde_json::to_vec_pretty(&manifest).unwrap_or_default());
-    for (path, bytes, _) in &entries.files {
-        zip.add(path, bytes);
-    }
-    Ok(zip.finish())
-}
-
-/// Cached map tiles around a track, lowest zoom first, within the budget.
-async fn add_tiles(entries: &mut Entries, router: &Router, headers: &HeaderMap, track: &[(f64, f64)], map_config: Option<&Value>, max_mb: Option<u32>) -> Value {
-    let budget = (max_mb.unwrap_or(DEFAULT_TILE_BUDGET_MB).min(MAX_TILE_BUDGET_MB) as usize) << 20;
-    let max_zoom = map_config.and_then(|m| m["max_native_zoom"].as_u64()).unwrap_or(16).min(17) as u32;
-    let (mut la0, mut la1, mut lo0, mut lo1) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
-    for &(la, lo) in track {
-        (la0, la1, lo0, lo1) = (la0.min(la), la1.max(la), lo0.min(lo), lo1.max(lo));
-    }
-    let (mut used, mut count, mut complete) = (0usize, 0u64, true);
-    'zoom: for z in 10..=max_zoom {
-        let (x0, y0) = tile_of(la1, lo0, z);
-        let (x1, y1) = tile_of(la0, lo1, z);
-        for x in x0.saturating_sub(1)..=x1 + 1 {
-            for y in y0.saturating_sub(1)..=y1 + 1 {
-                let Ok(bytes) = fetch(router, headers, &format!("/tiles/{z}/{x}/{y}.jpg")).await else { continue };
-                if bytes.is_empty() {
-                    continue;
-                }
-                if used + bytes.len() > budget {
-                    complete = false;
-                    break 'zoom;
-                }
-                used += bytes.len();
-                count += 1;
-                entries.add(&format!("tiles/{z}/{x}/{y}.jpg"), bytes, "image/jpeg");
+        "entries": entries.files.iter().map(|entry| {
+            let mut listed = json!({
+                "path": entry.path, "bytes": entry.bytes.len(), "sha256": sha256_hex(&entry.bytes), "media_type": entry.media_type,
+            });
+            if let Some(route) = &entry.route {
+                listed["route"] = route.as_str().into();
             }
-        }
-    }
-    json!({"included": count, "bytes": used, "budget_bytes": budget, "complete": complete})
-}
-
-/// A flight plan as a replay bundle (docs/flight-plans.md): the predicted
-/// trajectory as FC rows in `replay.json`, the station's configuration and
-/// geometry as for a recording, the plan itself, and tiles around its track.
-pub(crate) async fn build_plan(state: Arc<AppState>, headers: &HeaderMap, plan: &Value, now_ms: i64) -> Result<Vec<u8>, (StatusCode, String)> {
-    let router = sources(state);
-    let mut entries = Entries { files: Vec::new(), missing: Vec::new() };
-    let mut replay = crate::flight_plan::replay_document(plan);
-    let layout = entries.optional(&router, headers, "/api/layout", "config/layout.json").await;
-    // The live layout route serializes some maps in hash order: store it canonically.
-    if let Some(layout) = &layout
-        && let Some(entry) = entries.files.iter_mut().find(|(path, _, _)| path == "config/layout.json")
-    {
-        entry.1 = serde_json::to_vec_pretty(layout).unwrap_or_default();
-    }
-    let boards = entries.optional(&router, headers, "/api/boards", "config/boards.json").await;
-    let geometry = entries.optional(&router, headers, crate::vehicle_geometry::PATH, "models/vehicle_geometry.json").await;
-    entries.optional(&router, headers, "/api/diagrams", "config/diagrams.json").await;
-    let map_config = entries.optional(&router, headers, "/api/map_config", "config/map_config.json").await;
-    let trajectory = crate::flight_plan::replay_trajectory(&replay);
-    entries.add_json("derived/trajectory.json", &trajectory);
-    entries.add_json("derived/flight_plan.json", plan);
-    if let Some(layout) = &layout {
-        replay["layout"] = layout.clone();
-    }
-    if let Some(boards) = &boards {
-        replay["boards"] = boards["boards"].clone();
-    }
-    if let Some(geometry) = &geometry {
-        replay["vehicle_geometry"] = geometry.clone();
-    }
-    let track: Vec<(f64, f64)> = plan["points"].as_array().into_iter().flatten().filter_map(|p| Some((p["lat_deg"].as_f64()?, p["lon_deg"].as_f64()?))).collect();
-    let tiles = add_tiles(&mut entries, &router, headers, &track, map_config.as_ref(), None).await;
-    let csv = crate::flight_plan::replay_csv(&replay);
-    let rows = replay["samples"].as_array().map_or(0, Vec::len);
-    entries.files.insert(0, ("data/telemetry.csv".to_owned(), csv.into_bytes(), "text/csv"));
-    entries.files.insert(0, ("replay.json".to_owned(), serde_json::to_vec(&replay).unwrap_or_default(), "application/json"));
-    let manifest = json!({
-        "format": FORMAT,
-        "version": VERSION,
-        "created_ms": now_ms,
-        "generator": format!("groundstation_backend {}", env!("CARGO_PKG_VERSION")),
-        "source": {"station_name": crate::host_power::station_name(), "recording": replay["recording"], "flight_plan": plan["id"]},
-        "predicted": true,
-        "label": replay["label"],
-        "mode": "flight",
-        "recorded_mode": "normal",
-        "time_range": {"start_ms": replay["snapshot"]["start_ms"], "end_ms": replay["snapshot"]["end_ms"]},
-        "rows": rows,
-        "tiles": tiles,
-        "missing": entries.missing,
-        "entries": entries.files.iter().map(|(path, bytes, media_type)| json!({
-            "path": path, "bytes": bytes.len(), "sha256": sha256_hex(bytes), "media_type": media_type,
-        })).collect::<Vec<_>>(),
+            listed
+        }).collect::<Vec<_>>(),
     });
     let mut zip = crate::flight_review::zip::Zip::new(now_ms);
     zip.add("manifest.json", &serde_json::to_vec_pretty(&manifest).unwrap_or_default());
-    for (path, bytes, _) in &entries.files {
-        zip.add(path, bytes);
+    for entry in &entries.files {
+        zip.add(&entry.path, &entry.bytes);
     }
     Ok(zip.finish())
 }
@@ -452,34 +400,6 @@ mod tests {
         let db_bytes = std::fs::metadata(root.0.join(id)).map(|m| m.len()).unwrap_or(0);
         println!("realistic_capture_bundle_size: {rows} rows, recording db {db_bytes} bytes, bundle {} bytes, built in {:?}", bundle.len(), started.elapsed());
         assert!(bundle.len() < 64 << 20);
-    }
-
-    #[test]
-    fn terrain_request_covers_the_track() {
-        let points = vec![
-            json!({"latitude": 31.758, "longitude": -102.046}),
-            json!({"latitude": 31.768, "longitude": -102.036}),
-        ];
-        let (route, extent) = terrain_route(&points).unwrap();
-        assert_eq!(extent, 5_000.0);
-        assert!(route.starts_with("/api/terrain/heightmap?lat=31.758&lon=-102.046&extent_m=5000&size=129"), "{route}");
-        assert!(terrain_route(&[json!({"latitude": null})]).is_none());
-        let far = vec![json!({"latitude": 31.0, "longitude": -102.0}), json!({"latitude": 32.0, "longitude": -102.0})];
-        assert_eq!(terrain_route(&far).unwrap().1, 30_000.0);
-    }
-
-    #[tokio::test]
-    async fn bundle_carries_the_heightmap_when_a_dem_is_cached() {
-        // The heightmap route answers from a synthetic DEM; the bundle copies its body.
-        let (fx, fy) = crate::terrain::tile_xy(31.758, -102.046, 10);
-        let png = crate::terrain::encode_terrarium(256, 256, |x, _| 850.0 + x as f32);
-        let temp = crate::terrain::tests::temp_store("bundle", &[((10, fx as u32, fy as u32), png)]).await;
-        let map = crate::terrain::build_heightmap(&temp.store, 31.758, -102.046, 5_000.0, TERRAIN_GRID_SIZE).await.unwrap();
-        let bytes = serde_json::to_vec(&map).unwrap();
-        assert!(bytes.len() < MAX_TERRAIN_BYTES);
-        let value: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(value["available"], true);
-        assert_eq!(value["size"], TERRAIN_GRID_SIZE);
     }
 
     #[test]

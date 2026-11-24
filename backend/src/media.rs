@@ -52,12 +52,12 @@ struct MediaState {
     recorded_vehicle_cache: Mutex<recorded_vehicle::SceneCache>,
 }
 
-pub fn router(
+fn media_state(
     app: Arc<AppState>,
     relay_password: String,
     voice: Arc<crate::voice::VoiceHub>,
-) -> Router<Arc<AppState>> {
-    let state = Arc::new(MediaState {
+) -> MediaState {
+    MediaState {
         app,
         client: reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
@@ -87,7 +87,15 @@ pub fn router(
         models: std::env::var_os("GS_STAGE_MODELS_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/stage_models")),
-    });
+    }
+}
+
+pub fn router(
+    app: Arc<AppState>,
+    relay_password: String,
+    voice: Arc<crate::voice::VoiceHub>,
+) -> Router<Arc<AppState>> {
+    let state = Arc::new(media_state(app, relay_password, voice));
     tokio::spawn(publishing::reap(state.clone()));
     tokio::spawn(contract::capture_program_history(state.clone()));
     let initial = state.clone();
@@ -125,6 +133,19 @@ pub fn router(
             "/media",
             get(|| async { Html(gs_browser_assets::MEDIA_HTML) }),
         )
+}
+
+/// `GET /api/vehicle_visualization` on its own (the replay bundle snapshots
+/// it): the station's handler over a media state that starts no background
+/// tasks. Absent when the media routes are (internal flight simulation).
+pub(crate) fn view_config_routes(app: Arc<AppState>) -> Router<Arc<AppState>> {
+    if crate::flight_sim_runtime::enabled() {
+        return Router::new();
+    }
+    let state = Arc::new(media_state(app, String::new(), Arc::new(crate::voice::VoiceHub::default())));
+    Router::new()
+        .route("/api/vehicle_visualization", get(contract::vehicle))
+        .with_state(state)
 }
 
 pub(crate) fn recordings_directory() -> PathBuf {
