@@ -146,7 +146,8 @@ seconds read from `status.json`, with a wall fallback once the bay has stalled f
   RRLS, not in a `raspberry_pi` build, only with a complete cache), the real-hardware check, recording provenance,
   and the API: `GET /api/firmware-sim` (status for any signed-in viewer: banner, manifest, bay pace, nodes, resets,
   plant, control) and `POST /api/firmware-sim/control` (administrators only: plant inputs and faults; validated,
-  unknown keys refused, every change logged).
+  unknown keys refused, every change logged; sections replace the stored ones, except `faults` and `patch`, which
+  merge per key so a client keeps the keys it does not send).
 * `station_mode_switch.rs`: one more target per mode, `<mode>-firmware-sim` (normal, hitl, test_fire, testing,
   integrated_ground_test), labelled "<mode> · SIMULATED FIRMWARE ..."; entering or leaving restarts the backend (like
   Simulation), switching between them is in process. **Entering is refused while real hardware is connected**: any board heard on this

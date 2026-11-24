@@ -440,7 +440,7 @@ report was saved; ambient temperature and weather come from the launch capture's
 | Route | Who | |
 |---|---|---|
 | `GET /api/apogee_planner` | view | settings, last plan, applied plan, weather cache, motor fit, apply gate, post-flight comparison |
-| `PUT /api/apogee_planner/settings` | admin | planner settings |
+| `PUT /api/apogee_planner/settings` | admin | planner settings, merged into the stored ones (fields left out are kept); a body naming another settings `version` is refused with 409 |
 | `POST /api/apogee_planner/weather/fetch` | send commands | fetch from the selected online provider (refused unless enabled) |
 | `POST /api/apogee_planner/compute` | send commands | compute a plan from the current settings and weather |
 | `POST /api/apogee_planner/apply` | send commands | `{plan_id}`; writes fill targets (gated, logged) |
