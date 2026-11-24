@@ -111,6 +111,7 @@ mod operator_command_resend;
 mod operator_phase;
 mod primary_mirror;
 mod qualification_requests;
+mod recording_bundle;
 mod recording_export;
 mod recording_store;
 mod host_power;

@@ -478,6 +478,7 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .route("/api/firmware/flash/{board}", post(start_firmware_update))
         .route("/api/recording_status", get(get_recording_status))
         .merge(crate::recording_export::routes())
+        .merge(crate::recording_bundle::routes())
         .merge(crate::host_power::routes())
         .merge(crate::sd_download::routes())
         .route("/api/notifications", get(get_notifications))
@@ -559,6 +560,18 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         // Stream viewer tokens reach only the raw stream feed and their logout.
         .layer(axum::middleware::from_fn(crate::raw_stream::scope_stream_tokens))
         .with_state(state)
+}
+
+/// The configuration routes a replay bundle snapshots, with the same
+/// handlers as `router` (`recording_bundle`).
+pub(crate) fn bundle_config_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/api/boards", get(get_boards))
+        .route("/api/layout", get(get_layout))
+        .route("/api/calibration_config", get(get_calibration_config))
+        .route("/api/map_config", get(get_map_config))
+        .route("/api/calibration", get(get_loadcell_calibration))
+        .route("/tiles/{z}/{x}/{y}", get(get_tile_jpg))
 }
 
 /// Pulls a bearer token out of the Authorization header.

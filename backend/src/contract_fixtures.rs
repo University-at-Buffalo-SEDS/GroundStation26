@@ -662,7 +662,8 @@ async fn self_test_confirmation(out: &mut Fixtures) {
 /// app attaches from the same station (`layout`, `boards`, `view_config`,
 /// `vehicle_geometry`, `valve_mappings`, `mode`). The UI opens this with no station connected
 /// (offline replay).
-async fn replay_export(app: &axum::Router, out: &mut Fixtures) {
+/// Telemetry rows of the IGT `nominal_10k` mock flight, thinned to 0.5 Hz.
+fn nominal_10k_rows() -> Vec<(i64, &'static str, &'static str, Value)> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../test-data/igt/nominal_10k/IGT");
     let read = |name: &str| -> Vec<Vec<f64>> {
         std::fs::read_to_string(dir.join(name)).unwrap().lines().skip(1)
@@ -670,8 +671,6 @@ async fn replay_export(app: &axum::Router, out: &mut Fixtures) {
     };
     let (baro, gps) = (read("BARO0.CSV"), read("GPS0.CSV"));
     let at = |rows: &[Vec<f64>], t: f64| rows.iter().find(|r| r[0] >= t).unwrap_or(rows.last().unwrap()).clone();
-    let db = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
-    sqlx::query("CREATE TABLE telemetry(id INTEGER PRIMARY KEY,timestamp_ms INTEGER,source_timestamp_ms INTEGER,sender_id TEXT,data_type TEXT,values_json TEXT,payload_json TEXT)").execute(&db).await.unwrap();
     let mut rows: Vec<(i64, &str, &str, Value)> = Vec::new();
     // FlightState codes: Armed 6, Launch 7, Ascent 8, Coast 9, Descent 11, Landed 13.
     for (t, code) in [(0, 6), (10_000, 7), (10_200, 8), (17_300, 9), (36_600, 11), (204_000, 13)] {
@@ -687,10 +686,81 @@ async fn replay_export(app: &axum::Router, out: &mut Fixtures) {
         rows.push((t, "PB", "BATTERY_VOLTAGE", json!([7.9 - t as f64 * 1e-6])));
     }
     rows.sort_by_key(|r| r.0);
+    rows
+}
+
+async fn insert_rows(db: &sqlx::SqlitePool, rows: Vec<(i64, &str, &str, Value)>) {
     for (t, sender, data_type, values) in rows {
         sqlx::query("INSERT INTO telemetry(timestamp_ms,source_timestamp_ms,sender_id,data_type,values_json,payload_json) VALUES(?,NULL,?,?,?,'[]')")
-            .bind(T0 + t).bind(sender).bind(data_type).bind(values.to_string()).execute(&db).await.unwrap();
+            .bind(T0 + t).bind(sender).bind(data_type).bind(values.to_string()).execute(db).await.unwrap();
     }
+}
+
+/// A self-contained replay bundle (`GET /api/recordings/{id}/bundle`) of a
+/// recording of the same flight, the recording's own
+/// `GET /api/recordings/{id}/csv`, and the bundle manifest. The UI opens the
+/// bundle with no station and checks that its CSV export equals that CSV.
+async fn replay_bundle(root: &Path, state: &Arc<AppState>, app: &axum::Router, out: &mut Fixtures) {
+    let id = "groundstation_recording_2026-01-01_00-00-00_000.db";
+    let (db, _) = crate::telemetry_db::open_telemetry_db(&root.join(id)).await.unwrap();
+    insert_rows(&db, nominal_10k_rows()).await;
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert("Authorization", "Bearer viewer-token".parse().unwrap());
+    let options = crate::recording_bundle::Options { tiles: true, tiles_max_mb: Some(1) };
+    let bundle = crate::recording_bundle::build(state.clone(), &headers, id, &options, T0).await.unwrap();
+    let again = crate::recording_bundle::build(state.clone(), &headers, id, &options, T0).await.unwrap();
+    assert_eq!(bundle, again, "a bundle is reproducible");
+    let request = Request::builder().uri(format!("/api/recordings/{id}/csv")).header("Authorization", "Bearer viewer-token").body(Body::empty()).unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let csv = axum::body::to_bytes(response.into_body(), 1 << 24).await.unwrap().to_vec();
+    let request = Request::builder().uri(format!("/api/recordings/{id}/bundle")).header("Authorization", "Bearer viewer-token").body(Body::empty()).unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "the bundle route answers");
+    assert_eq!(response.headers()["content-type"], crate::recording_bundle::MEDIA_TYPE);
+    db.close().await;
+    let manifest = bundle_manifest(&bundle);
+    let csv_sha: String = ring::digest::digest(&ring::digest::SHA256, &csv).as_ref().iter().map(|b| format!("{b:02x}")).collect();
+    let listed = manifest["entries"].as_array().unwrap().iter().find(|e| e["path"] == "data/telemetry.csv").unwrap();
+    assert_eq!(listed["sha256"], csv_sha, "the bundle's CSV is the recording's own CSV export");
+    out.add("replay-bundle/flight.manifest", manifest);
+    binary_fixture("replay-bundle/flight.gsreplay", &bundle);
+    binary_fixture("replay-bundle/flight.csv", &csv);
+}
+
+/// `manifest.json`, the first (deflated or stored) entry of a bundle.
+fn bundle_manifest(bundle: &[u8]) -> Value {
+    let u16_at = |i: usize| u16::from_le_bytes([bundle[i], bundle[i + 1]]) as usize;
+    let u32_at = |i: usize| u32::from_le_bytes([bundle[i], bundle[i + 1], bundle[i + 2], bundle[i + 3]]) as usize;
+    assert_eq!(u32_at(0), 0x0403_4b50);
+    let (method, size, name_len, extra) = (u16_at(8), u32_at(18), u16_at(26), u16_at(28));
+    assert_eq!(&bundle[30..30 + name_len], b"manifest.json");
+    let body = &bundle[30 + name_len + extra..30 + name_len + extra + size];
+    let text = if method == 8 {
+        let mut out = String::new();
+        std::io::Read::read_to_string(&mut flate2::read::DeflateDecoder::new(body), &mut out).unwrap();
+        out
+    } else {
+        String::from_utf8(body.to_vec()).unwrap()
+    };
+    serde_json::from_str(&text).unwrap()
+}
+
+/// A non-JSON fixture: written under `GS_UPDATE_CONTRACT_FIXTURES=1`, compared byte for byte otherwise.
+fn binary_fixture(name: &str, bytes: &[u8]) {
+    let path = fixture_dir().join(name);
+    if std::env::var(UPDATE_ENV).as_deref() == Ok("1") {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+    } else {
+        assert!(std::fs::read(&path).ok().as_deref() == Some(bytes), "{name} differs from the backend's current output; regenerate with {UPDATE_ENV}=1");
+    }
+}
+
+async fn replay_export(app: &axum::Router, out: &mut Fixtures) {
+    let db = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+    sqlx::query("CREATE TABLE telemetry(id INTEGER PRIMARY KEY,timestamp_ms INTEGER,source_timestamp_ms INTEGER,sender_id TEXT,data_type TEXT,values_json TEXT,payload_json TEXT)").execute(&db).await.unwrap();
+    insert_rows(&db, nominal_10k_rows()).await;
     let mut file = crate::recording_replay::test_export_from(&db).await.unwrap();
     file["recording"] = "nominal_10k.db".into();
     file["mode"] = "flight".into();
@@ -730,6 +800,7 @@ async fn contract_fixtures_match_the_backend() {
     fc_estimator(&app, &mut out).await;
     vehicle_geometry(&app, &mut out).await;
     replay_export(&app, &mut out).await;
+    replay_bundle(&root.0, &state, &app, &mut out).await;
     drop(_mode);
     board_abort_hitl(&mut out).await;
     self_test_confirmation(&mut out).await;
