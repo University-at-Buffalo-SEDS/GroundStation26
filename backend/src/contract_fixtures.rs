@@ -656,6 +656,49 @@ async fn self_test_confirmation(out: &mut Fixtures) {
     out.add("requests/gse-self-test-confirmation", json!({"method": method, "path": path, "body": body, "reply": reply}));
 }
 
+/// A portable replay file as the app saves it: the actual
+/// `GET /api/recordings/{id}/replay/export` body for a recording of the IGT
+/// `nominal_10k` mock flight (thinned to 0.5 Hz), plus the configuration the
+/// app attaches from the same station (`layout`, `boards`, `mode`). The UI
+/// opens this with no station connected (offline replay).
+async fn replay_export(app: &axum::Router, out: &mut Fixtures) {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../test-data/igt/nominal_10k/IGT");
+    let read = |name: &str| -> Vec<Vec<f64>> {
+        std::fs::read_to_string(dir.join(name)).unwrap().lines().skip(1)
+            .map(|l| l.split(',').map(|v| v.parse().unwrap()).collect()).collect()
+    };
+    let (baro, gps) = (read("BARO0.CSV"), read("GPS0.CSV"));
+    let at = |rows: &[Vec<f64>], t: f64| rows.iter().find(|r| r[0] >= t).unwrap_or(rows.last().unwrap()).clone();
+    let db = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+    sqlx::query("CREATE TABLE telemetry(id INTEGER PRIMARY KEY,timestamp_ms INTEGER,source_timestamp_ms INTEGER,sender_id TEXT,data_type TEXT,values_json TEXT,payload_json TEXT)").execute(&db).await.unwrap();
+    let mut rows: Vec<(i64, &str, &str, Value)> = Vec::new();
+    // FlightState codes: Armed 6, Launch 7, Ascent 8, Coast 9, Descent 11, Landed 13.
+    for (t, code) in [(0, 6), (10_000, 7), (10_200, 8), (17_300, 9), (36_600, 11), (204_000, 13)] {
+        rows.push((t, "FC", "FLIGHT_STATE", json!([code])));
+    }
+    for t in (0..=236_000i64).step_by(2_000) {
+        let (b, g) = (at(&baro, t as f64), at(&gps, t as f64));
+        rows.push((t, "FC", "GPS_DATA", json!([g[1], g[2], g[3]])));
+        rows.push((t, "FC", "BAROMETER_DATA", json!([b[1], b[2], b[3]])));
+        let burning = (10_000..17_300).contains(&t);
+        rows.push((t, "VB", "VALVE_STATE", json!([burning as u8, 0, 0, (t == 10_000) as u8, 0, 0, 1])));
+        rows.push((t, "VB", "OX_TANK_PRESSURE", json!([if t < 10_000 { 745.0 } else if burning { 745.0 - (t - 10_000) as f64 * 0.08 } else { 30.0 }])));
+        rows.push((t, "PB", "BATTERY_VOLTAGE", json!([7.9 - t as f64 * 1e-6])));
+    }
+    rows.sort_by_key(|r| r.0);
+    for (t, sender, data_type, values) in rows {
+        sqlx::query("INSERT INTO telemetry(timestamp_ms,source_timestamp_ms,sender_id,data_type,values_json,payload_json) VALUES(?,NULL,?,?,?,'[]')")
+            .bind(T0 + t).bind(sender).bind(data_type).bind(values.to_string()).execute(&db).await.unwrap();
+    }
+    let mut file = crate::recording_replay::test_export_from(&db).await.unwrap();
+    file["recording"] = "nominal_10k.db".into();
+    file["mode"] = "flight".into();
+    file["layout"] = get_ok(app, "/api/layout", Some("viewer")).await;
+    file["boards"] = get_ok(app, "/api/boards", Some("viewer")).await["boards"].clone();
+    file["configuration_provenance"] = "Station configuration at export; not a claim of historical capture-time configuration.".into();
+    out.add("replay-export/flight", file);
+}
+
 #[tokio::test]
 async fn contract_fixtures_match_the_backend() {
     let _mode = thread_mode(Mode::Normal);
@@ -678,6 +721,7 @@ async fn contract_fixtures_match_the_backend() {
     auth(&app, &mut out).await;
     fc_estimator(&app, &mut out).await;
     vehicle_geometry(&app, &mut out).await;
+    replay_export(&app, &mut out).await;
     drop(_mode);
     board_abort_hitl(&mut out).await;
     self_test_confirmation(&mut out).await;

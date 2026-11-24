@@ -1,5 +1,12 @@
 # Frontend API Contract
 
+The UI repository's `docs/backend-contract.md` is the complete list of what
+the frontend calls and expects: every route and WebSocket message, the minimum
+backend, degradation rules, the hard-coding audit, the offline replay file
+format and the on-device demo station. Its `tests/test_backend_contract_docs.py`
+fails when the UI requests an undocumented route. This page adds
+backend-side detail.
+
 ## Camera archives and crew voice
 
 Mission links to `/media#recordings-heading` for original camera recordings and
