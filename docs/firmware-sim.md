@@ -396,9 +396,12 @@ Per mode (the e2e: `python3 tools/firmware_sim_e2e.py --out DIR --mode <mode>`):
   station stays in Startup in Testing and publishes no FLIGHT_STATE, so a DAQ without a stored flight state (fresh
   flash, as every sim start is) refuses DAC output ("does not know the flight state yet"); the DAC patch is therefore
   checked in Normal.
-* **DAC patch** (in the Normal run): a 20 Hz sine on DAC1 patched onto MCP3564R CH2 through the simulated loopback
-  cable, measured by the DAQ's frame engine and judged by the station's DAC validation, then the station's
-  linearity validation sweep (11 DC steps) through the same patch.
+* **DAC patch** (in the Normal run): a 2 Hz sine on DAC1 patched onto the KG1000 amplifier through a 1/1000
+  attenuator (the simulated loopback cable), measured by the DAQ's frame engine and judged by the station's DAC
+  validation, then the station's linearity sweep (11 DC steps) through the same patch: both pass (gain error -0.26 %,
+  sweep nonlinearity 0.003 % FS). The load-cell items are 20 ms bin means, so a 20 Hz sine reads 0.76 of its
+  amplitude there (sinc(0.4 pi)); stay below a quarter of the stream rate. MCP CH2-CH7 targets read NaN (open issue
+  2 below). `FIRMWARE_SIM_E2E_DAC_TARGET` / `_ATTENUATION` pick another target.
 
 Sim panel: Settings shows it while the station runs simulated firmware (revisions, pace, plant for everyone; plant
 inputs, conditions, calibration masses, faults and the IGT dataset for administrators). The DAQ DAC page shows the
@@ -432,6 +435,51 @@ KG50 zero and the fill to its 5 kg target; IGT to FC `Ready` with the dataset on
 end to end yet (host overloaded by other builds while these ran; see the next section): test-fire ignition and burn
 report with the igniter on PB7, Normal through Launch and the map track, IGT Launch and replay, the DAC patch
 validation, aarch64, the remote build.
+
+### Verified on jupiter (r6, 2026-11-24)
+
+Boards at dev on SEDSnet 7.0.0 (main 882daa3, CAN link v2, RR envelope v2): FC 2e182ed, RF 728f4a0, PB 767d556,
+GB 1e01818, AB 5fcf0e3, VB 6291c53, DAQ 9a8f973; FirmwareSimulator r6 (station clock, shim timer fix); the station on
+the bay's virtual clock in every run. Cache 161 MB (seven boards, the FC ground-test variant, the coordinator,
+simclock).
+
+* **Host load**: two to four bays at once with other agents' builds (load 25-55) and, for the Testing and HITL runs, 24
+  extra busy processes at higher priority than the bay. The bay slipped up to 868 s in a 1808 s test fire (about
+  0.5x, at times 0.24x) and 180 s in a 546 s HITL run, and every check that does not depend on the open issues below
+  passed: no valve report was refused as stale, the valve self-test, nitrogen test and fill ran as on a quiet host.
+* **HITL** 17/17 (twice, once under the artificial load). **Testing** 8/8 under the artificial load (links and fill
+  rules; the DAC patch moved to Normal, see section 6). **IGT** 21/21: card swap and Retry SD, Ready with the swapped
+  card's CSVs, the replayed flight with dry-run pyros and replayed GPS, GPS back to real, the FC SD collection reporting
+  the ground-test image has no SD service, IgtExit.
+* **Test fire** through the provisional burn report: valve self-test, nitrogen test, fill, qualification Armed,
+  Launch, the AB igniter on PB7, the hybrid motor on the stand (chamber about 370 psi, the KG50 unloading from +5 to
+  -37 kg, the KG1000 0.21 to 0.94 V), burnout, burn report about 3.95 kN peak / 7.9 kN s, back to Idle. The final
+  report does not arrive (open issue 1).
+* **Normal**: GPS gate, the DAC patch and sweep, the GSE procedure, QD retract (600 s), Launch, the FC's flight
+  (apogee about 1386 m, drogue T+19 s, main T+56 s, Landed), the map track (122 points, 662 m drift, 1386 m altitude
+  span) and the FC SD launch file downloaded (1.7 MB at about 10 KB/s); its attachment waits behind the DAQ launch
+  fetch (open issue 1).
+
+Open issues found by these runs:
+
+1. **The DAQ does not follow the station back to Idle.** After the burn (test fire: Launch, Armed, Fill x4, Idle in
+   3 s steps) the DAQ's flight-state cache stays at Fill (`g_flight_state_cache_value` 2; Launch, Armed and the Fill
+   writes were applied, the Idle write was not; one reliable refusal counted). In Normal it stays at Launch (the
+   station writes no Landed). The DAQ serves its SD stream only in Idle, Landed or Recovery, so the station's DAQ
+   launch-file listing times out, the burn report stays provisional and the FC SD attachment waits behind it. The
+   station now retries the listing four times and then lets the FC collection go on.
+2. **MCP CH2-CH7 (DAQ_SDADC_VOLTAGES) publish NaN.** The aux samples are fresh in the DAQ, but `daq_publish_analog`
+   ages them against `telemetry_now_ms()` (ThreadX ticks) while the samples carry HAL-tick milliseconds
+   (`mcp3564r.c` maps the TIM2 stamps onto HAL time). In the sim the ThreadX clock trails the HAL tick by about 50 ms,
+   so every sample looks newer than "now", `(uint32_t)(now - ms)` wraps and the value is dropped as stale. The same
+   mix of time bases could hit the board whenever ThreadX's tick starts after the HAL tick; to check on hardware.
+3. **Testing mode publishes no FLIGHT_STATE**, so a DAQ without a stored state refuses DAC output there.
+4. **A Launch right after the QD retract did nothing once.** In one of two Normal runs the station admitted Launch
+   0.7 s after the AB finished its 600 s stepper move (the retraction proof turns allowed at that moment); FLIGHT_STATE
+   Launch went out, but the AB never drove the igniter (PB7) nor the VB the pilot, with no board reset and nothing
+   in the station log. The other run sent Launch 3 s after the move ended and flew. Needs AB-side tracing of its launch
+   claim (`thread_comm_launch_claim`: station stamp window -5 s/+1 s) right after the move, during which the shim
+   delivered 20 million TIM1 update interrupts.
 
 ### Valve-report time stamps and the bay's pace (2026-11-23)
 
@@ -484,6 +532,7 @@ frame engine waveforms up to about 250 Hz come through faithfully (500 Hz Nyquis
 
 ## 7. Follow-ups
 
+* The open issues of the r6 runs above (DAQ flight state after the burn, the MCP aux time base).
 * Testing mode: the station publishes no FLIGHT_STATE in Startup, so a DAQ without a durable flight state refuses
   DAC output there (gate 2). Either the station publishes Startup or the DAQ treats "no state yet" as Startup for the
   DAC; to decide with the DAQ owner.
