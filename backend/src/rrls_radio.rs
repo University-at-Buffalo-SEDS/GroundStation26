@@ -347,6 +347,18 @@ impl CommsDevice for RecoveryRadio {
             |device| device.service_paid_budget_transmit_counted(),
         )
     }
+    /// The primary's AV-bay radio is this wrapper, so the owed settings turn
+    /// (framing offer, mode reply, HOST_CONTROL reply, station-state copy)
+    /// must reach the UART. With the trait default it never ran, and the
+    /// station state then waited for background admission, which a busy
+    /// control stream (a launch) held shut for 10 s or more.
+    fn service_owed_settings_turn(&mut self) -> TelemetryResult<bool> {
+        self.with_device(
+            TelemetryError::Io("RRLS radio disconnected"),
+            io_failure,
+            |device| device.service_owed_settings_turn(),
+        )
+    }
     fn service_transmit(&mut self) -> TelemetryResult<()> {
         self.with_device(
             TelemetryError::Io("RRLS radio disconnected"),
@@ -716,6 +728,45 @@ mod tests {
         let mut writer = radio.try_clone_tx().unwrap().unwrap();
         writer.send_data_with_priority(&[1, 2, 3], 200).unwrap();
         assert_eq!(*observed.lock().unwrap(), vec![(200, vec![1, 2, 3])]);
+    }
+    /// The primary's AV-bay radio is a RecoveryRadio: its TX worker's owed
+    /// settings turn (radio_io SETTINGS_TURN_MS) must reach the UART device.
+    /// It used to stop at the trait default, so the station-state broadcast
+    /// waited for background admission and an RRLS showed a launch 10 s late.
+    #[test]
+    fn the_owed_settings_turn_reaches_the_radio_device() {
+        struct OwedSpy(Arc<AtomicUsize>);
+        impl CommsDevice for OwedSpy {
+            fn try_clone_tx(&self) -> std::io::Result<Option<Box<dyn CommsDevice>>> {
+                Ok(Some(Box::new(Self(self.0.clone()))))
+            }
+            fn set_side_id(&mut self, _: RouterSideId) {}
+            fn recv_packet(
+                &mut self,
+                _: &Router,
+                _: &mut dyn FnMut(&Packet),
+            ) -> TelemetryResult<()> {
+                Ok(())
+            }
+            fn send_data(&mut self, _: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+                Ok(())
+            }
+            fn service_owed_settings_turn(&mut self) -> TelemetryResult<bool> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(true)
+            }
+        }
+        let radio = missing();
+        let turns = Arc::new(AtomicUsize::new(0));
+        let seen = turns.clone();
+        radio.shared.lock().unwrap().opener =
+            Box::new(move |_| Ok(Box::new(OwedSpy(seen.clone()))));
+        let mut writer = radio.try_clone_tx().unwrap().unwrap();
+        assert!(
+            writer.service_owed_settings_turn().unwrap(),
+            "the device's written frame is reported"
+        );
+        assert_eq!(turns.load(Ordering::Relaxed), 1);
     }
     #[test]
     fn uart_backpressure_keeps_recovery_radio_connected_and_can_resume() {

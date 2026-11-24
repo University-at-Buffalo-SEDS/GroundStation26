@@ -44,8 +44,14 @@ pub(crate) const PAYLOAD_LEN: usize = HEADER_LEN + BODY_LEN;
 const COPY_OFFSETS_MS: [u64; 3] = [0, 250, 750];
 /// Unchanged state is re-sent this often (a missed change, a new RRLS).
 pub(crate) const PERIOD_MS: u64 = 5_000;
-/// A queued copy older than this is superseded by the next one.
-pub(crate) const TTL_MS: u64 = 1_000;
+/// An unsent copy waits this long, until the next periodic copy replaces it.
+/// Every queued copy carries the newest body (a change supersedes it at
+/// once), so waiting never shows the RRLS an old state. It used to be 1 s,
+/// no longer than one owed settings turn (radio_io SETTINGS_TURN_MS): when a
+/// launch's control stream kept background admission shut and the one owed
+/// turn in that second went to a HOST_CONTROL reply, every copy of the change
+/// expired unsent and the RRLS showed it 5-10 s late, with the next copy.
+pub(crate) const TTL_MS: u64 = PERIOD_MS;
 /// The RRLS shows the primary's view for this long after the last copy (four
 /// periods): longer than the relay's HEALTH gaps, shorter than an outage.
 const VIEW_FRESH_MS: u64 = 4 * PERIOD_MS;

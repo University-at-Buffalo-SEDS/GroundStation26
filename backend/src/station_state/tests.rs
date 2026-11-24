@@ -139,6 +139,48 @@ fn the_broadcast_waits_behind_abort_and_control_and_takes_an_owed_settings_turn(
     assert_eq!(primary.begin_any_for_test(2_000 + TTL_MS + 1), None);
 }
 
+/// rrls_relay just after a cut (native SITL): a launch's control stream kept
+/// background admission shut, and the one owed settings turn in the second
+/// after the change went to a HOST_CONTROL reply. Every copy (0, 250, 750 ms)
+/// then expired unsent and the RRLS showed the launch 5-10 s late, with the
+/// next periodic copy. The newest copy now waits for the next owed turn.
+#[test]
+fn a_change_whose_owed_turn_went_to_a_reply_goes_on_the_next_turn() {
+    let _serial = TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    reset_for_test();
+    let (mut primary, mut rrls) = link(false, 0);
+    let armed = body(S::Armed, MissionPhase::Fill, idle_clock(), 3);
+    carry(&mut primary, &mut rrls, &armed, 0);
+    // The launch: the change and its copies, queued while nothing is sent.
+    let mut launch = body(S::Launch, MissionPhase::Launch, idle_clock(), 4);
+    launch.clock = LaunchClockMsg {
+        kind: LaunchClockKind::TPlus,
+        anchor_timestamp_ms: Some(1_767_225_760_000),
+        duration_ms: None,
+    };
+    for now in (1_000..=1_800).step_by(100) {
+        primary.publish_station_state(launch.encode(), now);
+    }
+    // The owed turn at 1.8 s carries an RRLS's HOST_CONTROL reply.
+    primary.queue_control_for_test(1_800);
+    let reply = primary.begin_owed_for_test(1_800).unwrap();
+    assert_eq!(crate::rrls::kind_of(&reply), Some(11));
+    // The next owed turn, one SETTINGS_TURN_MS later: the change goes now,
+    // not 5 s later with the next periodic copy.
+    for now in (1_900..=2_800).step_by(100) {
+        primary.publish_station_state(launch.encode(), now);
+    }
+    let frame = primary
+        .begin_owed_for_test(2_800)
+        .expect("the newest copy is still queued for the next owed turn");
+    assert_eq!(crate::rrls::kind_of(&frame), Some(16));
+    rrls.incoming(true, &frame, 2_800);
+    assert_eq!(received_for_test(), Some(launch));
+    reset_for_test();
+}
+
 #[test]
 fn an_rrls_takes_the_primarys_state_from_one_frame_listening_and_relaying() {
     let _serial = TEST_LOCK
