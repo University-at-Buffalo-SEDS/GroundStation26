@@ -175,6 +175,24 @@
       "path": "derived/trajectory.json",
       "route": "/api/recordings/groundstation_recording_2026-01-01_00-00-00_000.db/replay/trajectory?upper_id=601",
       "sha256": "782bfb3c64471a5c13a6e3f1307c50e37b95d2f303df472fda7b6f89b6e20fb2"
+    },
+    {
+      "bytes": 3019,
+      "media_type": "application/json",
+      "path": "config/report_context.json",
+      "sha256": "9496e03ce500a7e0397da357e4300b0cb473d5db40c83adcfc198d25409bdd71"
+    },
+    {
+      "bytes": 13356,
+      "media_type": "application/zip",
+      "path": "exports/flight_export.zip",
+      "sha256": "453426be41f56b448873ee3c73dc2e5d4a22ad6af9c26f12f205f90fcf395faa"
+    },
+    {
+      "bytes": 263,
+      "media_type": "application/json",
+      "path": "exports/index.json",
+      "sha256": "a95dd70b2b879cd0cb80d56d515afd660b2d89d0e47081d7983099a5cff3c30e"
     }
   ],
   "format": "gsreplay",
