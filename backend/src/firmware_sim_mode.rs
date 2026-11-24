@@ -375,12 +375,25 @@ fn write_control(dir: &std::path::Path, control: &Value) -> std::io::Result<()> 
         .and_then(|_| std::fs::rename(&tmp, dir.join("control.json")))
 }
 
-/// Top-level sections of `update` replace those of `current`.
+/// Top-level sections of `update` replace those of `current`, except
+/// `faults` and `patch`, which merge per key: a client that sends only the
+/// faults or patch inputs it knows (the UI panel, a test tool) keeps the
+/// others (a P10 swap, a drift, the DAC attenuations) instead of clearing
+/// them. Clearing a key takes an explicit value (false, 0, null).
 pub(crate) fn merge_control(current: Option<Value>, update: Value) -> Value {
     let mut merged = current.filter(Value::is_object).unwrap_or_else(|| json!({}));
     if let (Some(m), Some(u)) = (merged.as_object_mut(), update.as_object()) {
         for (k, v) in u {
-            m.insert(k.clone(), v.clone());
+            match (k.as_str(), m.get_mut(k).and_then(Value::as_object_mut), v.as_object()) {
+                ("faults" | "patch", Some(stored), Some(sent)) => {
+                    for (key, value) in sent {
+                        stored.insert(key.clone(), value.clone());
+                    }
+                }
+                _ => {
+                    m.insert(k.clone(), v.clone());
+                }
+            }
         }
     }
     merged
@@ -456,6 +469,12 @@ mod tests {
     fn control_sections_merge() {
         let merged = merge_control(Some(json!({"patch": {"dac1": "hvain1"}, "loads": {"kg50_kg": 5.0}})), json!({"loads": {"kg50_kg": 10.0}}));
         assert_eq!(merged, json!({"patch": {"dac1": "hvain1"}, "loads": {"kg50_kg": 10.0}}));
+        // The panel sends only the faults and patch keys it knows: the rest survive.
+        let stored = json!({"faults": {"p10_inputs_swapped": true, "kg50_drift_kg_per_c": 0.2, "radio_drop": true},
+            "patch": {"dac1": "hvain1", "dac1_attenuation": 0.5, "dac2_attenuation": 0.25}});
+        let merged = merge_control(Some(stored), json!({"faults": {"radio_drop": false, "stuck_valves": {}}, "patch": {"dac1": "kg50", "dac2": null}}));
+        assert_eq!(merged["faults"], json!({"p10_inputs_swapped": true, "kg50_drift_kg_per_c": 0.2, "radio_drop": false, "stuck_valves": {}}));
+        assert_eq!(merged["patch"], json!({"dac1": "kg50", "dac1_attenuation": 0.5, "dac2_attenuation": 0.25, "dac2": null}));
     }
 
     #[tokio::test]
