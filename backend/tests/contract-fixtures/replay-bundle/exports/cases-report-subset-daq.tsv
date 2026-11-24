@@ -1,0 +1,56 @@
+timestamp_ms	monotonic_ms	sensor	value	raw_adc_code	raw_value	calibrated_value	time_source	adc_temperature_c	adc_temperature_code	uptime_ticks	uptime_frequency_hz	record_sequence
+# export={"layout":"seds-sd-csv-13-v1","origin":"groundstation_recording","clock_policy":"source UTC only when calendar-valid; otherwise unknown","unavailable_fields":["monotonic_ms","raw_adc_code","raw_value","calibrated_value","adc_temperature_c","adc_temperature_code","uptime_ticks","uptime_frequency_hz","record_sequence"],"precision":"firmware nine-digit binary32; higher recorded precision retained","missing_values":"omitted; counts retained in channel metadata"}
+# channel={"sender":"DAQ","data_type":"DAQ_POWER_MONITOR","index":2,"unit":null,"unit_source":"unknown","value_kind":"recorded_unclassified","key":"[\"DAQ\",\"DAQ_POWER_MONITOR\",2]","samples":8,"missing_samples":0,"regression":{"status":"not_applicable"}}
+# channel={"sender":"DAQ","data_type":"LOADCELL_FILL_PERCENT","index":0,"unit":null,"unit_source":"unknown","value_kind":"recorded_derived","key":"[\"DAQ\",\"LOADCELL_FILL_PERCENT\",0]","samples":8,"missing_samples":0,"regression":{"status":"recorded_calibration","epochs":[{"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","first_sample_ms":1767312000000,"last_sample_ms":1767312000000,"channel":{"linear":{"b":0.0,"m":7.0},"points":[]},"equation":"y = f(raw) - f(zero_raw) if tare exists, else f(raw); linear: f(x)=m*x+b; polyN: descending a..e coefficients evaluated at (x-x0)","samples":1,"fill_targets":{"fill_source":"kg50","target_kg":8.0},"flight_state":"NitrousFill","fill_source":"KG50","postprocess":"clamp(100 * calibrated_kg / active_target_kg, 0, 100)"},{"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","first_sample_ms":1767312001000,"last_sample_ms":1767312004000,"channel":{"linear":{"b":1.0,"m":2.0},"fit":null,"zero_raw":0.25,"points":[{"kg":2.0,"raw":0.5}]},"equation":"y = f(raw) - f(zero_raw) if tare exists, else f(raw); linear: f(x)=m*x+b; polyN: descending a..e coefficients evaluated at (x-x0)","samples":4,"fill_targets":{"fill_source":"kg1000_absolute","target_kg":8.0},"flight_state":"NitrousFill","fill_source":"KG1000","postprocess":"clamp(100 * abs(calibrated_kg) / active_target_kg, 0, 100)"},{"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","first_sample_ms":1767312005000,"last_sample_ms":1767312007000,"channel":{"linear":{"b":1.0000001,"m":2.0},"fit":null,"zero_raw":0.25,"points":[{"kg":2.0,"raw":0.5}]},"equation":"y = f(raw) - f(zero_raw) if tare exists, else f(raw); linear: f(x)=m*x+b; polyN: descending a..e coefficients evaluated at (x-x0)","samples":3,"fill_targets":{"fill_source":"kg1000_absolute","target_kg":9.5},"flight_state":"Armed","fill_source":"KG1000","postprocess":"clamp(100 * abs(calibrated_kg) / active_target_kg, 0, 100)"}],"samples_without_metadata":0}}
+# channel={"sender":"DAQ","data_type":"KG50","index":0,"unit":null,"unit_source":"unknown","value_kind":"recorded_raw_input","key":"[\"DAQ\",\"KG50\",0]","samples":8,"missing_samples":1,"regression":{"status":"not_applicable"}}
+# channel={"sender":"DAQ","data_type":"REC_BOARD_DIE_TEMPERATURE","index":0,"unit":"\u00b0C","unit_source":"recorded_diagnostic_schema_v1","value_kind":"recorded_unclassified","channel_label":"MCU die temperature","precision":"counter CSV integers exact; graph projections approximate","key":"[\"DAQ\",\"REC_BOARD_DIE_TEMPERATURE\",0]","samples":2,"missing_samples":0,"regression":{"status":"not_applicable","channel_label":"MCU die temperature","unit":"\u00b0C","unit_source":"recorded_diagnostic_schema_v1","precision":"counter CSV integers exact; graph projections approximate"}}
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":3,"channel":"[\"DAQ\",\"KG50\",0]","received_timestamp_ms":1767312000000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		kg50_v	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":5,"channel":"[\"DAQ\",\"LOADCELL_FILL_PERCENT\",0]","received_timestamp_ms":1767312000000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""DAQ"",""LOADCELL_FILL_PERCENT"",0]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":8,"channel":"[\"DAQ\",\"DAQ_POWER_MONITOR\",2]","received_timestamp_ms":1767312000000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		input_voltage_v	"12"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":10,"channel":"[\"DAQ\",\"REC_BOARD_DIE_TEMPERATURE\",0]","received_timestamp_ms":1767312000500,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""DAQ"",""REC_BOARD_DIE_TEMPERATURE"",0]"	"3.15000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":13,"channel":"[\"DAQ\",\"KG50\",0]","received_timestamp_ms":1767312001000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		kg50_v	"0.1"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":15,"channel":"[\"DAQ\",\"LOADCELL_FILL_PERCENT\",0]","received_timestamp_ms":1767312001000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""DAQ"",""LOADCELL_FILL_PERCENT"",0]"	"1.25000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":18,"channel":"[\"DAQ\",\"DAQ_POWER_MONITOR\",2]","received_timestamp_ms":1767312001000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		input_voltage_v	"1.22500000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":20,"channel":"[\"DAQ\",\"REC_BOARD_DIE_TEMPERATURE\",0]","received_timestamp_ms":1767312001500,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""DAQ"",""REC_BOARD_DIE_TEMPERATURE"",0]"	"3.22500000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":23,"channel":"[\"DAQ\",\"KG50\",0]","received_timestamp_ms":1767312002000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		kg50_v	"0.2"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":25,"channel":"[\"DAQ\",\"LOADCELL_FILL_PERCENT\",0]","received_timestamp_ms":1767312002000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""DAQ"",""LOADCELL_FILL_PERCENT"",0]"	"25"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":28,"channel":"[\"DAQ\",\"DAQ_POWER_MONITOR\",2]","received_timestamp_ms":1767312002000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		input_voltage_v	"1.25000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":36,"channel":"[\"DAQ\",\"LOADCELL_FILL_PERCENT\",0]","received_timestamp_ms":1767312003000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""DAQ"",""LOADCELL_FILL_PERCENT"",0]"	"3.75000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":39,"channel":"[\"DAQ\",\"DAQ_POWER_MONITOR\",2]","received_timestamp_ms":1767312003000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		input_voltage_v	"1.27500000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":44,"channel":"[\"DAQ\",\"KG50\",0]","received_timestamp_ms":1767312004000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		kg50_v	"0.4"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":46,"channel":"[\"DAQ\",\"LOADCELL_FILL_PERCENT\",0]","received_timestamp_ms":1767312004000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""DAQ"",""LOADCELL_FILL_PERCENT"",0]"	"50"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":49,"channel":"[\"DAQ\",\"DAQ_POWER_MONITOR\",2]","received_timestamp_ms":1767312004000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		input_voltage_v	"13"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":54,"channel":"[\"DAQ\",\"KG50\",0]","received_timestamp_ms":1767312005000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		kg50_v	"5.00000000e-01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":56,"channel":"[\"DAQ\",\"LOADCELL_FILL_PERCENT\",0]","received_timestamp_ms":1767312005000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""DAQ"",""LOADCELL_FILL_PERCENT"",0]"	"6.25000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":59,"channel":"[\"DAQ\",\"DAQ_POWER_MONITOR\",2]","received_timestamp_ms":1767312005000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		input_voltage_v	"1.32500000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":63,"channel":"[\"DAQ\",\"KG50\",0]","received_timestamp_ms":1767312006000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		kg50_v	"0.6000000000000001"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":65,"channel":"[\"DAQ\",\"LOADCELL_FILL_PERCENT\",0]","received_timestamp_ms":1767312006000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""DAQ"",""LOADCELL_FILL_PERCENT"",0]"	"75"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":68,"channel":"[\"DAQ\",\"DAQ_POWER_MONITOR\",2]","received_timestamp_ms":1767312006000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		input_voltage_v	"1.35000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":72,"channel":"[\"DAQ\",\"KG50\",0]","received_timestamp_ms":1767312007000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		kg50_v	"0.7000000000000001"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":74,"channel":"[\"DAQ\",\"LOADCELL_FILL_PERCENT\",0]","received_timestamp_ms":1767312007000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""DAQ"",""LOADCELL_FILL_PERCENT"",0]"	"8.75000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":77,"channel":"[\"DAQ\",\"DAQ_POWER_MONITOR\",2]","received_timestamp_ms":1767312007000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		input_voltage_v	"1.37500000e+01"				unknown					

@@ -1,0 +1,227 @@
+timestamp_ms,monotonic_ms,sensor,value,raw_adc_code,raw_value,calibrated_value,time_source,adc_temperature_c,adc_temperature_code,uptime_ticks,uptime_frequency_hz,record_sequence
+# export={"layout":"seds-sd-csv-13-v1","origin":"groundstation_recording","clock_policy":"source UTC only when calendar-valid; otherwise unknown","unavailable_fields":["monotonic_ms","raw_adc_code","raw_value","calibrated_value","adc_temperature_c","adc_temperature_code","uptime_ticks","uptime_frequency_hz","record_sequence"],"precision":"firmware nine-digit binary32; higher recorded precision retained","missing_values":"omitted; counts retained in channel metadata"}
+# channel={"sender":"DAQ","data_type":"KG1000","index":0,"unit":null,"unit_source":"unknown","value_kind":"recorded_raw_input","key":"[\"DAQ\",\"KG1000\",0]","samples":5,"missing_samples":0,"regression":{"status":"not_applicable"}}
+# channel={"sender":"DAQ","data_type":"LOADCELL_WEIGHT_KG","index":0,"unit":null,"unit_source":"unknown","value_kind":"recorded_derived","key":"[\"DAQ\",\"LOADCELL_WEIGHT_KG\",0]","samples":5,"missing_samples":0,"regression":{"status":"recorded_calibration","epochs":[{"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","first_sample_ms":1767312001000,"last_sample_ms":1767312004000,"channel":{"linear":{"b":1.0,"m":2.0},"fit":null,"zero_raw":0.25,"points":[{"kg":2.0,"raw":0.5}]},"equation":"y = f(raw) - f(zero_raw) if tare exists, else f(raw); linear: f(x)=m*x+b; polyN: descending a..e coefficients evaluated at (x-x0)","samples":4},{"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","first_sample_ms":1767312005000,"last_sample_ms":1767312005000,"channel":{"linear":{"b":1.0000001,"m":2.0},"fit":null,"zero_raw":0.25,"points":[{"kg":2.0,"raw":0.5}]},"equation":"y = f(raw) - f(zero_raw) if tare exists, else f(raw); linear: f(x)=m*x+b; polyN: descending a..e coefficients evaluated at (x-x0)","samples":1}],"samples_without_metadata":0}}
+# channel={"sender":"DAQ","data_type":"KG50","index":0,"unit":null,"unit_source":"unknown","value_kind":"recorded_raw_input","key":"[\"DAQ\",\"KG50\",0]","samples":5,"missing_samples":1,"regression":{"status":"not_applicable"}}
+# channel={"sender":"DAQ","data_type":"LOADCELL_50_WEIGHT_KG","index":0,"unit":null,"unit_source":"unknown","value_kind":"recorded_derived","key":"[\"DAQ\",\"LOADCELL_50_WEIGHT_KG\",0]","samples":5,"missing_samples":0,"regression":{"status":"recorded_calibration","epochs":[{"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","first_sample_ms":1767312001000,"last_sample_ms":1767312005000,"channel":{"linear":{"b":0.0,"m":7.0},"points":[]},"equation":"y = f(raw) - f(zero_raw) if tare exists, else f(raw); linear: f(x)=m*x+b; polyN: descending a..e coefficients evaluated at (x-x0)","samples":5}],"samples_without_metadata":0}}
+# channel={"sender":"DAQ","data_type":"LOADCELL_FILL_PERCENT","index":0,"unit":null,"unit_source":"unknown","value_kind":"recorded_derived","key":"[\"DAQ\",\"LOADCELL_FILL_PERCENT\",0]","samples":5,"missing_samples":0,"regression":{"status":"recorded_calibration","epochs":[{"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","first_sample_ms":1767312001000,"last_sample_ms":1767312004000,"channel":{"linear":{"b":1.0,"m":2.0},"fit":null,"zero_raw":0.25,"points":[{"kg":2.0,"raw":0.5}]},"equation":"y = f(raw) - f(zero_raw) if tare exists, else f(raw); linear: f(x)=m*x+b; polyN: descending a..e coefficients evaluated at (x-x0)","samples":4,"fill_targets":{"fill_source":"kg1000_absolute","target_kg":8.0},"flight_state":"NitrousFill","fill_source":"KG1000","postprocess":"clamp(100 * abs(calibrated_kg) / active_target_kg, 0, 100)"},{"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","first_sample_ms":1767312005000,"last_sample_ms":1767312005000,"channel":{"linear":{"b":1.0000001,"m":2.0},"fit":null,"zero_raw":0.25,"points":[{"kg":2.0,"raw":0.5}]},"equation":"y = f(raw) - f(zero_raw) if tare exists, else f(raw); linear: f(x)=m*x+b; polyN: descending a..e coefficients evaluated at (x-x0)","samples":1,"fill_targets":{"fill_source":"kg1000_absolute","target_kg":9.5},"flight_state":"Armed","fill_source":"KG1000","postprocess":"clamp(100 * abs(calibrated_kg) / active_target_kg, 0, 100)"}],"samples_without_metadata":0}}
+# channel={"sender":"VB","data_type":"OX_TANK_PRESSURE","index":0,"unit":null,"unit_source":"unknown","value_kind":"recorded_raw_input","key":"[\"VB\",\"OX_TANK_PRESSURE\",0]","samples":5,"missing_samples":0,"regression":{"status":"not_applicable"}}
+# channel={"sender":"VB","data_type":"PRESSURE_TRANSDUCER_CALIBRATED","index":0,"unit":null,"unit_source":"unknown","value_kind":"recorded_derived","key":"[\"VB\",\"PRESSURE_TRANSDUCER_CALIBRATED\",0]","samples":5,"missing_samples":0,"regression":{"status":"inferred_from_recorded_pairs","equation":"y = slope * x + intercept","raw_type":"OX_TANK_PRESSURE","slope":312.49999999999994,"intercept":-60.99999999999997,"pair_count":5,"max_residual":2.842170943040401e-14,"note":"Reconstructed mapping, not a saved original calibration."}}
+# channel={"sender":"DAQ","data_type":"DAQ_POWER_MONITOR","index":0,"unit":null,"unit_source":"unknown","value_kind":"recorded_unclassified","key":"[\"DAQ\",\"DAQ_POWER_MONITOR\",0]","samples":5,"missing_samples":0,"regression":{"status":"not_applicable"}}
+# channel={"sender":"DAQ","data_type":"DAQ_POWER_MONITOR","index":1,"unit":null,"unit_source":"unknown","value_kind":"recorded_unclassified","key":"[\"DAQ\",\"DAQ_POWER_MONITOR\",1]","samples":5,"missing_samples":0,"regression":{"status":"not_applicable"}}
+# channel={"sender":"DAQ","data_type":"DAQ_POWER_MONITOR","index":2,"unit":null,"unit_source":"unknown","value_kind":"recorded_unclassified","key":"[\"DAQ\",\"DAQ_POWER_MONITOR\",2]","samples":5,"missing_samples":0,"regression":{"status":"not_applicable"}}
+# channel={"sender":"DAQ","data_type":"DAQ_POWER_MONITOR","index":3,"unit":null,"unit_source":"unknown","value_kind":"recorded_unclassified","key":"[\"DAQ\",\"DAQ_POWER_MONITOR\",3]","samples":5,"missing_samples":0,"regression":{"status":"not_applicable"}}
+# channel={"sender":"VB","data_type":"VALVE_STATE","index":0,"unit":null,"unit_source":"unknown","value_kind":"recorded_state","key":"[\"VB\",\"VALVE_STATE\",0]","samples":5,"missing_samples":0,"regression":{"status":"not_applicable","channel_label":"Pilot","boolean_labels":{"true_label":"Open","false_label":"Closed","unknown_label":"Unknown"}}}
+# channel={"sender":"VB","data_type":"VALVE_STATE","index":1,"unit":null,"unit_source":"unknown","value_kind":"recorded_state","key":"[\"VB\",\"VALVE_STATE\",1]","samples":5,"missing_samples":0,"regression":{"status":"not_applicable","channel_label":"Vent","boolean_labels":{"true_label":"Open","false_label":"Closed","unknown_label":"Unknown"}}}
+# channel={"sender":"VB","data_type":"VALVE_STATE","index":2,"unit":null,"unit_source":"unknown","value_kind":"recorded_state","key":"[\"VB\",\"VALVE_STATE\",2]","samples":5,"missing_samples":0,"regression":{"status":"not_applicable","channel_label":"Dump","boolean_labels":{"true_label":"Open","false_label":"Closed","unknown_label":"Unknown"}}}
+# channel={"sender":"VB","data_type":"VALVE_STATE","index":3,"unit":null,"unit_source":"unknown","value_kind":"recorded_state","key":"[\"VB\",\"VALVE_STATE\",3]","samples":5,"missing_samples":0,"regression":{"status":"not_applicable","channel_label":"Igniter","boolean_labels":{"true_label":"Open","false_label":"Closed","unknown_label":"Unknown"}}}
+# channel={"sender":"VB","data_type":"VALVE_STATE","index":4,"unit":null,"unit_source":"unknown","value_kind":"recorded_state","key":"[\"VB\",\"VALVE_STATE\",4]","samples":5,"missing_samples":0,"regression":{"status":"not_applicable","channel_label":"Nitrogen","boolean_labels":{"true_label":"Open","false_label":"Closed","unknown_label":"Unknown"}}}
+# channel={"sender":"VB","data_type":"VALVE_STATE","index":5,"unit":null,"unit_source":"unknown","value_kind":"recorded_state","key":"[\"VB\",\"VALVE_STATE\",5]","samples":5,"missing_samples":0,"regression":{"status":"not_applicable","channel_label":"Nitrous","boolean_labels":{"true_label":"Open","false_label":"Closed","unknown_label":"Unknown"}}}
+# channel={"sender":"VB","data_type":"VALVE_STATE","index":6,"unit":null,"unit_source":"unknown","value_kind":"recorded_state","key":"[\"VB\",\"VALVE_STATE\",6]","samples":5,"missing_samples":0,"regression":{"status":"not_applicable","channel_label":"Fill Lines","boolean_labels":{"true_label":"Removed","false_label":"Installed","unknown_label":"Unknown"}}}
+# channel={"sender":"DAQ","data_type":"REC_BOARD_DIE_TEMPERATURE","index":0,"unit":"\u00b0C","unit_source":"recorded_diagnostic_schema_v1","value_kind":"recorded_unclassified","channel_label":"MCU die temperature","precision":"counter CSV integers exact; graph projections approximate","key":"[\"DAQ\",\"REC_BOARD_DIE_TEMPERATURE\",0]","samples":1,"missing_samples":0,"regression":{"status":"not_applicable","channel_label":"MCU die temperature","unit":"\u00b0C","unit_source":"recorded_diagnostic_schema_v1","precision":"counter CSV integers exact; graph projections approximate"}}
+# channel={"sender":"=PB","data_type":"BATTERY_VOLTAGE","index":0,"unit":null,"unit_source":"unknown","value_kind":"recorded_unclassified","key":"[\"=PB\",\"BATTERY_VOLTAGE\",0]","samples":1,"missing_samples":0,"regression":{"status":"not_applicable"}}
+# channel={"sender":"B\u00e9","data_type":"CUSTOM_CALIBRATED","index":0,"unit":null,"unit_source":"unknown","value_kind":"recorded_unclassified","key":"[\"B\\u00e9\",\"CUSTOM_CALIBRATED\",0]","samples":1,"missing_samples":0,"regression":{"status":"unavailable","reason":"No historical regression recorded for this derived channel."}}
+# channel={"sender":"B\u00e9","data_type":"CUSTOM_CALIBRATED","index":1,"unit":null,"unit_source":"unknown","value_kind":"recorded_unclassified","key":"[\"B\\u00e9\",\"CUSTOM_CALIBRATED\",1]","samples":1,"missing_samples":0,"regression":{"status":"unavailable","reason":"No historical regression recorded for this derived channel."}}
+# channel={"sender":"B\u00e9","data_type":"CUSTOM_CALIBRATED","index":2,"unit":null,"unit_source":"unknown","value_kind":"recorded_unclassified","key":"[\"B\\u00e9\",\"CUSTOM_CALIBRATED\",2]","samples":1,"missing_samples":0,"regression":{"status":"unavailable","reason":"No historical regression recorded for this derived channel."}}
+# channel={"sender":"B\u00e9","data_type":"CUSTOM_CALIBRATED","index":3,"unit":null,"unit_source":"unknown","value_kind":"recorded_unclassified","key":"[\"B\\u00e9\",\"CUSTOM_CALIBRATED\",3]","samples":1,"missing_samples":0,"regression":{"status":"unavailable","reason":"No historical regression recorded for this derived channel."}}
+# channel={"sender":"B\u00e9","data_type":"CUSTOM_CALIBRATED","index":4,"unit":null,"unit_source":"unknown","value_kind":"recorded_unclassified","key":"[\"B\\u00e9\",\"CUSTOM_CALIBRATED\",4]","samples":1,"missing_samples":0,"regression":{"status":"unavailable","reason":"No historical regression recorded for this derived channel."}}
+# channel={"sender":"B\u00e9","data_type":"CUSTOM_CALIBRATED","index":5,"unit":null,"unit_source":"unknown","value_kind":"recorded_unclassified","key":"[\"B\\u00e9\",\"CUSTOM_CALIBRATED\",5]","samples":1,"missing_samples":0,"regression":{"status":"unavailable","reason":"No historical regression recorded for this derived channel."}}
+# channel={"sender":"B\u00e9","data_type":"CUSTOM_CALIBRATED","index":6,"unit":null,"unit_source":"unknown","value_kind":"recorded_unclassified","key":"[\"B\\u00e9\",\"CUSTOM_CALIBRATED\",6]","samples":1,"missing_samples":1,"regression":{"status":"unavailable","reason":"No historical regression recorded for this derived channel."}}
+# channel={"sender":"B\u00e9","data_type":"CUSTOM_CALIBRATED","index":7,"unit":null,"unit_source":"unknown","value_kind":"recorded_unclassified","key":"[\"B\\u00e9\",\"CUSTOM_CALIBRATED\",7]","samples":1,"missing_samples":1,"regression":{"status":"unavailable","reason":"No historical regression recorded for this derived channel."}}
+# channel={"sender":"FC","data_type":"OX_TANK_PRESSURE","index":0,"unit":null,"unit_source":"unknown","value_kind":"recorded_raw_input","key":"[\"FC\",\"OX_TANK_PRESSURE\",0]","samples":1,"missing_samples":0,"regression":{"status":"not_applicable"}}
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":11,"channel":"[\"DAQ\",\"KG1000\",0]","received_timestamp_ms":1767312001000,"source_timestamp_ms":1767312000960,"source_age_ms":40,"state_label":""}
+1767312000960,,kg1000_v,"3.75000000e-01",,,,network,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":12,"channel":"[\"DAQ\",\"LOADCELL_WEIGHT_KG\",0]","received_timestamp_ms":1767312001000,"source_timestamp_ms":1767312000960,"source_age_ms":40,"state_label":""}
+1767312000960,,"[""DAQ"",""LOADCELL_WEIGHT_KG"",0]","1.75000000e+00",,,,network,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":13,"channel":"[\"DAQ\",\"KG50\",0]","received_timestamp_ms":1767312001000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,kg50_v,"0.1",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":14,"channel":"[\"DAQ\",\"LOADCELL_50_WEIGHT_KG\",0]","received_timestamp_ms":1767312001000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,"[""DAQ"",""LOADCELL_50_WEIGHT_KG"",0]","0.7",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":15,"channel":"[\"DAQ\",\"LOADCELL_FILL_PERCENT\",0]","received_timestamp_ms":1767312001000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,"[""DAQ"",""LOADCELL_FILL_PERCENT"",0]","1.25000000e+01",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":16,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767312001000,"source_timestamp_ms":3,"source_age_ms":null,"state_label":""}
+,,"[""VB"",""OX_TANK_PRESSURE"",0]","0.6",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":17,"channel":"[\"VB\",\"PRESSURE_TRANSDUCER_CALIBRATED\",0]","received_timestamp_ms":1767312001000,"source_timestamp_ms":3,"source_age_ms":null,"state_label":""}
+,,"[""VB"",""PRESSURE_TRANSDUCER_CALIBRATED"",0]","1.26500000e+02",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":18,"channel":"[\"DAQ\",\"DAQ_POWER_MONITOR\",0]","received_timestamp_ms":1767312001000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,"[""DAQ"",""DAQ_POWER_MONITOR"",0]","1",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":18,"channel":"[\"DAQ\",\"DAQ_POWER_MONITOR\",1]","received_timestamp_ms":1767312001000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,"[""DAQ"",""DAQ_POWER_MONITOR"",1]","0.1",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":18,"channel":"[\"DAQ\",\"DAQ_POWER_MONITOR\",2]","received_timestamp_ms":1767312001000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,input_voltage_v,"1.22500000e+01",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":18,"channel":"[\"DAQ\",\"DAQ_POWER_MONITOR\",3]","received_timestamp_ms":1767312001000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,input_current_a,"0.11",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":19,"channel":"[\"VB\",\"VALVE_STATE\",0]","received_timestamp_ms":1767312001000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Open"}
+,,"[""VB"",""VALVE_STATE"",0]","1",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":19,"channel":"[\"VB\",\"VALVE_STATE\",1]","received_timestamp_ms":1767312001000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Open"}
+,,"[""VB"",""VALVE_STATE"",1]","1",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":19,"channel":"[\"VB\",\"VALVE_STATE\",2]","received_timestamp_ms":1767312001000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Unknown"}
+,,"[""VB"",""VALVE_STATE"",2]","2",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":19,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767312001000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+,,"[""VB"",""VALVE_STATE"",3]","0",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":19,"channel":"[\"VB\",\"VALVE_STATE\",4]","received_timestamp_ms":1767312001000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+,,"[""VB"",""VALVE_STATE"",4]","0",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":19,"channel":"[\"VB\",\"VALVE_STATE\",5]","received_timestamp_ms":1767312001000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+,,"[""VB"",""VALVE_STATE"",5]","0",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":19,"channel":"[\"VB\",\"VALVE_STATE\",6]","received_timestamp_ms":1767312001000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Removed"}
+,,"[""VB"",""VALVE_STATE"",6]","1",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":20,"channel":"[\"DAQ\",\"REC_BOARD_DIE_TEMPERATURE\",0]","received_timestamp_ms":1767312001500,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,"[""DAQ"",""REC_BOARD_DIE_TEMPERATURE"",0]","3.22500000e+01",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":21,"channel":"[\"DAQ\",\"KG1000\",0]","received_timestamp_ms":1767312002000,"source_timestamp_ms":1767312001960,"source_age_ms":40,"state_label":""}
+1767312001960,,kg1000_v,"5.00000000e-01",,,,network,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":22,"channel":"[\"DAQ\",\"LOADCELL_WEIGHT_KG\",0]","received_timestamp_ms":1767312002000,"source_timestamp_ms":1767312001960,"source_age_ms":40,"state_label":""}
+1767312001960,,"[""DAQ"",""LOADCELL_WEIGHT_KG"",0]","2",,,,network,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":23,"channel":"[\"DAQ\",\"KG50\",0]","received_timestamp_ms":1767312002000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,kg50_v,"0.2",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":24,"channel":"[\"DAQ\",\"LOADCELL_50_WEIGHT_KG\",0]","received_timestamp_ms":1767312002000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,"[""DAQ"",""LOADCELL_50_WEIGHT_KG"",0]","1.4",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":25,"channel":"[\"DAQ\",\"LOADCELL_FILL_PERCENT\",0]","received_timestamp_ms":1767312002000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,"[""DAQ"",""LOADCELL_FILL_PERCENT"",0]","25",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":26,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767312002000,"source_timestamp_ms":3,"source_age_ms":null,"state_label":""}
+,,"[""VB"",""OX_TANK_PRESSURE"",0]","0.7",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":27,"channel":"[\"VB\",\"PRESSURE_TRANSDUCER_CALIBRATED\",0]","received_timestamp_ms":1767312002000,"source_timestamp_ms":3,"source_age_ms":null,"state_label":""}
+,,"[""VB"",""PRESSURE_TRANSDUCER_CALIBRATED"",0]","1.57750000e+02",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":28,"channel":"[\"DAQ\",\"DAQ_POWER_MONITOR\",0]","received_timestamp_ms":1767312002000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,"[""DAQ"",""DAQ_POWER_MONITOR"",0]","2",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":28,"channel":"[\"DAQ\",\"DAQ_POWER_MONITOR\",1]","received_timestamp_ms":1767312002000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,"[""DAQ"",""DAQ_POWER_MONITOR"",1]","0.1",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":28,"channel":"[\"DAQ\",\"DAQ_POWER_MONITOR\",2]","received_timestamp_ms":1767312002000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,input_voltage_v,"1.25000000e+01",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":28,"channel":"[\"DAQ\",\"DAQ_POWER_MONITOR\",3]","received_timestamp_ms":1767312002000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,input_current_a,"0.12000000000000001",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":29,"channel":"[\"VB\",\"VALVE_STATE\",0]","received_timestamp_ms":1767312002000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+,,"[""VB"",""VALVE_STATE"",0]","0",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":29,"channel":"[\"VB\",\"VALVE_STATE\",1]","received_timestamp_ms":1767312002000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Open"}
+,,"[""VB"",""VALVE_STATE"",1]","1",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":29,"channel":"[\"VB\",\"VALVE_STATE\",2]","received_timestamp_ms":1767312002000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Unknown"}
+,,"[""VB"",""VALVE_STATE"",2]","2",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":29,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767312002000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+,,"[""VB"",""VALVE_STATE"",3]","0",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":29,"channel":"[\"VB\",\"VALVE_STATE\",4]","received_timestamp_ms":1767312002000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+,,"[""VB"",""VALVE_STATE"",4]","0",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":29,"channel":"[\"VB\",\"VALVE_STATE\",5]","received_timestamp_ms":1767312002000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+,,"[""VB"",""VALVE_STATE"",5]","0",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":29,"channel":"[\"VB\",\"VALVE_STATE\",6]","received_timestamp_ms":1767312002000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Removed"}
+,,"[""VB"",""VALVE_STATE"",6]","1",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":30,"channel":"[\"=PB\",\"BATTERY_VOLTAGE\",0]","received_timestamp_ms":1767312002500,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,"[""=PB"",""BATTERY_VOLTAGE"",0]","7.9",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":31,"channel":"[\"B\\u00e9\",\"CUSTOM_CALIBRATED\",0]","received_timestamp_ms":1767312002500,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,"[""B\u00e9"",""CUSTOM_CALIBRATED"",0]","True",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":31,"channel":"[\"B\\u00e9\",\"CUSTOM_CALIBRATED\",1]","received_timestamp_ms":1767312002500,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,"[""B\u00e9"",""CUSTOM_CALIBRATED"",1]","1e-07",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":31,"channel":"[\"B\\u00e9\",\"CUSTOM_CALIBRATED\",2]","received_timestamp_ms":1767312002500,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,"[""B\u00e9"",""CUSTOM_CALIBRATED"",2]","1e+16",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":31,"channel":"[\"B\\u00e9\",\"CUSTOM_CALIBRATED\",3]","received_timestamp_ms":1767312002500,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,"[""B\u00e9"",""CUSTOM_CALIBRATED"",3]","123456789.0",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":31,"channel":"[\"B\\u00e9\",\"CUSTOM_CALIBRATED\",4]","received_timestamp_ms":1767312002500,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,"[""B\u00e9"",""CUSTOM_CALIBRATED"",4]","-0",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":31,"channel":"[\"B\\u00e9\",\"CUSTOM_CALIBRATED\",5]","received_timestamp_ms":1767312002500,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,"[""B\u00e9"",""CUSTOM_CALIBRATED"",5]","3",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":32,"channel":"[\"DAQ\",\"KG1000\",0]","received_timestamp_ms":1767312003000,"source_timestamp_ms":1767312002960,"source_age_ms":40,"state_label":""}
+1767312002960,,kg1000_v,"6.25000000e-01",,,,network,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":33,"channel":"[\"DAQ\",\"LOADCELL_WEIGHT_KG\",0]","received_timestamp_ms":1767312003000,"source_timestamp_ms":1767312002960,"source_age_ms":40,"state_label":""}
+1767312002960,,"[""DAQ"",""LOADCELL_WEIGHT_KG"",0]","2.25000000e+00",,,,network,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":35,"channel":"[\"DAQ\",\"LOADCELL_50_WEIGHT_KG\",0]","received_timestamp_ms":1767312003000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,"[""DAQ"",""LOADCELL_50_WEIGHT_KG"",0]","2.0999999999999996",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":36,"channel":"[\"DAQ\",\"LOADCELL_FILL_PERCENT\",0]","received_timestamp_ms":1767312003000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,"[""DAQ"",""LOADCELL_FILL_PERCENT"",0]","3.75000000e+01",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":37,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767312003000,"source_timestamp_ms":3,"source_age_ms":null,"state_label":""}
+,,"[""VB"",""OX_TANK_PRESSURE"",0]","0.8",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":38,"channel":"[\"VB\",\"PRESSURE_TRANSDUCER_CALIBRATED\",0]","received_timestamp_ms":1767312003000,"source_timestamp_ms":3,"source_age_ms":null,"state_label":""}
+,,"[""VB"",""PRESSURE_TRANSDUCER_CALIBRATED"",0]","189",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":39,"channel":"[\"DAQ\",\"DAQ_POWER_MONITOR\",0]","received_timestamp_ms":1767312003000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,"[""DAQ"",""DAQ_POWER_MONITOR"",0]","3",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":39,"channel":"[\"DAQ\",\"DAQ_POWER_MONITOR\",1]","received_timestamp_ms":1767312003000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,"[""DAQ"",""DAQ_POWER_MONITOR"",1]","0.1",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":39,"channel":"[\"DAQ\",\"DAQ_POWER_MONITOR\",2]","received_timestamp_ms":1767312003000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,input_voltage_v,"1.27500000e+01",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":39,"channel":"[\"DAQ\",\"DAQ_POWER_MONITOR\",3]","received_timestamp_ms":1767312003000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,input_current_a,"0.13",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":40,"channel":"[\"VB\",\"VALVE_STATE\",0]","received_timestamp_ms":1767312003000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Open"}
+,,"[""VB"",""VALVE_STATE"",0]","1",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":40,"channel":"[\"VB\",\"VALVE_STATE\",1]","received_timestamp_ms":1767312003000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Open"}
+,,"[""VB"",""VALVE_STATE"",1]","1",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":40,"channel":"[\"VB\",\"VALVE_STATE\",2]","received_timestamp_ms":1767312003000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Unknown"}
+,,"[""VB"",""VALVE_STATE"",2]","2",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":40,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767312003000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Open"}
+,,"[""VB"",""VALVE_STATE"",3]","1",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":40,"channel":"[\"VB\",\"VALVE_STATE\",4]","received_timestamp_ms":1767312003000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+,,"[""VB"",""VALVE_STATE"",4]","0",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":40,"channel":"[\"VB\",\"VALVE_STATE\",5]","received_timestamp_ms":1767312003000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+,,"[""VB"",""VALVE_STATE"",5]","0",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":40,"channel":"[\"VB\",\"VALVE_STATE\",6]","received_timestamp_ms":1767312003000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Removed"}
+,,"[""VB"",""VALVE_STATE"",6]","1",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":41,"channel":"[\"FC\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767312003500,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,"[""FC"",""OX_TANK_PRESSURE"",0]","6.40000000e+02",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":42,"channel":"[\"DAQ\",\"KG1000\",0]","received_timestamp_ms":1767312004000,"source_timestamp_ms":1767312003960,"source_age_ms":40,"state_label":""}
+1767312003960,,kg1000_v,"7.50000000e-01",,,,network,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":43,"channel":"[\"DAQ\",\"LOADCELL_WEIGHT_KG\",0]","received_timestamp_ms":1767312004000,"source_timestamp_ms":1767312003960,"source_age_ms":40,"state_label":""}
+1767312003960,,"[""DAQ"",""LOADCELL_WEIGHT_KG"",0]","2.50000000e+00",,,,network,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":44,"channel":"[\"DAQ\",\"KG50\",0]","received_timestamp_ms":1767312004000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,kg50_v,"0.4",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":45,"channel":"[\"DAQ\",\"LOADCELL_50_WEIGHT_KG\",0]","received_timestamp_ms":1767312004000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,"[""DAQ"",""LOADCELL_50_WEIGHT_KG"",0]","2.8",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":46,"channel":"[\"DAQ\",\"LOADCELL_FILL_PERCENT\",0]","received_timestamp_ms":1767312004000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,"[""DAQ"",""LOADCELL_FILL_PERCENT"",0]","50",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":47,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767312004000,"source_timestamp_ms":3,"source_age_ms":null,"state_label":""}
+,,"[""VB"",""OX_TANK_PRESSURE"",0]","0.9",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":48,"channel":"[\"VB\",\"PRESSURE_TRANSDUCER_CALIBRATED\",0]","received_timestamp_ms":1767312004000,"source_timestamp_ms":3,"source_age_ms":null,"state_label":""}
+,,"[""VB"",""PRESSURE_TRANSDUCER_CALIBRATED"",0]","2.20250000e+02",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":49,"channel":"[\"DAQ\",\"DAQ_POWER_MONITOR\",0]","received_timestamp_ms":1767312004000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,"[""DAQ"",""DAQ_POWER_MONITOR"",0]","4",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":49,"channel":"[\"DAQ\",\"DAQ_POWER_MONITOR\",1]","received_timestamp_ms":1767312004000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,"[""DAQ"",""DAQ_POWER_MONITOR"",1]","0.1",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":49,"channel":"[\"DAQ\",\"DAQ_POWER_MONITOR\",2]","received_timestamp_ms":1767312004000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,input_voltage_v,"13",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":49,"channel":"[\"DAQ\",\"DAQ_POWER_MONITOR\",3]","received_timestamp_ms":1767312004000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,input_current_a,"0.14",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":50,"channel":"[\"VB\",\"VALVE_STATE\",0]","received_timestamp_ms":1767312004000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+,,"[""VB"",""VALVE_STATE"",0]","0",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":50,"channel":"[\"VB\",\"VALVE_STATE\",1]","received_timestamp_ms":1767312004000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Open"}
+,,"[""VB"",""VALVE_STATE"",1]","1",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":50,"channel":"[\"VB\",\"VALVE_STATE\",2]","received_timestamp_ms":1767312004000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Unknown"}
+,,"[""VB"",""VALVE_STATE"",2]","2",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":50,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767312004000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+,,"[""VB"",""VALVE_STATE"",3]","0",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":50,"channel":"[\"VB\",\"VALVE_STATE\",4]","received_timestamp_ms":1767312004000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+,,"[""VB"",""VALVE_STATE"",4]","0",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":50,"channel":"[\"VB\",\"VALVE_STATE\",5]","received_timestamp_ms":1767312004000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+,,"[""VB"",""VALVE_STATE"",5]","0",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":50,"channel":"[\"VB\",\"VALVE_STATE\",6]","received_timestamp_ms":1767312004000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Removed"}
+,,"[""VB"",""VALVE_STATE"",6]","1",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":52,"channel":"[\"DAQ\",\"KG1000\",0]","received_timestamp_ms":1767312005000,"source_timestamp_ms":1767312004960,"source_age_ms":40,"state_label":""}
+1767312004960,,kg1000_v,"8.75000000e-01",,,,network,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":53,"channel":"[\"DAQ\",\"LOADCELL_WEIGHT_KG\",0]","received_timestamp_ms":1767312005000,"source_timestamp_ms":1767312004960,"source_age_ms":40,"state_label":""}
+1767312004960,,"[""DAQ"",""LOADCELL_WEIGHT_KG"",0]","2.75000000e+00",,,,network,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":54,"channel":"[\"DAQ\",\"KG50\",0]","received_timestamp_ms":1767312005000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,kg50_v,"5.00000000e-01",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":55,"channel":"[\"DAQ\",\"LOADCELL_50_WEIGHT_KG\",0]","received_timestamp_ms":1767312005000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,"[""DAQ"",""LOADCELL_50_WEIGHT_KG"",0]","3.50000000e+00",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":56,"channel":"[\"DAQ\",\"LOADCELL_FILL_PERCENT\",0]","received_timestamp_ms":1767312005000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,"[""DAQ"",""LOADCELL_FILL_PERCENT"",0]","6.25000000e+01",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":57,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767312005000,"source_timestamp_ms":3,"source_age_ms":null,"state_label":""}
+,,"[""VB"",""OX_TANK_PRESSURE"",0]","1",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":58,"channel":"[\"VB\",\"PRESSURE_TRANSDUCER_CALIBRATED\",0]","received_timestamp_ms":1767312005000,"source_timestamp_ms":3,"source_age_ms":null,"state_label":""}
+,,"[""VB"",""PRESSURE_TRANSDUCER_CALIBRATED"",0]","2.51500000e+02",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":59,"channel":"[\"DAQ\",\"DAQ_POWER_MONITOR\",0]","received_timestamp_ms":1767312005000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,"[""DAQ"",""DAQ_POWER_MONITOR"",0]","5",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":59,"channel":"[\"DAQ\",\"DAQ_POWER_MONITOR\",1]","received_timestamp_ms":1767312005000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,"[""DAQ"",""DAQ_POWER_MONITOR"",1]","0.1",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":59,"channel":"[\"DAQ\",\"DAQ_POWER_MONITOR\",2]","received_timestamp_ms":1767312005000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,input_voltage_v,"1.32500000e+01",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":59,"channel":"[\"DAQ\",\"DAQ_POWER_MONITOR\",3]","received_timestamp_ms":1767312005000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+,,input_current_a,"0.15000000000000002",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":60,"channel":"[\"VB\",\"VALVE_STATE\",0]","received_timestamp_ms":1767312005000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Open"}
+,,"[""VB"",""VALVE_STATE"",0]","1",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":60,"channel":"[\"VB\",\"VALVE_STATE\",1]","received_timestamp_ms":1767312005000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Open"}
+,,"[""VB"",""VALVE_STATE"",1]","1",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":60,"channel":"[\"VB\",\"VALVE_STATE\",2]","received_timestamp_ms":1767312005000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Unknown"}
+,,"[""VB"",""VALVE_STATE"",2]","2",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":60,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767312005000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+,,"[""VB"",""VALVE_STATE"",3]","0",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":60,"channel":"[\"VB\",\"VALVE_STATE\",4]","received_timestamp_ms":1767312005000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+,,"[""VB"",""VALVE_STATE"",4]","0",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":60,"channel":"[\"VB\",\"VALVE_STATE\",5]","received_timestamp_ms":1767312005000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+,,"[""VB"",""VALVE_STATE"",5]","0",,,,unknown,,,,,
+# recorded_sample={"recording":"groundstation_recording_2026-01-02_00-00-00_000.db","row_id":60,"channel":"[\"VB\",\"VALVE_STATE\",6]","received_timestamp_ms":1767312005000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Removed"}
+,,"[""VB"",""VALVE_STATE"",6]","1",,,,unknown,,,,,

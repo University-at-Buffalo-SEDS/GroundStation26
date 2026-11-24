@@ -734,6 +734,212 @@ async fn replay_bundle(root: &Path, state: &Arc<AppState>, app: &axum::Router, o
     out.add("replay-bundle/flight.manifest", manifest);
     binary_fixture("replay-bundle/flight.gsreplay", &bundle);
     binary_fixture("replay-bundle/flight.csv", &csv);
+    bundle_exports(root, app, id, &bundle, out).await;
+}
+
+/// GET with the viewer's credentials; the report worker allows one job at a
+/// time across the process, so a busy answer (429) is retried.
+async fn get_bytes(app: &axum::Router, path: &str) -> (StatusCode, Vec<u8>) {
+    for _ in 0..600 {
+        let request = Request::builder().uri(path).header("Authorization", "Bearer viewer-token").body(Body::empty()).unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 26).await.unwrap().to_vec();
+        if status != StatusCode::TOO_MANY_REQUESTS {
+            return (status, body);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("{path} stayed busy");
+}
+
+fn report_route(request: Value) -> String {
+    let encoded: String = request.to_string().bytes().map(|b| format!("%{b:02X}")).collect();
+    format!("/api/recordings/report?request={encoded}")
+}
+
+/// An entry of a stored ZIP-or-deflated archive, by name.
+fn zip_entry(archive: &[u8], name: &str) -> Option<Vec<u8>> {
+    let u16_at = |i: usize| u16::from_le_bytes([archive[i], archive[i + 1]]) as usize;
+    let u32_at = |i: usize| u32::from_le_bytes([archive[i], archive[i + 1], archive[i + 2], archive[i + 3]]) as usize;
+    let end = (0..archive.len() - 21).rev().find(|&i| u32_at(i) == 0x0605_4b50)?;
+    let mut at = u32_at(end + 16);
+    for _ in 0..u16_at(end + 10) {
+        let (method, packed, name_len, extra, comment, local) = (u16_at(at + 10), u32_at(at + 20), u16_at(at + 28), u16_at(at + 30), u16_at(at + 32), u32_at(at + 42));
+        let entry = &archive[at + 46..at + 46 + name_len];
+        at += 46 + name_len + extra + comment;
+        if entry != name.as_bytes() {
+            continue;
+        }
+        let start = local + 30 + u16_at(local + 26) + u16_at(local + 28);
+        let body = &archive[start..start + packed];
+        return Some(if method == 8 {
+            let mut out = Vec::new();
+            std::io::Read::read_to_end(&mut flate2::read::DeflateDecoder::new(body), &mut out).unwrap();
+            out
+        } else {
+            body.to_vec()
+        });
+    }
+    None
+}
+
+/// Rows of a recording that exercise the report studio's cases the flight
+/// lacks: recorded calibration epochs (KG1000, KG50, fill percent),
+/// a regression inferred from raw/calibrated pairs, an over-range value,
+/// DAQ SD sensor names and binary32 values, valve state labels, a recorded
+/// diagnostic stream, formula-like and non-ASCII senders, and Python float
+/// formatting.
+async fn report_case_rows(db: &sqlx::SqlitePool, t0: i64) {
+    let mut rows: Vec<(i64, Option<i64>, &str, &str, Option<String>, String, Option<i64>)> = Vec::new();
+    for i in 0..8i64 {
+        let t = t0 + i * 1_000;
+        let v = 0.25 + i as f64 * 0.125;
+        rows.push((t, Some(t - 40), "DAQ", "KG1000", Some(format!("[{v}]")), "[]".into(), None));
+        rows.push((t, Some(t - 40), "DAQ", "LOADCELL_WEIGHT_KG", Some(format!("[{}]", 2.0 * v + 1.0)), "[]".into(), None));
+        if i == 3 {
+            rows.push((t, None, "DAQ", "KG50", Some("[null]".into()), "[]".into(), crate::over_range::pack(1, 0)));
+        } else {
+            rows.push((t, None, "DAQ", "KG50", Some(format!("[{}]", 0.1 * i as f64)), "[]".into(), None));
+        }
+        rows.push((t, None, "DAQ", "LOADCELL_50_WEIGHT_KG", Some(format!("[{}]", 0.7 * i as f64)), "[]".into(), None));
+        rows.push((t, None, "DAQ", "LOADCELL_FILL_PERCENT", Some(format!("[{}]", 12.5 * i as f64)), "[]".into(), None));
+        let p = 0.5 + 0.1 * i as f64;
+        rows.push((t, Some(3), "VB", "OX_TANK_PRESSURE", Some(format!("[{p}]")), "[]".into(), None));
+        rows.push((t, Some(3), "VB", "PRESSURE_TRANSDUCER_CALIBRATED", Some(format!("[{}]", 312.5 * p - 61.0)), "[]".into(), None));
+        rows.push((t, None, "DAQ", "DAQ_POWER_MONITOR", Some(format!("[{i},0.1,{},{}]", 12.0 + 0.25 * i as f64, 0.1 + 0.01 * i as f64)), "[]".into(), None));
+        rows.push((t, None, "VB", "VALVE_STATE", Some(format!("[{},1,2,{},0,0,1]", i % 2, (i % 3 == 0) as u8)), "[]".into(), None));
+    }
+    rows.push((t0 + 500, None, "DAQ", "REC_BOARD_DIE_TEMPERATURE", Some("[31.5]".into()), r#"{"context":{"version":1}}"#.into(), None));
+    rows.push((t0 + 1_500, None, "DAQ", "REC_BOARD_DIE_TEMPERATURE", Some("[32.25]".into()), r#"{"version":1}"#.into(), None));
+    rows.push((t0 + 2_500, None, "=PB", "BATTERY_VOLTAGE", Some("[7.9]".into()), "[]".into(), None));
+    rows.push((t0 + 2_500, None, "B\u{e9}", "CUSTOM_CALIBRATED", Some("[true,1e-7,1e16,123456789.0,-0.0,3,\"text\",null]".into()), "[\"x\"]".into(), None));
+    rows.push((t0 + 3_500, None, "FC", "FUEL_TANK_PRESSURE", Some("[640.0]".into()), "[]".into(), None));
+    rows.push((t0 + 4_500, None, "FC", "GPS_DATA", None, "[]".into(), None));
+    rows.sort_by_key(|r| r.0);
+    for (t, source, sender, data_type, values, payload, over) in rows {
+        sqlx::query("INSERT INTO telemetry(timestamp_ms,source_timestamp_ms,sender_id,data_type,values_json,payload_json,over_range) VALUES(?,?,?,?,?,?,?)")
+            .bind(t).bind(source).bind(sender).bind(data_type).bind(values).bind(payload).bind(over).execute(db).await.unwrap();
+    }
+    sqlx::query("CREATE TABLE IF NOT EXISTS calibration_history (timestamp_ms INTEGER NOT NULL, sender_id TEXT NOT NULL, sensor_id TEXT NOT NULL, config_json TEXT NOT NULL, PRIMARY KEY(timestamp_ms,sender_id,sensor_id))").execute(db).await.unwrap();
+    let calibration = |m: f64, b: f64| json!({"ch1": {"m": m, "b": b}, "ch1_fit": null, "ch1_zero_raw": 0.25, "points_ch1": [{"raw": 0.5, "kg": 2.0}],
+        "extra_channels": {"kg50": {"linear": {"m": 7.0, "b": 0.0}, "points": []}}, "iadc": {"m": 1.0, "b": 0.0}});
+    let history = [
+        (t0 + 1_000, "KG1000", json!({"calibration": calibration(2.0, 1.0), "fill_targets": {"fill_source": "kg1000_absolute", "target_kg": 8.0}, "flight_state": "NitrousFill"})),
+        (t0 + 2_000, "KG1000", json!({"calibration": calibration(2.0, 1.0), "fill_targets": {"fill_source": "kg1000_absolute", "target_kg": 8.0}, "flight_state": "NitrousFill"})),
+        (t0 + 5_000, "KG1000", json!({"calibration": calibration(2.0, 1.0000001), "fill_targets": {"fill_source": "kg1000_absolute", "target_kg": 9.5}, "flight_state": "Armed"})),
+        (t0, "KG50", json!({"calibration": calibration(2.0, 1.0), "fill_targets": {"fill_source": "kg50", "target_kg": 8.0}, "flight_state": "NitrousFill"})),
+    ];
+    for (t, sensor, config) in history {
+        sqlx::query("INSERT INTO calibration_history VALUES(?,?,?,?)").bind(t).bind("DAQ").bind(sensor).bind(config.to_string()).execute(db).await.unwrap();
+    }
+}
+
+/// The station's exports of the bundled flight recording, and of a second
+/// recording with report cases the flight lacks
+/// (`replay-bundle/exports/`). `exports/requests.json` lists each request as
+/// the UI makes it, the status, and the file holding the station's answer;
+/// the UI answers the same requests from the bundle with no station and must
+/// produce the same bytes (JSON previews: the same JSON).
+async fn bundle_exports(root: &Path, app: &axum::Router, id: &str, bundle: &[u8], out: &mut Fixtures) {
+    let mut requests = Vec::new();
+    let mut fetch = async |case: &str, path: String, file: &str| {
+        let (status, body) = get_bytes(app, &path).await;
+        let mut entry = json!({"case": case, "path": path, "status": status.as_u16()});
+        if status != StatusCode::OK {
+            entry["body"] = String::from_utf8_lossy(&body).into();
+        } else if let Some(name) = file.strip_suffix(".json") {
+            out.add(&format!("replay-bundle/exports/{name}"), serde_json::from_slice(&body).unwrap());
+            entry["file"] = format!("exports/{file}").into();
+        } else {
+            binary_fixture(&format!("replay-bundle/exports/{file}"), &body);
+            entry["file"] = format!("exports/{file}").into();
+        }
+        requests.push(entry);
+    };
+    let (start, end) = (T0, T0 + 236_001);
+    let (w0, w1) = (T0 + 10_000, T0 + 36_600);
+    let subset = json!(["[\"VB\",\"OX_TANK_PRESSURE\",0]", "[\"FC\",\"BAROMETER_DATA\",1]", "[\"VB\",\"VALVE_STATE\",3]"]);
+    fetch("flight", format!("/api/recordings/{id}/csv"), "flight-recording.csv").await;
+    fetch("flight", format!("/api/recordings/csv?start_ms={start}&end_ms={end}"), "flight-range-full.csv").await;
+    fetch("flight", format!("/api/recordings/csv?start_ms={w0}&end_ms={w1}"), "flight-range-window.csv").await;
+    fetch("flight", format!("/api/recordings/csv?start_ms={}&end_ms={}", T0 - 10_000, T0 - 5_000), "").await;
+    fetch("flight", format!("/api/recordings/csv?start_ms={w1}&end_ms={w0}"), "").await;
+    let reports = |case: &'static str, recording: &str, w0: i64, w1: i64, subset: &Value| {
+        let all = Value::Null;
+        vec![
+            (json!({"recording": recording, "format": "preview", "channels": all}), format!("{case}-report-preview.json")),
+            (json!({"recording": recording, "format": "preview", "channels": subset, "start_ms": w0, "end_ms": w1}), format!("{case}-report-preview-window.json")),
+            (json!({"recording": recording, "format": "csv", "channels": all}), format!("{case}-report.csv")),
+            (json!({"recording": recording, "format": "daq_csv", "channels": all}), format!("{case}-report-daq.csv")),
+            (json!({"recording": recording, "format": "daq_tsv", "channels": all}), format!("{case}-report-daq.tsv")),
+            (json!({"recording": recording, "format": "csv", "channels": all, "start_ms": w0, "end_ms": w1}), format!("{case}-report-window.csv")),
+            (json!({"recording": recording, "format": "daq_csv", "channels": all, "start_ms": w0, "end_ms": w1}), format!("{case}-report-window-daq.csv")),
+            (json!({"recording": recording, "format": "csv", "channels": subset}), format!("{case}-report-subset.csv")),
+            (json!({"recording": recording, "format": "daq_tsv", "channels": subset}), format!("{case}-report-subset-daq.tsv")),
+        ]
+    };
+    for (request, file) in reports("flight", id, w0, w1, &subset) {
+        fetch("flight", report_route(request), &file).await;
+    }
+    fetch("flight", report_route(json!({"recording": "", "format": "daq_csv", "channels": null})), "").await;
+    fetch("flight", report_route(json!({"recording": id, "format": "csv", "channels": ["[\"FC\",\"NOPE\",0]"]})), "").await;
+    fetch("flight", report_route(json!({"recording": id, "format": "csv", "channels": []})), "").await;
+    fetch("flight", report_route(json!({"recording": id, "format": "csv", "channels": null, "start_ms": w1, "end_ms": w0})), "").await;
+    fetch("flight", report_route(json!({"recording": id, "format": "csv", "channels": null, "start_ms": T0 - 10_000, "end_ms": T0 - 5_000})), "").await;
+    fetch("flight", report_route(json!({"recording": id, "format": "html"})), "").await;
+    // The motor/flight exports a bundle holds, as the offline station serves them.
+    let index: Value = serde_json::from_slice(&zip_entry(bundle, "exports/index.json").unwrap()).unwrap();
+    for kind in ["motor_export", "flight_export"] {
+        let path = format!("/api/flight_review/recording/{id}/{kind}");
+        let mut entry = json!({"case": "flight", "path": path});
+        match index[kind]["path"].as_str() {
+            Some(file) => {
+                binary_fixture(&format!("replay-bundle/{file}"), &zip_entry(bundle, file).unwrap());
+                entry["status"] = 200.into();
+                entry["file"] = file.into();
+            }
+            None => {
+                let (status, body) = get_bytes(app, &path).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{kind} applies to the recording but is not bundled");
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                entry["status"] = 404.into();
+                entry["body"] = body["error"].clone();
+            }
+        }
+        requests.push(entry);
+    }
+
+    // Report cases the flight lacks, on a second recording a day later.
+    let cases = "groundstation_recording_2026-01-02_00-00-00_000.db";
+    let t1 = T0 + 86_400_000;
+    let (db, _) = crate::telemetry_db::open_telemetry_db(&root.join(cases)).await.unwrap();
+    report_case_rows(&db, t1).await;
+    db.close().await;
+    let history = crate::recording_report::calibration_history(&root.join(cases)).await.unwrap();
+    out.add("replay-bundle/exports/cases-calibration-history", history);
+    let mut fetch = async |path: String, file: &str| {
+        let (status, body) = get_bytes(app, &path).await;
+        let mut entry = json!({"case": "cases", "path": path, "status": status.as_u16()});
+        if status != StatusCode::OK {
+            entry["body"] = String::from_utf8_lossy(&body).into();
+        } else if let Some(name) = file.strip_suffix(".json") {
+            out.add(&format!("replay-bundle/exports/{name}"), serde_json::from_slice(&body).unwrap());
+            entry["file"] = format!("exports/{file}").into();
+        } else {
+            binary_fixture(&format!("replay-bundle/exports/{file}"), &body);
+            entry["file"] = format!("exports/{file}").into();
+        }
+        requests.push(entry);
+    };
+    fetch(format!("/api/recordings/{cases}/csv"), "cases-recording.csv").await;
+    fetch(format!("/api/recordings/csv?start_ms={t1}&end_ms={}", t1 + 10_000), "cases-range-full.csv").await;
+    fetch(format!("/api/recordings/csv?start_ms={}&end_ms={}", t1 + 2_000, t1 + 4_000), "cases-range-window.csv").await;
+    let subset = json!(["[\"DAQ\",\"DAQ_POWER_MONITOR\",2]", "[\"DAQ\",\"LOADCELL_FILL_PERCENT\",0]", "[\"DAQ\",\"KG50\",0]", "[\"DAQ\",\"REC_BOARD_DIE_TEMPERATURE\",0]"]);
+    for (request, file) in reports("cases", cases, t1 + 1_000, t1 + 6_000, &subset) {
+        fetch(report_route(request), &file).await;
+    }
+    out.add("replay-bundle/exports/requests", Value::Array(requests));
 }
 
 /// Recovery search: start with a target area, a searcher's opt-in and track

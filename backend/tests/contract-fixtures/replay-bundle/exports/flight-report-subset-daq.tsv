@@ -1,0 +1,719 @@
+timestamp_ms	monotonic_ms	sensor	value	raw_adc_code	raw_value	calibrated_value	time_source	adc_temperature_c	adc_temperature_code	uptime_ticks	uptime_frequency_hz	record_sequence
+# export={"layout":"seds-sd-csv-13-v1","origin":"groundstation_recording","clock_policy":"source UTC only when calendar-valid; otherwise unknown","unavailable_fields":["monotonic_ms","raw_adc_code","raw_value","calibrated_value","adc_temperature_c","adc_temperature_code","uptime_ticks","uptime_frequency_hz","record_sequence"],"precision":"firmware nine-digit binary32; higher recorded precision retained","missing_values":"omitted; counts retained in channel metadata"}
+# channel={"sender":"VB","data_type":"OX_TANK_PRESSURE","index":0,"unit":null,"unit_source":"unknown","value_kind":"recorded_raw_input","key":"[\"VB\",\"OX_TANK_PRESSURE\",0]","samples":119,"missing_samples":0,"regression":{"status":"not_applicable"}}
+# channel={"sender":"FC","data_type":"BAROMETER_DATA","index":1,"unit":null,"unit_source":"unknown","value_kind":"recorded_unclassified","key":"[\"FC\",\"BAROMETER_DATA\",1]","samples":119,"missing_samples":0,"regression":{"status":"not_applicable"}}
+# channel={"sender":"VB","data_type":"VALVE_STATE","index":3,"unit":null,"unit_source":"unknown","value_kind":"recorded_state","key":"[\"VB\",\"VALVE_STATE\",3]","samples":119,"missing_samples":0,"regression":{"status":"not_applicable","channel_label":"Igniter","boolean_labels":{"true_label":"Open","false_label":"Closed","unknown_label":"Unknown"}}}
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":3,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225600000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"91077.1"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":4,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225600000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":5,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225600000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"7.45000000e+02"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":8,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225602000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"91077.1"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":9,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225602000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":10,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225602000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"7.45000000e+02"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":13,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225604000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"91076.2"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":14,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225604000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":15,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225604000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"7.45000000e+02"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":18,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225606000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"91076.7"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":19,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225606000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":20,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225606000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"7.45000000e+02"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":23,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225608000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"91077.4"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":24,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225608000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":25,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225608000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"7.45000000e+02"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":29,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225610000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"91077.3"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":30,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225610000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Open"}
+		"[""VB"",""VALVE_STATE"",3]"	"1"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":31,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225610000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"7.45000000e+02"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":35,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225612000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"90004.7"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":36,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225612000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":37,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225612000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"5.85000000e+02"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":40,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225614000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"86596.9"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":41,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225614000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":42,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225614000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"4.25000000e+02"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":45,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225616000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"82139.2"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":46,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225616000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":47,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225616000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"2.65000000e+02"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":51,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225618000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"77927.8"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":52,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225618000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":53,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225618000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":56,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225620000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"74308.8"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":57,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225620000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":58,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225620000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":61,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225622000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"71288.7"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":62,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225622000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":63,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225622000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":66,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225624000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"68796.6"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":67,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225624000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":68,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225624000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":71,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225626000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"6.67615000e+04"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":72,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225626000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":73,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225626000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":76,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225628000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"65141.7"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":77,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225628000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":78,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225628000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":81,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225630000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"63890.7"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":82,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225630000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":83,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225630000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":86,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225632000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"62992.3"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":87,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225632000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":88,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225632000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":91,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225634000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"62422.1"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":92,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225634000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":93,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225634000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":96,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225636000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"62165.3"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":97,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225636000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":98,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225636000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":102,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225638000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"62234.8"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":103,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225638000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":104,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225638000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":107,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225640000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"6.25165000e+04"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":108,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225640000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":109,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225640000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":112,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225642000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"62903.8"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":113,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225642000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":114,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225642000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":117,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225644000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"63324.7"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":118,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225644000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":119,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225644000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":122,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225646000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"63758.7"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":123,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225646000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":124,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225646000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":127,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225648000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"64198.4"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":128,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225648000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":129,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225648000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":132,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225650000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"64640.1"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":133,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225650000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":134,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225650000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":137,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225652000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"6.50875000e+04"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":138,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225652000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":139,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225652000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":142,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225654000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"65537.2"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":143,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225654000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":144,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225654000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":147,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225656000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"6.59870000e+04"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":148,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225656000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":149,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225656000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":152,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225658000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"66436.8"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":153,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225658000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":154,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225658000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":157,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225660000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"66889.1"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":158,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225660000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":159,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225660000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":162,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225662000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"67346.1"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":163,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225662000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":164,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225662000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":167,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225664000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"67801.8"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":168,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225664000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":169,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225664000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":172,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225666000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"68247.9"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":173,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225666000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":174,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225666000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":177,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225668000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"68698.4"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":178,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225668000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":179,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225668000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":182,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225670000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"69153.6"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":183,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225670000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":184,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225670000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":187,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225672000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"69616.7"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":188,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225672000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":189,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225672000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":192,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225674000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"7.00790000e+04"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":193,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225674000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":194,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225674000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":197,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225676000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"7.05385000e+04"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":198,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225676000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":199,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225676000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":202,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225678000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"7.09960000e+04"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":203,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225678000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":204,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225678000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":207,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225680000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"71449.1"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":208,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225680000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":209,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225680000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":212,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225682000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"71903.9"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":213,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225682000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":214,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225682000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":217,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225684000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"72362.7"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":218,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225684000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":219,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225684000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":222,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225686000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"7.28225000e+04"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":223,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225686000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":224,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225686000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":227,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225688000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"73282.4"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":228,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225688000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":229,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225688000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":232,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225690000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"7.37415000e+04"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":233,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225690000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":234,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225690000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":237,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225692000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"74208.4"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":238,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225692000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":239,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225692000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":242,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225694000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"74676.4"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":243,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225694000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":244,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225694000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":247,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225696000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"75149.2"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":248,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225696000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":249,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225696000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":252,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225698000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"75625.7"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":253,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225698000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":254,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225698000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":257,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225700000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"76103.7"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":258,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225700000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":259,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225700000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":262,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225702000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"7.65795000e+04"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":263,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225702000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":264,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225702000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":267,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225704000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"77059.3"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":268,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225704000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":269,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225704000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":272,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225706000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"77551.3"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":273,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225706000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":274,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225706000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":277,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225708000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"7.80425000e+04"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":278,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225708000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":279,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225708000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":282,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225710000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"78531.3"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":283,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225710000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":284,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225710000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":287,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225712000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"79007.6"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":288,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225712000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":289,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225712000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":292,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225714000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"79483.3"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":293,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225714000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":294,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225714000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":297,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225716000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"79964.6"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":298,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225716000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":299,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225716000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":302,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225718000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"8.04505000e+04"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":303,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225718000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":304,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225718000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":307,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225720000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"80936.4"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":308,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225720000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":309,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225720000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":312,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225722000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"81426.9"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":313,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225722000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":314,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225722000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":317,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225724000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"81922.3"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":318,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225724000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":319,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225724000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":322,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225726000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"82422.4"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":323,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225726000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":324,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225726000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":327,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225728000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"82916.7"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":328,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225728000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":329,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225728000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":332,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225730000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"8.34080000e+04"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":333,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225730000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":334,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225730000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":337,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225732000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"8.38975000e+04"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":338,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225732000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":339,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225732000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":342,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225734000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"8.43890000e+04"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":343,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225734000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":344,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225734000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":347,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225736000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"84885.8"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":348,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225736000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":349,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225736000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":352,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225738000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"85385.9"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":353,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225738000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":354,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225738000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":357,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225740000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"8.58825000e+04"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":358,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225740000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":359,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225740000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":362,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225742000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"8.63880000e+04"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":363,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225742000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":364,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225742000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":367,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225744000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"86718.6"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":368,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225744000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":369,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225744000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":372,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225746000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"86859.6"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":373,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225746000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":374,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225746000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":377,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225748000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"86989.6"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":378,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225748000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":379,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225748000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":382,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225750000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"87120.7"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":383,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225750000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":384,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225750000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":387,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225752000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"87259.4"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":388,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225752000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":389,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225752000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":392,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225754000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"8.74050000e+04"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":393,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225754000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":394,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225754000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":397,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225756000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"8.75565000e+04"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":398,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225756000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":399,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225756000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":402,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225758000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"8.77120000e+04"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":403,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225758000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":404,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225758000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":407,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225760000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"87862.8"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":408,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225760000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":409,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225760000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":412,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225762000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"8.80110000e+04"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":413,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225762000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":414,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225762000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":417,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225764000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"88162.2"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":418,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225764000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":419,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225764000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":422,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225766000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"88308.9"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":423,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225766000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":424,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225766000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":427,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225768000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"88462.3"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":428,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225768000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":429,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225768000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":432,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225770000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"88601.3"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":433,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225770000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":434,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225770000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":437,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225772000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"88730.6"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":438,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225772000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":439,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225772000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":442,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225774000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"88876.1"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":443,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225774000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":444,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225774000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":447,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225776000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"89028.8"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":448,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225776000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":449,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225776000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":452,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225778000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"89190.6"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":453,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225778000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":454,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225778000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":457,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225780000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"89347.2"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":458,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225780000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":459,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225780000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":462,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225782000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"8.94995000e+04"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":463,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225782000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":464,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225782000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":467,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225784000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"8.96435000e+04"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":468,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225784000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":469,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225784000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":472,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225786000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"89794.6"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":473,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225786000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":474,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225786000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":477,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225788000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"89931.8"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":478,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225788000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":479,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225788000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":482,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225790000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"90066.6"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":483,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225790000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":484,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225790000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":487,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225792000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"90209.2"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":488,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225792000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":489,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225792000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":492,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225794000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"90357.6"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":493,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225794000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":494,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225794000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":497,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225796000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"90501.7"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":498,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225796000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":499,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225796000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":502,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225798000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"90656.4"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":503,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225798000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":504,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225798000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":507,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225800000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"90794.6"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":508,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225800000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":509,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225800000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":512,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225802000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"90931.1"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":513,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225802000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":514,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225802000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":518,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225804000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"91062.7"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":519,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225804000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":520,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225804000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":523,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225806000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"91074.4"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":524,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225806000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":525,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225806000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":528,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225808000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"91072.2"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":529,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225808000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":530,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225808000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":533,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225810000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"91072.2"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":534,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225810000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":535,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225810000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":538,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225812000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"91073.6"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":539,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225812000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":540,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225812000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":543,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225814000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"91072.1"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":544,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225814000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":545,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225814000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":548,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225816000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"91073.1"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":549,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225816000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":550,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225816000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":553,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225818000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"91073.8"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":554,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225818000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":555,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225818000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":558,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225820000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"91072.9"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":559,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225820000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":560,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225820000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":563,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225822000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"91073.4"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":564,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225822000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":565,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225822000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":568,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225824000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"91071.7"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":569,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225824000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":570,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225824000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":573,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225826000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"91073.9"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":574,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225826000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":575,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225826000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":578,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225828000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"91071.3"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":579,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225828000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":580,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225828000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":583,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225830000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"9.10720000e+04"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":584,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225830000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":585,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225830000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":588,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225832000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"91072.3"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":589,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225832000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":590,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225832000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":593,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225834000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"9.10720000e+04"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":594,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225834000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":595,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225834000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":598,"channel":"[\"FC\",\"BAROMETER_DATA\",1]","received_timestamp_ms":1767225836000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""FC"",""BAROMETER_DATA"",1]"	"9.10720000e+04"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":599,"channel":"[\"VB\",\"VALVE_STATE\",3]","received_timestamp_ms":1767225836000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":"Closed"}
+		"[""VB"",""VALVE_STATE"",3]"	"0"				unknown					
+# recorded_sample={"recording":"groundstation_recording_2026-01-01_00-00-00_000.db","row_id":600,"channel":"[\"VB\",\"OX_TANK_PRESSURE\",0]","received_timestamp_ms":1767225836000,"source_timestamp_ms":null,"source_age_ms":null,"state_label":""}
+		"[""VB"",""OX_TANK_PRESSURE"",0]"	"3.00000000e+01"				unknown					

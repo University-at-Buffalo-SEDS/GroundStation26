@@ -1,0 +1,1329 @@
+{
+  "channels": [
+    {
+      "count": 8,
+      "data_type": "KG1000",
+      "finite_count": 8,
+      "index": 0,
+      "key": "[\"DAQ\",\"KG1000\",0]",
+      "label": "DAQ / KG1000 / 0",
+      "points": [
+        [
+          1767312000000,
+          0.25
+        ],
+        [
+          1767312001000,
+          0.375
+        ],
+        [
+          1767312002000,
+          0.5
+        ],
+        [
+          1767312003000,
+          0.625
+        ],
+        [
+          1767312004000,
+          0.75
+        ],
+        [
+          1767312005000,
+          0.875
+        ],
+        [
+          1767312006000,
+          1
+        ],
+        [
+          1767312007000,
+          1.125
+        ]
+      ],
+      "regression": {
+        "status": "not_applicable"
+      },
+      "sender": "DAQ",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_raw_input"
+    },
+    {
+      "count": 8,
+      "data_type": "LOADCELL_WEIGHT_KG",
+      "finite_count": 8,
+      "index": 0,
+      "key": "[\"DAQ\",\"LOADCELL_WEIGHT_KG\",0]",
+      "label": "DAQ / LOADCELL_WEIGHT_KG / 0",
+      "points": [
+        [
+          1767312000000,
+          1.5
+        ],
+        [
+          1767312001000,
+          1.75
+        ],
+        [
+          1767312002000,
+          2
+        ],
+        [
+          1767312003000,
+          2.25
+        ],
+        [
+          1767312004000,
+          2.5
+        ],
+        [
+          1767312005000,
+          2.75
+        ],
+        [
+          1767312006000,
+          3
+        ],
+        [
+          1767312007000,
+          3.25
+        ]
+      ],
+      "regression": {
+        "epochs": [
+          {
+            "channel": {
+              "fit": null,
+              "linear": {
+                "b": 1.0,
+                "m": 2.0
+              },
+              "points": [
+                {
+                  "kg": 2.0,
+                  "raw": 0.5
+                }
+              ],
+              "zero_raw": 0.25
+            },
+            "equation": "y = f(raw) - f(zero_raw) if tare exists, else f(raw); linear: f(x)=m*x+b; polyN: descending a..e coefficients evaluated at (x-x0)",
+            "first_sample_ms": 1767312001000,
+            "last_sample_ms": 1767312004000,
+            "recording": "groundstation_recording_2026-01-02_00-00-00_000.db",
+            "samples": 4
+          },
+          {
+            "channel": {
+              "fit": null,
+              "linear": {
+                "b": 1.0000001,
+                "m": 2.0
+              },
+              "points": [
+                {
+                  "kg": 2.0,
+                  "raw": 0.5
+                }
+              ],
+              "zero_raw": 0.25
+            },
+            "equation": "y = f(raw) - f(zero_raw) if tare exists, else f(raw); linear: f(x)=m*x+b; polyN: descending a..e coefficients evaluated at (x-x0)",
+            "first_sample_ms": 1767312005000,
+            "last_sample_ms": 1767312007000,
+            "recording": "groundstation_recording_2026-01-02_00-00-00_000.db",
+            "samples": 3
+          }
+        ],
+        "samples_without_metadata": 1,
+        "status": "partially_recorded_calibration"
+      },
+      "sender": "DAQ",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_derived"
+    },
+    {
+      "count": 8,
+      "data_type": "KG50",
+      "finite_count": 7,
+      "index": 0,
+      "key": "[\"DAQ\",\"KG50\",0]",
+      "label": "DAQ / KG50 / 0",
+      "points": [
+        [
+          1767312000000,
+          0
+        ],
+        [
+          1767312001000,
+          0.1
+        ],
+        [
+          1767312002000,
+          0.2
+        ],
+        [
+          1767312003000,
+          null
+        ],
+        [
+          1767312004000,
+          0.4
+        ],
+        [
+          1767312005000,
+          0.5
+        ],
+        [
+          1767312006000,
+          0.6000000000000001
+        ],
+        [
+          1767312007000,
+          0.7000000000000001
+        ]
+      ],
+      "regression": {
+        "status": "not_applicable"
+      },
+      "sender": "DAQ",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_raw_input"
+    },
+    {
+      "count": 8,
+      "data_type": "LOADCELL_50_WEIGHT_KG",
+      "finite_count": 8,
+      "index": 0,
+      "key": "[\"DAQ\",\"LOADCELL_50_WEIGHT_KG\",0]",
+      "label": "DAQ / LOADCELL_50_WEIGHT_KG / 0",
+      "points": [
+        [
+          1767312000000,
+          0
+        ],
+        [
+          1767312001000,
+          0.7
+        ],
+        [
+          1767312002000,
+          1.4
+        ],
+        [
+          1767312003000,
+          2.0999999999999996
+        ],
+        [
+          1767312004000,
+          2.8
+        ],
+        [
+          1767312005000,
+          3.5
+        ],
+        [
+          1767312006000,
+          4.199999999999999
+        ],
+        [
+          1767312007000,
+          4.8999999999999995
+        ]
+      ],
+      "regression": {
+        "epochs": [
+          {
+            "channel": {
+              "linear": {
+                "b": 0.0,
+                "m": 7.0
+              },
+              "points": []
+            },
+            "equation": "y = f(raw) - f(zero_raw) if tare exists, else f(raw); linear: f(x)=m*x+b; polyN: descending a..e coefficients evaluated at (x-x0)",
+            "first_sample_ms": 1767312000000,
+            "last_sample_ms": 1767312007000,
+            "recording": "groundstation_recording_2026-01-02_00-00-00_000.db",
+            "samples": 8
+          }
+        ],
+        "samples_without_metadata": 0,
+        "status": "recorded_calibration"
+      },
+      "sender": "DAQ",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_derived"
+    },
+    {
+      "count": 8,
+      "data_type": "LOADCELL_FILL_PERCENT",
+      "finite_count": 8,
+      "index": 0,
+      "key": "[\"DAQ\",\"LOADCELL_FILL_PERCENT\",0]",
+      "label": "DAQ / LOADCELL_FILL_PERCENT / 0",
+      "points": [
+        [
+          1767312000000,
+          0
+        ],
+        [
+          1767312001000,
+          12.5
+        ],
+        [
+          1767312002000,
+          25
+        ],
+        [
+          1767312003000,
+          37.5
+        ],
+        [
+          1767312004000,
+          50
+        ],
+        [
+          1767312005000,
+          62.5
+        ],
+        [
+          1767312006000,
+          75
+        ],
+        [
+          1767312007000,
+          87.5
+        ]
+      ],
+      "regression": {
+        "epochs": [
+          {
+            "channel": {
+              "linear": {
+                "b": 0.0,
+                "m": 7.0
+              },
+              "points": []
+            },
+            "equation": "y = f(raw) - f(zero_raw) if tare exists, else f(raw); linear: f(x)=m*x+b; polyN: descending a..e coefficients evaluated at (x-x0)",
+            "fill_source": "KG50",
+            "fill_targets": {
+              "fill_source": "kg50",
+              "target_kg": 8.0
+            },
+            "first_sample_ms": 1767312000000,
+            "flight_state": "NitrousFill",
+            "last_sample_ms": 1767312000000,
+            "postprocess": "clamp(100 * calibrated_kg / active_target_kg, 0, 100)",
+            "recording": "groundstation_recording_2026-01-02_00-00-00_000.db",
+            "samples": 1
+          },
+          {
+            "channel": {
+              "fit": null,
+              "linear": {
+                "b": 1.0,
+                "m": 2.0
+              },
+              "points": [
+                {
+                  "kg": 2.0,
+                  "raw": 0.5
+                }
+              ],
+              "zero_raw": 0.25
+            },
+            "equation": "y = f(raw) - f(zero_raw) if tare exists, else f(raw); linear: f(x)=m*x+b; polyN: descending a..e coefficients evaluated at (x-x0)",
+            "fill_source": "KG1000",
+            "fill_targets": {
+              "fill_source": "kg1000_absolute",
+              "target_kg": 8.0
+            },
+            "first_sample_ms": 1767312001000,
+            "flight_state": "NitrousFill",
+            "last_sample_ms": 1767312004000,
+            "postprocess": "clamp(100 * abs(calibrated_kg) / active_target_kg, 0, 100)",
+            "recording": "groundstation_recording_2026-01-02_00-00-00_000.db",
+            "samples": 4
+          },
+          {
+            "channel": {
+              "fit": null,
+              "linear": {
+                "b": 1.0000001,
+                "m": 2.0
+              },
+              "points": [
+                {
+                  "kg": 2.0,
+                  "raw": 0.5
+                }
+              ],
+              "zero_raw": 0.25
+            },
+            "equation": "y = f(raw) - f(zero_raw) if tare exists, else f(raw); linear: f(x)=m*x+b; polyN: descending a..e coefficients evaluated at (x-x0)",
+            "fill_source": "KG1000",
+            "fill_targets": {
+              "fill_source": "kg1000_absolute",
+              "target_kg": 9.5
+            },
+            "first_sample_ms": 1767312005000,
+            "flight_state": "Armed",
+            "last_sample_ms": 1767312007000,
+            "postprocess": "clamp(100 * abs(calibrated_kg) / active_target_kg, 0, 100)",
+            "recording": "groundstation_recording_2026-01-02_00-00-00_000.db",
+            "samples": 3
+          }
+        ],
+        "samples_without_metadata": 0,
+        "status": "recorded_calibration"
+      },
+      "sender": "DAQ",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_derived"
+    },
+    {
+      "count": 8,
+      "data_type": "OX_TANK_PRESSURE",
+      "finite_count": 8,
+      "index": 0,
+      "key": "[\"VB\",\"OX_TANK_PRESSURE\",0]",
+      "label": "VB / OX_TANK_PRESSURE / 0",
+      "points": [
+        [
+          1767312000000,
+          0.5
+        ],
+        [
+          1767312001000,
+          0.6
+        ],
+        [
+          1767312002000,
+          0.7
+        ],
+        [
+          1767312003000,
+          0.8
+        ],
+        [
+          1767312004000,
+          0.9
+        ],
+        [
+          1767312005000,
+          1
+        ],
+        [
+          1767312006000,
+          1.1
+        ],
+        [
+          1767312007000,
+          1.2000000000000002
+        ]
+      ],
+      "regression": {
+        "status": "not_applicable"
+      },
+      "sender": "VB",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_raw_input"
+    },
+    {
+      "count": 8,
+      "data_type": "PRESSURE_TRANSDUCER_CALIBRATED",
+      "finite_count": 8,
+      "index": 0,
+      "key": "[\"VB\",\"PRESSURE_TRANSDUCER_CALIBRATED\",0]",
+      "label": "VB / PRESSURE_TRANSDUCER_CALIBRATED / 0",
+      "points": [
+        [
+          1767312000000,
+          95.25
+        ],
+        [
+          1767312001000,
+          126.5
+        ],
+        [
+          1767312002000,
+          157.75
+        ],
+        [
+          1767312003000,
+          189
+        ],
+        [
+          1767312004000,
+          220.25
+        ],
+        [
+          1767312005000,
+          251.5
+        ],
+        [
+          1767312006000,
+          282.75
+        ],
+        [
+          1767312007000,
+          314.00000000000006
+        ]
+      ],
+      "regression": {
+        "equation": "y = slope * x + intercept",
+        "intercept": -61.0,
+        "max_residual": 0.0,
+        "note": "Reconstructed mapping, not a saved original calibration.",
+        "pair_count": 8,
+        "raw_type": "OX_TANK_PRESSURE",
+        "slope": 312.5,
+        "status": "inferred_from_recorded_pairs"
+      },
+      "sender": "VB",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_derived"
+    },
+    {
+      "count": 8,
+      "data_type": "DAQ_POWER_MONITOR",
+      "finite_count": 8,
+      "index": 0,
+      "key": "[\"DAQ\",\"DAQ_POWER_MONITOR\",0]",
+      "label": "DAQ / DAQ_POWER_MONITOR / 0",
+      "points": [
+        [
+          1767312000000,
+          0
+        ],
+        [
+          1767312001000,
+          1
+        ],
+        [
+          1767312002000,
+          2
+        ],
+        [
+          1767312003000,
+          3
+        ],
+        [
+          1767312004000,
+          4
+        ],
+        [
+          1767312005000,
+          5
+        ],
+        [
+          1767312006000,
+          6
+        ],
+        [
+          1767312007000,
+          7
+        ]
+      ],
+      "regression": {
+        "status": "not_applicable"
+      },
+      "sender": "DAQ",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_unclassified"
+    },
+    {
+      "count": 8,
+      "data_type": "DAQ_POWER_MONITOR",
+      "finite_count": 8,
+      "index": 1,
+      "key": "[\"DAQ\",\"DAQ_POWER_MONITOR\",1]",
+      "label": "DAQ / DAQ_POWER_MONITOR / 1",
+      "points": [
+        [
+          1767312000000,
+          0.1
+        ],
+        [
+          1767312001000,
+          0.1
+        ],
+        [
+          1767312002000,
+          0.1
+        ],
+        [
+          1767312003000,
+          0.1
+        ],
+        [
+          1767312004000,
+          0.1
+        ],
+        [
+          1767312005000,
+          0.1
+        ],
+        [
+          1767312006000,
+          0.1
+        ],
+        [
+          1767312007000,
+          0.1
+        ]
+      ],
+      "regression": {
+        "status": "not_applicable"
+      },
+      "sender": "DAQ",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_unclassified"
+    },
+    {
+      "count": 8,
+      "data_type": "DAQ_POWER_MONITOR",
+      "finite_count": 8,
+      "index": 2,
+      "key": "[\"DAQ\",\"DAQ_POWER_MONITOR\",2]",
+      "label": "DAQ / DAQ_POWER_MONITOR / 2",
+      "points": [
+        [
+          1767312000000,
+          12
+        ],
+        [
+          1767312001000,
+          12.25
+        ],
+        [
+          1767312002000,
+          12.5
+        ],
+        [
+          1767312003000,
+          12.75
+        ],
+        [
+          1767312004000,
+          13
+        ],
+        [
+          1767312005000,
+          13.25
+        ],
+        [
+          1767312006000,
+          13.5
+        ],
+        [
+          1767312007000,
+          13.75
+        ]
+      ],
+      "regression": {
+        "status": "not_applicable"
+      },
+      "sender": "DAQ",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_unclassified"
+    },
+    {
+      "count": 8,
+      "data_type": "DAQ_POWER_MONITOR",
+      "finite_count": 8,
+      "index": 3,
+      "key": "[\"DAQ\",\"DAQ_POWER_MONITOR\",3]",
+      "label": "DAQ / DAQ_POWER_MONITOR / 3",
+      "points": [
+        [
+          1767312000000,
+          0.1
+        ],
+        [
+          1767312001000,
+          0.11
+        ],
+        [
+          1767312002000,
+          0.12000000000000001
+        ],
+        [
+          1767312003000,
+          0.13
+        ],
+        [
+          1767312004000,
+          0.14
+        ],
+        [
+          1767312005000,
+          0.15000000000000002
+        ],
+        [
+          1767312006000,
+          0.16
+        ],
+        [
+          1767312007000,
+          0.17
+        ]
+      ],
+      "regression": {
+        "status": "not_applicable"
+      },
+      "sender": "DAQ",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_unclassified"
+    },
+    {
+      "count": 8,
+      "data_type": "VALVE_STATE",
+      "finite_count": 8,
+      "index": 0,
+      "key": "[\"VB\",\"VALVE_STATE\",0]",
+      "label": "Pilot",
+      "points": [
+        [
+          1767312000000,
+          0
+        ],
+        [
+          1767312001000,
+          1
+        ],
+        [
+          1767312002000,
+          0
+        ],
+        [
+          1767312003000,
+          1
+        ],
+        [
+          1767312004000,
+          0
+        ],
+        [
+          1767312005000,
+          1
+        ],
+        [
+          1767312006000,
+          0
+        ],
+        [
+          1767312007000,
+          1
+        ]
+      ],
+      "regression": {
+        "boolean_labels": {
+          "false_label": "Closed",
+          "true_label": "Open",
+          "unknown_label": "Unknown"
+        },
+        "channel_label": "Pilot",
+        "status": "not_applicable"
+      },
+      "sender": "VB",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_state"
+    },
+    {
+      "count": 8,
+      "data_type": "VALVE_STATE",
+      "finite_count": 8,
+      "index": 1,
+      "key": "[\"VB\",\"VALVE_STATE\",1]",
+      "label": "Vent",
+      "points": [
+        [
+          1767312000000,
+          1
+        ],
+        [
+          1767312001000,
+          1
+        ],
+        [
+          1767312002000,
+          1
+        ],
+        [
+          1767312003000,
+          1
+        ],
+        [
+          1767312004000,
+          1
+        ],
+        [
+          1767312005000,
+          1
+        ],
+        [
+          1767312006000,
+          1
+        ],
+        [
+          1767312007000,
+          1
+        ]
+      ],
+      "regression": {
+        "boolean_labels": {
+          "false_label": "Closed",
+          "true_label": "Open",
+          "unknown_label": "Unknown"
+        },
+        "channel_label": "Vent",
+        "status": "not_applicable"
+      },
+      "sender": "VB",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_state"
+    },
+    {
+      "count": 8,
+      "data_type": "VALVE_STATE",
+      "finite_count": 8,
+      "index": 2,
+      "key": "[\"VB\",\"VALVE_STATE\",2]",
+      "label": "Dump",
+      "points": [
+        [
+          1767312000000,
+          2
+        ],
+        [
+          1767312001000,
+          2
+        ],
+        [
+          1767312002000,
+          2
+        ],
+        [
+          1767312003000,
+          2
+        ],
+        [
+          1767312004000,
+          2
+        ],
+        [
+          1767312005000,
+          2
+        ],
+        [
+          1767312006000,
+          2
+        ],
+        [
+          1767312007000,
+          2
+        ]
+      ],
+      "regression": {
+        "boolean_labels": {
+          "false_label": "Closed",
+          "true_label": "Open",
+          "unknown_label": "Unknown"
+        },
+        "channel_label": "Dump",
+        "status": "not_applicable"
+      },
+      "sender": "VB",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_state"
+    },
+    {
+      "count": 8,
+      "data_type": "VALVE_STATE",
+      "finite_count": 8,
+      "index": 3,
+      "key": "[\"VB\",\"VALVE_STATE\",3]",
+      "label": "Igniter",
+      "points": [
+        [
+          1767312000000,
+          1
+        ],
+        [
+          1767312001000,
+          0
+        ],
+        [
+          1767312002000,
+          0
+        ],
+        [
+          1767312003000,
+          1
+        ],
+        [
+          1767312004000,
+          0
+        ],
+        [
+          1767312005000,
+          0
+        ],
+        [
+          1767312006000,
+          1
+        ],
+        [
+          1767312007000,
+          0
+        ]
+      ],
+      "regression": {
+        "boolean_labels": {
+          "false_label": "Closed",
+          "true_label": "Open",
+          "unknown_label": "Unknown"
+        },
+        "channel_label": "Igniter",
+        "status": "not_applicable"
+      },
+      "sender": "VB",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_state"
+    },
+    {
+      "count": 8,
+      "data_type": "VALVE_STATE",
+      "finite_count": 8,
+      "index": 4,
+      "key": "[\"VB\",\"VALVE_STATE\",4]",
+      "label": "Nitrogen",
+      "points": [
+        [
+          1767312000000,
+          0
+        ],
+        [
+          1767312001000,
+          0
+        ],
+        [
+          1767312002000,
+          0
+        ],
+        [
+          1767312003000,
+          0
+        ],
+        [
+          1767312004000,
+          0
+        ],
+        [
+          1767312005000,
+          0
+        ],
+        [
+          1767312006000,
+          0
+        ],
+        [
+          1767312007000,
+          0
+        ]
+      ],
+      "regression": {
+        "boolean_labels": {
+          "false_label": "Closed",
+          "true_label": "Open",
+          "unknown_label": "Unknown"
+        },
+        "channel_label": "Nitrogen",
+        "status": "not_applicable"
+      },
+      "sender": "VB",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_state"
+    },
+    {
+      "count": 8,
+      "data_type": "VALVE_STATE",
+      "finite_count": 8,
+      "index": 5,
+      "key": "[\"VB\",\"VALVE_STATE\",5]",
+      "label": "Nitrous",
+      "points": [
+        [
+          1767312000000,
+          0
+        ],
+        [
+          1767312001000,
+          0
+        ],
+        [
+          1767312002000,
+          0
+        ],
+        [
+          1767312003000,
+          0
+        ],
+        [
+          1767312004000,
+          0
+        ],
+        [
+          1767312005000,
+          0
+        ],
+        [
+          1767312006000,
+          0
+        ],
+        [
+          1767312007000,
+          0
+        ]
+      ],
+      "regression": {
+        "boolean_labels": {
+          "false_label": "Closed",
+          "true_label": "Open",
+          "unknown_label": "Unknown"
+        },
+        "channel_label": "Nitrous",
+        "status": "not_applicable"
+      },
+      "sender": "VB",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_state"
+    },
+    {
+      "count": 8,
+      "data_type": "VALVE_STATE",
+      "finite_count": 8,
+      "index": 6,
+      "key": "[\"VB\",\"VALVE_STATE\",6]",
+      "label": "Fill Lines",
+      "points": [
+        [
+          1767312000000,
+          1
+        ],
+        [
+          1767312001000,
+          1
+        ],
+        [
+          1767312002000,
+          1
+        ],
+        [
+          1767312003000,
+          1
+        ],
+        [
+          1767312004000,
+          1
+        ],
+        [
+          1767312005000,
+          1
+        ],
+        [
+          1767312006000,
+          1
+        ],
+        [
+          1767312007000,
+          1
+        ]
+      ],
+      "regression": {
+        "boolean_labels": {
+          "false_label": "Installed",
+          "true_label": "Removed",
+          "unknown_label": "Unknown"
+        },
+        "channel_label": "Fill Lines",
+        "status": "not_applicable"
+      },
+      "sender": "VB",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_state"
+    },
+    {
+      "channel_label": "MCU die temperature",
+      "count": 2,
+      "data_type": "REC_BOARD_DIE_TEMPERATURE",
+      "finite_count": 2,
+      "index": 0,
+      "key": "[\"DAQ\",\"REC_BOARD_DIE_TEMPERATURE\",0]",
+      "label": "MCU die temperature",
+      "points": [
+        [
+          1767312000500,
+          31.5
+        ],
+        [
+          1767312001500,
+          32.25
+        ]
+      ],
+      "precision": "counter CSV integers exact; graph projections approximate",
+      "regression": {
+        "channel_label": "MCU die temperature",
+        "precision": "counter CSV integers exact; graph projections approximate",
+        "status": "not_applicable",
+        "unit": "°C",
+        "unit_source": "recorded_diagnostic_schema_v1"
+      },
+      "sender": "DAQ",
+      "unit": "°C",
+      "unit_source": "recorded_diagnostic_schema_v1",
+      "value_kind": "recorded_unclassified"
+    },
+    {
+      "count": 1,
+      "data_type": "BATTERY_VOLTAGE",
+      "finite_count": 1,
+      "index": 0,
+      "key": "[\"=PB\",\"BATTERY_VOLTAGE\",0]",
+      "label": "=PB / BATTERY_VOLTAGE / 0",
+      "points": [
+        [
+          1767312002500,
+          7.9
+        ]
+      ],
+      "regression": {
+        "status": "not_applicable"
+      },
+      "sender": "=PB",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_unclassified"
+    },
+    {
+      "count": 1,
+      "data_type": "CUSTOM_CALIBRATED",
+      "finite_count": 1,
+      "index": 0,
+      "key": "[\"B\\u00e9\",\"CUSTOM_CALIBRATED\",0]",
+      "label": "Bé / CUSTOM_CALIBRATED / 0",
+      "points": [
+        [
+          1767312002500,
+          true
+        ]
+      ],
+      "regression": {
+        "reason": "No historical regression recorded for this derived channel.",
+        "status": "unavailable"
+      },
+      "sender": "Bé",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_unclassified"
+    },
+    {
+      "count": 1,
+      "data_type": "CUSTOM_CALIBRATED",
+      "finite_count": 1,
+      "index": 1,
+      "key": "[\"B\\u00e9\",\"CUSTOM_CALIBRATED\",1]",
+      "label": "Bé / CUSTOM_CALIBRATED / 1",
+      "points": [
+        [
+          1767312002500,
+          1e-7
+        ]
+      ],
+      "regression": {
+        "reason": "No historical regression recorded for this derived channel.",
+        "status": "unavailable"
+      },
+      "sender": "Bé",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_unclassified"
+    },
+    {
+      "count": 1,
+      "data_type": "CUSTOM_CALIBRATED",
+      "finite_count": 1,
+      "index": 2,
+      "key": "[\"B\\u00e9\",\"CUSTOM_CALIBRATED\",2]",
+      "label": "Bé / CUSTOM_CALIBRATED / 2",
+      "points": [
+        [
+          1767312002500,
+          1e+16
+        ]
+      ],
+      "regression": {
+        "reason": "No historical regression recorded for this derived channel.",
+        "status": "unavailable"
+      },
+      "sender": "Bé",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_unclassified"
+    },
+    {
+      "count": 1,
+      "data_type": "CUSTOM_CALIBRATED",
+      "finite_count": 1,
+      "index": 3,
+      "key": "[\"B\\u00e9\",\"CUSTOM_CALIBRATED\",3]",
+      "label": "Bé / CUSTOM_CALIBRATED / 3",
+      "points": [
+        [
+          1767312002500,
+          123456789.0
+        ]
+      ],
+      "regression": {
+        "reason": "No historical regression recorded for this derived channel.",
+        "status": "unavailable"
+      },
+      "sender": "Bé",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_unclassified"
+    },
+    {
+      "count": 1,
+      "data_type": "CUSTOM_CALIBRATED",
+      "finite_count": 1,
+      "index": 4,
+      "key": "[\"B\\u00e9\",\"CUSTOM_CALIBRATED\",4]",
+      "label": "Bé / CUSTOM_CALIBRATED / 4",
+      "points": [
+        [
+          1767312002500,
+          -0.0
+        ]
+      ],
+      "regression": {
+        "reason": "No historical regression recorded for this derived channel.",
+        "status": "unavailable"
+      },
+      "sender": "Bé",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_unclassified"
+    },
+    {
+      "count": 1,
+      "data_type": "CUSTOM_CALIBRATED",
+      "finite_count": 1,
+      "index": 5,
+      "key": "[\"B\\u00e9\",\"CUSTOM_CALIBRATED\",5]",
+      "label": "Bé / CUSTOM_CALIBRATED / 5",
+      "points": [
+        [
+          1767312002500,
+          3
+        ]
+      ],
+      "regression": {
+        "reason": "No historical regression recorded for this derived channel.",
+        "status": "unavailable"
+      },
+      "sender": "Bé",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_unclassified"
+    },
+    {
+      "count": 1,
+      "data_type": "CUSTOM_CALIBRATED",
+      "finite_count": 0,
+      "index": 6,
+      "key": "[\"B\\u00e9\",\"CUSTOM_CALIBRATED\",6]",
+      "label": "Bé / CUSTOM_CALIBRATED / 6",
+      "points": [
+        [
+          1767312002500,
+          null
+        ]
+      ],
+      "regression": {
+        "reason": "No historical regression recorded for this derived channel.",
+        "status": "unavailable"
+      },
+      "sender": "Bé",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_unclassified"
+    },
+    {
+      "count": 1,
+      "data_type": "CUSTOM_CALIBRATED",
+      "finite_count": 0,
+      "index": 7,
+      "key": "[\"B\\u00e9\",\"CUSTOM_CALIBRATED\",7]",
+      "label": "Bé / CUSTOM_CALIBRATED / 7",
+      "points": [
+        [
+          1767312002500,
+          null
+        ]
+      ],
+      "regression": {
+        "reason": "No historical regression recorded for this derived channel.",
+        "status": "unavailable"
+      },
+      "sender": "Bé",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_unclassified"
+    },
+    {
+      "count": 1,
+      "data_type": "OX_TANK_PRESSURE",
+      "finite_count": 1,
+      "index": 0,
+      "key": "[\"FC\",\"OX_TANK_PRESSURE\",0]",
+      "label": "FC / OX_TANK_PRESSURE / 0",
+      "points": [
+        [
+          1767312003500,
+          640.0
+        ]
+      ],
+      "regression": {
+        "status": "not_applicable"
+      },
+      "sender": "FC",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_raw_input"
+    }
+  ],
+  "end_ms": 1767312007001,
+  "recorded_rows": 78,
+  "start_ms": 1767312000000
+}

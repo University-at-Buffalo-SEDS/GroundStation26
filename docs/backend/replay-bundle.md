@@ -33,7 +33,19 @@ resource:
 `manifest.predicted: true`, synthesized FC rows in `replay.json`, and
 `derived/flight_plan.json`.
   fire-archive entry that names the recording, with each report's detail
-  and each fire's thrust curve.
+  and each fire's thrust curve;
+- what the station's exports need beyond the CSV
+  (`backend/src/recording_bundle_exports.rs`):
+  - `config/report_context.json`: the report studio's export-time context
+    (`recording_report::context`: valve labels and units from the station
+    layout, recorded diagnostic stream schema);
+  - `derived/calibration_history.json`: the recording's
+    `calibration_history` rows, when it has that table;
+  - `exports/motor_export.zip` / `exports/flight_export.zip`: the review
+    exports without a range (`flight_review::bundle_exports`), generated at
+    the bundle's time and without raster charts, for the ones that apply;
+  - `exports/index.json`: which review exports the bundle holds, with file
+    name and window.
 
 `replay.json` gains `layout`, `boards`, `view_config`, `valve_mappings` (from
 the layout's valve labels), `vehicle_geometry`, `mode` and
@@ -46,6 +58,18 @@ sorted keys (some routes serialize hash maps). A client can answer any GET
 whose path and query equal an entry's `route` from that entry. Routes that
 take a playhead window (`/replay/window`, `/api/recordings/report`) are not
 snapshot; a client computes them from `replay.json`.
+
+With these entries the UI answers the recording CSV, the time-range CSV
+(`GET /api/recordings/csv`), the report studio's preview, CSV and DAQ SD
+CSV/TSV, and the default-window review exports with no station, byte for
+byte as this station would (UI `docs/replay-bundle.md`, "Exports offline").
+Excel/PDF reports, review exports of a custom window, and exports of
+SD-resolved recordings still need the station.
+
+The time-range CSV writes over-range values as `OVR`/`-OVR`, like the
+recording CSV, so its row cells are the recording CSV's. It reads each
+primary recording's receipt rows (`telemetry`), never an SD-resolved
+timeline.
 
 Options:
 
@@ -106,7 +130,10 @@ Checks:
 
 - `contract_fixtures` writes `replay-bundle/flight.gsreplay`, its manifest
   and the recording's CSV, and checks the bundle's CSV hash against the CSV
-  route.
+  route. It also writes this station's answers to the export requests the UI
+  answers offline (`replay-bundle/exports/`, listed in
+  `exports/requests.json`), for the bundled flight and for a second
+  recording with the report cases the flight lacks.
 - `recording_import::tests` builds bundles of recordings with every CSV rule
   (over-range markers, legacy type names, formula-like text, quoted line
   breaks, NULLs, the IGT provenance column), imports them into a fresh store

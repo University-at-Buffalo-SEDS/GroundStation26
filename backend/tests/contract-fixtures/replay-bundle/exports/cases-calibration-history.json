@@ -1,0 +1,26 @@
+[
+  {
+    "config_json": "{\"calibration\":{\"ch1\":{\"b\":1.0,\"m\":2.0},\"ch1_fit\":null,\"ch1_zero_raw\":0.25,\"extra_channels\":{\"kg50\":{\"linear\":{\"b\":0.0,\"m\":7.0},\"points\":[]}},\"iadc\":{\"b\":0.0,\"m\":1.0},\"points_ch1\":[{\"kg\":2.0,\"raw\":0.5}]},\"fill_targets\":{\"fill_source\":\"kg50\",\"target_kg\":8.0},\"flight_state\":\"NitrousFill\"}",
+    "sender_id": "DAQ",
+    "sensor_id": "KG50",
+    "timestamp_ms": 1767312000000
+  },
+  {
+    "config_json": "{\"calibration\":{\"ch1\":{\"b\":1.0,\"m\":2.0},\"ch1_fit\":null,\"ch1_zero_raw\":0.25,\"extra_channels\":{\"kg50\":{\"linear\":{\"b\":0.0,\"m\":7.0},\"points\":[]}},\"iadc\":{\"b\":0.0,\"m\":1.0},\"points_ch1\":[{\"kg\":2.0,\"raw\":0.5}]},\"fill_targets\":{\"fill_source\":\"kg1000_absolute\",\"target_kg\":8.0},\"flight_state\":\"NitrousFill\"}",
+    "sender_id": "DAQ",
+    "sensor_id": "KG1000",
+    "timestamp_ms": 1767312001000
+  },
+  {
+    "config_json": "{\"calibration\":{\"ch1\":{\"b\":1.0,\"m\":2.0},\"ch1_fit\":null,\"ch1_zero_raw\":0.25,\"extra_channels\":{\"kg50\":{\"linear\":{\"b\":0.0,\"m\":7.0},\"points\":[]}},\"iadc\":{\"b\":0.0,\"m\":1.0},\"points_ch1\":[{\"kg\":2.0,\"raw\":0.5}]},\"fill_targets\":{\"fill_source\":\"kg1000_absolute\",\"target_kg\":8.0},\"flight_state\":\"NitrousFill\"}",
+    "sender_id": "DAQ",
+    "sensor_id": "KG1000",
+    "timestamp_ms": 1767312002000
+  },
+  {
+    "config_json": "{\"calibration\":{\"ch1\":{\"b\":1.0000001,\"m\":2.0},\"ch1_fit\":null,\"ch1_zero_raw\":0.25,\"extra_channels\":{\"kg50\":{\"linear\":{\"b\":0.0,\"m\":7.0},\"points\":[]}},\"iadc\":{\"b\":0.0,\"m\":1.0},\"points_ch1\":[{\"kg\":2.0,\"raw\":0.5}]},\"fill_targets\":{\"fill_source\":\"kg1000_absolute\",\"target_kg\":9.5},\"flight_state\":\"Armed\"}",
+    "sender_id": "DAQ",
+    "sensor_id": "KG1000",
+    "timestamp_ms": 1767312005000
+  }
+]

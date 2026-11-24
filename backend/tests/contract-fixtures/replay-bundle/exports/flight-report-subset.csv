@@ -1,0 +1,358 @@
+recording,row_id,received_timestamp_ms,source_timestamp_ms,sender,data_type,channel,value,regression_json,channel_label,state_label
+groundstation_recording_2026-01-01_00-00-00_000.db,5,1767225600000,,VB,OX_TANK_PRESSURE,0,745.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,10,1767225602000,,VB,OX_TANK_PRESSURE,0,745.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,15,1767225604000,,VB,OX_TANK_PRESSURE,0,745.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,20,1767225606000,,VB,OX_TANK_PRESSURE,0,745.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,25,1767225608000,,VB,OX_TANK_PRESSURE,0,745.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,31,1767225610000,,VB,OX_TANK_PRESSURE,0,745.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,37,1767225612000,,VB,OX_TANK_PRESSURE,0,585.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,42,1767225614000,,VB,OX_TANK_PRESSURE,0,425.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,47,1767225616000,,VB,OX_TANK_PRESSURE,0,265.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,53,1767225618000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,58,1767225620000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,63,1767225622000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,68,1767225624000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,73,1767225626000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,78,1767225628000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,83,1767225630000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,88,1767225632000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,93,1767225634000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,98,1767225636000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,104,1767225638000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,109,1767225640000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,114,1767225642000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,119,1767225644000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,124,1767225646000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,129,1767225648000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,134,1767225650000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,139,1767225652000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,144,1767225654000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,149,1767225656000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,154,1767225658000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,159,1767225660000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,164,1767225662000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,169,1767225664000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,174,1767225666000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,179,1767225668000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,184,1767225670000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,189,1767225672000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,194,1767225674000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,199,1767225676000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,204,1767225678000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,209,1767225680000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,214,1767225682000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,219,1767225684000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,224,1767225686000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,229,1767225688000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,234,1767225690000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,239,1767225692000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,244,1767225694000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,249,1767225696000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,254,1767225698000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,259,1767225700000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,264,1767225702000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,269,1767225704000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,274,1767225706000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,279,1767225708000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,284,1767225710000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,289,1767225712000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,294,1767225714000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,299,1767225716000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,304,1767225718000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,309,1767225720000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,314,1767225722000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,319,1767225724000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,324,1767225726000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,329,1767225728000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,334,1767225730000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,339,1767225732000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,344,1767225734000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,349,1767225736000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,354,1767225738000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,359,1767225740000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,364,1767225742000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,369,1767225744000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,374,1767225746000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,379,1767225748000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,384,1767225750000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,389,1767225752000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,394,1767225754000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,399,1767225756000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,404,1767225758000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,409,1767225760000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,414,1767225762000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,419,1767225764000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,424,1767225766000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,429,1767225768000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,434,1767225770000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,439,1767225772000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,444,1767225774000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,449,1767225776000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,454,1767225778000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,459,1767225780000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,464,1767225782000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,469,1767225784000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,474,1767225786000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,479,1767225788000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,484,1767225790000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,489,1767225792000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,494,1767225794000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,499,1767225796000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,504,1767225798000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,509,1767225800000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,514,1767225802000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,520,1767225804000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,525,1767225806000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,530,1767225808000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,535,1767225810000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,540,1767225812000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,545,1767225814000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,550,1767225816000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,555,1767225818000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,560,1767225820000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,565,1767225822000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,570,1767225824000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,575,1767225826000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,580,1767225828000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,585,1767225830000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,590,1767225832000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,595,1767225834000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,600,1767225836000,,VB,OX_TANK_PRESSURE,0,30.0,"{""status"":""not_applicable""}",VB / OX_TANK_PRESSURE / 0,
+groundstation_recording_2026-01-01_00-00-00_000.db,3,1767225600000,,FC,BAROMETER_DATA,1,91077.1,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,8,1767225602000,,FC,BAROMETER_DATA,1,91077.1,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,13,1767225604000,,FC,BAROMETER_DATA,1,91076.2,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,18,1767225606000,,FC,BAROMETER_DATA,1,91076.7,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,23,1767225608000,,FC,BAROMETER_DATA,1,91077.4,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,29,1767225610000,,FC,BAROMETER_DATA,1,91077.3,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,35,1767225612000,,FC,BAROMETER_DATA,1,90004.7,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,40,1767225614000,,FC,BAROMETER_DATA,1,86596.9,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,45,1767225616000,,FC,BAROMETER_DATA,1,82139.2,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,51,1767225618000,,FC,BAROMETER_DATA,1,77927.8,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,56,1767225620000,,FC,BAROMETER_DATA,1,74308.8,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,61,1767225622000,,FC,BAROMETER_DATA,1,71288.7,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,66,1767225624000,,FC,BAROMETER_DATA,1,68796.6,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,71,1767225626000,,FC,BAROMETER_DATA,1,66761.5,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,76,1767225628000,,FC,BAROMETER_DATA,1,65141.7,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,81,1767225630000,,FC,BAROMETER_DATA,1,63890.7,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,86,1767225632000,,FC,BAROMETER_DATA,1,62992.3,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,91,1767225634000,,FC,BAROMETER_DATA,1,62422.1,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,96,1767225636000,,FC,BAROMETER_DATA,1,62165.3,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,102,1767225638000,,FC,BAROMETER_DATA,1,62234.8,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,107,1767225640000,,FC,BAROMETER_DATA,1,62516.5,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,112,1767225642000,,FC,BAROMETER_DATA,1,62903.8,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,117,1767225644000,,FC,BAROMETER_DATA,1,63324.7,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,122,1767225646000,,FC,BAROMETER_DATA,1,63758.7,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,127,1767225648000,,FC,BAROMETER_DATA,1,64198.4,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,132,1767225650000,,FC,BAROMETER_DATA,1,64640.1,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,137,1767225652000,,FC,BAROMETER_DATA,1,65087.5,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,142,1767225654000,,FC,BAROMETER_DATA,1,65537.2,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,147,1767225656000,,FC,BAROMETER_DATA,1,65987.0,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,152,1767225658000,,FC,BAROMETER_DATA,1,66436.8,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,157,1767225660000,,FC,BAROMETER_DATA,1,66889.1,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,162,1767225662000,,FC,BAROMETER_DATA,1,67346.1,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,167,1767225664000,,FC,BAROMETER_DATA,1,67801.8,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,172,1767225666000,,FC,BAROMETER_DATA,1,68247.9,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,177,1767225668000,,FC,BAROMETER_DATA,1,68698.4,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,182,1767225670000,,FC,BAROMETER_DATA,1,69153.6,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,187,1767225672000,,FC,BAROMETER_DATA,1,69616.7,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,192,1767225674000,,FC,BAROMETER_DATA,1,70079.0,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,197,1767225676000,,FC,BAROMETER_DATA,1,70538.5,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,202,1767225678000,,FC,BAROMETER_DATA,1,70996.0,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,207,1767225680000,,FC,BAROMETER_DATA,1,71449.1,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,212,1767225682000,,FC,BAROMETER_DATA,1,71903.9,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,217,1767225684000,,FC,BAROMETER_DATA,1,72362.7,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,222,1767225686000,,FC,BAROMETER_DATA,1,72822.5,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,227,1767225688000,,FC,BAROMETER_DATA,1,73282.4,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,232,1767225690000,,FC,BAROMETER_DATA,1,73741.5,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,237,1767225692000,,FC,BAROMETER_DATA,1,74208.4,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,242,1767225694000,,FC,BAROMETER_DATA,1,74676.4,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,247,1767225696000,,FC,BAROMETER_DATA,1,75149.2,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,252,1767225698000,,FC,BAROMETER_DATA,1,75625.7,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,257,1767225700000,,FC,BAROMETER_DATA,1,76103.7,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,262,1767225702000,,FC,BAROMETER_DATA,1,76579.5,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,267,1767225704000,,FC,BAROMETER_DATA,1,77059.3,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,272,1767225706000,,FC,BAROMETER_DATA,1,77551.3,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,277,1767225708000,,FC,BAROMETER_DATA,1,78042.5,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,282,1767225710000,,FC,BAROMETER_DATA,1,78531.3,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,287,1767225712000,,FC,BAROMETER_DATA,1,79007.6,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,292,1767225714000,,FC,BAROMETER_DATA,1,79483.3,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,297,1767225716000,,FC,BAROMETER_DATA,1,79964.6,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,302,1767225718000,,FC,BAROMETER_DATA,1,80450.5,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,307,1767225720000,,FC,BAROMETER_DATA,1,80936.4,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,312,1767225722000,,FC,BAROMETER_DATA,1,81426.9,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,317,1767225724000,,FC,BAROMETER_DATA,1,81922.3,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,322,1767225726000,,FC,BAROMETER_DATA,1,82422.4,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,327,1767225728000,,FC,BAROMETER_DATA,1,82916.7,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,332,1767225730000,,FC,BAROMETER_DATA,1,83408.0,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,337,1767225732000,,FC,BAROMETER_DATA,1,83897.5,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,342,1767225734000,,FC,BAROMETER_DATA,1,84389.0,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,347,1767225736000,,FC,BAROMETER_DATA,1,84885.8,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,352,1767225738000,,FC,BAROMETER_DATA,1,85385.9,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,357,1767225740000,,FC,BAROMETER_DATA,1,85882.5,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,362,1767225742000,,FC,BAROMETER_DATA,1,86388.0,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,367,1767225744000,,FC,BAROMETER_DATA,1,86718.6,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,372,1767225746000,,FC,BAROMETER_DATA,1,86859.6,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,377,1767225748000,,FC,BAROMETER_DATA,1,86989.6,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,382,1767225750000,,FC,BAROMETER_DATA,1,87120.7,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,387,1767225752000,,FC,BAROMETER_DATA,1,87259.4,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,392,1767225754000,,FC,BAROMETER_DATA,1,87405.0,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,397,1767225756000,,FC,BAROMETER_DATA,1,87556.5,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,402,1767225758000,,FC,BAROMETER_DATA,1,87712.0,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,407,1767225760000,,FC,BAROMETER_DATA,1,87862.8,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,412,1767225762000,,FC,BAROMETER_DATA,1,88011.0,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,417,1767225764000,,FC,BAROMETER_DATA,1,88162.2,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,422,1767225766000,,FC,BAROMETER_DATA,1,88308.9,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,427,1767225768000,,FC,BAROMETER_DATA,1,88462.3,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,432,1767225770000,,FC,BAROMETER_DATA,1,88601.3,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,437,1767225772000,,FC,BAROMETER_DATA,1,88730.6,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,442,1767225774000,,FC,BAROMETER_DATA,1,88876.1,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,447,1767225776000,,FC,BAROMETER_DATA,1,89028.8,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,452,1767225778000,,FC,BAROMETER_DATA,1,89190.6,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,457,1767225780000,,FC,BAROMETER_DATA,1,89347.2,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,462,1767225782000,,FC,BAROMETER_DATA,1,89499.5,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,467,1767225784000,,FC,BAROMETER_DATA,1,89643.5,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,472,1767225786000,,FC,BAROMETER_DATA,1,89794.6,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,477,1767225788000,,FC,BAROMETER_DATA,1,89931.8,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,482,1767225790000,,FC,BAROMETER_DATA,1,90066.6,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,487,1767225792000,,FC,BAROMETER_DATA,1,90209.2,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,492,1767225794000,,FC,BAROMETER_DATA,1,90357.6,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,497,1767225796000,,FC,BAROMETER_DATA,1,90501.7,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,502,1767225798000,,FC,BAROMETER_DATA,1,90656.4,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,507,1767225800000,,FC,BAROMETER_DATA,1,90794.6,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,512,1767225802000,,FC,BAROMETER_DATA,1,90931.1,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,518,1767225804000,,FC,BAROMETER_DATA,1,91062.7,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,523,1767225806000,,FC,BAROMETER_DATA,1,91074.4,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,528,1767225808000,,FC,BAROMETER_DATA,1,91072.2,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,533,1767225810000,,FC,BAROMETER_DATA,1,91072.2,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,538,1767225812000,,FC,BAROMETER_DATA,1,91073.6,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,543,1767225814000,,FC,BAROMETER_DATA,1,91072.1,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,548,1767225816000,,FC,BAROMETER_DATA,1,91073.1,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,553,1767225818000,,FC,BAROMETER_DATA,1,91073.8,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,558,1767225820000,,FC,BAROMETER_DATA,1,91072.9,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,563,1767225822000,,FC,BAROMETER_DATA,1,91073.4,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,568,1767225824000,,FC,BAROMETER_DATA,1,91071.7,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,573,1767225826000,,FC,BAROMETER_DATA,1,91073.9,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,578,1767225828000,,FC,BAROMETER_DATA,1,91071.3,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,583,1767225830000,,FC,BAROMETER_DATA,1,91072.0,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,588,1767225832000,,FC,BAROMETER_DATA,1,91072.3,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,593,1767225834000,,FC,BAROMETER_DATA,1,91072.0,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,598,1767225836000,,FC,BAROMETER_DATA,1,91072.0,"{""status"":""not_applicable""}",FC / BAROMETER_DATA / 1,
+groundstation_recording_2026-01-01_00-00-00_000.db,4,1767225600000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,9,1767225602000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,14,1767225604000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,19,1767225606000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,24,1767225608000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,30,1767225610000,,VB,VALVE_STATE,3,1,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Open
+groundstation_recording_2026-01-01_00-00-00_000.db,36,1767225612000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,41,1767225614000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,46,1767225616000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,52,1767225618000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,57,1767225620000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,62,1767225622000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,67,1767225624000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,72,1767225626000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,77,1767225628000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,82,1767225630000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,87,1767225632000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,92,1767225634000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,97,1767225636000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,103,1767225638000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,108,1767225640000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,113,1767225642000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,118,1767225644000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,123,1767225646000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,128,1767225648000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,133,1767225650000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,138,1767225652000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,143,1767225654000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,148,1767225656000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,153,1767225658000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,158,1767225660000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,163,1767225662000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,168,1767225664000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,173,1767225666000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,178,1767225668000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,183,1767225670000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,188,1767225672000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,193,1767225674000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,198,1767225676000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,203,1767225678000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,208,1767225680000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,213,1767225682000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,218,1767225684000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,223,1767225686000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,228,1767225688000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,233,1767225690000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,238,1767225692000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,243,1767225694000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,248,1767225696000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,253,1767225698000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,258,1767225700000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,263,1767225702000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,268,1767225704000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,273,1767225706000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,278,1767225708000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,283,1767225710000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,288,1767225712000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,293,1767225714000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,298,1767225716000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,303,1767225718000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,308,1767225720000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,313,1767225722000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,318,1767225724000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,323,1767225726000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,328,1767225728000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,333,1767225730000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,338,1767225732000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,343,1767225734000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,348,1767225736000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,353,1767225738000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,358,1767225740000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,363,1767225742000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,368,1767225744000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,373,1767225746000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,378,1767225748000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,383,1767225750000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,388,1767225752000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,393,1767225754000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,398,1767225756000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,403,1767225758000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,408,1767225760000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,413,1767225762000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,418,1767225764000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,423,1767225766000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,428,1767225768000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,433,1767225770000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,438,1767225772000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,443,1767225774000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,448,1767225776000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,453,1767225778000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,458,1767225780000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,463,1767225782000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,468,1767225784000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,473,1767225786000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,478,1767225788000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,483,1767225790000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,488,1767225792000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,493,1767225794000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,498,1767225796000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,503,1767225798000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,508,1767225800000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,513,1767225802000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,519,1767225804000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,524,1767225806000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,529,1767225808000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,534,1767225810000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,539,1767225812000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,544,1767225814000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,549,1767225816000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,554,1767225818000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,559,1767225820000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,564,1767225822000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,569,1767225824000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,574,1767225826000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,579,1767225828000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,584,1767225830000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,589,1767225832000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,594,1767225834000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
+groundstation_recording_2026-01-01_00-00-00_000.db,599,1767225836000,,VB,VALVE_STATE,3,0,"{""status"":""not_applicable"",""channel_label"":""Igniter"",""boolean_labels"":{""true_label"":""Open"",""false_label"":""Closed"",""unknown_label"":""Unknown""}}",Igniter,Closed
