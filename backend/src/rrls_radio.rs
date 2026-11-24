@@ -172,6 +172,16 @@ impl RecoveryRadio {
             state.retry_at = Instant::now() + Duration::from_secs(1);
         }
     }
+    /// This endpoint's connected device (TX or RX handle), without opening
+    /// one; the state lock is released before the device is locked.
+    fn current_device(&self) -> Option<Device> {
+        let state = self.shared.lock().unwrap();
+        if self.tx {
+            state.tx.clone()
+        } else {
+            state.rx.clone()
+        }
+    }
     fn with_device<T, E>(
         &self,
         offline: E,
@@ -258,6 +268,32 @@ impl CommsDevice for RecoveryRadio {
                 .unwrap()
                 .command_batch_frame_len(priority, payload)
         })
+    }
+    // Every CommsDevice method that has a default is forwarded here: the
+    // primary's and the RRLS's AV-bay radios are this wrapper, so a default
+    // silently switched the UART's behaviour off on hardware (the owed
+    // settings turn, the Abort pair and compact bundles all were).
+    // `every_comms_device_method_is_forwarded` keeps the list complete.
+    /// The ABORT and its FLIGHT_STATE=15 leave in one write (the UART takes
+    /// the pair in `send_tracked_counted`, which is forwarded below).
+    /// Disconnected: false, so the ABORT is not held for a pair.
+    fn supports_abort_pair(&self) -> bool {
+        self.current_device()
+            .is_some_and(|device| device.lock().unwrap().supports_abort_pair())
+    }
+    /// Compact-bundle followers, as the UART sizes them.
+    fn bundle_frame_len(
+        &self,
+        priority: u8,
+        payload: &[u8],
+        first: Option<(u8, &[u8])>,
+    ) -> Option<usize> {
+        self.current_device()
+            .and_then(|device| device.lock().unwrap().bundle_frame_len(priority, payload, first))
+    }
+    fn testing_model_link(&self) -> bool {
+        self.current_device()
+            .is_some_and(|device| device.lock().unwrap().testing_model_link())
     }
     fn send_tracked(
         &mut self,
@@ -767,6 +803,115 @@ mod tests {
             "the device's written frame is reported"
         );
         assert_eq!(turns.load(Ordering::Relaxed), 1);
+    }
+    /// The method names declared in the first `header { ... }` block of `src`.
+    fn block_methods(src: &str, header: &str) -> Vec<String> {
+        let start = src.find(header).unwrap_or_else(|| panic!("{header} not found"));
+        let mut depth = 0usize;
+        let mut end = start;
+        for (offset, ch) in src[start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = start + offset;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Only the block's own methods (four-space indent), not nested items.
+        src[start..end]
+            .lines()
+            .filter_map(|line| line.strip_prefix("    fn "))
+            .map(|rest| rest.split(|c: char| c == '(' || c == '<').next().unwrap().trim().to_string())
+            .collect()
+    }
+    /// A RecoveryRadio that falls back to a CommsDevice default instead of
+    /// asking its device silently switches the UART's behaviour off on
+    /// hardware: the primary's owed settings turn, the Abort pair (ABORT and
+    /// FLIGHT_STATE=15 in one write) and compact bundles were all off this way.
+    /// Every trait method, a new one included, must be implemented here.
+    #[test]
+    fn every_comms_device_method_is_forwarded() {
+        let trait_methods = block_methods(include_str!("comms.rs"), "pub trait CommsDevice: Send {");
+        assert!(trait_methods.len() > 20, "parsed the trait: {trait_methods:?}");
+        let wrapper = block_methods(include_str!("rrls_radio.rs"), "impl CommsDevice for RecoveryRadio {");
+        let missing: Vec<_> = trait_methods.iter().filter(|name| !wrapper.contains(name)).collect();
+        assert!(missing.is_empty(), "RecoveryRadio inherits the default of {missing:?}");
+    }
+    /// Each forwarded query answers as the device does, on the RX handle and
+    /// on a TX clone, and a disconnected radio does not claim the pair.
+    #[test]
+    fn forwarded_queries_answer_as_the_device_does() {
+        struct Answers;
+        impl CommsDevice for Answers {
+            fn try_clone_tx(&self) -> std::io::Result<Option<Box<dyn CommsDevice>>> {
+                Ok(Some(Box::new(Answers)))
+            }
+            fn set_side_id(&mut self, _: RouterSideId) {}
+            fn recv_packet(
+                &mut self,
+                _: &Router,
+                _: &mut dyn FnMut(&Packet),
+            ) -> TelemetryResult<()> {
+                Ok(())
+            }
+            fn send_data(&mut self, _: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+                Ok(())
+            }
+            fn testing_model_link(&self) -> bool {
+                true
+            }
+            fn supports_abort_pair(&self) -> bool {
+                true
+            }
+            fn ordinary_background_state(&self) -> Option<crate::comms::OrdinaryLaneState> {
+                Some(crate::comms::OrdinaryLaneState::Blocked)
+            }
+            fn transmit_ready_for(&self, priority: u8, _: &[u8]) -> bool {
+                priority == 7
+            }
+            fn command_batch_frame_len(&self, priority: u8, payload: &[u8]) -> Option<usize> {
+                Some(usize::from(priority) + payload.len())
+            }
+            fn bundle_frame_len(
+                &self,
+                priority: u8,
+                payload: &[u8],
+                first: Option<(u8, &[u8])>,
+            ) -> Option<usize> {
+                (first.is_none_or(|(p, _)| p == priority)).then_some(payload.len() + 100)
+            }
+            fn recovery_budget_configured(&self) -> bool {
+                true
+            }
+            fn receive_budget_exhausted(&self) -> bool {
+                true
+            }
+        }
+        let radio = missing();
+        assert!(!radio.supports_abort_pair(), "disconnected: no pair");
+        assert_eq!(radio.bundle_frame_len(1, &[0; 3], None), None);
+        radio.shared.lock().unwrap().opener = Box::new(|_| Ok(Box::new(Answers)));
+        assert!(radio.connect().is_some());
+        let writer = radio.try_clone_tx().unwrap().unwrap();
+        for endpoint in [&radio as &dyn CommsDevice, &*writer] {
+            assert!(endpoint.supports_abort_pair());
+            assert!(endpoint.testing_model_link());
+            assert_eq!(endpoint.bundle_frame_len(1, &[0; 3], None), Some(103));
+            assert_eq!(endpoint.bundle_frame_len(1, &[0; 3], Some((2, &[0]))), None);
+            assert_eq!(endpoint.command_batch_frame_len(4, &[0; 5]), Some(9));
+            assert_eq!(
+                endpoint.ordinary_background_state(),
+                Some(crate::comms::OrdinaryLaneState::Blocked)
+            );
+            assert!(endpoint.transmit_ready_for(7, &[]) && !endpoint.transmit_ready_for(6, &[]));
+            assert!(endpoint.recovery_budget_configured());
+            assert!(endpoint.receive_budget_exhausted());
+        }
     }
     #[test]
     fn uart_backpressure_keeps_recovery_radio_connected_and_can_resume() {

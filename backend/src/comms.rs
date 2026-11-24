@@ -4217,23 +4217,30 @@ impl UartComms {
             None
         };
         // The follower's own RR frame, wrapped in the same routing snapshot.
+        // A follower the mesh declines is dropped as it would be alone, and
+        // the first frame still goes: a listening RRLS's Abort egress admits
+        // the ABORT but not its FLIGHT_STATE=15, and the pair once returned
+        // here without writing either while reporting both complete.
         let follower_framed = match follower {
             Some(next) => {
-                let routed_next = if let Some(shared) = &self.recovery {
-                    let mesh = shared.lock().unwrap();
-                    let Some(frame) = mesh.local_tx(false, next, mesh.now()) else {
-                        return Ok(0);
-                    };
-                    Some(frame)
-                } else {
-                    None
+                let routed_next = match &self.recovery {
+                    Some(shared) => {
+                        let mesh = shared.lock().unwrap();
+                        mesh.local_tx(false, next, mesh.now()).map(Some)
+                    }
+                    None => Some(None),
                 };
-                let body = routed_next.as_ref().map_or(next, |frame| &frame.bytes[..]);
-                Some(if routed_next.as_ref().is_some_and(|frame| frame.command) {
-                    build_raw_uart_command_frame(body)?
-                } else {
-                    build_raw_uart_frame(body)?
-                })
+                match routed_next {
+                    None => None,
+                    Some(routed_next) => {
+                        let body = routed_next.as_ref().map_or(next, |frame| &frame.bytes[..]);
+                        Some(if routed_next.as_ref().is_some_and(|frame| frame.command) {
+                            build_raw_uart_command_frame(body)?
+                        } else {
+                            build_raw_uart_frame(body)?
+                        })
+                    }
+                }
             }
             None => None,
         };
@@ -4493,7 +4500,7 @@ impl UartComms {
         if io_result.is_ok() && matches!(self.protocol, SerialProtocol::RawUart) {
             report_write_leases_drained(leases);
             if self.recovery.is_some() {
-                for written in core::iter::once(sdk_payload).chain(follower) {
+                for written in core::iter::once(sdk_payload).chain(follower.filter(|_| follower_framed.is_some())) {
                     // An Abort's FLIGHT_STATE=15 write: schedule its early copies.
                     ABORT_STATE_BURST
                         .lock()
@@ -8486,6 +8493,141 @@ mod raw_uart_tests {
         let mut probe = [0u8; 1];
         peer.set_timeout(Duration::from_millis(50)).unwrap();
         assert!(peer.read_exact(&mut probe).is_err(), "nothing else written");
+    }
+
+    /// The primary's AV-bay radio is a RecoveryRadio around this UART. It
+    /// used to answer the trait defaults (no Abort pair, no bundle
+    /// followers), so on hardware an ABORT left without its FLIGHT_STATE=15
+    /// and every bundle-class frame went alone. Through the wrapper the pair
+    /// is one write and bundles are sized as the UART sizes them.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_recovery_radio_wrapper_keeps_the_abort_pair_and_bundles() {
+        const CHILD: &str = "GS_WRAPPED_PAIR_CHILD";
+        const NAME: &str = "comms::raw_uart_tests::the_recovery_radio_wrapper_keeps_the_abort_pair_and_bundles";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env_remove("GS_RADIO_TURN_TAKING")
+                .env_remove("GS_SIM_CLOCK_FILE")
+                .env_remove("GS_SIMULATED_SERIAL_PTY")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        crate::telemetry_schema::initialize().unwrap();
+        let pack = |name: &str, endpoint: &str, ts: u64, payload: &[u8]| {
+            serialize::pack_packet(
+                &Packet::new(
+                    crate::telemetry_schema::data_type(name),
+                    &[crate::telemetry_schema::endpoint(endpoint)],
+                    "GS",
+                    ts,
+                    std::sync::Arc::from(payload),
+                )
+                .unwrap(),
+            )
+            .to_vec()
+        };
+        let abort = pack("ABORT", "ABORT", 9, b"SEDS_MANUAL_ABORT_V1:K");
+        let state = pack("FLIGHT_STATE", "FLIGHT_STATE", 9, &[15]);
+        let heartbeat = pack("HEARTBEAT", "HEART_BEAT", 1_000, &[]);
+        let (mut peer, port) = serialport::TTYPort::pair().unwrap();
+        peer.set_timeout(Duration::from_millis(200)).unwrap();
+        let (uart, _mesh, _) = recovery_uart_fixture(port);
+        let expected_bundle = uart.bundle_frame_len(255, &heartbeat, Some((255, &heartbeat)));
+        assert!(expected_bundle.is_some() && uart.supports_abort_pair());
+        let config = crate::comms_config::CommsLinkConfig::Serial {
+            serial: crate::comms_config::SerialLinkConfig {
+                hardware_flow_control: false,
+                rfd_profile: None,
+                port: "/wrapped-uart-for-test".into(),
+                baud_rate: 115200,
+                protocol: SerialProtocol::RawUart,
+            },
+        };
+        let radio = crate::rrls_radio::RecoveryRadio::from_open(config, Box::new(uart)).unwrap();
+        let mut writer = radio.try_clone_tx().unwrap().unwrap();
+        assert!(radio.supports_abort_pair() && writer.supports_abort_pair());
+        assert_eq!(writer.bundle_frame_len(255, &heartbeat, Some((255, &heartbeat))), expected_bundle);
+        assert_eq!(writer.bundle_frame_len(255, &abort, None), None, "ABORT never bundles");
+        writer
+            .send_tracked_counted(&[(255, &abort[..]), (255, &state[..])], &[])
+            .expect("the pair through the wrapper");
+        let mut written = Vec::new();
+        let mut buf = [0u8; 1024];
+        while let Ok(n) = peer.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            written.extend_from_slice(&buf[..n]);
+        }
+        let contains = |frame: &[u8]| written.windows(frame.len()).any(|w| w == frame);
+        assert!(contains(&abort) && contains(&state), "ABORT and FLIGHT_STATE=15 in one write");
+    }
+
+    /// A listening RRLS's Abort egress admits the ABORT but not its
+    /// FLIGHT_STATE=15 (the RRLS is not the network-variable authority). Its
+    /// radio is also a RecoveryRadio, so it now offers the Abort pair: the
+    /// ABORT must still go, alone, as it did unpaired. (The pair returned
+    /// without writing either frame while reporting both complete.)
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_listening_rrls_sends_its_abort_when_the_pair_follower_is_declined() {
+        const CHILD: &str = "GS_RRLS_PAIR_CHILD";
+        const NAME: &str = "comms::raw_uart_tests::a_listening_rrls_sends_its_abort_when_the_pair_follower_is_declined";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env_remove("GS_RADIO_TURN_TAKING")
+                .env_remove("GS_SIM_CLOCK_FILE")
+                .env_remove("GS_SIMULATED_SERIAL_PTY")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        crate::telemetry_schema::initialize().unwrap();
+        let pack = |name: &str, endpoint: &str, ts: u64, payload: &[u8]| {
+            serialize::pack_packet(
+                &Packet::new(
+                    crate::telemetry_schema::data_type(name),
+                    &[crate::telemetry_schema::endpoint(endpoint)],
+                    "GS",
+                    ts,
+                    std::sync::Arc::from(payload),
+                )
+                .unwrap(),
+            )
+            .to_vec()
+        };
+        let abort = pack("ABORT", "ABORT", 9, b"SEDS_MANUAL_ABORT_V1:K");
+        let state = pack("FLIGHT_STATE", "FLIGHT_STATE", 9, &[15]);
+        let (mut peer, port) = serialport::TTYPort::pair().unwrap();
+        peer.set_timeout(Duration::from_millis(200)).unwrap();
+        let (mut uart, _primary, _) = recovery_uart_fixture(port);
+        let mut rrls = crate::rrls::Mesh::new(crate::rrls::Role::Rrls, 2);
+        let now = rrls.now();
+        rrls.open_abort_egress(now);
+        assert!(rrls.local_tx(false, &abort, now).is_some() && rrls.local_tx(false, &state, now).is_none());
+        uart.recovery = Some(Arc::new(Mutex::new(rrls)));
+        assert!(uart.supports_abort_pair());
+        uart.send_tracked_counted(&[(255, &abort[..]), (255, &state[..])], &[])
+            .expect("the ABORT goes");
+        let mut written = Vec::new();
+        let mut buf = [0u8; 1024];
+        while let Ok(n) = peer.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            written.extend_from_slice(&buf[..n]);
+        }
+        let contains = |frame: &[u8]| written.windows(frame.len()).any(|w| w == frame);
+        assert!(contains(&abort), "the ABORT is on the wire");
+        assert!(!contains(&state), "FLIGHT_STATE=15 stays off a listening RRLS's air");
     }
 
     /// Through the real writer: an Abort's first copy goes mid-turn, its
