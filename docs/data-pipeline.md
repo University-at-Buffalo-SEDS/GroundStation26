@@ -300,6 +300,20 @@ above 15 V (`telemetry_task/derived.rs:4-5`).
 | `MESSAGE_DATA` / `ORDERED_MESSAGE` | string | event | `recovery_events`, `flight_maxima` | messages table |
 | `LAUNCH_SITE` | f32[3] | echo | `launch_site::observe_echo` | |
 
+FC evaluation abort (FlightComputer26 `docs/rud-abort.md`): the operator's
+`EvaluationAbort` (FC byte 16) stops the FC estimator in every flight phase,
+so no automatic drogue or main follows; manual `DeployParachute` and
+`ExpandParachute` still work. The station sends it only on an explicit
+press (it is also allowed while the station Abort is latched,
+`gse.rs` `abort_safe_control`). The FC raises the same stop by itself only
+on a break-up between Launch and Apogee: the IMU tumbling (pitch/yaw rate of
+at least 360 deg/s) or loaded sideways (at least 5 g) on 22 of the last 25
+estimator steps, and at the same time the barometer altitude moving faster
+than 450 m/s on 12 of them. Either sensor alone, a transient, a dropout or
+a deployment or landing shock never triggers it. The FC then sends the
+ordered message `RUD: break-up detected; automatic deployment stopped`,
+which lands in the messages table like any other FC message.
+
 ### 2.7 RF board and power board
 
 - **RF:** `GPS_DATA`, `GPS_SATELLITE_NUMBER` and `GPS_STATUS`, each at 1 Hz (`RF_TELEMETRY_RATE_HZ 1`, RFBoard26 `Core/Inc/telemetry_rate.h:9`). `GPS_SATELLITE_NUMBER` goes through `handle_gps_satellite_count_packet`.
