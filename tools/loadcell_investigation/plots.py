@@ -20,6 +20,52 @@ def load(d, name):
 def s(z, k, col=0):
     return z[k + '__t'], z[k + '__v'][:, col]
 
+# MCP3564R codes. KG1000 arrives on the legacy raw scale (code * 2.2104 / 2^27), so
+# ADC-pin volts = code * 2.4 / 2^23. With DATA_FORMAT = 11 the ADC reports over range
+# (datasheet DS20006391C §5.6, Tables 5-7/5-8): |code| > 2^23 - 1 means the input is
+# beyond +/-VREF, accuracy is only kept to about +/-1.05 VREF, and there is no status bit.
+# Such samples are not measurements. The 0xB40000 plateau ("3.375 V") is one of them.
+CODE_FS = 2 ** 23
+LEGACY_PER_CODE = 2.2104 / 2 ** 27
+OVER_RANGE_LABEL = 'KG1000 over range (ADC)'
+# Firmware of the time converted the STM32 ADC1 VMON channel assuming VDDA = +3V3A = 3.3 V.
+VDDA_ASSUMED = 3.3
+
+def kg1000_code(raw):
+    return np.asarray(raw, float) / LEGACY_PER_CODE
+
+def over_range(code, flag=None):
+    """True where an MCP3564R sample is over range: |code| > 2^23 - 1, a published value of
+    +/-Inf (the new pipeline's marker), or a set over-range flag. NaN (no sample) is False."""
+    code = np.asarray(code, float)
+    m = np.abs(np.nan_to_num(code, nan=0.0)) > CODE_FS - 1
+    if flag is not None:
+        m |= np.nan_to_num(np.asarray(flag, float), nan=0.0) != 0
+    return m
+
+def runs(mask):
+    """(start, stop) index pairs of the True runs in mask, stop exclusive."""
+    d = np.diff(np.concatenate(([0], np.asarray(mask, int), [0])))
+    return list(zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1)))
+
+def spans(x, mask):
+    """x intervals covered by the True runs: from the first sample of a run to the sample
+    after it. Across a telemetry gap (or at the end of the data) the band stops one median
+    sample interval after the run's last sample, so a gap is not shown as over range."""
+    x = np.asarray(x, float)
+    dt = float(np.median(np.diff(x))) if len(x) > 1 else 0.0
+    return [(x[a], x[b] if b < len(x) and x[b] - x[b - 1] <= 4 * dt else x[b - 1] + dt) for a, b in runs(mask)]
+
+def shade(ax, intervals, label=None, strong=True):
+    """Hatched translucent band over each interval; only the first one carries the label."""
+    for i, (a, b) in enumerate(intervals):
+        ax.axvspan(a, b, facecolor=RED, alpha=0.13 if strong else 0.07, hatch='///' if strong else None,
+                   edgecolor=RED, lw=0, label=label if i == 0 else None)
+
+def without(y, mask):
+    """y with masked samples replaced by NaN, so the line breaks there instead of plotting them."""
+    return np.where(mask, np.nan, y)
+
 def panels(n, title, h=1.6):
     fig, ax = plt.subplots(n, 1, sharex=True, figsize=(8, h * n + 0.6))
     fig.suptitle(title, x=0.01, ha='left', fontsize=10, color=INK)
@@ -31,12 +77,16 @@ FIRE_T0_OFFSET_MS = 9200
 
 def fire_ignition(d, out):
     """Ignition window: KG1000, KG50, DAQ VMAIN and the gateway (GB) battery rail in
-    separate panels on one t - T0 axis. GB BATTERY_VOLTAGE is the gateway LTC2990 V1
+    separate panels on one t - T0 axis. KG1000 over-range samples are not plotted; their
+    intervals are shaded in every panel, and DAQ VMAIN inside them is marked as the VDDA
+    artifact (the gateway battery is the reference). GB BATTERY_VOLTAGE is the gateway LTC2990 V1
     through its 91k/10k divider (volts); BATTERY_CURRENT is its LTC2990 current channel
     (amps). Both arrive at about 1 Hz. Also writes every plotted sample of the window to
     fire-20261116-ignition.csv (wide, full resolution, t_s = t - T0; see write_wide_csv):
     kg1000_adc_pin_v, kg50_p6_input_mv, vmain_v, gb_battery_v, gb_battery_a and
-    ox_tank_psi. The 2.4 V full-scale line is a constant and not a CSV column."""
+    ox_tank_psi. kg1000_adc_pin_v keeps the over-range samples the figure leaves out (their
+    linear value, e.g. the 3.375 V plateau; over range where |code| > 2^23 - 1). The 2.4 V
+    full-scale line is a constant and not a CSV column."""
     from datetime import datetime, timezone
     from matplotlib.ticker import MultipleLocator
     z = load(d, '2026-11-17_00-59-46_065')
@@ -49,9 +99,12 @@ def fire_ignition(d, out):
     fig.suptitle(f'2026-11-16 test fire, ignition window. T0 = burn start = {t0_utc} UTC '
                  f'(recording 2026-11-17 00:59:46 UTC + {FIRE_T0_OFFSET_MS / 1000:g} s)',
                  x=0.01, ha='left', fontsize=10, color=INK)
-    m1 = win(t1)
-    ax[0].plot(rel(t1)[m1], k1[m1] * K, color=BLUE); ax[0].axhline(2.4, color=RED, lw=0.8, ls='--')
-    ax[0].set_ylabel('DAQ KG1000\nADC-pin V'); ax[0].text(lo_s + 0.2, 2.55, 'ADC full scale 2.4 V', color=RED, fontsize=8)
+    m1 = win(t1); ov = over_range(kg1000_code(k1)); band = spans(rel(t1)[m1], ov[m1])
+    ax[0].plot(rel(t1)[m1], without(k1[m1] * K, ov[m1]), color=BLUE); ax[0].axhline(2.4, color=RED, lw=0.8, ls='--')
+    ax[0].set_ylabel('DAQ KG1000\nADC-pin V'); ax[0].text(lo_s + 0.2, 2.45, 'ADC full scale 2.4 V', color=RED, fontsize=8)
+    ax[0].set_ylim(0, 2.9)
+    ax[0].text(lo_s + 0.2, 1.2, 'over range: code > 2^23−1 (plateau 0xB40000, the old "3.375 V"),\n'
+               'an overloaded ADC code, not a reading; not plotted', fontsize=8, color=RED)
     t5, k5 = s(z, 'DAQ|KG50'); m5 = win(t5)
     ax[1].plot(rel(t5)[m5], k5[m5] * 1000, color=ORANGE); ax[1].set_ylabel('DAQ KG50 (P6)\ninput mV')
     tp, vm = s(z, 'DAQ|DAQ_POWER_MONITOR', 2); mp = win(tp)
@@ -62,7 +115,12 @@ def fire_ignition(d, out):
     lo, hi = ax[2].get_ylim(); off = np.nanmedian(vg[mg]) - np.nanmedian(vm[mp & (rel(tp) > 0)])
     ax[3].set_ylim(lo + off, hi + off)
     ax[3].text(lo_s + 0.2, lo + off + 0.15 * (hi - lo), f'GB {np.nanmin(vg[mg]):.2f}–{np.nanmax(vg[mg]):.2f} V in this window; '
-               'same V/div as VMAIN panel', fontsize=8, color=MUTED)
+               'same V/div as VMAIN panel; the battery reference', fontsize=8, color=MUTED)
+    # VMAIN read through a lifted VDDA: implied +3V3A = 3.3 V x battery / VMAIN read.
+    pre = mp & (rel(tp) < 0)
+    vdda = VDDA_ASSUMED * np.nanmedian(vg[mg & (rel(tg) < 0)]) / np.nanmedian(vm[pre])
+    ax[2].text(lo_s + 0.2, lo + 0.35 * (hi - lo), f'DAQ VMAIN during KG1000 over range is a VDDA\n'
+               f'artifact: +3V3A lifted by the D24 clamp,\nimplied ≈ {vdda:.2f} V (3.3 V × GB / VMAIN)', fontsize=8, color=RED)
     ti, ig = s(z, 'GB|BATTERY_CURRENT'); mi = win(ti)
     ax[4].plot(rel(ti)[mi], ig[mi], color=MUTED, marker='o', ms=3, lw=0.8); ax[4].set_ylabel('Gateway (GB)\nbattery A (1 Hz)')
     ax[4].set_ylim(0, max(1.0, np.nanmax(ig[mi]) * 1.3))
@@ -71,11 +129,13 @@ def fire_ignition(d, out):
     ax[5].set_xlabel('t − T0 (s)')
     ax[5].set_xlim(lo_s, hi_s)
     ax[5].xaxis.set_major_locator(MultipleLocator(1)); ax[5].xaxis.set_minor_locator(MultipleLocator(0.25))
-    for a in ax:
+    for i, a in enumerate(ax):
+        shade(a, band, OVER_RANGE_LABEL if i == 0 else None, strong=i in (0, 2))
         a.axvline(0, color=RED, lw=0.9, ls=':')
         a.tick_params(axis='x', which='both', labelbottom=True, labelsize=7.5)
+    ax[0].legend(fontsize=7.5, loc='upper right', frameon=False)
     ax[0].text(0, 1.01, 'T0', transform=ax[0].get_xaxis_transform(), ha='center', va='bottom', fontsize=8, color=RED)
-    ax[5].text(0.2, 300, 'supply restored /\nburn starts', fontsize=8, color=MUTED)
+    ax[5].text(0.2, 300, 'KG1000 back in range, VMAIN\nartifact ends / burn starts', fontsize=8, color=MUTED)
     fig.tight_layout(); fig.savefig(os.path.join(out, 'fire-20261116-ignition.png'), dpi=110); plt.close(fig)
     write_wide_csv(os.path.join(out, 'fire-20261116-ignition.csv'), T0,
                    [('kg1000_adc_pin_v', t1[m1], k1[m1] * K), ('kg50_p6_input_mv', t5[m5], k5[m5] * 1000),
@@ -103,38 +163,56 @@ def write_wide_csv(path, t_ref, series):
             iso = datetime.fromtimestamp(tt / 1000, timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
             w.writerow([f'{(tt - t_ref) / 1000:.3f}', tt, iso] + vals)
 
+def battery_reference(ax, z, x):
+    """Gateway battery points on a VMAIN panel, when the recording has them."""
+    if 'GB|BATTERY_VOLTAGE__t' in z.files:
+        tg, vg = s(z, 'GB|BATTERY_VOLTAGE')
+        ax.plot(x(tg), vg, color=INK, ls='none', marker='o', ms=1.6, label='gateway battery (reference)')
+
+def kg1000_log_panels(z, title, n):
+    """Shared top of the minute-scale figures: KG1000 (log, over range removed and shaded)
+    and DAQ VMAIN with the gateway battery as reference."""
+    t1, k1 = s(z, 'DAQ|KG1000'); t0 = t1[0]
+    mins = lambda t: (t - t0) / 60000.0
+    ov = over_range(kg1000_code(k1)); band = spans(mins(t1), ov)
+    fig, ax = panels(n, title)
+    ax[0].plot(mins(t1), without(k1 * K, ov), color=BLUE, lw=0.6); ax[0].set_ylabel('KG1000 V'); ax[0].set_yscale('log')
+    ax[0].axhline(2.4, color=RED, lw=0.8, ls='--')
+    tp, vm = s(z, 'DAQ|DAQ_POWER_MONITOR', 2)
+    ax[1].plot(mins(tp), vm, color=AQUA, lw=0.6, label='DAQ VMAIN'); ax[1].set_ylabel('VMAIN V')
+    battery_reference(ax[1], z, mins)
+    ax[1].set_title('VMAIN "dips" occur with KG1000 over range: +3V3A (STM32 VDDA) lifted by the D24 clamp, '
+                    'not a supply dip', loc='left', fontsize=7.5, color=RED)
+    for i, a in enumerate(ax):
+        shade(a, band, OVER_RANGE_LABEL if i == 0 else None, strong=i < 2)
+    ax[0].legend(fontsize=7, loc='lower right', frameon=False); ax[1].legend(fontsize=7, loc='lower right', frameon=False)
+    return fig, ax, mins
+
 def fire_overview(d, out):
     """Whole 11-16 fire recording: KG1000, DAQ VMAIN, KG50 and the ADC die temperature on
     one minutes axis from the first KG1000 sample. Also writes every plotted sample to
-    fire-20261116-overview.csv (wide, full resolution; see write_wide_csv): kg1000_adc_pin_v,
-    vmain_v, kg50_p6_input_mv (only after 0.4 min, as plotted; the panel's y-limits
-    3.6-3.95 mV clip a few points that are still in the CSV) and adc_die_temp_c. The
-    dashed 0.2126 V calibrated-zero line is a constant and not a CSV column."""
+    fire-20261116-overview.csv (wide, full resolution; see write_wide_csv): kg1000_adc_pin_v
+    (including the over-range samples the figure leaves out), vmain_v, kg50_p6_input_mv (only after 0.4 min, as plotted; the panel's y-limits 3.6-3.95 mV clip
+    a few points that are still in the CSV) and adc_die_temp_c. The dashed 0.2126 V
+    calibrated-zero line is a constant and not a CSV column."""
     z = load(d, '2026-11-17_00-59-46_065')
-    t1, k1 = s(z, 'DAQ|KG1000'); t0 = t1[0]
-    mins = lambda t: (t - t0) / 60000.0
-    fig, ax = panels(4, '2026-11-16 test fire, whole recording (28 min)')
-    ax[0].plot(mins(t1), k1 * K, color=BLUE, lw=0.6); ax[0].set_ylabel('KG1000 V'); ax[0].set_yscale('log')
+    fig, ax, mins = kg1000_log_panels(z, '2026-11-16 test fire, whole recording (28 min)', 4)
     ax[0].axhline(0.2126, color=MUTED, lw=0.8, ls='--'); ax[0].text(20, 0.3, 'calibrated zero 0.213 V', fontsize=8, color=MUTED)
-    tp, vm = s(z, 'DAQ|DAQ_POWER_MONITOR', 2)
-    ax[1].plot(mins(tp), vm, color=AQUA, lw=0.6); ax[1].set_ylabel('VMAIN V')
     t5, k5 = s(z, 'DAQ|KG50'); g = mins(t5) > 0.4
     ax[2].plot(mins(t5)[g], k5[g] * 1000, color=ORANGE, lw=0.6); ax[2].set_ylabel('KG50 input mV'); ax[2].set_ylim(3.6, 3.95)
     tt, tc = s(z, 'DAQ|DAQ_ADC_TEMPERATURE')
     ax[3].plot(mins(tt), tc, color=YELLOW, lw=0.8); ax[3].set_ylabel('ADC die °C'); ax[3].set_xlabel('minutes')
     fig.tight_layout(); fig.savefig(os.path.join(out, 'fire-20261116-overview.png'), dpi=110); plt.close(fig)
-    write_wide_csv(os.path.join(out, 'fire-20261116-overview.csv'), t0,
-                   [('kg1000_adc_pin_v', t1, k1 * K), ('vmain_v', tp, vm),
-                    ('kg50_p6_input_mv', t5[g], k5[g] * 1000), ('adc_die_temp_c', tt, tc)])
+    t1, k1 = s(z, 'DAQ|KG1000')
+    tp, vm = s(z, 'DAQ|DAQ_POWER_MONITOR', 2)
+    write_wide_csv(os.path.join(out, 'fire-20261116-overview.csv'), t1[0],
+                   [('kg1000_adc_pin_v', t1, k1 * K), ('vmain_v', tp, vm), ('kg50_p6_input_mv', t5[g], k5[g] * 1000), ('adc_die_temp_c', tt, tc)])
 
 def rail_1106(d, out):
     z = load(d, '2026-11-06_22-51-01_544')
-    t1, k1 = s(z, 'DAQ|KG1000'); t0 = t1[0]
-    mins = lambda t: (t - t0) / 60000.0
-    fig, ax = panels(2, '2026-11-06 17:51 local: KG1000 rails with supply dips and keeps a +16 kg zero shift')
-    ax[0].plot(mins(t1), k1 * K, color=BLUE, lw=0.6); ax[0].set_ylabel('KG1000 V'); ax[0].set_yscale('log')
-    tp, vm = s(z, 'DAQ|DAQ_POWER_MONITOR', 2)
-    ax[1].plot(mins(tp), vm, color=AQUA, lw=0.6); ax[1].set_ylabel('VMAIN V'); ax[1].set_xlabel('minutes')
+    fig, ax, mins = kg1000_log_panels(z, '2026-11-06: DAQ VMAIN dips only with KG1000 over range; '
+                                      'no telemetry 10.9–38 min', 2)
+    ax[1].set_xlabel('minutes')
     fig.tight_layout(); fig.savefig(os.path.join(out, 'rail-20261106.png'), dpi=110); plt.close(fig)
 
 def calibration_steps(out):
