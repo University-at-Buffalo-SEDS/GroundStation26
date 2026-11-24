@@ -112,30 +112,9 @@ pub(crate) fn report_python() -> String {
     })
 }
 
-pub async fn report(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Query(query): Query<ReportQuery>,
-) -> Response {
-    if let Err(e) = crate::web::authorize_headers(&state, &headers, Permission::ViewData).await {
-        return e;
-    }
-    if query.request.len() > 24_000 {
-        return (StatusCode::BAD_REQUEST, "Report selection is too large.").into_response();
-    }
-    let mut request: serde_json::Value = match serde_json::from_str(&query.request) {
-        Ok(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
-        _ => return (StatusCode::BAD_REQUEST, "Invalid report selection.").into_response(),
-    };
-    let format = request["format"].as_str().unwrap_or("preview").to_owned();
-    let content_type = match format.as_str() {
-        "preview" => "application/json",
-        "csv" | "daq_csv" => "text/csv; charset=utf-8",
-        "daq_tsv" => "text/tab-separated-values; charset=utf-8",
-        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "pdf" => "application/pdf",
-        _ => return (StatusCode::BAD_REQUEST, "Choose CSV, DAQ SD CSV/TSV, Excel or PDF.").into_response(),
-    };
+/// The station's side of a report request: the export-time context, the
+/// data root and the recording files, whatever the client sent for them.
+async fn prepare(state: &Arc<AppState>, mut request: serde_json::Value) -> Result<serde_json::Value, (StatusCode, String)> {
     // These names are export-time station configuration, not historical state.
     // Override any client-supplied mapping; numeric saved values remain intact.
     if let serde_json::Value::Object(context) = context() {
@@ -144,7 +123,7 @@ pub async fn report(
         }
     }
     // The root is always server-controlled, regardless of request JSON.
-    let root = crate::recording_export::directory(&state);
+    let root = crate::recording_export::directory(state);
     request["root"] = root.to_string_lossy().into_owned().into();
     // The server resolves the files: one selected recording (any kind), or
     // the ring plus legacy files for "all recordings".
@@ -160,18 +139,21 @@ pub async fn report(
     } else {
         match crate::recording_export::recording_path(&root, &selected).await {
             Ok(path) => vec![serde_json::json!([selected, path.to_string_lossy()])],
-            Err(_) => return (StatusCode::NOT_FOUND, "Recording not found. Refresh the recording list.").into_response(),
+            Err(_) => return Err((StatusCode::NOT_FOUND, "Recording not found. Refresh the recording list.".into())),
         }
     };
     request["files"] = files.into();
-    static JOBS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
-    let Ok(_permit) = JOBS.try_acquire() else {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            "Another report is being prepared. Retry when it finishes.",
-        )
-            .into_response();
-    };
+    Ok(request)
+}
+
+/// One report job at a time across the station.
+static JOBS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+/// Runs the report worker on a prepared request. `wait`: queue behind a
+/// running job instead of answering 429 (bundle exports).
+async fn run_worker(request: &serde_json::Value, wait: bool) -> Result<Vec<u8>, (StatusCode, String)> {
+    let busy = || (StatusCode::TOO_MANY_REQUESTS, "Another report is being prepared. Retry when it finishes.".to_owned());
+    let _permit = if wait { JOBS.acquire().await.map_err(|_| busy())? } else { JOBS.try_acquire().map_err(|_| busy())? };
     let output = tokio::time::timeout(Duration::from_secs(120), async {
         let mut child = tokio::process::Command::new(report_python())
             .args(["-c", include_str!("recording_report.py")])
@@ -191,32 +173,62 @@ pub async fn report(
         Ok(Ok(out)) => out,
         Ok(Err(e)) => {
             log::error!("Report worker: {e}");
-            return (StatusCode::SERVICE_UNAVAILABLE,"Report worker unavailable. Install Python 3 or set GS_REPORT_PYTHON on the backend.").into_response();
+            return Err((StatusCode::SERVICE_UNAVAILABLE, "Report worker unavailable. Install Python 3 or set GS_REPORT_PYTHON on the backend.".into()));
         }
-        Err(_) => {
-            return (
-                StatusCode::REQUEST_TIMEOUT,
-                "Report exceeded two minutes. Select a smaller time window or fewer channels.",
-            )
-                .into_response();
-        }
+        Err(_) => return Err((StatusCode::REQUEST_TIMEOUT, "Report exceeded two minutes. Select a smaller time window or fewer channels.".into())),
     };
     if !output.status.success() {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            String::from_utf8_lossy(&output.stderr)
-                .chars()
-                .take(1500)
-                .collect::<String>(),
-        )
-            .into_response();
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, String::from_utf8_lossy(&output.stderr).chars().take(1500).collect()));
     }
+    Ok(output.stdout)
+}
+
+/// The report studio's standard report of one recording (all channels, the
+/// whole recording) in `format`, its document time pinned to `generated_ms`,
+/// for a replay bundle. Waits for a running report job.
+pub(crate) async fn standard(state: &Arc<AppState>, id: &str, format: &str, generated_ms: i64) -> Result<Vec<u8>, (StatusCode, String)> {
+    let request = serde_json::json!({"recording": id, "format": format, "channels": null, "generated_ms": generated_ms});
+    run_worker(&prepare(state, request).await?, true).await
+}
+
+pub async fn report(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<ReportQuery>,
+) -> Response {
+    if let Err(e) = crate::web::authorize_headers(&state, &headers, Permission::ViewData).await {
+        return e;
+    }
+    if query.request.len() > 24_000 {
+        return (StatusCode::BAD_REQUEST, "Report selection is too large.").into_response();
+    }
+    let request: serde_json::Value = match serde_json::from_str(&query.request) {
+        Ok(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
+        _ => return (StatusCode::BAD_REQUEST, "Invalid report selection.").into_response(),
+    };
+    let format = request["format"].as_str().unwrap_or("preview").to_owned();
+    let content_type = match format.as_str() {
+        "preview" => "application/json",
+        "csv" | "daq_csv" => "text/csv; charset=utf-8",
+        "daq_tsv" => "text/tab-separated-values; charset=utf-8",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "pdf" => "application/pdf",
+        _ => return (StatusCode::BAD_REQUEST, "Choose CSV, DAQ SD CSV/TSV, Excel or PDF.").into_response(),
+    };
+    let output = match prepare(&state, request).await {
+        Ok(request) => run_worker(&request, false).await,
+        Err(error) => Err(error),
+    };
+    let output = match output {
+        Ok(output) => output,
+        Err((status, message)) => return (status, message).into_response(),
+    };
     let mut response = (
         [
             (header::CONTENT_TYPE, content_type),
             (header::CACHE_CONTROL, "no-store"),
         ],
-        output.stdout,
+        output,
     )
         .into_response();
     if format != "preview" {

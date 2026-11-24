@@ -86,6 +86,12 @@ pub(crate) struct Options {
     /// Media directories; the station's own when `None` (tests set them).
     #[serde(skip)]
     pub media_dirs: Option<crate::recording_bundle_media::MediaDirs>,
+    /// Include the report studio's standard Excel and PDF reports
+    /// (`recording_bundle_exports::reports`).
+    #[serde(default, deserialize_with = "crate::recording_bundle_exports::flag")]
+    pub reports: bool,
+    /// Report budget in MiB (default 16, at most 64).
+    pub reports_max_mb: Option<u32>,
 }
 
 pub(crate) fn routes() -> Router<Arc<AppState>> {
@@ -320,6 +326,11 @@ pub(crate) async fn build(
             continue;
         }
         entries.add(&path, bytes, media_type, None);
+    }
+    if options.reports {
+        for (path, bytes, media_type) in crate::recording_bundle_exports::reports(&state, id, now_ms, options.reports_max_mb).await {
+            entries.add(&path, bytes, media_type, None);
+        }
     }
 
     // Recovery search tracks from the recording's start until a few hours
