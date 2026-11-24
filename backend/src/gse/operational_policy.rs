@@ -1328,6 +1328,20 @@ mod tests {
         }
         assert_eq!(command_allowed(&state, &TelemetryCommand::NitrogenTest), Some(false));
         state.gse.lock().unwrap().observe_pressure(Some(0.0));
+        // The fill boards kept reporting through the real 2 s wait (a loaded
+        // host can stretch it toward their 5 s presence window); only the
+        // pressure sample is the stale input under test.
+        for board in [
+            Board::GatewayBoard,
+            Board::ValveBoard,
+            Board::ActuatorBoard,
+            Board::DaqBoard,
+        ] {
+            state.mark_board_seen(
+                board.sender_id(),
+                crate::telemetry_task::get_current_timestamp_ms(),
+            );
+        }
         assert_eq!(command_allowed(&state, &TelemetryCommand::NitrogenTest), Some(true));
         cleanup(&state);
     }
