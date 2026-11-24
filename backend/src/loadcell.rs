@@ -2409,7 +2409,8 @@ mod channel_save_tests {
         current
             .thermal
             .insert("KG1000".into(), ThermalCalibration::default());
-        sync_extra_channels_into_legacy(&mut current);
+        // Also stamps each load cell with its MCP3564R reference.
+        normalize_calibration(&mut current);
         let original = json(&current);
         let mut stale = LoadcellCalibrationFile::default();
         normalize_calibration(&mut stale);
