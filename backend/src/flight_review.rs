@@ -158,6 +158,8 @@ fn archive_report(record: &crate::fire_archive::FireRecord, curve: Vec<[f64; 2]>
         kg1000_impulse_ns: 0.0,
         kg50_term_ns: 0.0,
         startup_fill_impulse_ns: 0.0,
+        impulse_lower_bound: false,
+        over_range_gap_s: 0.0,
         archive_id: Some(record.id.clone()),
         tank_curve: Vec::new(),
         chamber_curve: Vec::new(),

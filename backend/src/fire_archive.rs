@@ -332,7 +332,10 @@ pub(crate) fn ingest(
         simulated: report.simulated,
         review: Review {
             status: "pending".into(),
-            exclude_from_fit: report.simulated,
+            // An over-range thrust gap leaves only a lower-bound impulse (the
+            // report's `*_over_range` quality flag says where): kept out of
+            // the motor fit until the operator reviews it.
+            exclude_from_fit: report.simulated || report.impulse_lower_bound,
             ..Default::default()
         },
         supercharge_psi,

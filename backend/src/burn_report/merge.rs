@@ -122,10 +122,11 @@ pub(crate) fn parse_daq_line(line: &str) -> Option<(Channel, Sample)> {
         .into_iter()
         .find(|c| c.daq_sensor() == sensor)?;
     let t_ms = fields[0].trim().parse::<i64>().ok()?;
+    // `inf` / `-inf` is an over-range bin (format v4): kept as the marker.
     let value = [3usize, 6]
         .iter()
         .filter_map(|i| fields.get(*i).and_then(|f| f.trim().parse::<f64>().ok()))
-        .find(|v| v.is_finite())?;
+        .find(|v| !v.is_nan())?;
     Some((
         channel,
         Sample {

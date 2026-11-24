@@ -303,7 +303,7 @@ fn live_log_and_cache_feed_the_live_summary() {
             timestamp_ms: r.t_ms,
             data_type: r.data_type.clone(),
             sender_id: r.sender.clone(),
-            values: r.values.iter().map(|v| v.map(|x| x as f32)).collect(),
+            values: r.values.iter().map(|v| v.map(|x| x as f32)).collect(), over_range: 0, over_range_low: 0,
         })
         .collect();
     let from = ms(-20.0) + 7_777; // a window this test alone uses

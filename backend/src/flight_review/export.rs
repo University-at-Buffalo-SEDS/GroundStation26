@@ -465,7 +465,11 @@ fn readme(kind: &str, prov: &Provenance, files: &[(&str, &str)]) -> String {
 fn row_values_csv(row: &Row) -> String {
     row.values
         .iter()
-        .map(|v| v.map_or(String::new(), |v| format!("{v}")))
+        .map(|v| match v {
+            Some(v) if v.is_infinite() => crate::over_range::csv_marker(*v < 0.0).to_string(),
+            Some(v) => format!("{v}"),
+            None => String::new(),
+        })
         .collect::<Vec<_>>()
         .join(",")
 }

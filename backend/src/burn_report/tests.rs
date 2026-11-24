@@ -718,3 +718,42 @@ fn firmware_sim_captures_are_simulated_in_any_mode() {
     m.simulated = true;
     assert!(meta_for(&m, "f", 0).simulated);
 }
+
+/// The real fire with KG1000 over range: a 0.3 s stretch inside the burn is
+/// a reported gap (impulse lower bound, no Inf integrated); one or two
+/// samples within 5 ms are bridged; an over-range SD value is a marker.
+#[test]
+fn over_range_thrust_samples_are_bridged_or_reported_never_integrated() {
+    let t0 = 1_800_000_000_000i64;
+    let build = |over: &dyn Fn(f64) -> bool| {
+        let mut inputs = Inputs { valve_open_ms: vec![t0], ..Default::default() };
+        for (name, ty, sender) in [("kg1000_kg", "LOADCELL_WEIGHT_KG", "DAQ"), ("kg50_kg", "LOADCELL_50_WEIGHT_KG", "DAQ"), ("tank_psi", "PRESSURE_TRANSDUCER_CALIBRATED", "VB")] {
+            for (t, v) in window_channel(name) {
+                let v = if name == "kg1000_kg" && over(t) { f64::INFINITY } else { v };
+                inputs.push_gs(t0 + (t * 1000.0).round() as i64, ty, sender, &[Some(v)]);
+            }
+        }
+        let meta = Meta { id: "fire".into(), capture_id: None, capture_label: "fire".into(), mode: "test_fire".into(), simulated: false, created_ms: 0 };
+        compute(&inputs, meta).unwrap()
+    };
+    let clean = build(&|_| false);
+    assert!(!clean.impulse_lower_bound && clean.over_range_gap_s == 0.0);
+    let gap = build(&|t| (1.0..1.3).contains(&t));
+    assert!(gap.impulse_lower_bound);
+    assert!(gap.over_range_gap_s > 0.2 && gap.over_range_gap_s < 0.35, "{}", gap.over_range_gap_s);
+    assert!(gap.total_impulse_ns.is_finite() && gap.peak_thrust_n.is_finite());
+    let flag = gap.quality_flags.iter().find(|f| f.code == "kg1000_over_range").expect("gap flag");
+    assert_eq!(flag.severity, "bad");
+    assert!(flag.message.contains("lower bound"), "{}", flag.message);
+    assert!(gap.flags.contains(&"kg1000_over_range".to_string()));
+    // Gap detection on its own: two samples 1 ms apart are bridged, three are not.
+    let s = |t_ms: i64, value: f64| Sample { t_ms, value, source: Source::DaqSd };
+    let gaps = over_range_gaps(&[s(0, 1.0), s(1, f64::INFINITY), s(2, f64::INFINITY), s(3, 1.0), s(10, f64::NEG_INFINITY), s(11, f64::NEG_INFINITY), s(12, f64::NEG_INFINITY), s(13, 1.0)]);
+    assert_eq!(gaps.len(), 2);
+    assert!(gaps[0].bridged() && !gaps[0].low);
+    assert!(!gaps[1].bridged() && gaps[1].low);
+    assert!(!OverRangeGap { start_ms: 0, end_ms: 6, samples: 2, low: false }.bridged(), "longer than 5 ms");
+    // An over-range DAQ SD value is kept as the marker, not skipped.
+    let (_, sample) = merge::parse_daq_line("1794877195300,1234,kg1000_network,inf,,,inf,network,,,1234,1000,9").unwrap();
+    assert!(sample.value.is_infinite() && sample.value > 0.0);
+}

@@ -125,6 +125,62 @@ pub struct BurnReport {
     /// The hybrid motor model's prediction for this fill and tank pressure, for the overlay.
     #[serde(default)]
     pub predicted: Option<Predicted>,
+    /// A thrust load cell was over range (beyond the ADC's full scale) for
+    /// longer than can be bridged inside the burn: the impulse is a lower
+    /// bound (above +full scale) or unknown there.
+    #[serde(default)]
+    pub impulse_lower_bound: bool,
+    /// Total over-range time of the thrust load cells inside the analysed
+    /// window that was not bridged, s.
+    #[serde(default)]
+    pub over_range_gap_s: f64,
+}
+
+/// An over-range stretch this short is bridged by the curve (its samples are
+/// left out and the neighbours carry the curve): at most this many samples
+/// and this long. 2 samples / 5 ms at the DAQ's 1 kHz raw rate is a quarter
+/// of the 20 ms publish bin and far below the motor's ~100 ms thrust rise,
+/// so leaving it out changes the impulse by well under 0.1 %; anything
+/// longer can hide the thrust peak and is reported as a gap instead.
+pub(crate) const OVER_RANGE_BRIDGE_MAX_SAMPLES: usize = 2;
+pub(crate) const OVER_RANGE_BRIDGE_MAX_MS: i64 = 5;
+
+/// One over-range stretch of a channel: consecutive over-range samples.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct OverRangeGap {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub samples: usize,
+    pub low: bool,
+}
+
+impl OverRangeGap {
+    pub(crate) fn bridged(&self) -> bool {
+        self.samples <= OVER_RANGE_BRIDGE_MAX_SAMPLES && self.end_ms - self.start_ms <= OVER_RANGE_BRIDGE_MAX_MS
+    }
+}
+
+/// Over-range stretches of a time-sorted series whose over-range samples are
+/// ±Inf markers.
+pub(crate) fn over_range_gaps(series: &[Sample]) -> Vec<OverRangeGap> {
+    let mut gaps: Vec<OverRangeGap> = Vec::new();
+    let mut open = false;
+    for s in series {
+        if s.value.is_infinite() {
+            match gaps.last_mut() {
+                Some(gap) if open => {
+                    gap.end_ms = s.t_ms;
+                    gap.samples += 1;
+                    gap.low |= s.value < 0.0;
+                }
+                _ => gaps.push(OverRangeGap { start_ms: s.t_ms, end_ms: s.t_ms, samples: 1, low: s.value < 0.0 }),
+            }
+            open = true;
+        } else {
+            open = false;
+        }
+    }
+    gaps
 }
 
 /// The hybrid motor model's prediction of a burn (docs/hybrid-motor-model.md section 7).
@@ -242,6 +298,7 @@ impl Inputs {
             .unwrap_or(&[])
     }
     /// Adds one station telemetry row (any type; others are ignored).
+    /// `values` may carry ±Inf over-range markers (TelemetryRow::marked_values).
     pub(crate) fn push_gs(
         &mut self,
         t_ms: i64,
@@ -258,7 +315,8 @@ impl Inputs {
         let Some(channel) = Channel::from_gs(data_type, sender) else {
             return;
         };
-        if let Some(value) = values.first().copied().flatten().filter(|v| v.is_finite()) {
+        // ±Inf is kept as the over-range marker (compute() never integrates it).
+        if let Some(value) = values.first().copied().flatten().filter(|v| !v.is_nan()) {
             self.channels.entry(channel).or_default().push(Sample {
                 t_ms,
                 value,
@@ -309,7 +367,8 @@ fn ignition(inputs: &Inputs) -> Option<(i64, &'static str)> {
     {
         return Some((t, "main_valve_open"));
     }
-    let mut sorted: Vec<&Sample> = k50.iter().collect();
+    // Over-range markers carry no level for the unloading detection.
+    let mut sorted: Vec<&Sample> = k50.iter().filter(|s| s.value.is_finite()).collect();
     sorted.sort_by_key(|s| s.t_ms);
     for (i, s) in sorted.iter().enumerate() {
         let before: Vec<f64> = sorted[..i]
@@ -326,7 +385,7 @@ fn ignition(inputs: &Inputs) -> Option<(i64, &'static str)> {
         if next.len() == 5 && median(next).is_some_and(|m| m < base - 3.0) {
             let k1k_first = k1k
                 .iter()
-                .filter(|p| p.value > 20.0 && p.value < 600.0)
+                .filter(|p| p.value.is_finite() && p.value > 20.0 && p.value < 600.0)
                 .map(|p| p.t_ms)
                 .min();
             let t = k1k_first.map_or(s.t_ms, |k| k.min(s.t_ms));
@@ -349,15 +408,27 @@ pub(crate) struct Meta {
 pub(crate) fn compute(inputs: &Inputs, meta: Meta) -> Result<BurnReport, String> {
     let (t0, ignition_source) =
         ignition(inputs).ok_or("no burn found (no valve open and no load-cell unloading)")?;
+    // Over-range samples (±Inf markers) never enter the curve: a short
+    // stretch is bridged by its neighbours, a longer one is a reported gap.
     let rel = |channel: Channel| -> Vec<(f64, f64)> {
         let mut v: Vec<(f64, f64)> = inputs
             .series(channel)
             .iter()
-            .filter(|s| s.t_ms >= t0 - PRE_MS && s.t_ms <= t0 + POST_MS)
+            .filter(|s| s.t_ms >= t0 - PRE_MS && s.t_ms <= t0 + POST_MS && s.value.is_finite())
             .map(|s| ((s.t_ms - t0) as f64 / 1000.0, s.value))
             .collect();
         v.sort_by(|a, b| a.0.total_cmp(&b.0));
         v
+    };
+    let gaps = |channel: Channel| -> Vec<OverRangeGap> {
+        let mut series: Vec<Sample> = inputs
+            .series(channel)
+            .iter()
+            .filter(|s| s.t_ms >= t0 - PRE_MS && s.t_ms <= t0 + POST_MS)
+            .copied()
+            .collect();
+        series.sort_by_key(|s| s.t_ms);
+        over_range_gaps(&series)
     };
     let kg1000 = rel(Channel::Kg1000);
     let kg50 = rel(Channel::Kg50);
@@ -366,6 +437,49 @@ pub(crate) fn compute(inputs: &Inputs, meta: Meta) -> Result<BurnReport, String>
     }
     let thrust = thrust::extract(&kg1000, &kg50, &thrust::Config::default())?;
     let mut flags = thrust.flags.clone();
+    let mut impulse_lower_bound = false;
+    let mut over_range_gap_ms = 0i64;
+    for (channel, name) in [(Channel::Kg1000, "KG1000"), (Channel::Kg50, "KG50")] {
+        let gaps = gaps(channel);
+        let bridged = gaps.iter().filter(|g| g.bridged()).count();
+        if bridged > 0 {
+            flags.push(Flag::new(
+                &format!("{}_over_range_bridged", name.to_lowercase()),
+                "info",
+                format!("{name} was over range in {bridged} short stretch(es) (at most {OVER_RANGE_BRIDGE_MAX_SAMPLES} samples / {OVER_RANGE_BRIDGE_MAX_MS} ms each); the curve bridges them"),
+            ));
+        }
+        let open: Vec<&OverRangeGap> = gaps.iter().filter(|g| !g.bridged()).collect();
+        if !open.is_empty() {
+            let ms: i64 = open.iter().map(|g| (g.end_ms - g.start_ms).max(1)).sum();
+            over_range_gap_ms += ms;
+            let high = open.iter().any(|g| !g.low);
+            impulse_lower_bound |= high;
+            let first = (open[0].start_ms - t0) as f64 / 1000.0;
+            flags.push(Flag::new(
+                &format!("{}_over_range", name.to_lowercase()),
+                "bad",
+                format!(
+                    "{name} over range (beyond the ADC full scale) for {:.3} s in {} gap(s) from T{first:+.2} s: no data there{}",
+                    ms as f64 / 1000.0,
+                    open.len(),
+                    if high { "; the total impulse is a lower bound" } else { "" }
+                ),
+            ));
+        }
+    }
+    let chamber_gaps = gaps(Channel::Chamber);
+    if !chamber_gaps.is_empty() {
+        let ms: i64 = chamber_gaps.iter().map(|g| (g.end_ms - g.start_ms).max(1)).sum();
+        flags.push(Flag::new(
+            "chamber_over_range",
+            "bad",
+            format!(
+                "chamber PT over range for {:.3} s (overpressure or sensor fault): its peak is a lower bound",
+                ms as f64 / 1000.0
+            ),
+        ));
+    }
     let tank = rel(Channel::Tank);
     let tank_at = median(
         tank.iter()
@@ -491,6 +605,8 @@ pub(crate) fn compute(inputs: &Inputs, meta: Meta) -> Result<BurnReport, String>
         tank_curve: binned(&tank, 12.0),
         chamber_curve: if chamber_valid { binned(&chamber_rel, 12.0) } else { Vec::new() },
         predicted,
+        impulse_lower_bound,
+        over_range_gap_s: over_range_gap_ms as f64 / 1000.0,
     })
 }
 
@@ -648,7 +764,7 @@ fn live_tick(state: &Arc<AppState>, now: i64) {
                 .filter(|r| r.timestamp_ms >= capture.window_start_ms)
             {
                 let values: Vec<Option<f64>> =
-                    row.values.iter().map(|v| v.map(f64::from)).collect();
+                    row.marked_values().iter().map(|v| v.map(f64::from)).collect();
                 inputs.push_gs(row.timestamp_ms, &row.data_type, &row.sender_id, &values);
             }
         }
@@ -700,17 +816,24 @@ async fn read_capture_telemetry(db_path: &Path, inputs: &mut Inputs) -> anyhow::
     use sqlx::Row;
     let url = format!("sqlite://{}?mode=ro", db_path.display());
     let pool = sqlx::SqlitePool::connect(&url).await?;
-    let rows = sqlx::query(
+    let over_range = if crate::over_range::table_has_column(&pool, "telemetry").await { "over_range" } else { "NULL" };
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT COALESCE(source_timestamp_ms, timestamp_ms) AS t, data_type, COALESCE(sender_id,'') AS sender, \
-         COALESCE(values_json,'[]') AS v FROM telemetry WHERE data_type IN \
+         COALESCE(values_json,'[]') AS v, {over_range} AS over_range FROM telemetry WHERE data_type IN \
          ('LOADCELL_WEIGHT_KG','LOADCELL_50_WEIGHT_KG','PRESSURE_TRANSDUCER_CALIBRATED','COMBUSTION_CHAMBER_PRESSURE','VALVE_STATE') \
-         ORDER BY t",
-    )
+         ORDER BY t"
+    )))
     .fetch_all(&pool)
     .await?;
     for row in rows {
-        let values: Vec<Option<f64>> =
+        let mut values: Vec<Option<f64>> =
             serde_json::from_str(&row.get::<String, _>("v")).unwrap_or_default();
+        let (mask, low) = crate::over_range::unpack(row.try_get::<Option<i64>, _>("over_range").ok().flatten());
+        for (i, value) in values.iter_mut().enumerate().take(32) {
+            if mask & (1 << i) != 0 {
+                *value = Some(if low & (1 << i) != 0 { f64::NEG_INFINITY } else { f64::INFINITY });
+            }
+        }
         inputs.push_gs(
             row.get::<i64, _>("t"),
             &row.get::<String, _>("data_type"),

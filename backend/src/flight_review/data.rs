@@ -111,6 +111,15 @@ fn wanted(data_type: &str, sender: &str) -> bool {
         || sender == "DAQ_SD"
 }
 
+/// Over-range positions as ±Inf markers.
+fn mark(values: &mut [Option<f64>], (mask, low): (u32, u32)) {
+    for (i, value) in values.iter_mut().enumerate().take(32) {
+        if mask & (1 << i) != 0 {
+            *value = Some(if low & (1 << i) != 0 { f64::NEG_INFINITY } else { f64::INFINITY });
+        }
+    }
+}
+
 fn parse_values(json: Option<&str>) -> Vec<Option<f64>> {
     json.and_then(|j| serde_json::from_str::<Vec<Option<f64>>>(j).ok())
         .unwrap_or_default()
@@ -132,8 +141,11 @@ pub(crate) async fn read_pool(db: &SqlitePool, from_ms: Option<i64>, to_ms: Opti
     let slack = 120_000;
     let lo = from_ms.map_or(i64::MIN, |f| f.saturating_sub(slack));
     let hi = to_ms.map_or(i64::MAX, |t| t.saturating_add(slack));
+    // Over-range values (null + the over_range column) become ±Inf markers:
+    // `Row::v` never returns them, the burn report treats them as gaps.
+    let over_range = if crate::over_range::table_has_column(db, "telemetry").await { "over_range" } else { "NULL" };
     let sql = format!(
-        "SELECT COALESCE(source_timestamp_ms, timestamp_ms) AS t, data_type, COALESCE(sender_id,'') AS sender, values_json, payload_json \
+        "SELECT COALESCE(source_timestamp_ms, timestamp_ms) AS t, data_type, COALESCE(sender_id,'') AS sender, values_json, payload_json, {over_range} AS over_range \
          FROM telemetry WHERE (data_type IN ({list}) OR data_type LIKE 'SIM\\_%' ESCAPE '\\' OR data_type LIKE '%TEMP%' \
          OR data_type LIKE 'DAQ\\_SD\\_%' ESCAPE '\\' OR sender_id = 'DAQ_SD') \
          AND (timestamp_ms BETWEEN ? AND ? OR data_type = 'GS_STATION_MODE') ORDER BY t LIMIT ?"
@@ -153,11 +165,13 @@ pub(crate) async fn read_pool(db: &SqlitePool, from_ms: Option<i64>, to_ms: Opti
             continue;
         }
         let values_json: Option<String> = row.try_get("values_json").ok().flatten();
+        let mut values = parse_values(values_json.as_deref());
+        mark(&mut values, crate::over_range::unpack(row.try_get::<Option<i64>, _>("over_range").ok().flatten()));
         data.rows.push(Row {
             t_ms: row.try_get("t")?,
             data_type: crate::telemetry_schema::canonical_type_name(&data_type).to_owned(),
             sender,
-            values: parse_values(values_json.as_deref()),
+            values,
             payload: row.try_get("payload_json").ok().flatten(),
         });
     }
@@ -203,7 +217,7 @@ pub(crate) fn from_cache<'a>(rows: impl IntoIterator<Item = &'a TelemetryRow>, f
             t_ms: row.timestamp_ms,
             data_type: data_type.to_owned(),
             sender: row.sender_id.clone(),
-            values: row.values.iter().map(|v| v.map(f64::from)).collect(),
+            values: row.marked_values().iter().map(|v| v.map(f64::from)).collect(),
             payload: None,
         });
     }

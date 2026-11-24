@@ -194,11 +194,13 @@ impl Runtime {
         for sample in self.kg50.iter_mut().chain(self.kg1000.iter_mut()) { sample.at.invalidate(); }
     }
     fn observe_sample(&mut self, sensor: &str, raw: f32, packet_id: Option<u64>) {
-        if !raw.is_finite() || !matches!(sensor, "KG50" | "KG1000") { return; }
+        // ±Inf is the DAQ's over-range marker: kept in the window so it blocks
+        // the zero (stable_count), never averaged.
+        if raw.is_nan() || !matches!(sensor, "KG50" | "KG1000") { return; }
         self.observe_captured(sensor, raw, packet_id, CaptureClock::now());
     }
     fn observe_captured(&mut self, sensor: &str, raw: f32, packet_id: Option<u64>, at: CaptureClock) {
-        if !raw.is_finite() || !matches!(sensor, "KG50" | "KG1000") { return; }
+        if raw.is_nan() || !matches!(sensor, "KG50" | "KG1000") { return; }
         let changed = self.last_capture_clock.is_some_and(|previous| !previous.same_domain(at));
         if !at.is_valid() || changed {
             self.invalidate_sample_eligibility();
@@ -254,6 +256,13 @@ fn stable_count(
     sensor: &str,
     count: usize,
 ) -> Result<(f32, bool), String> {
+    let over_range = raw.iter().filter(|raw| raw.is_infinite()).count();
+    if over_range > 0 {
+        return Err(format!(
+            "{sensor} was over range during the automatic-zero window ({over_range} sample{}); no automatic zero was applied — bring the input back in range",
+            if over_range == 1 { "" } else { "s" }
+        ));
+    }
     if count < 20 || raw.len() != count {
         return Err(format!("Need {count} fresh loadcell samples"));
     }
@@ -805,6 +814,23 @@ mod tests {
         let (mean, zero) = stable(&raw, &config(), "KG1000").unwrap();
         assert!(zero);
         assert!((mean - 0.2).abs() < 0.001);
+    }
+    #[test]
+    fn an_over_range_sample_blocks_the_zero_with_a_reason() {
+        let mut raw = vec![0.2; COUNT];
+        raw[7] = f32::INFINITY;
+        raw[8] = f32::NEG_INFINITY;
+        let err = stable(&raw, &config(), "KG1000").unwrap_err();
+        assert_eq!(
+            err,
+            "KG1000 was over range during the automatic-zero window (2 samples); no automatic zero was applied — bring the input back in range"
+        );
+        // The marker is kept in the window (not dropped as missing data).
+        let mut rt = Runtime::default();
+        rt.observe("KG1000", f32::INFINITY);
+        rt.observe("KG1000", f32::NAN);
+        rt.observe("KG1000", 0.2);
+        assert_eq!(rt.captured_source_counts_for_test(), [0, 2]);
     }
     #[test]
     fn movement_load_and_missing_samples_are_rejected() {
