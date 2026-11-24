@@ -162,6 +162,13 @@ const OPERATOR_MODE_FLIGHT_STATE_ORDER: [FlightState; 17] = [
     FlightState::Aborted,
 ];
 
+/// The FC's report moved the station into Landed (or Recovery) from a flight
+/// phase: the station publishes Landed for the ground boards.
+pub(crate) fn relay_fc_landed(fc: bool, previous: FlightState, next: FlightState) -> bool {
+    use crate::types::NetworkFlightState as N;
+    fc && next.network() == N::Landed && matches!(previous.network(), N::Launch | N::InFlight)
+}
+
 fn operator_mode_adjacent_flight_state(current: FlightState, delta: i32) -> FlightState {
     let idx = OPERATOR_MODE_FLIGHT_STATE_ORDER
         .iter()
@@ -217,6 +224,15 @@ fn reset_operator_flight_state(state: &Arc<AppState>) {
 #[cfg(test)]
 mod recovery_tests {
     use super::*;
+
+    #[test]
+    fn an_fc_landing_is_relayed_to_the_ground_boards_once() {
+        assert!(relay_fc_landed(true, FlightState::Reefing, FlightState::Landed));
+        assert!(relay_fc_landed(true, FlightState::Launch, FlightState::Recovery));
+        assert!(!relay_fc_landed(true, FlightState::Landed, FlightState::Recovery), "already Landed on the wire");
+        assert!(!relay_fc_landed(false, FlightState::Descent, FlightState::Landed), "only the FC's report");
+        assert!(!relay_fc_landed(true, FlightState::Idle, FlightState::Landed), "not from a prelaunch state");
+    }
 
     #[tokio::test]
     async fn reset_state_preserves_clock_and_confirmed_valve_state() {
@@ -1819,6 +1835,9 @@ pub async fn telemetry_task(
                     if crate::primary_mirror::relayed_outputs::take_changed() {
                         state.broadcast_action_policy_snapshot();
                     }
+                    if let Err(err) = crate::network_variables::resend_settled_flight_state(&router) {
+                        log::warn!("FLIGHT_STATE: settle re-send failed: {err}");
+                    }
                     if crate::network_variables::reconcile_network_outputs_for_state(&state, &router) {
                         sequences::refresh_action_policy_now(&state);
                         state.broadcast_action_policy_snapshot();
@@ -3077,6 +3096,7 @@ async fn handle_packet_inner(
                 values: vec![Some(pkt_data as f32)], over_range: 0, over_range_low: 0,
             }];
         }
+        let mut relay_landed = false;
         {
             let mut fs = state.state.lock().unwrap();
             // The original snapshot is not final authority across a local Stop
@@ -3092,7 +3112,21 @@ async fn handle_packet_inner(
                     values: vec![Some(pkt_data as f32)], over_range: 0, over_range_low: 0,
                 }];
             }
+            let previous = *fs;
             *fs = new_flight_state;
+            relay_landed = relay_fc_landed(fc, previous, new_flight_state);
+        }
+        // The FC's own FLIGHT_STATE reaches the station over the radio only, and
+        // the ground boards follow the station alone (the DAQ refuses any other
+        // writer): without this the DAQ stayed in Launch after the landing and
+        // never served its SD launch file. The station writes Landed itself once.
+        if relay_landed && !crate::rrls::is_rrls()
+            && let Some(router) = state.topology_router.get()
+        {
+            match crate::network_variables::set_flight_state(router, FlightState::Landed as u8) {
+                Ok(()) => log::info!("FC reported Landed: published Landed to the ground boards"),
+                Err(err) => log::warn!("FC reported Landed but the Landed FLIGHT_STATE was not published: {err}"),
+            }
         }
         // Deployments follow the FC's detailed phase (fc_phase); an accepted
         // prelaunch report still starts a new deployment cycle.

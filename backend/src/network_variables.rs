@@ -318,6 +318,7 @@ pub(crate) fn network_output_packet(router: &Router, output: NetworkOutput, valu
 fn flight_state_wire_packet(state: NetworkFlightState, stamp: Stamp) -> Result<Packet> {
     // The simulator's set-(a) wire assertion reads this line.
     log::info!("FLIGHT_STATE wire value={} ({})", state as u8, state.label());
+    SETTLE.lock().unwrap().last_write = Some(std::time::Instant::now());
     Ok(packet_bytes_at(
         FLIGHT_STATE_TYPE,
         "FLIGHT_STATE",
@@ -1107,6 +1108,82 @@ pub(crate) fn resend_dropped_flight_state(router: &Router, exhausted_heads: &[u6
     resend_latest_flight_state(router, exhausted_heads, |_| true)
 }
 
+/// FLIGHT_STATE writes made in quick succession (an operator stepping the
+/// phase, Launch then the rewind to Idle after a test fire) can reach the
+/// fill-CAN boards only in part: the gateway relays the burst onto CAN and
+/// the latest write was seen lost there (firmware sim, 2026-11-24: GB applied
+/// all eight writes, VB and DAQ two, and stayed in Fill while the station was
+/// Idle, so the DAQ never served its launch file). Once the writes have been
+/// quiet for this long, the station's own latest value is sent once more
+/// (same stamp, fresh identity; boards re-apply the same value), so every
+/// board ends on it.
+pub(crate) const FLIGHT_STATE_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
+
+struct Settle {
+    last_write: Option<std::time::Instant>,
+    /// The packet id of the latest value already re-sent (or found not to need it).
+    settled_packet: Option<u64>,
+    /// The write instant that was settled: the 1 ms tick looks no further until a new write.
+    settled_write: Option<std::time::Instant>,
+    /// While an older write is still pending in the router, look again only after this.
+    next_check: Option<std::time::Instant>,
+}
+static SETTLE: Mutex<Settle> =
+    Mutex::new(Settle { last_write: None, settled_packet: None, settled_write: None, next_check: None });
+
+/// Whether the latest FLIGHT_STATE write `latest_id` is due its settle re-send.
+pub(crate) fn settle_resend_due(
+    last_write: Option<std::time::Instant>,
+    now: std::time::Instant,
+    latest_id: Option<u64>,
+    settled: Option<u64>,
+) -> bool {
+    match (last_write, latest_id) {
+        (Some(at), Some(id)) => now.saturating_duration_since(at) >= FLIGHT_STATE_SETTLE && settled != Some(id),
+        _ => false,
+    }
+}
+
+/// Periodic (station task tick): re-send the station's latest FLIGHT_STATE
+/// once after a burst of writes went quiet. Launch is never re-sent here (its
+/// admission owns its exact packet); a write still pending in the router is
+/// left to its own retries and checked again on a later tick.
+pub(crate) fn resend_settled_flight_state(router: &Router) -> Result<bool> {
+    if crate::rrls::is_rrls() {
+        return Ok(false);
+    }
+    let (last_write, settled) = {
+        let settle = SETTLE.lock().unwrap();
+        let quiet = settle.last_write.is_some_and(|at| at.elapsed() >= FLIGHT_STATE_SETTLE);
+        if !quiet || settle.settled_write == settle.last_write
+            || settle.next_check.is_some_and(|at| std::time::Instant::now() < at) {
+            return Ok(false);
+        }
+        (settle.last_write, settle.settled_packet)
+    };
+    let ty = crate::telemetry_schema::data_type(FLIGHT_STATE_TYPE);
+    let latest = router.own_network_variable(ty).map(|p| p.packet_id());
+    if !settle_resend_due(last_write, std::time::Instant::now(), latest, settled) {
+        SETTLE.lock().unwrap().settled_write = last_write;
+        return Ok(false);
+    }
+    if router.export_reliable_pending_stats().iter().any(|row| row.data_type == ty) {
+        SETTLE.lock().unwrap().next_check = Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
+        return Ok(false);
+    }
+    let sent = resend_latest_flight_state(router, &[], |value| value != NetworkFlightState::Launch)?;
+    // The copy (when sent) or the unchanged latest value is settled: no loop
+    // (the copy's own build moved last_write; that instant counts as settled).
+    let mut settle = SETTLE.lock().unwrap();
+    settle.settled_packet = router.own_network_variable(ty).map(|p| p.packet_id());
+    settle.settled_write = settle.last_write;
+    drop(settle);
+    if sent {
+        log::info!("FLIGHT_STATE: re-sent the latest value after the writes settled");
+    }
+    Ok(sent)
+}
+
 /// An operator Abort held because the AV bay had no route: once it has one,
 /// send the retained Aborted FLIGHT_STATE again. The one written with the
 /// Abort reached only the boards the station knew then (PB, which takes an
@@ -1714,6 +1791,19 @@ fn verify_qualification_boot_cache(path: &Path, completed: usize, actual: u8) ->
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_latest_flight_state_is_resent_once_after_writes_settle() {
+        use super::{FLIGHT_STATE_SETTLE, settle_resend_due};
+        let t0 = std::time::Instant::now();
+        let quiet = t0 + FLIGHT_STATE_SETTLE;
+        assert!(!settle_resend_due(None, quiet, Some(7), None), "no write yet");
+        assert!(!settle_resend_due(Some(t0), quiet, None, None), "no own value");
+        assert!(!settle_resend_due(Some(t0), t0 + FLIGHT_STATE_SETTLE / 2, Some(7), None), "still in the burst");
+        assert!(settle_resend_due(Some(t0), quiet, Some(7), None), "quiet: re-send the latest");
+        assert!(!settle_resend_due(Some(t0), quiet, Some(7), Some(7)), "already settled: once only");
+        assert!(settle_resend_due(Some(t0), quiet, Some(8), Some(7)), "a newer write settles again");
+    }
+
     use super::*;
     use sedsnet::router::{EndpointHandler, RouterConfig};
     /// Bench 2026-11-11: after the failover the RRLS refused its own underglow
