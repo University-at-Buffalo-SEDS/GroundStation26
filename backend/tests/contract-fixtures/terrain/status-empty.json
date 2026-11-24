@@ -1,0 +1,28 @@
+{
+  "check": {
+    "dem": [],
+    "dem_complete": false,
+    "imagery": [],
+    "imagery_complete": false,
+    "lat_deg": 31.758,
+    "lon_deg": -102.046,
+    "radius_m": 1000.0
+  },
+  "dem": {
+    "attribution": "Terrain: Mapzen/Tilezen Terrain Tiles via AWS Open Data (SRTM, USGS 3DEP, GMTED2010, ETOPO1 and others)",
+    "available": false,
+    "license": "Open data, attribution required: https://github.com/tilezen/joerd/blob/master/docs/attribution.md",
+    "max_zoom": null,
+    "source": "AWS Terrain Tiles (Terrarium)",
+    "source_url": "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png",
+    "tiles": 0,
+    "zooms": []
+  },
+  "download_hint": "python3 download_map.py downloads imagery and the DEM for the selected regions; --terrain-only refreshes just the DEM.",
+  "imagery": {
+    "attribution": "Imagery: Esri, Maxar, Earthstar Geographics and the GIS User Community",
+    "available": false,
+    "max_zoom": null,
+    "source": "Esri World Imagery"
+  }
+}

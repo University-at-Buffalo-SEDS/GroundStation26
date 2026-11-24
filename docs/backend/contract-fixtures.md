@@ -27,6 +27,14 @@ real `GET /api/recordings/{id}/replay/export` body for a recording of the IGT
 `nominal_10k` mock flight (thinned to 0.5 Hz) plus the `layout`, `boards`,
 `view_config`, `vehicle_geometry`, `valve_mappings` and `mode` the app attaches; the UI opens
 it with no station connected (offline replay). Also `flight-plans/*`: a computed flight plan (8.5 kg, manual weather, 20 dispersion samples, its timings pinned to 0) as `GET /api/flight_plans/{id}` serves it, the plan list with its request defaults, a viewer's refused run and the plan bundle's manifest; and `los-prediction/*`: a simulated signal cut (`POST /api/los_prediction/simulate`, the station position pinned to the launch site) and the idle live view.
+`replay-trajectory/flight` is that recording's
+`GET /api/recordings/{id}/replay/trajectory` with its flight-phase `phases`,
+`events` and per-point `phase`; `flight-phases/live` is the live
+`GET /api/flight_phases` document for the same flight (assembled from fixed
+inputs, since the live log is process-wide); `terrain/heightmap-unavailable`
+and `terrain/status-empty` are the terrain routes on a station with no DEM, and
+`terrain/heightmap` is a grid built from a synthetic Terrarium tile through
+the real serializer (docs/backend/terrain.md).
 
 Values that change from run to run (tickets, boot epochs, random ids, clock
 readings, process-wide counters) are replaced by fixed values of the same type

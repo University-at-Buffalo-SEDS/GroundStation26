@@ -348,6 +348,23 @@ Failure impact:
 
 - The map still renders, but zoom behavior may be wrong or conservative.
 
+### `GET /api/flight_phases`, `GET /api/terrain/heightmap`, `GET /api/terrain/status`
+
+Purpose:
+
+- The map tab's rocket track coloured by flight phase (2D and 3D), and the 3D
+  view's offline terrain and coverage line.
+
+Shapes, sources, attribution and fallbacks: `docs/backend/terrain.md` (and the
+UI's `docs/backend-contract.md` section 12). The recorded equivalent of the
+phases is `GET /api/recordings/{id}/replay/trajectory` (`phases`, `events`,
+per-point `phase`).
+
+Failure impact:
+
+- No phase-coloured track; the 3D view falls back to flat ground with imagery,
+  then to the plain reference ground. 2D stays available.
+
 ### `GET /flightstate`
 
 Returns the authoritative live state used by command gating and WebSocket

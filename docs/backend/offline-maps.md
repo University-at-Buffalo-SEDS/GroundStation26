@@ -45,3 +45,12 @@ at most five minutes, retrying DNS at most once per second; certificate/hostname
 verification remains enabled. No DNS servers, interfaces or system-wide limits
 are changed. Exhausted tile retries still report the final error, and restarting
 the downloader retains completed tiles.
+
+## Terrain (DEM)
+
+`python3 download_map.py` also downloads the open AWS Terrain Tiles DEM
+(Terrarium PNG) for the same regions into
+`backend/data/maps/<region>/terrain.sqlite3`, for the 3D map and 3D replay.
+`--no-terrain` skips it and `--terrain-only` refreshes only it. Request
+`/terrain/12/{x}/{y}.png` or `/api/terrain/status` to check what is cached.
+Sources, licences, routes and fallbacks: [terrain.md](terrain.md).

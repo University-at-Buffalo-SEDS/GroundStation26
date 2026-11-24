@@ -74,10 +74,10 @@
       "sha256": "5a95aff7f5620245faa20f5a23a1e5de49dadb3a8712846df33279681eb58e21"
     },
     {
-      "bytes": 14299,
+      "bytes": 17178,
       "media_type": "application/json",
       "path": "derived/trajectory.json",
-      "sha256": "2f89cb97dec4220199293e9abe4561e94a609fc1add7f24cd9c32313d330e009"
+      "sha256": "c005f7a6b3273110b5958ac443eb386c2aec53a9f9a4d7d879c1684ce72a19ce"
     }
   ],
   "format": "gsreplay",
@@ -89,6 +89,10 @@
   "source": {
     "recording": "groundstation_recording_2026-01-01_00-00-00_000.db",
     "station_name": "Ground Station"
+  },
+  "terrain": {
+    "included": false,
+    "reason": "no DEM tiles are cached on this station"
   },
   "tiles": {
     "budget_bytes": 1048576,

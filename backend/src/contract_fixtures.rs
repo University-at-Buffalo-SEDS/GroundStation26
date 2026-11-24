@@ -726,6 +726,10 @@ async fn replay_bundle(root: &Path, state: &Arc<AppState>, app: &axum::Router, o
     let csv_sha: String = ring::digest::digest(&ring::digest::SHA256, &csv).as_ref().iter().map(|b| format!("{b:02x}")).collect();
     let listed = manifest["entries"].as_array().unwrap().iter().find(|e| e["path"] == "data/telemetry.csv").unwrap();
     assert_eq!(listed["sha256"], csv_sha, "the bundle's CSV is the recording's own CSV export");
+    // The recording's trajectory with its flight-phase segmentation.
+    let upper = nominal_10k_rows().len();
+    let trajectory = get_ok(app, &format!("/api/recordings/{id}/replay/trajectory?upper_id={upper}"), Some("viewer")).await;
+    out.add("replay-trajectory/flight", trajectory);
     out.add("replay-bundle/flight.manifest", manifest);
     binary_fixture("replay-bundle/flight.gsreplay", &bundle);
     binary_fixture("replay-bundle/flight.csv", &csv);
@@ -901,6 +905,28 @@ async fn flight_plans(state: &Arc<AppState>, app: &axum::Router, out: &mut Fixtu
     out.add("los-prediction/idle", live);
 }
 
+/// Terrain (no DEM cached on the test station, plus a synthetic DEM grid
+/// through the real serializer) and the live flight phases of the nominal
+/// 10k flight (`GET /api/flight_phases`, assembled from fixed inputs).
+async fn terrain_and_phases(app: &axum::Router, out: &mut Fixtures) {
+    out.add("terrain/heightmap-unavailable", get_ok(app, "/api/terrain/heightmap?lat=31.758&lon=-102.046&extent_m=6000&size=65", Some("viewer")).await);
+    out.add("terrain/status-empty", get_ok(app, "/api/terrain/status?lat=31.758&lon=-102.046&radius_m=1000", Some("viewer")).await);
+    let (fx, fy) = crate::terrain::tile_xy(31.758, -102.046, 10);
+    let png = crate::terrain::encode_terrarium(256, 256, |x, y| 850.0 + x as f32 * 0.5 + y as f32 * 0.25);
+    let temp = crate::terrain::tests::temp_store("fixture", &[((10, fx as u32, fy as u32), png)]).await;
+    let map = crate::terrain::build_heightmap(&temp.store, 31.758, -102.046, 2_000.0, 17).await.unwrap();
+    out.add("terrain/heightmap", serde_json::to_value(map).unwrap());
+    let rows = nominal_10k_rows();
+    let reports: Vec<(i64, u8)> = rows.iter().filter(|r| r.2 == "FLIGHT_STATE").map(|r| (T0 + r.0, r.3[0].as_u64().unwrap() as u8)).collect();
+    let fc: Vec<(i64, f64, f64, f64)> = rows
+        .iter()
+        .filter(|r| r.2 == "GPS_DATA" && r.0 % 10_000 == 0)
+        .map(|r| (T0 + r.0, r.3[0].as_f64().unwrap(), r.3[1].as_f64().unwrap(), r.3[2].as_f64().unwrap()))
+        .collect();
+    let live = crate::flight_phases::assemble(Some(T0), &reports, Vec::new(), fc);
+    out.add("flight-phases/live", serde_json::to_value(live).unwrap());
+}
+
 #[tokio::test]
 async fn contract_fixtures_match_the_backend() {
     let _mode = thread_mode(Mode::Normal);
@@ -927,6 +953,7 @@ async fn contract_fixtures_match_the_backend() {
     replay_bundle(&root.0, &state, &app, &mut out).await;
     flight_plans(&state, &app, &mut out).await;
     recovery_search(&app, &mut out).await;
+    terrain_and_phases(&app, &mut out).await;
     drop(_mode);
     board_abort_hitl(&mut out).await;
     self_test_confirmation(&mut out).await;

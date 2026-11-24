@@ -36,6 +36,18 @@ Options:
 - `?tiles=1` adds cached map tiles around the trajectory, from zoom 10 up to
   `max_native_zoom`, lowest zoom first.
 - `tiles_max_mb` sets the tile budget: 8 MiB by default, at most 32.
+- `?terrain=1` (default: on whenever `tiles=1`) adds `terrain/heightmap.json`,
+  the body of `GET /api/terrain/heightmap` centred on the trajectory's first
+  fix (the pad), wide enough for the whole track plus 1 km each side
+  (2–30 km), 129 × 129 samples (about 45 KB, capped at 1 MiB). It is added
+  only when the station has DEM tiles for the area (docs/backend/terrain.md);
+  `manifest.terrain` records `{included, bytes, extent_m, size, zoom, source,
+  attribution}` or `{included: false, reason}`. `terrain=0` leaves it out.
+
+The trajectory entry (`derived/trajectory.json`) carries the flight-phase
+segmentation (`phases`, `events`, a `phase` on each point;
+docs/backend/terrain.md "Flight phases"), so a client colours the track by
+phase with no station.
 
 The ZIP writer is `flight_review::zip` (deflate, no ZIP64). Bundles are
 reproducible: the same recording and time give the same bytes.

@@ -1,0 +1,8 @@
+{
+  "attribution": "Terrain: Mapzen/Tilezen Terrain Tiles via AWS Open Data (SRTM, USGS 3DEP, GMTED2010, ETOPO1 and others)",
+  "available": false,
+  "format": "gs26.heightmap",
+  "reason": "no DEM tiles are cached on this station",
+  "source": "AWS Terrain Tiles (Terrarium)",
+  "version": 1
+}
