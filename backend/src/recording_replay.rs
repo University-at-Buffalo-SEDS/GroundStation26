@@ -413,6 +413,9 @@ pub struct TrajectoryPoint {
     pub longitude: f64,
     pub altitude_m: f64,
     pub break_before: bool,
+    /// Flight phase at this point (crate::flight_phases); absent when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<crate::flight_phases::Phase>,
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Trajectory {
@@ -421,6 +424,11 @@ pub struct Trajectory {
     pub points: Vec<TrajectoryPoint>,
     pub truncated: bool,
     pub sampled: bool,
+    /// Phase segments and events from the recorded flight states (crate::flight_phases).
+    #[serde(default, skip_deserializing)]
+    pub phases: Vec<crate::flight_phases::PhaseSegment>,
+    #[serde(default, skip_deserializing)]
+    pub events: Vec<crate::flight_phases::PhaseEvent>,
 }
 #[derive(Clone)]
 struct SegmentPoint {
@@ -540,7 +548,24 @@ fn saved_gps_point(timestamp_ms: i64, raw: &str) -> Option<TrajectoryPoint> {
         longitude,
         altitude_m,
         break_before: false,
+        phase: None,
     })
+}
+/// The recording's flight-state reports up to the snapshot: the station's
+/// and the FC's FLIGHT_STATE rows, the station's GS_FC_PHASE rows (the FC's
+/// detailed phase) and the station's `flight_state` table.
+async fn phase_reports(db: &SqlitePool, upper_id: i64) -> anyhow::Result<(Vec<(i64, u8)>, Option<i64>)> {
+    let rows = sqlx::query_as::<_, (i64, Option<f64>)>("SELECT timestamp_ms, CASE WHEN json_valid(values_json) THEN CAST(json_extract(values_json,'$[0]') AS REAL) END FROM telemetry WHERE id <= ? AND data_type IN ('FLIGHT_STATE','GS_FC_PHASE') ORDER BY timestamp_ms, id LIMIT 200000")
+        .bind(upper_id).fetch_all(db).await?;
+    let end_ms: Option<i64> = sqlx::query_scalar("SELECT MAX(timestamp_ms) FROM telemetry WHERE id <= ?").bind(upper_id).fetch_one(db).await?;
+    let mut reports: Vec<(i64, u8)> = rows.into_iter().filter_map(|(t, v)| v.filter(|v| (0.0..=255.0).contains(v)).map(|v| (t, v as u8))).collect();
+    let has_table = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='flight_state'").fetch_one(db).await? > 0;
+    if has_table && let Some(end) = end_ms {
+        let states = sqlx::query_as::<_, (i64, i64)>("SELECT timestamp_ms, f_state FROM flight_state WHERE timestamp_ms <= ? ORDER BY timestamp_ms LIMIT 100000")
+            .bind(end).fetch_all(db).await?;
+        reports.extend(states.into_iter().filter_map(|(t, code)| u8::try_from(code).ok().map(|c| (t, c))));
+    }
+    Ok((reports, end_ms))
 }
 async fn trajectory_from(db: &SqlitePool, upper_id: i64) -> anyhow::Result<Trajectory> {
     use futures::TryStreamExt;
@@ -585,16 +610,22 @@ async fn trajectory_from(db: &SqlitePool, upper_id: i64) -> anyhow::Result<Traje
         (radio, None)
     };
     selected.compact(MAX_TRAJECTORY_POINTS);
+    let (reports, end_ms) = phase_reports(db, upper_id).await.unwrap_or_default();
+    let mut segmentation = crate::flight_phases::segment(&reports, end_ms);
+    let mut points: Vec<TrajectoryPoint> = selected.points.into_iter().map(|value| value.point).collect();
+    for point in &mut points {
+        point.phase = crate::flight_phases::phase_at(&segmentation.phases, point.timestamp_ms);
+    }
+    let track: Vec<(i64, f64, f64, f64)> = points.iter().map(|p| (p.timestamp_ms, p.latitude, p.longitude, p.altitude_m)).collect();
+    crate::flight_phases::place_events(&mut segmentation.events, &track);
     Ok(Trajectory {
         upper_id,
         source_sender_id: source.map(str::to_owned),
-        points: selected
-            .points
-            .into_iter()
-            .map(|value| value.point)
-            .collect(),
+        points,
         truncated: truncated || selected.truncated,
         sampled: selected.sampled,
+        phases: segmentation.phases,
+        events: segmentation.events,
     })
 }
 

@@ -943,6 +943,16 @@ async fn three_asset(Path(file): Path<String>) -> ApiResult<Response> {
                 "T-clock module unavailable in selected frontend",
             )
         })?,
+        // The terrain module and the map tab's 3D view (optional in older frontends).
+        "terrain.js" | "map-3d.js" => {
+            let name = if file == "terrain.js" { "TERRAIN_JS" } else { "MAP_3D_JS" };
+            gs_browser_assets::asset_bytes(name).ok_or_else(|| {
+                error(
+                    StatusCode::NOT_FOUND,
+                    "Renderer asset unavailable in selected frontend",
+                )
+            })?
+        }
         "software-renderer.js" => gs_browser_assets::SOFTWARE_RENDERER_JS,
         "three.module.js" => gs_browser_assets::THREE_MODULE_JS,
         "three.core.js" => gs_browser_assets::THREE_CORE_JS,
@@ -1045,6 +1055,21 @@ mod tests {
                     let body = axum::body::to_bytes(response.into_body(), expected.len() + 1)
                         .await
                         .unwrap();
+                    assert_eq!(body.as_ref(), expected);
+                }
+                None => assert_eq!(result.err().unwrap().status(), StatusCode::NOT_FOUND),
+            }
+        }
+    }
+    #[tokio::test]
+    async fn selected_frontend_terrain_and_map_assets_are_served_or_explicitly_absent() {
+        for (file, name) in [("terrain.js", "TERRAIN_JS"), ("map-3d.js", "MAP_3D_JS")] {
+            let result = three_asset(Path(file.into())).await;
+            match gs_browser_assets::asset_bytes(name) {
+                Some(expected) => {
+                    let response = result.unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let body = axum::body::to_bytes(response.into_body(), expected.len() + 1).await.unwrap();
                     assert_eq!(body.as_ref(), expected);
                 }
                 None => assert_eq!(result.err().unwrap().status(), StatusCode::NOT_FOUND),
