@@ -322,7 +322,7 @@ fn no_store(value: Value) -> Response {
     super::json(value)
 }
 
-async fn authorized_db(state: &Arc<AppState>, headers: &HeaderMap, id: &str) -> Result<(Source, SqlitePool), Response> {
+pub(crate) async fn authorized_db(state: &Arc<AppState>, headers: &HeaderMap, id: &str) -> Result<(Source, SqlitePool), Response> {
     crate::web::authorize_headers(state, headers, Permission::ViewData).await?;
     let source = Source::parse(id).ok_or_else(|| StatusCode::BAD_REQUEST.into_response())?;
     let db = sources::open(state, id).await.map_err(|code| {

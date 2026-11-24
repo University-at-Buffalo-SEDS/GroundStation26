@@ -20,6 +20,7 @@ resource:
 - the replay snapshot, flight snapshot, context, overlays, alerts and
   trajectory, the first page of SD sources, and the recording's own entry of
   `GET /api/recordings`;
+- `derived/firmware.json` (`GET /api/recordings/{id}/firmware`, below);
 - the flight review, apogee planner state, and any burn report or
   fire-archive entry that names the recording.
 - the station's five newest flight plans (`derived/flight_plans.json`, when
@@ -224,6 +225,34 @@ sample is plotted, and the UI can build the same pages offline.
 
 The ZIP writer is `flight_review::zip` (deflate, no ZIP64). Bundles are
 reproducible: the same recording and time give the same bytes.
+
+## Recorded firmware and board health
+
+`GET /api/recordings/{id}/firmware` (view_data, `backend/src/recording_firmware.rs`)
+says what a recording holds about the boards for the firmware panel of a
+replay. It is computed from the recording alone and has no wall-clock values:
+
+- `boards[]`: every board that sent a row, or that the capture manifest names,
+  with `rows`, `first_ms`, `last_ms`;
+  - `health`: its `BOARD_HEALTH` reports decoded as the live station decodes
+    them (`network_health::decode_diagnostics`): `reports`,
+    `undecoded_reports`, `first_ms`/`last_ms`, `first_uptime_s`/
+    `last_uptime_s`, `resets_observed` (uptime going backwards),
+    `watchdog_missing_mask` (OR of all reports) and `last` (the last report in
+    the live `BoardDiagnostics` shape); null without reports;
+  - `firmware`: `repo`, `ref`, `commit`, `short`, `describe`, `subject`,
+    `committed`, `sedsnet`, `defines`, with `firmware_source:
+    "firmware_sim_manifest"`, for captures of the firmware simulation (the
+    capture manifest's `versions.simulated_firmware`); null otherwise.
+- `identity_note`: why no board has a firmware identity. Board firmware does
+  not report its build over SEDSnet, so hardware recordings never have one.
+- `provenance` (`hardware`, `firmware_sim`, `internal_flight_sim`; from the
+  capture manifest or the first `GS_STATION_MODE` row), `station`
+  (`groundstation_backend` version of the capture), `firmware_simulator`,
+  `sedsnet`.
+- `updates[]`: firmware transfers (`GET /api/firmware/updates` entries) this
+  station still remembers that started during the recording. They are kept
+  in memory only, so a bundle made after a restart has none.
 
 ## Import
 

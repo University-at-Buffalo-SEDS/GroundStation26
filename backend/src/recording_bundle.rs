@@ -137,6 +137,7 @@ async fn download(
 fn sources(state: Arc<AppState>) -> Router {
     Router::new()
         .merge(crate::recording_export::routes())
+        .merge(crate::recording_firmware::routes())
         .merge(crate::media::view_config_routes(state.clone()))
         .merge(crate::diagrams::routes())
         .merge(crate::vehicle_geometry::routes())
@@ -271,6 +272,8 @@ pub(crate) async fn build(
     entries.optional(&router, headers, &format!("/api/recordings/{id}/replay/flight"), "derived/flight_snapshot.json").await;
     entries.optional(&router, headers, &format!("/api/recordings/{id}/replay/overlays"), "derived/overlays.json").await;
     entries.optional(&router, headers, &format!("/api/recordings/{id}/sd/sources"), "derived/sd_sources.json").await;
+    // Boards heard, their health reports and any firmware identity the recording names.
+    entries.optional(&router, headers, &format!("/api/recordings/{id}/firmware"), "derived/firmware.json").await;
     // The listing as a station holding only this recording would answer it.
     if let Ok(bytes) = fetch(&router, headers, "/api/recordings").await
         && let Ok(Value::Array(list)) = serde_json::from_slice::<Value>(&bytes)

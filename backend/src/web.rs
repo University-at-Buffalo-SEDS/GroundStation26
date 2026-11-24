@@ -480,6 +480,7 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .merge(crate::recording_export::routes())
         .merge(crate::recording_bundle::routes())
         .merge(crate::recording_import::routes())
+        .merge(crate::recording_firmware::routes())
         .merge(crate::host_power::routes())
         .merge(crate::sd_download::routes())
         .route("/api/notifications", get(get_notifications))

@@ -100,6 +100,13 @@
       "sha256": "23f7a5f86117ec95297eb57e5b8789050ce1007db8ee71031981502dc21d63fa"
     },
     {
+      "bytes": 796,
+      "media_type": "application/json",
+      "path": "derived/firmware.json",
+      "route": "/api/recordings/groundstation_recording_2026-01-01_00-00-00_000.db/firmware",
+      "sha256": "9831d5d73b210499ff1011ac68ddf4a37671568198a6838e262d19462957ec32"
+    },
+    {
       "bytes": 167,
       "media_type": "application/json",
       "path": "derived/recordings.json",
