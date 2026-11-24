@@ -119,6 +119,14 @@ exit "$rc"
 """
 
 
+def connect_timeout_s() -> int:
+    """Seconds to wait for the remote host to answer (GS_REMOTE_CONNECT_TIMEOUT, default 10)."""
+    try:
+        return max(1, int(os.environ.get("GS_REMOTE_CONNECT_TIMEOUT", "10")))
+    except ValueError:
+        return 10
+
+
 class Remote:
     def __init__(self, spec: str):
         spec = spec.strip()
@@ -160,10 +168,38 @@ class Remote:
         return environment
 
     def ssh_options(self) -> list[str]:
-        # One authenticated connection is reused for every step.
+        # One authenticated connection is reused for every step. ConnectTimeout
+        # bounds the TCP connect and handshake, so an unreachable host fails in
+        # seconds instead of after the OS timeout.
         return ["-o", "ControlMaster=auto", "-o", f"ControlPath={self._control}",
                 "-o", "ControlPersist=900", "-o", "StrictHostKeyChecking=accept-new",
+                "-o", f"ConnectTimeout={connect_timeout_s()}", "-o", "ConnectionAttempts=1",
                 "-o", "ServerAliveInterval=30"]
+
+    def check_reachable(self) -> None:
+        """Fail before any login prompt when the host's SSH port does not answer.
+
+        The host and port come from `ssh -G`, so ssh config aliases apply. A
+        proxied host (ProxyJump/ProxyCommand) is left to ssh's ConnectTimeout."""
+        timeout = connect_timeout_s()
+        try:
+            resolved = subprocess.run(["ssh", "-G", self.destination], capture_output=True, text=True,
+                                      timeout=timeout).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            return
+        config: dict[str, str] = {}
+        for line in resolved.splitlines():
+            key, _, value = line.partition(" ")
+            config.setdefault(key.lower(), value.strip())
+        if config.get("proxyjump", "none") != "none" or config.get("proxycommand", "none") != "none":
+            return
+        host = config.get("hostname") or self.destination.rsplit("@", 1)[-1]
+        port = int(config.get("port") or 22)
+        try:
+            socket.create_connection((host, port), timeout=timeout).close()
+        except OSError as error:
+            raise SystemExit(f"Remote build host {host}:{port} did not answer within {timeout} s ({error}); "
+                             f"check the address and network (GS_REMOTE_CONNECT_TIMEOUT sets the wait).") from None
 
     def ssh(self, command: str, capture: bool = False) -> str:
         cmd = ["ssh", *self.ssh_options(), self.destination, command]
@@ -229,6 +265,7 @@ class Remote:
     def connect(self) -> None:
         """Authenticate once; later ssh and rsync calls reuse this connection."""
         print(f"Connecting to {self.destination} for the remote build...", flush=True)
+        self.check_reachable()
         subprocess.run(["ssh", *self.ssh_options(), self.destination, "true"], env=self.env(), check=True)
 
     def close(self) -> None:

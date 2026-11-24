@@ -191,6 +191,34 @@ class SimBundleTests(unittest.TestCase):
         self.assertNotIn("gcc-multilib", remote_build.DOCKERFILE)
 
 
+class ConnectTimeoutTests(unittest.TestCase):
+    def test_ssh_options_bound_the_connect(self) -> None:
+        with patch.dict(os.environ, {"GS_REMOTE_CONNECT_TIMEOUT": "7"}):
+            options = remote_build.Remote("builder").ssh_options()
+        self.assertIn("ConnectTimeout=7", options)
+        self.assertIn("ConnectionAttempts=1", options)
+
+    def test_unreachable_host_fails_before_ssh_prompts(self) -> None:
+        remote = remote_build.Remote("rylan@builder")
+        resolved = subprocess.CompletedProcess([], 0, stdout="hostname 192.0.2.1\nport 22\nproxyjump none\n", stderr="")
+        with patch.object(remote_build.subprocess, "run", side_effect=[resolved]) as run, \
+                patch.object(remote_build.socket, "create_connection", side_effect=TimeoutError("timed out")):
+            with self.assertRaises(SystemExit) as stop:
+                remote.connect()
+        self.assertIn("192.0.2.1:22 did not answer", str(stop.exception))
+        # Only `ssh -G` ran: the login (`ssh ... true`) never started.
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.args[0][:2], ["ssh", "-G"])
+
+    def test_proxied_host_is_left_to_ssh(self) -> None:
+        remote = remote_build.Remote("builder")
+        resolved = subprocess.CompletedProcess([], 0, stdout="hostname inner\nport 22\nproxyjump bastion\n", stderr="")
+        with patch.object(remote_build.subprocess, "run", return_value=resolved), \
+                patch.object(remote_build.socket, "create_connection") as probe:
+            remote.check_reachable()
+        probe.assert_not_called()
+
+
 class BuildWrapperTests(unittest.TestCase):
     def test_backend_build_uses_remote_when_requested(self) -> None:
         import importlib.util
