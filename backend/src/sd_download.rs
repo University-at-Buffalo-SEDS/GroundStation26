@@ -1525,6 +1525,9 @@ pub(crate) fn take_launch_fetch() -> bool {
 /// a time, as soon as downloads are allowed (Idle, Landed or Recovery, no
 /// sequence, no other transfer). Each completed file attaches itself to its
 /// launch capture (see `transfer`). Gives up after an hour of waiting.
+/// Wait between DAQ launch-file listing attempts.
+const LAUNCH_LIST_RETRY: Duration = Duration::from_secs(15);
+
 pub(crate) async fn fetch_launch_files(state: Arc<AppState>) {
     struct Running;
     impl Drop for Running {
@@ -1547,11 +1550,26 @@ pub(crate) async fn fetch_launch_files(state: Arc<AppState>) {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     let Some(router) = state.topology_router.get().cloned() else { return };
-    let listing = match refresh_listing(&MANAGER, router.clone(), Board::DaqBoard, app_gate(&state)).await {
-        Ok(listing) => listing,
-        Err(error) => {
-            log::warn!("DAQ launch files: listing failed: {error}");
-            return;
+    // A listing that times out (the DAQ busy closing its launch file, a lost answer) is retried within the same
+    // hour: the burn report's final version depends on it.
+    let listing = loop {
+        match refresh_listing(&MANAGER, router.clone(), Board::DaqBoard, app_gate(&state)).await {
+            Ok(listing) => break listing,
+            Err(error) if Instant::now() + LAUNCH_LIST_RETRY < deadline => {
+                log::warn!("DAQ launch files: listing failed: {error}; retrying in {} s", LAUNCH_LIST_RETRY.as_secs());
+                tokio::time::sleep(LAUNCH_LIST_RETRY).await;
+                while station_gate(&state).is_some() || MANAGER.active() {
+                    if Instant::now() >= deadline {
+                        log::warn!("DAQ launch files were not fetched: downloads stayed unavailable for an hour");
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+            Err(error) => {
+                log::warn!("DAQ launch files: listing failed: {error}");
+                return;
+            }
         }
     };
     let root = download_root(&state);

@@ -334,6 +334,8 @@ def arm_and_launch(st: Station, check):
         st.sleep(3)
     if st.mode != "test_fire":
         check("station and boards reach Armed", state == "Armed", state=state, fc=fc_phase(st))
+    if st.mode == "normal":
+        return normal_launch(st, check)
     launched = False
     for _ in range(8):
         st.api("/api/board_abort/refresh", {})
@@ -347,6 +349,51 @@ def arm_and_launch(st: Station, check):
             st.sleep(6)
     check("Launch accepted by the station", launched)
     return launched
+
+
+def normal_launch(st: Station, check):
+    """Normal mode after the fill (FirmwareSimulator test-operational-flight-sim.py): sign the checkout checklist,
+    retract the QD (RetractPlumbing, refreshing the actuator readback until the station reports QD motion), then
+    Launch once every required board's state proof and the retraction proof are fresh (/api/board_abort)."""
+    code, doc = st.api("/api/checklists")
+    if code == 200 and isinstance(doc, dict):
+        code, body = st.api("/api/checklists/sign", {"checklist_id": "checkout", "revision": doc.get("revision")})
+        st.log("checklist sign-off", http=code, body=body)
+
+    def retracting():
+        g = gse(st)
+        if g.get("qd") not in (None, "NotStarted"):
+            return g.get("qd")
+        st.api("/api/actuator/plumbing/query", {})
+        st.command("RetractPlumbing")
+        return None
+    qd = st.wait(retracting, 90, "QD retract dispatched", poll=3)
+    check("the QD retracts (RetractPlumbing through the AB)", qd, qd=qd, umbilical=st.plant().get("umbilical_attached"))
+    launched = [None]
+    last_refresh = [st.now() - 30]
+
+    def launch():
+        if st.now() - last_refresh[0] >= 10:
+            last_refresh[0] = st.now()
+            st.api("/api/board_abort/refresh", {})
+        code, snap = st.api("/api/board_abort")
+        if code != 200 or not isinstance(snap, dict):
+            return None
+        missing = snap.get("missing_required_state") or []
+        retraction = snap.get("retraction") or {}
+        if missing or not retraction.get("allowed"):
+            if not missing:
+                st.api("/api/actuator/plumbing/query", {})
+            launched[0] = {"missing": missing, "retraction": retraction.get("phase")}
+            return None
+        code, body = st.command("Launch")
+        launched[0] = {"http": code, "body": body}
+        return code == 200
+    # the AB drives the stepper the full retract (ActuatorBoard26 main_task.c: 200000 motor steps x 100 gearbox at
+    # 30 us, 600 s) before it reports the retraction complete
+    ok = st.wait(launch, 900, "Launch admitted", poll=2)
+    check("Launch accepted by the station", ok, last=launched[0])
+    return bool(ok)
 
 
 def flight(st: Station, check, result):
@@ -747,8 +794,9 @@ def scenario_igt(st, check, result):
         if g.get("gps_simulated"):
             seen["gps_simulated"] = True
         if str(g.get("fc_mode", "")).lower() == "sim":
-            dry = bool(g.get("drogue_dry_run") and g.get("main_dry_run"))
-            seen["dry_run"] = dry if seen["dry_run"] is None else (seen["dry_run"] and dry)
+            # the FC reports both outputs dry-run while it flies the replay (the first report of Sim may predate it)
+            if g.get("drogue_dry_run") and g.get("main_dry_run"):
+                seen["dry_run"] = True
         seen["live_pyro"] |= bool(g.get("live_pyro"))
         if ph and (not phases or phases[-1] != ph):
             phases.append(ph)
