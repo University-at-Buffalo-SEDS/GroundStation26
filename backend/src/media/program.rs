@@ -106,15 +106,15 @@ pub(super) fn now_ms() -> u64 {
 }
 fn program_t_clock(clock: &crate::telemetry_db::LaunchClockMsg, now: i64) -> Option<String> {
     use crate::telemetry_db::LaunchClockKind;
-    let (sign, delta) = match clock.kind {
+    let (before_t0, delta) = match clock.kind {
         LaunchClockKind::Idle => (
-            "−",
+            true,
             clock
                 .duration_ms
                 .unwrap_or(crate::state::LAUNCH_COUNTDOWN_DURATION_MS),
         ),
         LaunchClockKind::TMinus => (
-            "−",
+            true,
             match (clock.anchor_timestamp_ms, clock.duration_ms) {
                 (Some(anchor), Some(duration)) => {
                     duration.saturating_sub(now.saturating_sub(anchor))
@@ -124,15 +124,11 @@ fn program_t_clock(clock: &crate::telemetry_db::LaunchClockMsg, now: i64) -> Opt
                 _ => return None,
             },
         ),
-        LaunchClockKind::TPlus => ("+", now.saturating_sub(clock.anchor_timestamp_ms?)),
+        LaunchClockKind::TPlus => (false, now.saturating_sub(clock.anchor_timestamp_ms?)),
     };
-    let centis = delta.max(0).saturating_add(5) / 10;
-    Some(format!(
-        "T{sign} {:02}:{:02}.{:02}",
-        centis / 6000,
-        centis / 100 % 60,
-        centis % 100
-    ))
+    // Nearest hundredth, as the dashboard header shows it.
+    let magnitude = delta.max(0).unsigned_abs().saturating_add(5);
+    Some(crate::tclock::format_tclock(before_t0, magnitude, 2))
 }
 const PROGRAM_HISTORY_MS: u64 = 90_000;
 const PROGRAM_SAMPLE_MS: u64 = 250;
@@ -881,7 +877,7 @@ mod tests {
             );
         }
         let delayed = delayed_program_snapshot(&history, 102_500).unwrap();
-        assert_eq!(delayed["t_clock"], "T− 00:17.50");
+        assert_eq!(delayed["t_clock"], "T- 00:17.50");
         assert_ne!(
             delayed["t_clock"],
             program_t_clock(&clock, 115_000).unwrap()
@@ -914,11 +910,11 @@ mod tests {
         let minus = crate::state::launch_countdown_clock(epoch + 100_000);
         assert_eq!(
             program_t_clock(&minus, epoch + 100_833).as_deref(),
-            Some("T− 00:09.17")
+            Some("T- 00:09.17")
         );
         assert_eq!(
             program_t_clock(&minus, epoch + 100_833).as_deref(),
-            Some("T− 00:09.17")
+            Some("T- 00:09.17")
         );
         let plus = LaunchClockMsg {
             kind: LaunchClockKind::TPlus,
@@ -945,11 +941,11 @@ mod tests {
         };
         assert_eq!(
             program_t_clock(&clock, 104_250).as_deref(),
-            Some("T− 00:05.75")
+            Some("T- 00:05.75")
         );
         assert_eq!(
             program_t_clock(&clock, 115_000).as_deref(),
-            Some("T− 00:00.00")
+            Some("T- 00:00.00")
         );
         clock.kind = LaunchClockKind::TPlus;
         clock.anchor_timestamp_ms = Some(110_000);
@@ -967,12 +963,23 @@ mod tests {
         clock.kind = LaunchClockKind::TMinus;
         assert_eq!(
             program_t_clock(&clock, 125_250).as_deref(),
-            Some("T− 00:10.00")
+            Some("T- 00:10.00")
         );
         assert_eq!(
             program_t_clock(&LaunchClockMsg::idle(), 125_250).as_deref(),
-            Some("T− 00:10.00")
+            Some("T- 00:10.00")
         );
+        // Hours and days extend the lead field instead of wrapping minutes.
+        clock.kind = LaunchClockKind::TPlus;
+        clock.anchor_timestamp_ms = Some(0);
+        assert_eq!(program_t_clock(&clock, 3_723_456).as_deref(), Some("T+ 1:02:03.46"));
+        assert_eq!(program_t_clock(&clock, 93_784_000).as_deref(), Some("T+ 1:02:03:04.00"));
+        assert_eq!(
+            program_t_clock(&clock, i64::MAX).as_deref(),
+            Some("T+ 106751991167:07:12:55.81")
+        );
+        clock.anchor_timestamp_ms = Some(i64::MAX);
+        assert_eq!(program_t_clock(&clock, i64::MIN).as_deref(), Some("T+ 00:00.00"));
     }
     #[test]
     fn playlist_uris_are_scoped() {

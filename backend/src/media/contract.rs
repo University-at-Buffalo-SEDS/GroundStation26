@@ -937,6 +937,12 @@ async fn three_asset(Path(file): Path<String>) -> ApiResult<Response> {
                 )
             })?
         }
+        "tclock.js" => gs_browser_assets::asset_bytes("TCLOCK_JS").ok_or_else(|| {
+            error(
+                StatusCode::NOT_FOUND,
+                "T-clock module unavailable in selected frontend",
+            )
+        })?,
         "software-renderer.js" => gs_browser_assets::SOFTWARE_RENDERER_JS,
         "three.module.js" => gs_browser_assets::THREE_MODULE_JS,
         "three.core.js" => gs_browser_assets::THREE_CORE_JS,
@@ -1029,18 +1035,20 @@ mod tests {
 
     #[tokio::test]
     async fn selected_frontend_replay_asset_is_served_or_explicitly_absent() {
-        let result = three_asset(Path("replay-scene.js".into())).await;
-        match gs_browser_assets::asset_bytes("REPLAY_SCENE_JS") {
-            Some(expected) => {
-                let response = result.unwrap();
-                assert_eq!(response.status(), StatusCode::OK);
-                assert_eq!(response.headers()[header::CONTENT_TYPE], "text/javascript");
-                let body = axum::body::to_bytes(response.into_body(), expected.len() + 1)
-                    .await
-                    .unwrap();
-                assert_eq!(body.as_ref(), expected);
+        for (file, name) in [("replay-scene.js", "REPLAY_SCENE_JS"), ("tclock.js", "TCLOCK_JS")] {
+            let result = three_asset(Path(file.into())).await;
+            match gs_browser_assets::asset_bytes(name) {
+                Some(expected) => {
+                    let response = result.unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
+                    assert_eq!(response.headers()[header::CONTENT_TYPE], "text/javascript");
+                    let body = axum::body::to_bytes(response.into_body(), expected.len() + 1)
+                        .await
+                        .unwrap();
+                    assert_eq!(body.as_ref(), expected);
+                }
+                None => assert_eq!(result.err().unwrap().status(), StatusCode::NOT_FOUND),
             }
-            None => assert_eq!(result.err().unwrap().status(), StatusCode::NOT_FOUND),
         }
     }
     #[tokio::test]

@@ -44,6 +44,7 @@ mod ignition_pair;
 mod checklists;
 mod client_settings;
 mod watch;
+mod tclock;
 mod raw_stream;
 mod diagrams;
 mod vehicle_geometry;

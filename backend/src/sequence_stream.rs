@@ -106,7 +106,7 @@ mod tests {
         assert_eq!(reset["sequence_visuals"]["clock"]["advancing"], false);
         assert!(after["sequence_visuals"]["igniter"]["output"].is_null());
         assert!(after["sequence_visuals"]["valves"]["nitrogen"]["flow"].is_null());
-        let old = serde_json::json!({"t_clock":"T− 00:05.00"});
+        let old = serde_json::json!({"t_clock":"T- 00:05.00"});
         let mut still_old = old.clone();
         observe_clock_progress(Some(&after), &mut still_old);
         assert_eq!(still_old, old);

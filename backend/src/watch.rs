@@ -680,10 +680,10 @@ fn fmt_number(value: f64, precision: usize) -> String {
 }
 
 fn clock_text(clock: &Clock) -> String {
-    let s = clock.ms.max(0) / 1000;
+    let magnitude = clock.ms.max(0).unsigned_abs();
     match clock.kind {
-        "tminus" => format!("T- {:02}:{:02}", s / 60, s % 60),
-        "tplus" => format!("T+ {:02}:{:02}", s / 60, s % 60),
+        "tminus" => crate::tclock::format_tclock(true, magnitude, 0),
+        "tplus" => crate::tclock::format_tclock(false, magnitude, 0),
         _ => "Idle".into(),
     }
 }
@@ -1020,6 +1020,17 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
     use tower::ServiceExt;
+
+    #[test]
+    fn clock_text_extends_past_an_hour() {
+        let text = |kind, ms| clock_text(&Clock { kind, ms });
+        assert_eq!(text("tminus", 9_500), "T- 00:09");
+        assert_eq!(text("tminus", -5), "T- 00:00");
+        assert_eq!(text("tplus", 6_000_000), "T+ 1:40:00");
+        assert_eq!(text("tplus", 93_784_000), "T+ 1:02:03:04");
+        assert_eq!(text("tplus", i64::MAX), "T+ 106751991167:07:12:55");
+        assert_eq!(text("idle", 0), "Idle");
+    }
 
     fn none(_: &str, _: Option<&str>, _: usize) -> Option<(f64, i64)> {
         None
