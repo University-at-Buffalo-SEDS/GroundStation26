@@ -2,6 +2,7 @@ mod budget;
 mod cache_probe;
 mod connection_test;
 mod dns;
+mod layer;
 mod limits;
 mod network;
 mod options;
@@ -178,7 +179,7 @@ async fn fetch_tile_with_retries(
         let _ = async_fs::remove_file(&part_path).await;
     }
 
-    let url = format!("{base}/{z}/{y}/{x}", base = base_url, z = z, y = y, x = x,);
+    let url = layer::tile_url(base_url, z, x, y);
 
     let mut attempts: u32 = 0;
     loop {
@@ -280,9 +281,9 @@ fn should_resume_bundle() -> bool {
 }
 
 fn bundle_path_for(data_dir: &Path) -> PathBuf {
-    match env::var("MAP_BUNDLE_PATH") {
+    match env::var(layer::bundle_path_env()) {
         Ok(raw) if !raw.trim().is_empty() => PathBuf::from(raw),
-        _ => data_dir.join("tiles.sqlite3"),
+        _ => data_dir.join(layer::bundle_file()),
     }
 }
 
@@ -810,10 +811,25 @@ async fn main() -> Result<()> {
         println!("High-detail regions selected by MAP_REGIONS: {} region(s)", regions.len());
     }
     let region = env::var("MAP_REGION").unwrap_or_else(|_| profile.default_region().to_string());
-    let max_zoom = env::var("MAP_MAX_ZOOM")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(DEFAULT_MAX_ZOOM);
+    let options = options::Options::parse(env::args().skip(1))?;
+    if options.terrain {
+        layer::select(layer::Layer::Terrain);
+    }
+    let max_zoom = if options.terrain {
+        let z = layer::terrain_max_zoom(env::var("MAP_TERRAIN_MAX_ZOOM").ok().as_deref())?;
+        println!(
+            "Terrain (DEM): {} z=0..={z}, {} tiles planned; source {} (open data, attribution: Mapzen/Tilezen terrain sources)",
+            layer::bundle_file(),
+            layer::planned_terrain_tiles(profile, z),
+            layer::TERRAIN_BASE_URL
+        );
+        z
+    } else {
+        env::var("MAP_MAX_ZOOM")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(DEFAULT_MAX_ZOOM)
+    };
 
     if max_zoom > 30 {
         anyhow::bail!("MAP_MAX_ZOOM must be between 0 and 30");
@@ -824,7 +840,6 @@ async fn main() -> Result<()> {
         should_resume_bundle(),
         should_build_bundle(),
     )?;
-    let options = options::Options::parse(env::args().skip(1))?;
     options.validate(
         profile,
         max_zoom,
@@ -843,13 +858,13 @@ async fn main() -> Result<()> {
             &connection_test::sample_tiles_for_profile(max_zoom, profile),
         )
         .await;
-        let client = TileClient::configured(&format!("{SATELLITE_BASE_URL}/0/0/0")).await?;
+        let client = TileClient::configured(&layer::tile_url(layer::base_url(), 0, 0, 0)).await?;
         let network = connection_test::run(
             &client,
             &region,
             profile,
             max_zoom,
-            SATELLITE_BASE_URL,
+            layer::base_url(),
             env::var_os("MAP_DIRECT_INTERFACE").is_some(),
         )
         .await;
@@ -892,7 +907,7 @@ async fn main() -> Result<()> {
     }
 
     // Async HTTP client
-    let client = TileClient::configured(&format!("{SATELLITE_BASE_URL}/0/0/0")).await?;
+    let client = TileClient::configured(&layer::tile_url(layer::base_url(), 0, 0, 0)).await?;
 
     if !options.repairs.is_empty() {
         return repair::run(
@@ -903,7 +918,7 @@ async fn main() -> Result<()> {
             profile,
             direct_to_bundle,
             MAX_RETRY_ATTEMPTS,
-            SATELLITE_BASE_URL,
+            layer::base_url(),
         )
         .await;
     }
@@ -1012,7 +1027,7 @@ async fn fetch_tiles_for_zoom_async(
     client: &TileClient,
     profile: Profile,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let bounds = profile.bounds(z);
+    let bounds = layer::bounds(profile, z);
 
     // Enumerate + de-duplicate all tile coordinates across selected bounds.
     let mut coord_set = HashSet::<(u32, u32)>::new();
@@ -1147,7 +1162,7 @@ async fn fetch_tiles_for_zoom_async(
                     pb_for_worker.as_ref(),
                     limiter_for_worker.as_ref(),
                     MAX_RETRY_ATTEMPTS,
-                    SATELLITE_BASE_URL,
+                    layer::base_url(),
                     false,
                 )
                 .await;
@@ -1214,7 +1229,7 @@ async fn fetch_tiles_for_zoom_async(
                         pb.as_ref(),
                         limiter.as_ref(),
                         MAX_RETRY_ATTEMPTS,
-                        SATELLITE_BASE_URL,
+                        layer::base_url(),
                         false,
                     )
                     .await;
@@ -1330,7 +1345,7 @@ async fn fetch_tile_with_retries_to_db(
     max_attempts: u32,
     base_url: &str,
 ) -> TileOutcome {
-    let url = format!("{base}/{z}/{y}/{x}", base = base_url, z = z, y = y, x = x,);
+    let url = layer::tile_url(base_url, z, x, y);
 
     let mut attempts: u32 = 0;
     loop {
@@ -1397,7 +1412,7 @@ async fn fetch_tiles_for_zoom_async_to_db(
     profile: Profile,
     budget: Option<Arc<budget::DatasetBudget>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let bounds = profile.bounds(z);
+    let bounds = layer::bounds(profile, z);
 
     let mut coord_set = HashSet::<(u32, u32)>::new();
     for bbox in bounds {
@@ -1423,8 +1438,8 @@ async fn fetch_tiles_for_zoom_async_to_db(
     let (x_start, x_end, y_start, y_end) = bounds_tile_extent(&coords);
     let total = coords.len() as u64;
     println!(
-        "z={z}: fetching satellite tiles directly to bundle x=[{}..={}], y=[{}..={}], total={} tiles",
-        x_start, x_end, y_start, y_end, total
+        "z={z}: fetching {} tiles directly to bundle x=[{}..={}], y=[{}..={}], total={} tiles",
+        layer::label(), x_start, x_end, y_start, y_end, total
     );
     let is_tty = std::io::stdout().is_terminal();
 
@@ -1528,7 +1543,7 @@ async fn fetch_tiles_for_zoom_async_to_db(
                     pb_for_worker.as_ref(),
                     limiter_for_worker.as_ref(),
                     MAX_RETRY_ATTEMPTS,
-                    SATELLITE_BASE_URL,
+                    layer::base_url(),
                 )
                 .await;
                 match ok {
@@ -1593,7 +1608,7 @@ async fn fetch_tiles_for_zoom_async_to_db(
                         pb.as_ref(),
                         limiter.as_ref(),
                         MAX_RETRY_ATTEMPTS,
-                        SATELLITE_BASE_URL,
+                        layer::base_url(),
                     )
                     .await;
                     match ok {

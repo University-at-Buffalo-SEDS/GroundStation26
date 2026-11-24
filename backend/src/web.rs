@@ -521,6 +521,7 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         )
         .route("/ws", get(ws_handler))
         .route("/tiles/{z}/{x}/{y}", get(get_tile_jpg))
+        .merge(crate::terrain::routes())
         .route("/favicon.ico", get(get_favicon))
         .route("/valvestate", get(get_valve_state))
         .merge(if crate::flight_sim_runtime::enabled() {
@@ -575,6 +576,7 @@ pub(crate) fn bundle_config_routes() -> Router<Arc<AppState>> {
         .route("/api/map_config", get(get_map_config))
         .route("/api/calibration", get(get_loadcell_calibration))
         .route("/tiles/{z}/{x}/{y}", get(get_tile_jpg))
+        .merge(crate::terrain::routes())
 }
 
 /// Pulls a bearer token out of the Authorization header.

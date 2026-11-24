@@ -6,7 +6,8 @@ class WrapperTests(unittest.TestCase):
  def invoke(self,args):
   with patch('sys.argv',['download_map.py']+args),patch.dict(module.os.environ,{},clear=True),patch.object(module,'run')as run:
    module.main()
-  return run.call_args
+  self.runs=[call.args[0] for call in run.call_args_list]
+  return run.call_args_list[0]
  def test_test_flag_forwarded_to_rust_binary(self):
   args=self.invoke(['--test']);self.assertEqual(args.args[0],['cargo','run','--release','-p','map_downloader','--','--test'])
  def test_direct_interface_and_existing_configuration_preserved(self):
@@ -34,4 +35,15 @@ class WrapperTests(unittest.TestCase):
   self.assertNotIn('MAP_REGIONS',args.kwargs['env'])
  def test_ordinary_download_command_unchanged(self):
   args=self.invoke([]);self.assertEqual(args.args[0],['cargo','run','--release','-p','map_downloader'])
+ def test_terrain_follows_the_imagery_for_the_same_regions(self):
+  self.invoke(['--regions','midland']);self.assertEqual(self.runs,[['cargo','run','--release','-p','map_downloader'],['cargo','run','--release','-p','map_downloader','--','--terrain']])
+  self.invoke(['--test']);self.assertEqual(self.runs[1][-2:],['--test','--terrain'])
+ def test_terrain_can_be_skipped_or_run_alone(self):
+  self.invoke(['--no-terrain']);self.assertEqual(len(self.runs),1)
+  args=self.invoke(['--terrain-only','--terrain-max-zoom','14']);self.assertEqual(self.runs,[['cargo','run','--release','-p','map_downloader','--','--terrain']]);self.assertEqual(args.kwargs['env']['MAP_TERRAIN_MAX_ZOOM'],'14')
+  for bad in (['--terrain-only','--no-terrain'],['--terrain-max-zoom','16'],['--terrain-only','--via-tiles']):
+   with self.assertRaises(SystemExit):self.invoke(bad)
+ def test_repairs_and_legacy_files_do_not_start_a_terrain_run(self):
+  self.invoke(['--repair-tile','1/0/0']);self.assertEqual(len(self.runs),1)
+  self.invoke(['--via-tiles']);self.assertEqual(len(self.runs),1)
 if __name__=='__main__':unittest.main()

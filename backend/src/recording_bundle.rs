@@ -32,6 +32,9 @@ pub(crate) const VERSION: u64 = 1;
 pub(crate) const MEDIA_TYPE: &str = "application/vnd.seds.gsreplay+zip";
 const DEFAULT_TILE_BUDGET_MB: u32 = 8;
 const MAX_TILE_BUDGET_MB: u32 = 32;
+/// The terrain heightmap entry is at most this large (a 129 x 129 grid is about 45 KB).
+const MAX_TERRAIN_BYTES: usize = 1 << 20;
+const TERRAIN_GRID_SIZE: u32 = 129;
 /// Largest body read from one internal route (the replay export caps itself at 64 MiB).
 const MAX_ENTRY_BYTES: usize = 96 << 20;
 
@@ -42,6 +45,8 @@ pub(crate) struct Options {
     pub tiles: bool,
     /// Tile budget in MiB (default 8, at most 32).
     pub tiles_max_mb: Option<u32>,
+    /// Include the cached DEM heightmap around the track (default: with tiles).
+    pub terrain: Option<bool>,
 }
 
 pub(crate) fn routes() -> Router<Arc<AppState>> {
@@ -111,6 +116,22 @@ fn tile_of(lat: f64, lon: f64, z: u32) -> (u32, u32) {
     let rad = lat.clamp(-85.05, 85.05).to_radians();
     let y = ((1.0 - (rad.tan() + 1.0 / rad.cos()).ln() / std::f64::consts::PI) / 2.0 * n).floor().clamp(0.0, n - 1.0) as u32;
     (x, y)
+}
+
+/// The heightmap request for a track: centred on its first fix (the pad),
+/// wide enough for the whole track plus a margin, 2..30 km.
+fn terrain_route(points: &[Value]) -> Option<(String, f64)> {
+    let fix = |p: &Value| Some((p["latitude"].as_f64()?, p["longitude"].as_f64()?));
+    let (lat0, lon0) = points.iter().find_map(fix)?;
+    let mut reach = 0.0f64;
+    for (lat, lon) in points.iter().filter_map(fix) {
+        let north = (lat - lat0).to_radians() * crate::terrain::EARTH_RADIUS_M;
+        let east = (lon - lon0).to_radians() * crate::terrain::EARTH_RADIUS_M * lat0.to_radians().cos();
+        reach = reach.max(north.abs()).max(east.abs());
+    }
+    let extent = ((reach * 2.0 + 2_000.0) / 1_000.0).ceil() * 1_000.0;
+    let extent = extent.clamp(2_000.0, 30_000.0);
+    Some((format!("/api/terrain/heightmap?lat={lat0}&lon={lon0}&extent_m={extent}&size={TERRAIN_GRID_SIZE}"), extent))
 }
 
 struct Entries {
@@ -243,6 +264,30 @@ pub(crate) async fn build(
         entries.add_json("derived/flight_plans.json", &json!({"plans": plans.into_iter().take(5).collect::<Vec<_>>()}));
     }
 
+    // Optional DEM heightmap around the pad, covering the track.
+    let mut terrain = json!({"included": false});
+    if options.terrain.unwrap_or(options.tiles)
+        && let Some(points) = trajectory.as_ref().and_then(|t| t["points"].as_array())
+        && let Some((route, extent_m)) = terrain_route(points)
+    {
+        match fetch(&router, headers, &route).await {
+            Ok(bytes) if bytes.len() <= MAX_TERRAIN_BYTES => {
+                let value = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
+                if value["available"] == true {
+                    terrain = json!({
+                        "included": true, "bytes": bytes.len(), "extent_m": extent_m, "size": value["size"],
+                        "zoom": value["zoom"], "source": value["source"], "attribution": value["attribution"],
+                    });
+                    entries.add("terrain/heightmap.json", bytes, "application/json");
+                } else {
+                    terrain = json!({"included": false, "reason": value["reason"]});
+                }
+            }
+            Ok(bytes) => terrain = json!({"included": false, "reason": format!("heightmap of {} bytes exceeds the {MAX_TERRAIN_BYTES}-byte cap", bytes.len())}),
+            Err(status) => entries.missing.push(json!({"path": "terrain/heightmap.json", "route": route, "status": status})),
+        }
+    }
+
     entries.files.insert(0, ("data/telemetry.csv".to_owned(), csv, "text/csv"));
     entries.files.insert(0, ("replay.json".to_owned(), serde_json::to_vec(&replay).unwrap_or_default(), "application/json"));
     let manifest = json!({
@@ -256,6 +301,7 @@ pub(crate) async fn build(
         "time_range": {"start_ms": replay["snapshot"]["start_ms"], "end_ms": replay["snapshot"]["end_ms"]},
         "rows": rows,
         "tiles": tiles,
+        "terrain": terrain,
         "missing": entries.missing,
         "entries": entries.files.iter().map(|(path, bytes, media_type)| json!({
             "path": path, "bytes": bytes.len(), "sha256": sha256_hex(bytes), "media_type": media_type,
@@ -406,6 +452,34 @@ mod tests {
         let db_bytes = std::fs::metadata(root.0.join(id)).map(|m| m.len()).unwrap_or(0);
         println!("realistic_capture_bundle_size: {rows} rows, recording db {db_bytes} bytes, bundle {} bytes, built in {:?}", bundle.len(), started.elapsed());
         assert!(bundle.len() < 64 << 20);
+    }
+
+    #[test]
+    fn terrain_request_covers_the_track() {
+        let points = vec![
+            json!({"latitude": 31.758, "longitude": -102.046}),
+            json!({"latitude": 31.768, "longitude": -102.036}),
+        ];
+        let (route, extent) = terrain_route(&points).unwrap();
+        assert_eq!(extent, 5_000.0);
+        assert!(route.starts_with("/api/terrain/heightmap?lat=31.758&lon=-102.046&extent_m=5000&size=129"), "{route}");
+        assert!(terrain_route(&[json!({"latitude": null})]).is_none());
+        let far = vec![json!({"latitude": 31.0, "longitude": -102.0}), json!({"latitude": 32.0, "longitude": -102.0})];
+        assert_eq!(terrain_route(&far).unwrap().1, 30_000.0);
+    }
+
+    #[tokio::test]
+    async fn bundle_carries_the_heightmap_when_a_dem_is_cached() {
+        // The heightmap route answers from a synthetic DEM; the bundle copies its body.
+        let (fx, fy) = crate::terrain::tile_xy(31.758, -102.046, 10);
+        let png = crate::terrain::encode_terrarium(256, 256, |x, _| 850.0 + x as f32);
+        let temp = crate::terrain::tests::temp_store("bundle", &[((10, fx as u32, fy as u32), png)]).await;
+        let map = crate::terrain::build_heightmap(&temp.store, 31.758, -102.046, 5_000.0, TERRAIN_GRID_SIZE).await.unwrap();
+        let bytes = serde_json::to_vec(&map).unwrap();
+        assert!(bytes.len() < MAX_TERRAIN_BYTES);
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["available"], true);
+        assert_eq!(value["size"], TERRAIN_GRID_SIZE);
     }
 
     #[test]

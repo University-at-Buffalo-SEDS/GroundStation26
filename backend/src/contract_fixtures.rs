@@ -709,7 +709,7 @@ async fn replay_bundle(root: &Path, state: &Arc<AppState>, app: &axum::Router, o
     // Loading a calibration file without a 50 kg input stamp stamps it with the
     // wall clock; pin it so the bundle's calibration entry is reproducible.
     state.loadcell_calibration.lock().unwrap().kg50_input_stamp_ms = T0 as u64;
-    let options = crate::recording_bundle::Options { tiles: true, tiles_max_mb: Some(1) };
+    let options = crate::recording_bundle::Options { tiles: true, tiles_max_mb: Some(1), ..Default::default() };
     let bundle = crate::recording_bundle::build(state.clone(), &headers, id, &options, T0).await.unwrap();
     let again = crate::recording_bundle::build(state.clone(), &headers, id, &options, T0).await.unwrap();
     assert_eq!(bundle, again, "a bundle is reproducible");

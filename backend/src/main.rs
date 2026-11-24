@@ -153,6 +153,7 @@ mod telemetry_db;
 mod telemetry_provenance;
 mod telemetry_schema;
 mod telemetry_task;
+mod terrain;
 mod test_fire_csv;
 mod testing_board_lifecycle;
 mod thermal_fit;

@@ -107,6 +107,23 @@ def choose_regions(args: argparse.Namespace) -> list[str] | None:
         return pick_regions_text()
 
 
+def downloader_runs(args: argparse.Namespace) -> list[list[str]]:
+    """The map_downloader invocations: imagery, then the terrain (DEM) for the
+    same regions. Repairs touch the imagery only."""
+    if args.repair_tile:
+        return [[arg for tile in args.repair_tile for arg in ("--repair-tile", tile)]]
+    base = ["--test"] if args.test else []
+    terrain_possible = not args.no_bundle and not args.via_tiles
+    runs = []
+    if not args.terrain_only:
+        runs.append(base)
+    if not args.no_terrain and (terrain_possible or args.test):
+        runs.append(base + ["--terrain"])
+    elif args.terrain_only:
+        raise SystemExit("Error: the terrain downloads only into its bundle; remove --no-bundle/--via-tiles.")
+    return runs
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Download offline map tiles.")
     parser.add_argument("--profile", choices=["groundstation", "rrls"], default=None,
@@ -164,6 +181,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--direct-interface", nargs="?", const="auto", default=None, metavar="auto|NAME",
         help="Bind map HTTP sockets to a physical interface (auto if omitted), bypassing VPN/proxy; fall back to normal networking if unavailable. Does not change network configuration.",
+    )
+    parser.add_argument(
+        "--no-terrain", action="store_true",
+        help="Skip the terrain (DEM) download that follows the imagery (backend/data/maps/<region>/terrain.sqlite3).",
+    )
+    parser.add_argument(
+        "--terrain-only", action="store_true",
+        help="Download only the terrain (DEM) for the selected regions, not the imagery.",
+    )
+    parser.add_argument(
+        "--terrain-max-zoom", type=int, default=None, metavar="Z",
+        help="Deepest DEM zoom (MAP_TERRAIN_MAX_ZOOM, default 12, at most 15).",
     )
     parser.add_argument(
         "--min-free-mib", type=int, default=None,
@@ -232,13 +261,22 @@ def main() -> None:
         env["MAP_DIRECT_TO_BUNDLE"] = "0"
         print("Using MAP_DIRECT_TO_BUNDLE=0")
 
+    if args.no_terrain and args.terrain_only:
+        print("Error: --no-terrain and --terrain-only are mutually exclusive.", file=sys.stderr)
+        sys.exit(2)
+    if args.terrain_max_zoom is not None:
+        if not 0 <= args.terrain_max_zoom <= 15:
+            print("Error: --terrain-max-zoom must be 0..15.", file=sys.stderr)
+            sys.exit(2)
+        env["MAP_TERRAIN_MAX_ZOOM"] = str(args.terrain_max_zoom)
+
     try:
-        binary_args = ["--test"] if args.test else [arg for tile in args.repair_tile for arg in ("--repair-tile", tile)]
-        run(
-            ["cargo", "run", "--release", "-p", "map_downloader"] + (["--"] + binary_args if binary_args else []),
-            cwd=repo_root,
-            env=env,
-        )
+        for binary_args in downloader_runs(args):
+            run(
+                ["cargo", "run", "--release", "-p", "map_downloader"] + (["--"] + binary_args if binary_args else []),
+                cwd=repo_root,
+                env=env,
+            )
     except subprocess.CalledProcessError as e:
         print("Map downloader exited with error.", file=sys.stderr)
         sys.exit(e.returncode)

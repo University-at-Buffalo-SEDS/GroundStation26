@@ -61,7 +61,7 @@ async fn check(client: &TileClient, tiles: &[(u32, u32, u32)], base_url: &str) -
         ..Report::default()
     };
     for &(z, x, y) in tiles {
-        let url = format!("{base_url}/{z}/{y}/{x}");
+        let url = crate::layer::tile_url(base_url, z, x, y);
         match tokio::time::timeout(Duration::from_secs(35), client.fetch(&url)).await {
             Ok(Ok(response)) => {
                 match response.route {
