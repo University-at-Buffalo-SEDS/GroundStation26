@@ -198,24 +198,6 @@
     "show_flight_setup": false,
     "show_fill_targets": true,
     "fill_targets_require_actions_enabled": true,
-    "controls": [
-      {
-        "cmd": "TogglePlumbingDelayInterlock",
-        "label": "Retraction minimum 45 seconds"
-      },
-      {
-        "cmd": "ToggleChecklistInterlock",
-        "label": "Checklist enforcement"
-      },
-      {
-        "cmd": "ToggleSupplyInterlock",
-        "label": "Nitrogen/nitrous one at a time"
-      },
-      {
-        "cmd": "ToggleBoardStateProofInterlock",
-        "label": "Board state checks"
-      }
-    ],
     "fill_target_fluids": [
       {
         "id": "nitrogen",

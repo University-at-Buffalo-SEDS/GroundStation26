@@ -294,7 +294,7 @@ Critical expectations:
   - `watch_items: [{id, channels:[{data_type, sender_id?, index}]}]`: watch item channels by id;
     `/api/watch/status` reads the same list.
   - `actions_tab.controls: [{cmd, label}]`: names of controls that are not layout buttons (the
-    HITL interlock toggles).
+    HITL interlock toggles, named in `layout_hitl.json` only, since only HITL has those commands).
   - `actions_tab.fill_target_fluids: [{id, label}]`: the `/api/fill_targets` fluids the UI edits,
     in order, with their names.
 

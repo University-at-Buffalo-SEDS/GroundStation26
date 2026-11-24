@@ -1356,16 +1356,21 @@ mod vehicle_binding_tests {
             let layout: LayoutConfig = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
             let labels: Vec<(&str, &str)> =
                 layout.actions_tab.controls.iter().map(|c| (c.cmd.as_str(), c.label.as_str())).collect();
-            assert_eq!(
-                labels,
-                [
-                    ("TogglePlumbingDelayInterlock", "Retraction minimum 45 seconds"),
-                    ("ToggleChecklistInterlock", "Checklist enforcement"),
-                    ("ToggleSupplyInterlock", "Nitrogen/nitrous one at a time"),
-                    ("ToggleBoardStateProofInterlock", "Board state checks"),
-                ],
-                "{file}"
-            );
+            // The interlock toggles exist only in HITL (only that build has the
+            // commands), so only the HITL layout names them.
+            if file == DEFAULT_HITL_LAYOUT_PATH {
+                assert_eq!(
+                    labels,
+                    [
+                        ("TogglePlumbingDelayInterlock", "Retraction minimum 45 seconds"),
+                        ("ToggleChecklistInterlock", "Checklist enforcement"),
+                        ("ToggleSupplyInterlock", "Nitrogen/nitrous one at a time"),
+                        ("ToggleBoardStateProofInterlock", "Board state checks"),
+                    ],
+                );
+            } else {
+                assert!(labels.is_empty(), "{file}");
+            }
             assert_eq!(
                 layout.gps,
                 Some(GpsLayout {
