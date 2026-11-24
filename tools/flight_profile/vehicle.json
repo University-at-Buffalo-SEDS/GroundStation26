@@ -81,11 +81,12 @@
   "launch": {
     "ignition_s": 10.0,
     "ignition_source": "repo: docs/integrated-ground-test.md 4.2: VB pilot at Launch + 10 s; replayed liftoff about t_ms 10000",
-    "rail_length_m": 5.18,
-    "rail_source": "17 ft rail (SA Cup/IREC tower); effective travel taken as the full length",
+    "rail_length_m": 9.144,
+    "rail_source": "30 ft launch rail (9.144 m), the launch rod of the .ork's IREC_STANDARDREPORT and Simulation 1; effective travel taken as the full length",
     "tilt_deg": 5.0,
     "azimuth_deg": 60.0,
-    "rail_friction": 0.03,
+    "rail_friction": 0.15,
+    "rail_friction_source": "Coulomb coefficient of the rail buttons on the aluminium rail (acetal/nylon on anodised aluminium, kinetic 0.1-0.2; mid value). Applied only on the rail, to the load across it: the weight's cross-rail component plus the cross-flow normal force (apogee_planner flight.rs rail_normal_accel). OpenRocket models no rail friction.",
     "tilt_source": "IREC/SA Cup launch angle about 5 deg (DTEG allows up to 10); azimuth = tools/igt_csv.py default"
   },
 

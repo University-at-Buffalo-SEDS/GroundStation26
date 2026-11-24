@@ -247,7 +247,7 @@ Liftoff and flight: the motor lights once the igniter has fired (not required in
 fires no igniter) and the pilot opens with at least 0.5 kg of liquid; the main valve is assumed to stay open to
 burnout once lit (HITL opens the pilot for 1.5 s). On the test stand (test fire mode) the rocket stays put. In
 flight: the umbilical separates (the VB leaves the fill CAN bus, the continuity loop opens, the QD disconnects);
-the vehicle runs up the launcher (`vehicle.json` `launch`: 5.18 m rail, 5 deg tilt towards 60 deg, friction 0.03),
+the vehicle runs up the launcher (`vehicle.json` `launch`: the 30 ft (9.144 m) rail, 5 deg tilt towards 60 deg, Coulomb friction 0.15 on the load across the rail, as the apogee planner),
 constrained to it, then flies 3-D with the apogee planner's pitch/yaw dynamics (`backend/src/apogee_planner/flight.rs`
 `fly_traced`): thrust on the body axis, drag on the air-relative velocity (ISA density shifted by the ambient
 temperature, Cd 0.5), the normal force qd A CNa limited at 15 deg of attack, the restoring moment with the static margin

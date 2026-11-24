@@ -90,6 +90,40 @@ fn planner_flight_matches_the_python_reference_cases() {
     }
 }
 
+/// The 30 ft launch rail with Coulomb button friction (vehicle.json `launch`, the one definition the
+/// planner, flight plans, the LOS prediction and the firmware-sim plant read).
+#[test]
+fn the_launch_rail_is_30_ft_with_coulomb_friction_on_the_cross_rail_load() {
+    let cfg = flight::Config::reference();
+    assert!((cfg.launch.rail_length_m - 30.0 * 0.3048).abs() < 1e-9, "30 ft rail: {}", cfg.launch.rail_length_m);
+    assert!((0.1..=0.2).contains(&cfg.launch.rail_friction), "rail buttons on aluminium: {}", cfg.launch.rail_friction);
+    // At rest in still air the buttons carry the weight's cross-rail component, m g sin(tilt).
+    let tilt = cfg.launch.tilt_deg.to_radians();
+    let dir = [tilt.sin(), 0.0, tilt.cos()];
+    let n = flight::rail_normal_accel(dir, 9.8, [0.0; 3], 0.0, 0.018, 9.28, 40.0);
+    assert!((n - 9.8 * tilt.sin()).abs() < 1e-9, "{n}");
+    // A vertical rail carries nothing without a cross-wind, and the cross-flow's normal force with one.
+    assert!(flight::rail_normal_accel([0.0, 0.0, 1.0], 9.8, [0.0, 0.0, 20.0], 240.0, 0.018, 9.28, 40.0) < 1e-12);
+    assert!(flight::rail_normal_accel([0.0, 0.0, 1.0], 9.8, [-5.0, 0.0, 20.0], 240.0, 0.018, 9.28, 40.0) > 0.1);
+
+    let motor = flight::Motor::from_config(&cfg.motor, flight::THRUST_CSV);
+    let env = flight::Environment::from_config(&cfg);
+    let with = flight::fly(&cfg, &env, &motor, 0.001);
+    let mut frictionless = cfg.clone();
+    frictionless.launch.rail_friction = 0.0;
+    let without = flight::fly(&frictionless, &env, &motor, 0.001);
+    // Rail exit above the IREC/SA Cup 30.5 m/s minimum on the 30 ft rail; friction costs a little speed
+    // and height (about 0.03 m/s and 1-2 m at 5 deg), never more than 1 %.
+    assert!((30.5..40.0).contains(&with.rail_exit_mps), "rail exit {}", with.rail_exit_mps);
+    assert!(with.rail_exit_mps < without.rail_exit_mps && with.apogee_m < without.apogee_m);
+    assert!(without.rail_exit_mps - with.rail_exit_mps < 0.01 * without.rail_exit_mps);
+    assert!(without.apogee_m - with.apogee_m < 0.01 * without.apogee_m);
+    // A 17 ft rail would have released it well below the minimum.
+    let mut short = cfg.clone();
+    short.launch.rail_length_m = 17.0 * 0.3048;
+    assert!(flight::fly(&short, &env, &motor, 0.001).rail_exit_mps < 30.5);
+}
+
 #[test]
 fn descent_drifts_downwind() {
     let cfg = flight::Config::reference();

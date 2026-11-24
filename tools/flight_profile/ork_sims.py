@@ -226,7 +226,8 @@ def flight_config(base: dict, sim: dict) -> tuple[dict, float, float]:
                 'temp_offset_k': 0.0, 'wind_mps': sim['wind_mps'], 'wind_from_deg': sim['wind_dir_deg'],
                 'wind_shear_exponent': 0.0, 'gust_sigma_mps': 0.0})
     lau = cfg['launch']
-    lau.update({'rail_length_m': sim['rod_length_m'], 'tilt_deg': sim['rod_angle_deg'], 'ignition_s': 0.0,
+    # OpenRocket models no rail friction: none here either, for a like-for-like comparison.
+    lau.update({'rail_length_m': sim['rod_length_m'], 'tilt_deg': sim['rod_angle_deg'], 'ignition_s': 0.0, 'rail_friction': 0.0,
                 'azimuth_deg': sim['wind_dir_deg'] if sim['into_wind'] else sim['rod_direction_deg']})
     return cfg, dry, prop
 

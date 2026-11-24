@@ -85,7 +85,18 @@ operator approves it.
   apogee, rail-exit speed and peak acceleration next to ours. Ours is 1-2 % lower in
   apogee (our +10 % friction and 0.02 Cd allowance for protuberances, which OpenRocket's
   model of this file does not have; without them ours is 1 % higher), within 0.5 % in
-  peak speed and acceleration, and 1-5 % lower in rail-exit speed.
+  peak speed and acceleration, and 1-5 % lower in rail-exit speed. These runs set the
+  rail friction to zero, as OpenRocket has none.
+- **The launch rail** (`vehicle.json` `launch`, the one definition the planner, flight
+  plans, the LOS prediction, `tools/flight_profile` and the firmware-sim plant all read):
+  the 30 ft (9.144 m) rail of the .ork's IREC_STANDARDREPORT and Simulation 1, 5 deg tilt
+  towards 60 deg, and `rail_friction` 0.15, the Coulomb coefficient of the rail buttons
+  on the aluminium rail (acetal/nylon on anodised aluminium, kinetic 0.1-0.2). On the
+  rail the friction force is that coefficient times the load across the rail: the
+  weight's cross-rail component (m g sin tilt) plus the aerodynamic normal force of the
+  cross-flow (the free flight's qd A CNa, capped at 15 deg), `flight.rs`
+  `rail_normal_accel`; liftoff needs thrust above m g (cos tilt + mu sin tilt). Off the
+  rail there is no friction.
 - **Cross-check (dev machine only):** `tools/flight_profile/openrocket_crosscheck.py`
   runs OpenRocket itself through `orhelper` (JPype + the OpenRocket JAR) and prints
   OpenRocket's apogee next to the in-repo model's for the same `.ork` and motor. It is

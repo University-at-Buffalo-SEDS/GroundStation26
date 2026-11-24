@@ -308,6 +308,28 @@ def norm(a):
     return math.sqrt(dot(a, a))
 
 
+def rail_normal_accel(rail_dir, g, vair, qd, aref, cna, mass):
+    """Load (per kg) the rail buttons carry while on the launcher: the weight's component across the
+    rail plus the aerodynamic normal force of the cross-flow (the same CNa force as in boost, capped at
+    15 deg), as a magnitude. Rail friction is mu times this (Coulomb, vehicle.json launch.rail_friction).
+    Mirrored in backend/src/apogee_planner/flight.rs and FirmwareSimulator native_plant.rs."""
+    gpar = -g * rail_dir[2]
+    load = [0.0 - gpar * rail_dir[0], 0.0 - gpar * rail_dir[1], -g - gpar * rail_dir[2]]
+    vmag = norm(vair)
+    if vmag > 0.5:
+        vh = tuple(c / vmag for c in vair)
+        du = dot(rail_dir, vh)
+        nperp = [rail_dir[i] - du * vh[i] for i in range(3)]
+        sin_a = norm(nperp)
+        lim = math.sin(math.radians(15.0))
+        ks = min(lim / sin_a, 1.0) if sin_a > lim else 1.0
+        fa = [qd * aref * cna * c * ks / mass for c in nperp]
+        fa_par = dot(fa, rail_dir)
+        for i in range(3):
+            load[i] += fa[i] - fa_par * rail_dir[i]
+    return norm(load)
+
+
 def unit(a):
     n = norm(a)
     return (a[0] / n, a[1] / n, a[2] / n) if n > 1e-12 else (0.0, 0.0, 1.0)
@@ -426,7 +448,10 @@ def fly(cfg: dict, rng: random.Random, motor: Motor, record: bool = True,
         inertia = mass * L * L / 12.0 * i_factor
 
         if phase == 'pad':
-            if thrust > mass * g * rail_dir[2] * (1.0 + lau.get('rail_friction', 0.0)):
+            # Breakaway: thrust beats the weight along the rail plus static friction on the
+            # weight's cross-rail component.
+            mu_rail = lau.get('rail_friction', 0.0)
+            if thrust > mass * g * (rail_dir[2] + mu_rail * math.sqrt(max(0.0, 1.0 - rail_dir[2] ** 2))):
                 phase = 'rail'
                 ev['liftoff_s'] = t
             acc = [0.0, 0.0, 0.0]
@@ -434,7 +459,9 @@ def fly(cfg: dict, rng: random.Random, motor: Motor, record: bool = True,
         elif phase == 'rail':
             cd = aero.cd(mach, rho * vmag * L / mu, thrust > 0)
             drag = qd * aref * cd
-            along = (thrust - drag) / mass - g * rail_dir[2] * (1.0 + lau.get('rail_friction', 0.0))
+            mu_rail = lau.get('rail_friction', 0.0)
+            normal = rail_normal_accel(rail_dir, g, vair, qd, aref, cna, mass)
+            along = (thrust - drag) / mass - g * rail_dir[2] - mu_rail * normal
             sp = dot(vel, rail_dir)
             if sp <= 0 and along < 0:
                 along = 0.0

@@ -66,8 +66,34 @@ pub struct LaunchCfg {
     pub rail_length_m: f64,
     pub tilt_deg: f64,
     pub azimuth_deg: f64,
+    /// Coulomb friction coefficient of the rail buttons on the rail: the friction force is this times
+    /// the load across the rail ([`rail_normal_accel`]), only while on the launcher.
     #[serde(default)]
     pub rail_friction: f64,
+}
+
+/// The load per kg the rail buttons carry while on the launcher: the weight's component across the
+/// rail plus the aerodynamic normal force of the cross-flow (the CNa force of the free flight, capped
+/// at 15 deg), as a magnitude. Mirrored in tools/flight_profile/flightsim.py `rail_normal_accel` and
+/// FirmwareSimulator native_plant.rs.
+pub fn rail_normal_accel(rail_dir: [f64; 3], g: f64, vair: [f64; 3], qd: f64, aref: f64, cna: f64, mass: f64) -> f64 {
+    let gpar = -g * rail_dir[2];
+    let mut load = [-gpar * rail_dir[0], -gpar * rail_dir[1], -g - gpar * rail_dir[2]];
+    let vmag = norm(vair);
+    if vmag > 0.5 {
+        let vh = [vair[0] / vmag, vair[1] / vmag, vair[2] / vmag];
+        let du = dot(rail_dir, vh);
+        let nperp = [rail_dir[0] - du * vh[0], rail_dir[1] - du * vh[1], rail_dir[2] - du * vh[2]];
+        let sin_a = norm(nperp);
+        let lim = 15.0_f64.to_radians().sin();
+        let ks = if sin_a > lim { (lim / sin_a).min(1.0) } else { 1.0 };
+        let fa = [0, 1, 2].map(|i| qd * aref * cna * nperp[i] * ks / mass);
+        let fa_par = dot(fa, rail_dir);
+        for i in 0..3 {
+            load[i] += fa[i] - fa_par * rail_dir[i];
+        }
+    }
+    norm(load)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -652,9 +678,10 @@ pub fn fly_traced(cfg: &Config, env: &Environment, motor: &Motor, dt: f64, mut t
         let mut acc = [0.0; 3];
         let mut torque = [0.0; 3];
         let inertia = mass * l * l / 12.0 * v.pitch_inertia_factor;
-        let fric = 1.0 + lau.rail_friction;
         if phase == Phase::Pad {
-            if thrust > mass * g * rail_dir[2] * fric {
+            // Breakaway: thrust beats the weight along the rail plus static friction on its cross-rail part.
+            let across = (1.0 - rail_dir[2] * rail_dir[2]).max(0.0).sqrt();
+            if thrust > mass * g * (rail_dir[2] + lau.rail_friction * across) {
                 phase = Phase::Rail;
                 res.liftoff_s = t;
                 if let Some(tr) = trace.as_deref_mut() {
@@ -664,7 +691,8 @@ pub fn fly_traced(cfg: &Config, env: &Environment, motor: &Motor, dt: f64, mut t
         } else if phase == Phase::Rail {
             let cd = aero.cd(mach, rho * vmag * l / mu, thrust > 0.0);
             let drag = qd * aref * cd;
-            let mut along = (thrust - drag) / mass - g * rail_dir[2] * fric;
+            let normal = rail_normal_accel(rail_dir, g, vair, qd, aref, cna, mass);
+            let mut along = (thrust - drag) / mass - g * rail_dir[2] - lau.rail_friction * normal;
             let sp = dot(vel, rail_dir);
             if sp <= 0.0 && along < 0.0 {
                 along = 0.0;
