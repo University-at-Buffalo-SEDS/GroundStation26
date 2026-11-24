@@ -399,11 +399,12 @@ def export_daq(streams, metadata, request, delimiter=",", provenance=None, all_s
         utc = source if isinstance(source, int) and 315532800000 <= source < 4354819200000 else None
         sensor = DAQ_SD_SENSORS.get((sender, kind, index), key)
         labels = metadata[key].get("boolean_labels")
-        provenance = {"recording": recording, "row_id": row_id, "channel": key,
-                      "received_timestamp_ms": received, "source_timestamp_ms": source,
-                      "source_age_ms": received-source if utc is not None and 315532800000 <= received < 4354819200000 else None,
-                      "state_label": state_label(key, value, labels)}
-        out.append("# recorded_sample=" + json.dumps(provenance, separators=(",", ":")) + "\r\n")
+        # Not `provenance`: that names the resolved rows' sources for the rows after this one.
+        recorded = {"recording": recording, "row_id": row_id, "channel": key,
+                    "received_timestamp_ms": received, "source_timestamp_ms": source,
+                    "source_age_ms": received-source if utc is not None and 315532800000 <= received < 4354819200000 else None,
+                    "state_label": state_label(key, value, labels)}
+        out.append("# recorded_sample=" + json.dumps(recorded, separators=(",", ":")) + "\r\n")
         out.append(daq_record({"timestamp_ms": utc, "sensor": sensor, "value": daq_float(value),
                                "time_source": "network" if utc is not None else "unknown"}, delimiter))
     return "".join(out).encode()
