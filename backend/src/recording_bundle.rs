@@ -84,6 +84,7 @@ fn sources(state: Arc<AppState>) -> Router {
         .merge(crate::burn_report::routes())
         .merge(crate::fire_archive::routes())
         .merge(crate::apogee_planner::routes())
+        .merge(crate::recovery_search::routes())
         .merge(crate::web::bundle_config_routes())
         .with_state(state)
 }
@@ -195,6 +196,16 @@ pub(crate) async fn build(
             if !related.is_empty() {
                 entries.add_json(path, &Value::Array(related));
             }
+        }
+    }
+
+    // Recovery search tracks from the recording's start until a few hours
+    // after its last row (searches often outlast the capture). Only when
+    // there are any: an empty search adds nothing to the bundle.
+    if let Some(start) = replay["snapshot"]["start_ms"].as_i64() {
+        let end = replay["snapshot"]["end_ms"].as_i64().unwrap_or(start) + crate::recovery_search::BUNDLE_AFTER_END_MS;
+        if let Ok(bytes) = fetch(&router, headers, &format!("/api/recovery_search/export?from_ms={start}&to_ms={end}")).await {
+            entries.add("derived/recovery_search.json", bytes, "application/json");
         }
     }
 
