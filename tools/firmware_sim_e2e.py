@@ -652,7 +652,7 @@ def burn_report(st: Station, check, result, after_provisional=None):
           daq_sd=daq if code == 200 else code)
 
 
-def fc_sd_collection(st: Station, check, result, timeout_s=1200, ground_test=False):
+def fc_sd_collection(st: Station, check, result, timeout_s=1200):
     """The station's automatic FC SD collection after landing (Landed held 5 s or Recovery): a job is queued, the
     newest irec_LAUNCH file of the flight is listed and downloaded over the link and attached to the capture."""
     def status():
@@ -675,19 +675,11 @@ def fc_sd_collection(st: Station, check, result, timeout_s=1200, ground_test=Fal
             a = s.get("active") or {}
             st.log("FC SD collection", phase=job.get("phase"), file=job.get("launch_file"), done=a.get("bytes_done"),
                    total=a.get("total_bytes"), bps=a.get("bytes_per_second"), paused=a.get("paused_reason"), message=job.get("message"))
-        if ground_test and job.get("done") and job.get("phase") == "unavailable":
-            return job
         return job if job.get("done") and job.get("downloaded_at_ms") else None
     job = st.wait(collected, timeout_s, "FC SD launch file collected", poll=5)
     s = status()
     result["fc_sd"] = s
     j = job or (s.get("jobs") or [{}])[0]
-    if ground_test and j.get("phase") == "unavailable":
-        # FlightComputer26 builds the SD read service into the flight image only (CMakeLists FC_SD_SERVICE): the
-        # station must say so instead of retrying forever
-        check("FC SD collection in IGT: the ground-test image has no SD service and the station says so",
-              "ground-test image" in str(j.get("message")), phase=j.get("phase"), message=j.get("message"))
-        return
     check("FC SD auto-collection downloads the flight's launch file and attaches it", job and job.get("capture"),
           file=j.get("launch_file"), size=j.get("launch_size"), capture=j.get("capture"), crc_errors=j.get("crc_errors"),
           phase=j.get("phase"), message=j.get("message"), active=s.get("active"))
@@ -834,7 +826,8 @@ def scenario_igt(st, check, result):
     real = st.wait(lambda: seen["gps_simulated"] and not igt().get("gps_simulated") and igt(), 120, "GPS back to real", poll=2)
     check("the FC flew replayed GPS and switches back to real GPS after the replay", real,
           replayed=seen["gps_simulated"], igt=igt())
-    fc_sd_collection(st, check, result, ground_test=True)
+    # the ground-test image serves its card too (FlightComputer26 ec999d7): collected as after a flight
+    fc_sd_collection(st, check, result)
     st.command("IgtExit")
     off = st.wait(lambda: str(igt().get("fc_mode", "")).lower() == "off" and igt(), 60, "IGT exit", poll=2)
     check("IGT exit: the FC leaves ground test (mode Off)", off, igt=igt())
