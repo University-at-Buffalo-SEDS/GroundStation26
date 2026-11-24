@@ -409,6 +409,11 @@ pub struct CalibrationSensorSpec {
     pub fit_modes: Vec<String>,
     #[serde(default)]
     pub formatter: Option<ValueFormatter>,
+    /// The board whose rows the calibration tab reads for this sensor
+    /// (captures and Live Raw take only fresh rows from it). Omitted: the
+    /// UI reads any sender, except a load cell, which it reads from `DAQ`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -419,13 +424,15 @@ pub struct CalibrationTabLayout {
 }
 
 pub fn calibration_tab_layout() -> CalibrationTabLayout {
+    load_calibration_tab_layout_from_file().unwrap_or_else(built_in_calibration_tab_layout)
+}
+
+/// The tab layout when no `calibration_config.json` is readable.
+fn built_in_calibration_tab_layout() -> CalibrationTabLayout {
     let fit_modes: Vec<String> = ALL_CALIBRATION_FIT_MODES
         .iter()
         .map(|s| (*s).to_string())
         .collect();
-    if let Some(config) = load_calibration_tab_layout_from_file() {
-        return config;
-    }
     CalibrationTabLayout {
         capture_target_samples: CALIBRATION_CAPTURE_TARGET_SAMPLES,
         fit_modes: fit_modes.clone(),
@@ -445,6 +452,7 @@ pub fn calibration_tab_layout() -> CalibrationTabLayout {
                     prefix: None,
                     suffix: None,
                 }),
+                sender_id: Some("DAQ".to_string()),
             },
             CalibrationSensorSpec {
                 id: "KG50".to_string(),
@@ -461,6 +469,7 @@ pub fn calibration_tab_layout() -> CalibrationTabLayout {
                     prefix: None,
                     suffix: None,
                 }),
+                sender_id: Some("DAQ".to_string()),
             },
             CalibrationSensorSpec {
                 id: "IADC".to_string(),
@@ -477,6 +486,7 @@ pub fn calibration_tab_layout() -> CalibrationTabLayout {
                     prefix: None,
                     suffix: None,
                 }),
+                sender_id: None,
             },
         ],
     }
@@ -3483,5 +3493,35 @@ mod volts_migration_tests {
         assert_eq!((loaded.version, loaded.ch1.m), (CALIBRATION_VERSION, Some(1.0)));
         assert!(!dir.join("sim.json.v1-raw").exists());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod calibration_sender_tests {
+    use super::*;
+
+    fn senders(layout: &CalibrationTabLayout) -> Vec<(String, Option<String>)> {
+        layout.sensors.iter().map(|s| (s.id.clone(), s.sender_id.clone())).collect()
+    }
+
+    /// The calibration tab reads each sensor from the board the station names:
+    /// the SEDS load cells from DAQ, the ox tank PT from any sender.
+    #[test]
+    fn shipped_calibration_config_names_the_load_cell_board() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config/calibration_config.json");
+        let raw = std::fs::read_to_string(path).unwrap();
+        let shipped: CalibrationTabLayout = serde_json::from_str(&raw).unwrap();
+        let expected = vec![
+            ("KG1000".to_string(), Some("DAQ".to_string())),
+            ("KG50".to_string(), Some("DAQ".to_string())),
+            ("IADC".to_string(), None),
+        ];
+        assert_eq!(senders(&shipped), expected);
+        // The built-in fallback (no config file) says the same.
+        let built_in = built_in_calibration_tab_layout();
+        assert_eq!(senders(&built_in), expected);
+        let json = serde_json::to_value(&built_in).unwrap();
+        assert_eq!(json["sensors"][0]["sender_id"], "DAQ");
+        assert!(json["sensors"][2].get("sender_id").is_none(), "an unnamed sender is omitted");
     }
 }
