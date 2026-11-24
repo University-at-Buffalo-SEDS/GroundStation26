@@ -381,6 +381,47 @@ pub(crate) async fn flight_export_bytes(mut loaded: Loaded, now_ms: i64, raster:
     Some((name, export::flight_bundle(&loaded.data, &summary, prov, raster).await))
 }
 
+/// One default-window export of a recording, for a replay bundle.
+pub(crate) struct BundledExport {
+    /// `motor_export` or `flight_export`.
+    pub kind: &'static str,
+    /// The file name the route's `Content-Disposition` gives.
+    pub filename: String,
+    /// The window the export covers (the burn window / the flight).
+    pub from_ms: Option<i64>,
+    pub to_ms: Option<i64>,
+    pub bytes: Vec<u8>,
+}
+
+/// The motor and flight exports `GET .../motor_export` and `.../flight_export`
+/// give without a range, generated at `now_ms` and without raster charts
+/// (the SVG charts, data and HTML report are kept), so a bundle made at a
+/// fixed time is reproducible. Exports that do not apply are left out.
+pub(crate) async fn bundle_exports(state: &Arc<AppState>, id: &str, now_ms: i64) -> Vec<BundledExport> {
+    let mut out = Vec::new();
+    for kind in ["motor_export", "flight_export"] {
+        let Ok(pool) = sources::open(state, id).await else { return out };
+        let root = crate::recording_export::directory(state);
+        let loaded = load(&root, id, &pool, &Range::default(), now_ms).await;
+        if matches!(Source::parse(id), Some(Source::File(_))) {
+            pool.close().await;
+        }
+        let Ok(loaded) = loaded else { continue };
+        let window = if kind == "motor_export" {
+            loaded.review.motor.as_ref().map(|m| (m.window_from_ms, m.window_to_ms))
+        } else {
+            loaded.review.flight.as_ref().map(|f| {
+                (f.launch_accepted_ms.or(f.t0_ms).or(f.liftoff_ms).map(|t| t - 30_000), f.landed_ms.map(|t| t + 60_000))
+            })
+        };
+        let built = if kind == "motor_export" { motor_export_bytes(loaded, now_ms, false).await } else { flight_export_bytes(loaded, now_ms, false).await };
+        if let (Some((filename, bytes)), Some((from_ms, to_ms))) = (built, window) {
+            out.push(BundledExport { kind, filename, from_ms, to_ms, bytes });
+        }
+    }
+    out
+}
+
 fn zip_response(name: String, bytes: Vec<u8>) -> Response {
     (
         [

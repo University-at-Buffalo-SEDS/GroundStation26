@@ -51,6 +51,50 @@ fn channel_metadata(layout:&serde_json::Value)->serde_json::Value {
     let mut out=Vec::new();walk(layout,&mut out);serde_json::Value::Array(out)
 }
 
+/// The export-time station context the report worker labels channels with:
+/// `valve_mappings` and `channel_metadata` from the station layout, and the
+/// recorded diagnostic stream schema. A replay bundle carries it as
+/// `config/report_context.json` so a client can build the same reports offline.
+pub(crate) fn context() -> serde_json::Value {
+    let export_layout = crate::layout::load_layout().ok().and_then(|layout| serde_json::to_value(layout).ok());
+    serde_json::json!({
+        "valve_mappings": export_layout.as_ref().map(valve_labels).unwrap_or_else(|| serde_json::json!([])),
+        "channel_metadata": export_layout.as_ref().map(channel_metadata).unwrap_or_else(|| serde_json::json!([])),
+        "recording_diagnostic_streams": crate::telemetry_task::recording_diagnostics::descriptors(),
+    })
+}
+
+/// A recording's `calibration_history` rows as the report worker reads them
+/// (`ORDER BY timestamp_ms`), with `config_json` kept as the stored text.
+/// None when the recording has no such table.
+pub(crate) async fn calibration_history(path: &std::path::Path) -> Option<serde_json::Value> {
+    use sqlx::Row;
+    let db = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(path).read_only(true).create_if_missing(false))
+        .await
+        .ok()?;
+    let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sqlite_master WHERE name='calibration_history'").fetch_one(&db).await.unwrap_or(0) > 0;
+    let rows = if exists {
+        sqlx::query("SELECT timestamp_ms,sender_id,sensor_id,config_json FROM calibration_history ORDER BY timestamp_ms").fetch_all(&db).await.ok()
+    } else {
+        None
+    };
+    db.close().await;
+    let rows = rows?
+        .iter()
+        .map(|row| {
+            serde_json::json!({
+                "timestamp_ms": row.try_get::<Option<i64>, _>(0).ok().flatten(),
+                "sender_id": row.try_get::<Option<String>, _>(1).ok().flatten(),
+                "sensor_id": row.try_get::<Option<String>, _>(2).ok().flatten(),
+                "config_json": row.try_get::<Option<String>, _>(3).ok().flatten(),
+            })
+        })
+        .collect();
+    Some(serde_json::Value::Array(rows))
+}
+
 /// The report worker's Python: `GS_REPORT_PYTHON`, else the backend's
 /// `.venv-reports`, else `python3`.
 pub(crate) fn report_python() -> String {
@@ -94,10 +138,11 @@ pub async fn report(
     };
     // These names are export-time station configuration, not historical state.
     // Override any client-supplied mapping; numeric saved values remain intact.
-    let export_layout=crate::layout::load_layout().ok().and_then(|layout|serde_json::to_value(layout).ok());
-    request["valve_mappings"]=export_layout.as_ref().map(valve_labels).unwrap_or_else(||serde_json::json!([]));
-    request["channel_metadata"]=export_layout.as_ref().map(channel_metadata).unwrap_or_else(||serde_json::json!([]));
-    request["recording_diagnostic_streams"] = crate::telemetry_task::recording_diagnostics::descriptors();
+    if let serde_json::Value::Object(context) = context() {
+        for (key, value) in context {
+            request[key] = value;
+        }
+    }
     // The root is always server-controlled, regardless of request JSON.
     let root = crate::recording_export::directory(&state);
     request["root"] = root.to_string_lossy().into_owned().into();

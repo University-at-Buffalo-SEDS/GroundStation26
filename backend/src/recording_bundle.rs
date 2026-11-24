@@ -169,7 +169,7 @@ pub(crate) async fn build(
     options: &Options,
     now_ms: i64,
 ) -> Result<Vec<u8>, (StatusCode, String)> {
-    let router = sources(state);
+    let router = sources(state.clone());
     let required = |route: String| {
         let router = router.clone();
         async move {
@@ -249,6 +249,11 @@ pub(crate) async fn build(
                 entries.add_json(path, &Value::Array(related));
             }
         }
+    }
+
+    // What the station's exports need beyond the CSV (recording_bundle_exports).
+    for (path, bytes, media_type) in crate::recording_bundle_exports::entries(&state, id, now_ms).await {
+        entries.add(&path, bytes, media_type);
     }
 
     // The replay document carries what a client needs even if it reads nothing else.
