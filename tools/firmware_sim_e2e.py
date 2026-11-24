@@ -341,7 +341,9 @@ def arm_and_launch(st: Station, check):
         st.api("/api/board_abort/refresh", {})
         st.sleep(2)
         code, body = st.command("Launch")
-        if code == 200:
+        # an accepted request can still be blocked a moment later ("Command Launch blocked by sequence/key
+        # interlock" while the fill sequence finishes): Launch counts once the station is in Launch
+        if code == 200 and st.wait(lambda: launch_started(st), 15, "station in Launch"):
             launched = True
             break
         if "etract" in str(body):
@@ -349,6 +351,12 @@ def arm_and_launch(st: Station, check):
             st.sleep(6)
     check("Launch accepted by the station", launched)
     return launched
+
+
+def launch_started(st: Station):
+    code, f = st.api("/flightstate")
+    state = (f or {}).get("state") if code == 200 and isinstance(f, dict) else None
+    return state not in (None, "Startup", "Idle", "Fill", "Armed") or st.plant().get("igniter_fired")
 
 
 def normal_launch(st: Station, check):
@@ -388,7 +396,7 @@ def normal_launch(st: Station, check):
             return None
         code, body = st.command("Launch")
         launched[0] = {"http": code, "body": body}
-        return code == 200
+        return code == 200 and st.wait(lambda: launch_started(st), 15, "station in Launch")
     # the AB drives the stepper the full retract (ActuatorBoard26 main_task.c: 200000 motor steps x 100 gearbox at
     # 30 us, 600 s) before it reports the retraction complete
     ok = st.wait(launch, 900, "Launch admitted", poll=2)
