@@ -1,10 +1,13 @@
 //! Bounded local WebSocket crew voice, with an opt-in RRLS Codec2 radio bridge.
-//! Camera/video and voice recording are outside the radio voice path.
+//! Camera/video recording is outside the radio voice path; crew voice is
+//! recorded only when the deployment opts in (`voice/recorder.rs`).
 use crate::{auth::Permission, state::AppState};
 #[path = "voice/pairing.rs"]
 mod pairing;
 #[path = "voice/program.rs"]
 mod program;
+#[path = "voice/recorder.rs"]
+pub(crate) mod recorder;
 use axum::{
     Router,
     extract::{
@@ -124,6 +127,7 @@ impl VoiceHub {
         self.history.lock().await.commentary_enabled
     }
     async fn capture(&self, speaker: u32, pcm: &[u8]) {
+        recorder::submit(if speaker == RADIO_SPEAKER { "radio" } else { "crew" }, speaker, pcm);
         self.capture_source(speaker, pcm, false).await;
     }
     async fn capture_program(&self, speaker: u32, pcm: &[u8]) {

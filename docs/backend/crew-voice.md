@@ -47,7 +47,8 @@ conversation before enabling is not replayed. Restarting the backend also clears
 
 This adds comms to the browser audience program. It does not mux voice into raw
 camera MP4 archives or into standalone camera HLS URLs, and does not save a voice
-recording. Audio is held only in a bounded in-memory delay buffer.
+recording. Audio is held only in a bounded in-memory delay buffer. (Crew voice
+recording is a separate opt-in; see "Recording" below.)
 
 The default is **push to talk**: hold the button or Space while the voice page has
 focus. Space does not activate while typing or using another control. Release,
@@ -81,9 +82,10 @@ This favors broad browser support over bandwidth efficiency; capacity-plan your
 link for the number of simultaneous speakers. Browser buffering and server queues
 are bounded. Old/excess audio is dropped rather than accumulating without limit.
 
-Voice is not recorded. Watch audio (below) is decoded into the same PCM16
-pipeline as browser audio, so the audience program buffer, the radio bridge
-and any future recording treat it exactly like browser audio. HTTPS encrypts traffic in transit; the Ground Station
+Voice is not recorded unless the deployment opts in (below). Watch audio
+(below) is decoded into the same PCM16 pipeline as browser audio, so the
+audience program buffer, the radio bridge and the recorder treat it exactly
+like browser audio. HTTPS encrypts traffic in transit; the Ground Station
 relays decoded PCM, so this is not end-to-end encryption between participants.
 It grants no hardware command access.
 
@@ -194,3 +196,31 @@ permission denial. Voice capability responses are not cached. A username such as
 `admin` or hardware-command access does not itself grant the application `admin`
 role. The SSH terminal tool in `docs/application-administration.md` can inspect
 and change roles without a graphical desktop.
+
+## Recording
+
+Crew voice recording is off by default. Set `GS_VOICE_RECORDINGS_DIR` on the
+Ground Station service to turn it on. Tell the crew before you do.
+
+When it is on, `backend/src/voice/recorder.rs` writes every crew and radio
+frame the station relays:
+
+- **Files.** One file per transmission per speaker,
+  `<dir>/<stream>/<start_ms>-<speaker>.wav`. `stream` is `crew` (browser and
+  watch push-to-talk) or `radio` (the RRLS bridge), and `start_ms` is the
+  Unix time of the first frame. The audio is 16 kHz mono PCM16 WAV, about
+  1.9 MB per minute of speech.
+- **Bursts.** A transmission ends after one second without frames, or after
+  ten minutes. Shorter gaps are written as silence so the file keeps real
+  time.
+- **Commentary.** Programme commentary is not recorded.
+- **No effect on live voice.** Frames go through a bounded queue
+  (`try_send`, 500 frames) to one writer thread that does all file I/O. A
+  full queue or a disk error drops audio from the recording, never from the
+  live channel.
+- **Retention.** Files are kept until removed, as camera recordings are.
+  There is no quota.
+
+Replay bundles include the bursts that overlap a recording with `?voice=1`.
+This needs the voice permission (`replay-bundle.md`, "Recorded media").
+
