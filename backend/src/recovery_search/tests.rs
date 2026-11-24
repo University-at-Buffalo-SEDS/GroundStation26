@@ -292,3 +292,34 @@ async fn walk_helper_matches_lane_density() {
     // Guards the fixtures above: the coverage-test walk and the lane agree.
     assert_eq!(walk((0.0, -50.0), (0.0, 250.0)).len(), lane(0.0, 1, 0).len());
 }
+
+#[tokio::test]
+async fn a_replay_bundle_carries_the_search_tracks_only_when_there_are_any() {
+    let root = crate::recording_export::tests::TestDirectory::new();
+    let state = crate::recording_export::tests::export_state(&root.0, true).await;
+    let id = "groundstation_recording_2026-01-01_00-00-00_000.db";
+    let (db, _) = crate::telemetry_db::open_telemetry_db(&root.0.join(id)).await.unwrap();
+    for i in 0..60i64 {
+        sqlx::query("INSERT INTO telemetry(timestamp_ms,source_timestamp_ms,sender_id,data_type,values_json,payload_json) VALUES(?,NULL,'FC','GPS_DATA',?,'[]')")
+            .bind(T0 + i * 1000)
+            .bind(format!("[31.758,{},900.0]", -102.046 + i as f64 * 1e-5))
+            .execute(&db)
+            .await
+            .unwrap();
+    }
+    db.close().await;
+    let headers = axum::http::HeaderMap::new();
+    let options = crate::recording_bundle::Options::default();
+    let entry = b"derived/recovery_search.json";
+    let has = |bundle: &[u8]| bundle.windows(entry.len()).any(|w| w == entry);
+    let plain = crate::recording_bundle::build(state.clone(), &headers, id, &options, T0).await.unwrap();
+    assert!(!has(&plain), "no search: the bundle is unchanged");
+
+    start(&state, &operator(), b"", T0 + 60_000).unwrap();
+    let opt_in_id = opt(&state, "alice", "dev-a", true, T0 + 61_000).unwrap()["opt_in_id"].as_str().unwrap().to_owned();
+    send(&state, "alice", &batch(&state, &opt_in_id, "dev-a", &lane(0.0, 1, T0 + 70_000)), T0 + 400_000).unwrap();
+    let bundle = crate::recording_bundle::build(state.clone(), &headers, id, &options, T0).await.unwrap();
+    assert!(has(&bundle), "the search tracks ride along");
+    // A recording from long before the search does not get it.
+    assert!(export(&state, Some(T0 - 10 * BUNDLE_AFTER_END_MS), Some(T0 - BUNDLE_AFTER_END_MS)).is_none());
+}
