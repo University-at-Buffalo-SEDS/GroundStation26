@@ -4479,9 +4479,8 @@ mod tests {
         reached
             .recv_timeout(Duration::from_secs(2))
             .expect("actual SDK clock call reached");
-        let start = std::time::Instant::now();
-        assert_eq!(state.manual_abort_intent.request(), 2);
-        assert!(start.elapsed() < Duration::from_millis(100));
+        // The SDK clock call stays parked until `release` drops below.
+        assert_eq!(state.manual_abort_intent.request_while_contended(), 2);
         assert_eq!(state.manual_abort_intent.pending_epoch(), Some(2));
         ticks.store(1, Ordering::Release);
         drop(release);
@@ -5010,9 +5009,8 @@ mod tests {
         .await
         .unwrap();
         assert!(!prepare.is_finished());
-        let start = std::time::Instant::now();
-        cold_state.manual_abort_intent.request();
-        assert!(start.elapsed() < Duration::from_millis(100));
+        // PREPARE stays parked on the revoked clock until this Stop publishes.
+        cold_state.manual_abort_intent.request_while_contended();
         let mut stop = cold_state.manual_abort_intent.try_claim().unwrap();
         assert!(
             crate::manual_abort_utc::publish_claim(
@@ -5859,6 +5857,9 @@ mod tests {
         let fixture = Fixture::from_saved_with_services_profile_and_c_boards(None,None,None,false,false,true,false).await;
         completed_manual_cohort(&fixture).await;
         let state = fixture.state();
+        // The fixture's pump shares the SDK Core; a preempted pump must not
+        // expire the 100 ms CoreBusy retry window of the Launch below.
+        let _window = crate::gse::nonwaiting_admission_tests::FrozenWindow::new(&state);
         let router = state.topology_router.get().unwrap();
         let model = &fixture
             .models

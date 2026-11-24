@@ -33,6 +33,21 @@ impl ManualAbortIntent {
     pub(crate) fn request(&self) -> u64 {
         self.request_with_wire(None)
     }
+    /// Test-only: request Stop on another thread while the caller keeps some
+    /// contender parked (a held SDK clock or Core). A Stop that waited behind
+    /// that contender never returns, because the contender is only released
+    /// after this call; so returning at all proves the request did not wait,
+    /// with no wall-clock budget a loaded host could overrun.
+    #[cfg(test)]
+    pub(crate) fn request_while_contended(self: &Arc<Self>) -> u64 {
+        let intent = self.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(intent.request());
+        });
+        rx.recv_timeout(Duration::from_secs(60))
+            .expect("Stop request waited behind the parked contender")
+    }
     /// Secondary-origin Stop has no proven original UTC at this primary.
     /// Freeze legacy for this newly accepted epoch before any publisher runs.
     pub(crate) fn request_untimed(&self) -> u64 {
@@ -346,7 +361,9 @@ mod tests {
         assert_eq!(intent.epoch(), u64::MAX);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    // Paused clock: the publisher's 5 ms retry sleeps and this test's waits
+    // are virtual, so host load cannot outlast them.
+    #[tokio::test(start_paused = true)]
     async fn independent_publisher_retries_without_holding_state_or_ordinary_queue() {
         let intent = Arc::new(ManualAbortIntent::default());
         let calls = Arc::new(AtomicUsize::new(0));
@@ -377,8 +394,7 @@ mod tests {
             .unwrap()
             .unwrap();
         // The publisher signals from inside `admit`, before its claim is
-        // accepted and dropped on the other worker: wait for that by time, not
-        // by a count of yields, which a preempted worker (host load) outlasts.
+        // accepted and dropped: wait for that on the (paused) clock.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
         while intent.pending_epoch().is_some() && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(1)).await;

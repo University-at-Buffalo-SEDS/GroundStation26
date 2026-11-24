@@ -53,6 +53,8 @@ opus = "0.4.0"
 codec2 = "0.3.1"
 
 [dev-dependencies]
+# Paused/advanced clocks for deterministic timing tests (test builds only).
+tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake"] }
 
 [build-dependencies]
