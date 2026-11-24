@@ -444,19 +444,28 @@ def scenario_testing(st, check, result):
     fill(st, check)
 
 
-def dac_patch(st: Station, check, result, frequency_hz=20.0):
-    """The DAQ's DAC waveform engine through the simulated loopback cable: a sine on DAC channel 0 patched onto
-    MCP3564R CH2, measured by the DAQ's frame engine and judged by the station's DAC validation."""
-    st.api("/api/firmware-sim/control", {"patch": {"dac1": "mcp_ch2"}})
+def dac_patch(st: Station, check, result, frequency_hz=20.0, target=None, attenuation=None):
+    """The DAQ's DAC waveform engine through the simulated loopback cable: a sine on DAC channel 0 patched onto a DAQ
+    input (default the KG1000 amplifier through a 1/1000 attenuator), measured by the DAQ's frame engine and judged by
+    the station's DAC validation, then the station's linearity sweep. (The MCP CH2-CH7 auxiliary inputs publish NaN
+    in the sim: docs/firmware-sim.md, DAC patch.)"""
+    target = target or os.environ.get("FIRMWARE_SIM_E2E_DAC_TARGET", "loadcell_kg1000")
+    attenuation = attenuation if attenuation is not None else float(os.environ.get(
+        "FIRMWARE_SIM_E2E_DAC_ATTENUATION", "0.001" if target.startswith("loadcell") else "1.0"))
+    if target.startswith("loadcell"):
+        # the load-cell items are 20 ms bin means (50 Hz): a 20 Hz sine would read sinc(0.4 pi) = 0.76 of its
+        # amplitude, so stay well below a quarter of the stream rate
+        frequency_hz = min(frequency_hz, 2.0)
+    st.api("/api/firmware-sim/control", {"patch": {"dac1": target, "dac1_attenuation": attenuation}})
     config = {"channel": 0, "waveform": "sine", "amplitude_v": 1.0, "offset_v": 1.5, "frequency_hz": frequency_hz}
 
     def configured():
         # the DAQ refuses DAC output until it knows the flight state (shortly after the network comes up)
         code, body = st.api("/api/daq/dac/config", config)
         st.log("DAC config", http=code, body=body)
-        return code == 200
+        return code in (200, 202)
     st.wait(configured, 90, "DAC output accepted", poll=5)
-    code, body = st.api("/api/daq/dac/validation", {"target": "mcp_ch2", "channel": 0})
+    code, body = st.api("/api/daq/dac/validation", {"target": target, "channel": 0, "attenuation": attenuation})
     st.log("DAC validation", http=code, body=body)
 
     def analysed():
@@ -473,7 +482,7 @@ def dac_patch(st: Station, check, result, frequency_hz=20.0):
           analysis=a, warnings=v.get("warnings"))
     st.api("/api/daq/dac/disable", {"channel": 0})
     # the station's validation sweep (linearity: DC steps through the patch, judged against the target's model)
-    code, body = st.api("/api/daq/dac/sweep", {"target": "mcp_ch2", "channel": 0, "steps": 11, "dwell_ms": 1000})
+    code, body = st.api("/api/daq/dac/sweep", {"target": target, "channel": 0, "attenuation": attenuation, "steps": 11, "dwell_ms": 1000})
     st.log("DAC sweep", http=code, body=body)
 
     def swept():

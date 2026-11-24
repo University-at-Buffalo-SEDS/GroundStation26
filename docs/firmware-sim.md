@@ -371,25 +371,34 @@ Per mode (the e2e: `python3 tools/firmware_sim_e2e.py --out DIR --mode <mode>`):
 * **Test fire**: the fill-side boards on the umbilical. Armed comes from the station's own GSE procedure (valve
   self-test, nitrogen test, fill to target), not from manual valve commands; the e2e drives that procedure: a dry
   valve self-test (the e2e closes both supply bottles first, as the self-test confirmation asks), the nitrogen test
-  (dump at the hold), Start fill (the automatic KG50 zero, then the fill to its mass target), Launch, ignition on
-  the stand (AB igniter, VB pilot), the burn, burnout and the station's burn report.
-* **Normal**: the RF NEO-M9N fix reaches the station, so the GPS gate passes; the e2e then drives the full
-  procedure (self-test, nitrogen test, fill, QD retract, Launch) and follows the flight on the map
-  (`/api/antenna/status` rocket positions from the RF GPS).
-* **IGT**: the FC ground-test variant; pick a dataset in the sim panel (card out, dataset, card in, Retry SD), Ground
-  test > Enter ground test, fill, Launch: the FC (lying apart on the ground) replays the CSV flight while the motor
-  burns on the stand. The FC refuses Enter (reason 11, "refused (wrong state)") while it still counts the station as
-  lost, e.g. a few seconds after the radio path came back at boot; press it again. Swapping the card's contents while
-  the FC runs (card out, another dataset, card in, Retry SD) currently ends in an FC fault "CSV parse error" (code 4)
-  although the same files pass when the card holds them from power-on: the FC reads the new card through what it
-  cached of the old one (FileX media not reopened on Retry SD; to confirm on hardware with a real card swap). The
-  e2e therefore powers on with the dataset on the card (`FIRMWARE_SIM_CONTROL={"igt":{"dataset":...}}`).
-  After the replayed landing the station collects the FC's SD launch file over port 4511 as after a flight (the
-  ground-test variant carries the SD read service) and records which `test-data/igt` dataset was on the card
-  (`docs/data-pipeline.md` §3.4a).
-* **Testing**: the mode's own logic against the simulated boards (the e2e checks the links, the DAC waveform engine
-  through the simulated loopback cable (a 20 Hz sine on DAC1 patched onto MCP3564R CH2, judged by the station's DAC
-  validation) and the fill rules).
+  (dump at the hold), Start fill (the automatic KG50 zero, then the fill to its mass target), Launch, the AB igniter
+  on its drive enable (PB7), the VB pilot, the hybrid motor's burn on the stand (the KG50 unloads, then the KG1000
+  carries the thrust once the gap closes; the DAQ chamber PT), burnout and the provisional burn report. Then the
+  operator steps the station back to Idle (RewindFlightState down to Idle: a test fire has no FC to land, and the
+  return to Idle ends the launch capture); the station then fetches the DAQ's SD launch file (only in Idle, Landed or
+  Recovery) and the burn report goes final.
+* **Normal**: the RF NEO-M9N fix reaches the station, so the GPS gate passes; while the station is Idle the e2e runs
+  the DAC patch (below), then the full procedure (self-test, nitrogen test, fill, QD retract, Launch). The QD retract
+  is the AB's stepper move: 200000 motor steps x 100 gearbox at 30 us (ActuatorBoard26 `main_task.c`), i.e. 600 s
+  before the AB reports it complete and the station's retraction proof admits Launch (`/api/board_abort`
+  `retraction.allowed`). The e2e then follows the flight on the map (`/api/antenna/status` rocket positions from the
+  RF GPS) through drogue, main and Landed, and the automatic FC SD collection of the launch file.
+* **IGT**: the FC ground-test variant. The e2e powers on with one dataset on the card, then swaps the card for
+  another while the FC runs (card out, dataset, card in, Retry SD; FlightComputer26 34c7835 mounts the swapped card
+  fresh), Ground test > Enter ground test (Ready loads the swapped card's CSVs), fill, Launch: the FC (lying apart on
+  the ground) replays the CSV flight with dry-run pyros (no deployment reaches the plant) and replayed GPS while the
+  motor burns on the stand; after Landed the FC returns to real GPS and the station collects the FC's SD launch file
+  over port 4511 as after a flight (the ground-test variant carries the SD read service since FlightComputer26
+  ec999d7 and reports it in BOARD_HEALTH word 6 bit 29), recording which `test-data/igt` dataset was on the card
+  (`docs/data-pipeline.md` §3.4a); then IgtExit leaves ground test. The FC refuses Enter (reason 11, "refused (wrong state)") while it still counts the
+  station as lost, e.g. a few seconds after the radio path came back at boot; press it again.
+* **Testing**: the mode's own logic against the simulated boards (the e2e checks the links and the fill rules). The
+  station stays in Startup in Testing and publishes no FLIGHT_STATE, so a DAQ without a stored flight state (fresh
+  flash, as every sim start is) refuses DAC output ("does not know the flight state yet"); the DAC patch is therefore
+  checked in Normal.
+* **DAC patch** (in the Normal run): a 20 Hz sine on DAC1 patched onto MCP3564R CH2 through the simulated loopback
+  cable, measured by the DAQ's frame engine and judged by the station's DAC validation, then the station's
+  linearity validation sweep (11 DC steps) through the same patch.
 
 Sim panel: Settings shows it while the station runs simulated firmware (revisions, pace, plant for everyone; plant
 inputs, conditions, calibration masses, faults and the IGT dataset for administrators). The DAQ DAC page shows the
@@ -475,10 +484,12 @@ frame engine waveforms up to about 250 Hz come through faithfully (500 Hz Nyquis
 
 ## 7. Follow-ups
 
-* Run the remaining e2e scenarios on a quiet host (test-fire burn and burn report, Normal launch and map track, IGT
-  Launch and replay, Testing DAC patch); the station on the bay's virtual clock, so host load slows the whole sim
-  instead of skewing its clocks.
-* FC: a card swapped while running (Retry SD) is read through FileX's cache of the old card (IGT CSV parse fault).
-* Thermocouples and tank wall temperature telemetry, power rails and battery discharge (the LTC2990 monitors still
-  read static values), weathercocking/3-DOF attitude, SAR inputs in the DAC patch.
+* Testing mode: the station publishes no FLIGHT_STATE in Startup, so a DAQ without a durable flight state refuses
+  DAC output there (gate 2). Either the station publishes Startup or the DAQ treats "no state yet" as Startup for the
+  DAC; to decide with the DAQ owner.
+* Test fire: no automatic return to a download-permitting state after the burn; the final burn report waits for the
+  operator's rewind to Idle.
+* The AB's QD retract takes 600 s (200000 x 100 steps at 30 us): check the gearbox constant against the mechanism.
+* Thermocouples (no board reads one yet), power rails and battery discharge (the LTC2990 monitors still read static
+  values), weathercocking/3-DOF attitude, SAR inputs in the DAC patch.
 * An actual remote bundle run, the armhf cross build and a run on the Pi station.

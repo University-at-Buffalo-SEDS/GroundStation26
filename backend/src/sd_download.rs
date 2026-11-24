@@ -1527,6 +1527,8 @@ pub(crate) fn take_launch_fetch() -> bool {
 /// launch capture (see `transfer`). Gives up after an hour of waiting.
 /// Wait between DAQ launch-file listing attempts.
 const LAUNCH_LIST_RETRY: Duration = Duration::from_secs(15);
+/// DAQ launch-file listing attempts before the fetch gives up.
+const LAUNCH_LIST_ATTEMPTS: u32 = 4;
 
 pub(crate) async fn fetch_launch_files(state: Arc<AppState>) {
     struct Running;
@@ -1550,12 +1552,15 @@ pub(crate) async fn fetch_launch_files(state: Arc<AppState>) {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     let Some(router) = state.topology_router.get().cloned() else { return };
-    // A listing that times out (the DAQ busy closing its launch file, a lost answer) is retried within the same
-    // hour: the burn report's final version depends on it.
+    // A listing that times out (the DAQ busy closing its launch file, a lost answer) is retried a few times: the
+    // burn report's final version depends on it. Not indefinitely: the FC SD collection waits behind this fetch,
+    // and a DAQ that refuses its SD stream (its flight state not Idle, Landed or Recovery) never answers.
+    let mut attempts = 0;
     let listing = loop {
+        attempts += 1;
         match refresh_listing(&MANAGER, router.clone(), Board::DaqBoard, app_gate(&state)).await {
             Ok(listing) => break listing,
-            Err(error) if Instant::now() + LAUNCH_LIST_RETRY < deadline => {
+            Err(error) if attempts < LAUNCH_LIST_ATTEMPTS && Instant::now() + LAUNCH_LIST_RETRY < deadline => {
                 log::warn!("DAQ launch files: listing failed: {error}; retrying in {} s", LAUNCH_LIST_RETRY.as_secs());
                 tokio::time::sleep(LAUNCH_LIST_RETRY).await;
                 while station_gate(&state).is_some() || MANAGER.active() {
