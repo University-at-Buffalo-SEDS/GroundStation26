@@ -14,34 +14,39 @@
       "sha256": "366389e60f5497201206b12f191550e37b515ae6d0012e023fb126ab74c6b714"
     },
     {
-      "bytes": 211017,
+      "bytes": 96232,
       "media_type": "application/json",
       "path": "config/layout.json",
-      "sha256": "a279fca2dbdd26d1d3c9fb686e59fcaef040583aba725866cb985093286662af"
+      "route": "/api/layout",
+      "sha256": "dbc8d8ae14dcaff3c153c69f2fc34283de4f6619648e9511f1bc3bd67dab51b5"
     },
     {
       "bytes": 1083,
       "media_type": "application/json",
       "path": "config/boards.json",
-      "sha256": "c278c04ef2851c3e6f4f6339c1f0ddb6d7adaaacde29c4866a554dfcd60aac87"
+      "route": "/api/boards",
+      "sha256": "9e23a9e6826fc78b06fbb36609283a3b3c05a6dfe1d81d5ea601103a48eef890"
     },
     {
       "bytes": 10109,
       "media_type": "application/json",
       "path": "models/vehicle_geometry.json",
-      "sha256": "8b93a6bf3fa5f10d904d413c95fe54f7f891d953c78a1b9626f810e49e562d50"
+      "route": "/api/vehicle/geometry",
+      "sha256": "895cf7b7a317d99f8578150007eff67bfcd5b1d384e619a254c11e17c8b46930"
     },
     {
       "bytes": 22987,
       "media_type": "application/json",
       "path": "config/diagrams.json",
+      "route": "/api/diagrams",
       "sha256": "519efd3abe29e64a1fc5ae291c9084657cc6f3b00713069658830fdc521008b1"
     },
     {
       "bytes": 172,
       "media_type": "application/json",
       "path": "config/map_config.json",
-      "sha256": "136b0e3093044b2be66e320cf0cc259c5bb98db8e7b5be4434a2ade8f716d62c"
+      "route": "/api/map_config",
+      "sha256": "71051be2ba3c2ccb620420a74af7132752f9d0b4c4bf6b559506fb2935928abb"
     },
     {
       "bytes": 115083,
