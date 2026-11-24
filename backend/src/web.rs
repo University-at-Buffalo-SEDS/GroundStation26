@@ -1042,6 +1042,13 @@ struct CaptureLoadcellPointReq {
     /// over_range::CAPTURE_LOOKBACK_MS.
     #[serde(default)]
     capture_started_ms: Option<i64>,
+    /// Calibration revision the client loaded (`check_base`).
+    #[serde(default)]
+    revision: Option<u64>,
+    /// MCP3564R reference (V) of the calibration the client loaded: the
+    /// reference its reading is in. Required for KG1000/KG50.
+    #[serde(default)]
+    mcp_vref_v: Option<f32>,
 }
 
 /// Refuses a zero/span capture when its sensor was over range while the
@@ -1056,6 +1063,41 @@ fn capture_over_range_refusal(state: &AppState, sensor: &str, started_ms: Option
     (n > 0).then(|| (StatusCode::CONFLICT, crate::over_range::capture_refusal(sensor, n)).into_response())
 }
 
+/// HTTP status for a refused calibration write.
+pub(crate) fn calibration_refusal_response(refusal: loadcell::UpdateRefusal) -> Response {
+    let status = match &refusal {
+        loadcell::UpdateRefusal::RevisionRequired(_) => StatusCode::PRECONDITION_REQUIRED,
+        loadcell::UpdateRefusal::ReferenceRequired(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        loadcell::UpdateRefusal::Stale(_) | loadcell::UpdateRefusal::Rejected(_) => StatusCode::CONFLICT,
+    };
+    (status, refusal.message().to_string()).into_response()
+}
+
+/// Refuses a capture whose samples (from `since_ms`, station ms) include any
+/// taken before the station's MCP3564R reference last changed: those volts are
+/// in the previous reference.
+fn capture_reference_refusal(cfg: &loadcell::LoadcellCalibrationFile, since_ms: i64) -> Option<Response> {
+    let changed = i64::try_from(cfg.mcp_vref_changed_ms).unwrap_or(i64::MAX);
+    (changed > since_ms).then(|| {
+        (
+            StatusCode::CONFLICT,
+            format!(
+                "The DAQ MCP3564R reference changed to {} V while these samples were taken. Nothing was saved: capture again.",
+                cfg.mcp_vref_v
+            ),
+        )
+            .into_response()
+    })
+}
+
+/// Start of a client capture's samples, as `capture_over_range_refusal` reads it.
+fn capture_since_ms(started_ms: Option<i64>) -> i64 {
+    let now = crate::telemetry_task::get_current_timestamp_ms() as i64;
+    started_ms
+        .filter(|start| *start <= now)
+        .unwrap_or(now - crate::over_range::CAPTURE_LOOKBACK_MS)
+}
+
 #[derive(Deserialize)]
 struct CaptureLoadcellSpanReq {
     sensor_id: String,
@@ -1065,6 +1107,10 @@ struct CaptureLoadcellSpanReq {
     known_kg: f32,
     #[serde(default)]
     capture_started_ms: Option<i64>,
+    #[serde(default)]
+    revision: Option<u64>,
+    #[serde(default)]
+    mcp_vref_v: Option<f32>,
 }
 
 #[derive(Deserialize)]
@@ -1120,11 +1166,11 @@ async fn set_loadcell_calibration(
     };
     let cfg = {
         let mut current = state.loadcell_calibration.lock().unwrap();
-        let cfg = match loadcell::merge_channel_update(&current, &update) {
+        let mut cfg = match loadcell::merge_channel_update(&current, &update) {
             Ok(cfg) => cfg,
-            Err(err) => return (StatusCode::CONFLICT, err).into_response(),
+            Err(refusal) => return calibration_refusal_response(refusal),
         };
-        if let Err(err) = loadcell::save(&cfg) {
+        if let Err(err) = loadcell::save(&mut cfg) {
             return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
         }
         *current = cfg.clone();
@@ -1178,7 +1224,7 @@ async fn set_chamber_pt(
         if current.chamber_pt_installed != req.installed {
             let mut cfg = current.clone();
             cfg.chamber_pt_installed = req.installed;
-            if let Err(err) = loadcell::save(&cfg) {
+            if let Err(err) = loadcell::save(&mut cfg) {
                 return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
             }
             *current = cfg;
@@ -1252,27 +1298,37 @@ async fn set_mcp_reference(
     let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
         return admission_refused(&state, "Changing the DAQ reference");
     };
-    let mut cfg = state.loadcell_calibration.lock().unwrap().clone();
-    let changed = cfg.mcp_vref_v != req.mcp_vref_v;
-    if changed {
+    if state.loadcell_calibration.lock().unwrap().mcp_vref_v != req.mcp_vref_v {
         if state.loadcell_processing.status().running {
             return (StatusCode::CONFLICT, "Stop the zero capture before changing the DAQ reference").into_response();
         }
         if state.recording_status_snapshot().mode != crate::telemetry_db::RecordingModeWire::Idle {
             return (StatusCode::CONFLICT, "Stop recording before changing the DAQ reference").into_response();
         }
-        if let Err(err) = loadcell::mcp_reference::set_reference(&mut cfg, req.mcp_vref_v) {
-            return (StatusCode::BAD_REQUEST, err).into_response();
-        }
     }
-    let note = note.unwrap_or_else(|| cfg.mcp_vref_note.clone());
-    if changed || cfg.mcp_vref_note != note {
-        cfg.mcp_vref_note = note;
-        if let Err(err) = loadcell::save(&cfg) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
+    // Compare, convert, save and replace under one lock so a concurrent
+    // calibration write is neither lost nor given the same revision.
+    let (cfg, changed) = {
+        let mut current = state.loadcell_calibration.lock().unwrap();
+        let mut cfg = current.clone();
+        let changed = cfg.mcp_vref_v != req.mcp_vref_v;
+        if changed {
+            if let Err(err) = loadcell::mcp_reference::set_reference(&mut cfg, req.mcp_vref_v) {
+                return (StatusCode::BAD_REQUEST, err).into_response();
+            }
+            cfg.mcp_vref_changed_ms = crate::telemetry_task::get_current_timestamp_ms()
+                .max(cfg.mcp_vref_changed_ms.saturating_add(1));
         }
-        *state.loadcell_calibration.lock().unwrap() = cfg.clone();
-    }
+        let note = note.unwrap_or_else(|| cfg.mcp_vref_note.clone());
+        if changed || cfg.mcp_vref_note != note {
+            cfg.mcp_vref_note = note;
+            if let Err(err) = loadcell::save(&mut cfg) {
+                return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
+            }
+            *current = cfg.clone();
+        }
+        (cfg, changed)
+    };
     if changed {
         log::info!("DAQ MCP3564R reference set to {} V; load-cell calibrations converted", cfg.mcp_vref_v);
         state.clear_kg50_samples();
@@ -1331,18 +1387,23 @@ async fn set_kg50_input(
         )
             .into_response();
     }
-    let mut cfg = state.loadcell_calibration.lock().unwrap().clone();
-    if cfg.kg50_input == req.input {
-        publish_kg50_input(&state, &cfg);
-        return Json(cfg).into_response();
-    }
-    loadcell::switch_kg50_input(&mut cfg, req.input);
-    cfg.kg50_input_stamp_ms = crate::telemetry_task::get_current_timestamp_ms()
-        .max(cfg.kg50_input_stamp_ms.saturating_add(1));
-    if let Err(err) = loadcell::save(&cfg) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
-    }
-    *state.loadcell_calibration.lock().unwrap() = cfg.clone();
+    let cfg = {
+        let mut current = state.loadcell_calibration.lock().unwrap();
+        let mut cfg = current.clone();
+        if cfg.kg50_input == req.input {
+            drop(current);
+            publish_kg50_input(&state, &cfg);
+            return Json(cfg).into_response();
+        }
+        loadcell::switch_kg50_input(&mut cfg, req.input);
+        cfg.kg50_input_stamp_ms = crate::telemetry_task::get_current_timestamp_ms()
+            .max(cfg.kg50_input_stamp_ms.saturating_add(1));
+        if let Err(err) = loadcell::save(&mut cfg) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
+        }
+        *current = cfg.clone();
+        cfg
+    };
     state.clear_kg50_samples();
     state.gse.lock().unwrap().observe_mass(None);
     publish_kg50_input(&state, &cfg);
@@ -1370,7 +1431,19 @@ async fn capture_loadcell_zero(
         return refusal;
     }
     let updated = {
-        let mut cfg = state.loadcell_calibration.lock().unwrap();
+        let mut current = state.loadcell_calibration.lock().unwrap();
+        if let Err(refusal) = loadcell::check_base(
+            &current,
+            req.revision,
+            req.mcp_vref_v,
+            loadcell::uses_mcp_reference(&req.sensor_id),
+        ) {
+            return calibration_refusal_response(refusal);
+        }
+        if let Some(refusal) = capture_reference_refusal(&current, capture_since_ms(req.capture_started_ms)) {
+            return refusal;
+        }
+        let mut cfg = current.clone();
         let temperature = loadcell::recent_adc_temperature(
             state.recent_telemetry_cache.lock().unwrap().iter(),
             "DAQ",
@@ -1387,11 +1460,12 @@ async fn capture_loadcell_zero(
         };
         loadcell::record_capture_temperature(&mut cfg, &req.sensor_id, 0.0, req.raw, temperature);
         loadcell::capture_zero(&mut cfg, &req.sensor_id, raw);
-        cfg.clone()
+        if let Err(err) = loadcell::save(&mut cfg) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
+        }
+        *current = cfg.clone();
+        cfg
     };
-    if let Err(err) = loadcell::save(&updated) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
-    }
     if let Err(err) = publish_daq_calibration(&state, &updated) {
         return (StatusCode::SERVICE_UNAVAILABLE, err).into_response();
     }
@@ -1420,7 +1494,19 @@ async fn capture_loadcell_span(
         return refusal;
     }
     let updated = {
-        let mut cfg = state.loadcell_calibration.lock().unwrap();
+        let mut current = state.loadcell_calibration.lock().unwrap();
+        if let Err(refusal) = loadcell::check_base(
+            &current,
+            req.revision,
+            req.mcp_vref_v,
+            loadcell::uses_mcp_reference(&req.sensor_id),
+        ) {
+            return calibration_refusal_response(refusal);
+        }
+        if let Some(refusal) = capture_reference_refusal(&current, capture_since_ms(req.capture_started_ms)) {
+            return refusal;
+        }
+        let mut cfg = current.clone();
         let temperature = loadcell::recent_adc_temperature(
             state.recent_telemetry_cache.lock().unwrap().iter(),
             "DAQ",
@@ -1443,11 +1529,12 @@ async fn capture_loadcell_span(
             temperature,
         );
         loadcell::capture_span(&mut cfg, &req.sensor_id, raw, req.known_kg);
-        cfg.clone()
+        if let Err(err) = loadcell::save(&mut cfg) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
+        }
+        *current = cfg.clone();
+        cfg
     };
-    if let Err(err) = loadcell::save(&updated) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
-    }
     if let Err(err) = publish_daq_calibration(&state, &updated) {
         return (StatusCode::SERVICE_UNAVAILABLE, err).into_response();
     }
@@ -1455,7 +1542,9 @@ async fn capture_loadcell_span(
     Json(updated).into_response()
 }
 
-/// Recomputes the selected calibration channel using the requested fit mode.
+/// Compatibility stub: the editor refits locally and saves through
+/// `POST /api/calibration`. This writes nothing (the revision does not move)
+/// and returns the current calibration.
 async fn refit_loadcell_channel(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -6922,12 +7011,16 @@ async fn capture_thermal_zero(
         if !check.ready {
             return (StatusCode::CONFLICT, check.message).into_response();
         }
+        // The settling window's volts must all be in the current reference.
+        if let Some(refusal) = capture_reference_refusal(&slot, now - 132_000) {
+            return refusal;
+        }
         let mut cfg = slot.clone();
         if let Err(err) = loadcell::capture_thermal_zero(&mut cfg, &req.sensor_id, raw, temperature)
         {
             return (StatusCode::BAD_REQUEST, err).into_response();
         }
-        if let Err(err) = loadcell::save(&cfg) {
+        if let Err(err) = loadcell::save(&mut cfg) {
             return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
         }
         *slot = cfg.clone();
@@ -7021,6 +7114,15 @@ async fn long_zero_apply(
     };
     let updated = {
         let mut slot = state.loadcell_calibration.lock().unwrap();
+        if let Some(captured) = state.loadcell_processing.captured_mcp_vref_v(&req.session_id)
+            && captured != slot.mcp_vref_v
+        {
+            return (
+                StatusCode::CONFLICT,
+                crate::loadcell_zero::reference_changed_message(captured, slot.mcp_vref_v),
+            )
+                .into_response();
+        }
         let mut cfg = slot.clone();
         if let Err(e) = state.loadcell_processing.apply(
             &req.session_id,
@@ -7030,7 +7132,7 @@ async fn long_zero_apply(
         ) {
             return (StatusCode::BAD_REQUEST, e).into_response();
         }
-        if let Err(e) = loadcell::save(&cfg) {
+        if let Err(e) = loadcell::save(&mut cfg) {
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
         *slot = cfg.clone();
@@ -7090,17 +7192,19 @@ mod recovery_direct_ingress_tests {
         headers: HeaderMap,
         kind: usize,
     ) -> axum::response::Response {
+        let (revision, vref) = {
+            let base = state.loadcell_calibration.lock().unwrap();
+            (base.revision, base.mcp_vref_v)
+        };
         match kind {
             0 => {
                 let mut calibration = loadcell::LoadcellCalibrationFile::default();
                 calibration.ch1.m = Some(2.0);
+                let base = state.loadcell_calibration.lock().unwrap().clone();
                 set_loadcell_calibration(
                     State(state),
                     headers,
-                    Json(loadcell::CalibrationUpdate {
-                        channel: "ch1".into(),
-                        calibration,
-                    }),
+                    Json(loadcell::CalibrationUpdate::based_on(&base, "ch1", calibration)),
                 )
                 .await
                 .into_response()
@@ -7121,6 +7225,8 @@ mod recovery_direct_ingress_tests {
                     sensor_id: "KG1000".into(),
                     raw: 0.123,
                     capture_started_ms: None,
+                    revision: Some(revision),
+                    mcp_vref_v: Some(vref),
                 }),
             )
             .await
@@ -7133,6 +7239,8 @@ mod recovery_direct_ingress_tests {
                     raw: 1.234,
                     known_kg: 1.0,
                     capture_started_ms: None,
+                    revision: Some(revision),
+                    mcp_vref_v: Some(vref),
                 }),
             )
             .await
@@ -7296,6 +7404,191 @@ mod recovery_direct_ingress_tests {
         assert_eq!(file["mcp_vref_v"].as_f64().unwrap() as f32, 2.2);
         assert_eq!(reply["nominal_v"].as_f64().unwrap() as f32, 2.4);
         assert_eq!(reply["mcp_vref_v"].as_f64().unwrap() as f32, 2.2);
+    }
+    #[tokio::test]
+    async fn calibration_writes_are_revisioned_and_keep_the_reference_they_were_taken_at() {
+        if crate::operator_queue::isolated_case(
+            module_path!(),
+            "calibration_writes_are_revisioned_and_keep_the_reference_they_were_taken_at",
+        ) {
+            return;
+        }
+        let (_root, state, headers, _router, _) = fixture().await;
+        let current = || state.loadcell_calibration.lock().unwrap().clone();
+        async fn text(response: Response) -> (StatusCode, String) {
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+        let edit = |base: &loadcell::LoadcellCalibrationFile, m: f32| {
+            let mut cfg = base.clone();
+            let ch1 = cfg.extra_channels.entry("ch1".into()).or_default();
+            ch1.linear = loadcell::ChannelLinear { m: Some(m), b: Some(0.0) };
+            ch1.fit = None;
+            ch1.points.clear();
+            ch1.zero_raw = None;
+            cfg
+        };
+        let save = |update: loadcell::CalibrationUpdate| {
+            set_loadcell_calibration(State(state.clone()), headers.clone(), Json(update))
+        };
+
+        // A fresh save is a new revision, in memory, in the reply and on disk.
+        let loaded = current();
+        let r0 = loaded.revision;
+        let response = save(loadcell::CalibrationUpdate::based_on(&loaded, "ch1", edit(&loaded, 900.0))).await;
+        let (status, body) = text(response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(reply["revision"], r0 + 1);
+        assert_eq!(current().revision, r0 + 1);
+        assert_eq!(loadcell::load_or_default().revision, r0 + 1);
+
+        // The same edit again is stale: refused with a reload message, nothing changes.
+        let before = serde_json::to_value(current()).unwrap();
+        let (status, body) =
+            text(save(loadcell::CalibrationUpdate::based_on(&loaded, "ch1", edit(&loaded, 950.0))).await).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body.contains("changed on the station since it was loaded") && body.contains("reload"), "{body}");
+        assert_eq!(serde_json::to_value(current()).unwrap(), before);
+
+        // No revision (a client from before revisions): 428, nothing changes.
+        let mut missing = loadcell::CalibrationUpdate::based_on(&current(), "ch1", edit(&loaded, 950.0));
+        missing.revision = None;
+        assert_eq!(save(missing).await.status(), StatusCode::PRECONDITION_REQUIRED);
+        // No reference for a load cell: 422.
+        let mut unknown = loadcell::CalibrationUpdate::based_on(&current(), "ch1", edit(&loaded, 950.0));
+        unknown.fitted_mcp_vref_v = None;
+        assert_eq!(save(unknown).await.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(serde_json::to_value(current()).unwrap(), before);
+
+        // Changing the reference is a write; the editor's earlier load is stale.
+        let before_reference = current();
+        let response = set_mcp_reference(
+            State(state.clone()),
+            headers.clone(),
+            Json(McpReferenceRequest { mcp_vref_v: 2.2, note: None }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let converted = current();
+        assert_eq!(converted.revision, before_reference.revision + 1);
+        assert!(converted.mcp_vref_changed_ms > 0);
+        assert_eq!(converted.extra_channels["ch1"].fitted_mcp_vref_v, Some(2.2));
+        let (status, _) = text(
+            save(loadcell::CalibrationUpdate::based_on(&before_reference, "ch1", edit(&before_reference, 950.0))).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        // Even naming the new revision, a fit made at 2.4 V is refused, not
+        // stamped with the current 2.2 V setting.
+        let mut old_fit = loadcell::CalibrationUpdate::based_on(&converted, "ch1", edit(&before_reference, 950.0));
+        old_fit.fitted_mcp_vref_v = Some(2.4);
+        let (status, body) = text(save(old_fit).await).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body.contains("2.4 V") && body.contains("2.2 V"), "{body}");
+        assert_eq!(current().revision, converted.revision);
+        let (status, body) =
+            text(save(loadcell::CalibrationUpdate::based_on(&converted, "ch1", edit(&converted, 950.0))).await).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let saved = current();
+        assert_eq!(saved.revision, converted.revision + 1);
+        assert_eq!(saved.extra_channels["ch1"].linear.m, Some(950.0));
+        assert_eq!(saved.extra_channels["ch1"].fitted_mcp_vref_v, Some(2.2));
+
+        // API captures follow the same rules and are writes.
+        let zero = |revision: Option<u64>, vref: Option<f32>, started: Option<i64>| {
+            capture_loadcell_zero(
+                State(state.clone()),
+                headers.clone(),
+                Json(CaptureLoadcellPointReq {
+                    sensor_id: "ch1".into(),
+                    raw: 0.2,
+                    capture_started_ms: started,
+                    revision,
+                    mcp_vref_v: vref,
+                }),
+            )
+        };
+        let base = current();
+        let now = crate::telemetry_task::get_current_timestamp_ms() as i64;
+        assert_eq!(zero(None, Some(2.2), Some(now)).await.into_response().status(), StatusCode::PRECONDITION_REQUIRED);
+        assert_eq!(
+            zero(Some(base.revision - 1), Some(2.2), Some(now)).await.into_response().status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            zero(Some(base.revision), Some(2.4), Some(now)).await.into_response().status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            zero(Some(base.revision), None, Some(now)).await.into_response().status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        // Samples from before the reference changed (the default look-back
+        // window covers the change made above) are in the old reference.
+        let (status, body) = text(zero(Some(base.revision), Some(2.2), None).await.into_response()).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body.contains("changed to 2.2 V while these samples were taken"), "{body}");
+        let started = i64::try_from(base.mcp_vref_changed_ms).unwrap();
+        assert_eq!(
+            zero(Some(base.revision), Some(2.2), Some(started - 1)).await.into_response().status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(current().revision, base.revision, "no refused capture is a write");
+        let (status, body) = text(zero(Some(base.revision), Some(2.2), Some(now.max(started))).await.into_response()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let zeroed = current();
+        assert_eq!(zeroed.revision, base.revision + 1);
+        assert_eq!(zeroed.extra_channels["ch1"].zero_raw, Some(0.2));
+        assert_eq!(zeroed.extra_channels["ch1"].fitted_mcp_vref_v, Some(2.2));
+        let response = capture_loadcell_span(
+            State(state.clone()),
+            headers.clone(),
+            Json(CaptureLoadcellSpanReq {
+                sensor_id: "ch1".into(),
+                raw: 0.4,
+                known_kg: 10.0,
+                capture_started_ms: Some(now.max(started)),
+                revision: Some(zeroed.revision),
+                mcp_vref_v: Some(2.2),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(current().revision, zeroed.revision + 1);
+
+        // Refit writes nothing.
+        let before_refit = current().revision;
+        let response = refit_loadcell_channel(State(state.clone()), headers.clone(), Json(RefitLoadcellReq {}))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(current().revision, before_refit);
+
+        // Station settings saved in the same file are writes too.
+        let response = set_kg50_input(
+            State(state.clone()),
+            headers.clone(),
+            Json(Kg50InputRequest { input: loadcell::Kg50Input::P6Differential }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(current().revision, before_refit + 1);
+        let response = set_kg50_input(
+            State(state.clone()),
+            headers.clone(),
+            Json(Kg50InputRequest { input: loadcell::Kg50Input::P6Differential }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(current().revision, before_refit + 1, "re-selecting the same input writes nothing");
+        let response =
+            set_chamber_pt(State(state.clone()), headers.clone(), Json(ChamberPtRequest { installed: false })).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(current().revision, before_refit + 2);
+        assert_eq!(loadcell::load_or_default().revision, before_refit + 2);
     }
     #[tokio::test]
     async fn chamber_pt_setting_persists_and_defaults_to_installed() {

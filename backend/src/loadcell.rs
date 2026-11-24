@@ -211,6 +211,18 @@ pub struct LoadcellCalibrationFile {
     /// empty for none.
     #[serde(default)]
     pub mcp_vref_note: String,
+    /// Station wall-clock ms when `mcp_vref_v` last changed; 0 when it has not
+    /// changed since this field existed. A capture whose samples start before
+    /// it was read under the previous reference and is refused.
+    #[serde(default)]
+    pub mcp_vref_changed_ms: u64,
+    /// Revision of this document. Every write of the calibration file through
+    /// `save`/`save_guarded` adds one, so a writer that edits what it loaded
+    /// (the calibration editor, API captures) sends the revision it loaded and
+    /// is refused when the station's has moved on (`merge_channel_update`,
+    /// `check_base`). A file saved before revisions existed loads as 0.
+    #[serde(default)]
+    pub revision: u64,
 }
 
 impl Default for LoadcellCalibrationFile {
@@ -249,6 +261,8 @@ impl Default for LoadcellCalibrationFile {
             chamber_pt_installed: true,
             mcp_vref_v: mcp_reference::NOMINAL_MCP_VREF_V,
             mcp_vref_note: String::new(),
+            mcp_vref_changed_ms: 0,
+            revision: 0,
         }
     }
 }
@@ -932,28 +946,133 @@ fn retain_matching_captures(captures: &mut Vec<TemperatureCapture>, channel: Opt
 pub struct CalibrationUpdate {
     pub channel: String,
     pub calibration: LoadcellCalibrationFile,
+    /// `LoadcellCalibrationFile::revision` of the document the editor loaded
+    /// and edited. Required: a save without it is refused (428), a save whose
+    /// revision is not the station's current one is refused as stale (409).
+    #[serde(default)]
+    pub revision: Option<u64>,
+    /// MCP3564R reference (V) the saved KG1000/KG50 points, zero, fit and
+    /// thermal correction were captured and fitted at: the `mcp_vref_v` of the
+    /// document the editor loaded. Required for `ch1` and `kg50` (422 when
+    /// missing); a value that is not the station's current reference is
+    /// refused (409), never converted or restamped. Per-channel
+    /// `fitted_mcp_vref_v` inside `calibration` is ignored: a missing one
+    /// deserializes as the legacy nominal and cannot be told from a real one.
+    #[serde(default)]
+    pub fitted_mcp_vref_v: Option<f32>,
+}
+
+#[cfg(test)]
+impl CalibrationUpdate {
+    /// An editor save of `channel` made against `base` as loaded.
+    pub(crate) fn based_on(base: &LoadcellCalibrationFile, channel: &str, calibration: LoadcellCalibrationFile) -> Self {
+        Self {
+            channel: channel.into(),
+            calibration,
+            revision: Some(base.revision),
+            fitted_mcp_vref_v: Some(base.mcp_vref_v),
+        }
+    }
+}
+
+/// Why a calibration write was refused; the web layer maps each to a status.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UpdateRefusal {
+    /// 428: the write does not say which revision it was based on.
+    RevisionRequired(String),
+    /// 409: the station's calibration (revision, 50 kg input or reference)
+    /// changed since the client loaded it.
+    Stale(String),
+    /// 422: the write does not say which MCP3564R reference its volts are in.
+    ReferenceRequired(String),
+    /// 409: the update itself is not acceptable (unknown channel, legacy
+    /// scale, railed points, invalid thermal or noise values).
+    Rejected(String),
+}
+
+impl UpdateRefusal {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::RevisionRequired(m) | Self::Stale(m) | Self::ReferenceRequired(m) | Self::Rejected(m) => m,
+        }
+    }
+}
+
+impl std::fmt::Display for UpdateRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+/// Load-cell inputs whose volts are scaled by the MCP3564R reference.
+pub fn uses_mcp_reference(sensor_or_channel: &str) -> bool {
+    matches!(sensor_or_channel, "ch1" | "kg50" | "KG1000" | "KG50")
+}
+
+/// Check that a write was made against the station's current calibration.
+/// `revision` is the revision the client loaded; `vref` the reference its
+/// readings were taken under, required when `needs_reference`. Messages tell
+/// the operator what changed and to reload.
+pub fn check_base(
+    current: &LoadcellCalibrationFile,
+    revision: Option<u64>,
+    vref: Option<f32>,
+    needs_reference: bool,
+) -> Result<(), UpdateRefusal> {
+    let Some(revision) = revision else {
+        return Err(UpdateRefusal::RevisionRequired(
+            "This client did not say which calibration revision it edited. Reload the calibration (update the UI if this repeats) and re-apply your changes.".into(),
+        ));
+    };
+    if revision != current.revision {
+        return Err(UpdateRefusal::Stale(format!(
+            "Calibration changed on the station since it was loaded (loaded revision {revision}, station revision {}). Nothing was saved: reload the calibration and re-apply your changes.",
+            current.revision
+        )));
+    }
+    if needs_reference {
+        let Some(vref) = vref else {
+            return Err(UpdateRefusal::ReferenceRequired(
+                "This save does not say which DAQ MCP3564R reference its readings were taken at, so it cannot be stored. Reload the calibration and re-apply your changes.".into(),
+            ));
+        };
+        if vref != current.mcp_vref_v {
+            return Err(UpdateRefusal::Stale(format!(
+                "These readings were taken at DAQ MCP3564R reference {vref} V but the station reference is now {} V. Nothing was saved: reload the calibration and capture the points again.",
+                current.mcp_vref_v
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub fn merge_channel_update(
     current: &LoadcellCalibrationFile,
     update: &CalibrationUpdate,
-) -> Result<LoadcellCalibrationFile, String> {
+) -> Result<LoadcellCalibrationFile, UpdateRefusal> {
     let channel = update.channel.as_str();
     let sensor = match channel {
         "ch1" => "KG1000",
         "kg50" => "KG50",
         "iadc" => "IADC",
-        _ => return Err("Unknown calibration channel".into()),
+        _ => return Err(UpdateRefusal::Rejected("Unknown calibration channel".into())),
     };
     if update.calibration.version < CALIBRATION_VERSION {
-        return Err(format!(
+        return Err(UpdateRefusal::Rejected(format!(
             "Calibration version {} uses the legacy raw scale; reload calibration (version {CALIBRATION_VERSION}, volts) before saving",
             update.calibration.version
+        )));
+    }
+    check_base(current, update.revision, update.fitted_mcp_vref_v, uses_mcp_reference(channel))?;
+    if channel == "kg50" && update.calibration.kg50_input != current.kg50_input {
+        return Err(UpdateRefusal::Stale(
+            "50 kg input changed; reload calibration before saving".into(),
         ));
     }
-    if channel == "kg50" && update.calibration.kg50_input != current.kg50_input {
-        return Err("50 kg input changed; reload calibration before saving".into());
-    }
+    // Provenance: the reference the client says it fitted at (checked equal
+    // to the station's above), never a value filled in here. Other channels
+    // do not carry one.
+    let fitted = if uses_mcp_reference(channel) { update.fitted_mcp_vref_v } else { None };
     let incoming = &update.calibration;
     let mut result = current.clone();
     // An omitted selected channel means an explicit reset. Keep an empty entry
@@ -966,15 +1085,13 @@ pub fn merge_channel_update(
             .cloned()
             .unwrap_or_default(),
     );
-    // The UI works in the volts the DAQ publishes now, whatever the (unechoed)
-    // field deserialized as: what it saves is fitted under the current reference.
     if let Some(entry) = result.extra_channels.get_mut(channel) {
-        entry.fitted_mcp_vref_v = None;
+        entry.fitted_mcp_vref_v = fitted;
     }
     result.thermal.remove(sensor);
     if let Some(value) = incoming.thermal.get(sensor) {
         let mut value = value.clone();
-        value.fitted_mcp_vref_v = None;
+        value.fitted_mcp_vref_v = fitted;
         result.thermal.insert(sensor.into(), value);
     }
     result.noise.remove(sensor);
@@ -989,17 +1106,29 @@ pub fn merge_channel_update(
             result.temperature_captures.insert(sensor.into(), captures);
         }
     }
-    reject_railed_points(&result, channel, sensor)?;
+    reject_railed_points(&result, channel, sensor).map_err(UpdateRefusal::Rejected)?;
     // Make the selected authoritative generic channel agree with legacy fields
     // before migration normalization (including explicit zero/fit removal).
     sync_extra_channels_into_legacy(&mut result);
     normalize_calibration(&mut result);
-    validate_thermal(&result)?;
+    validate_thermal(&result).map_err(UpdateRefusal::Rejected)?;
     Ok(result)
 }
 
-pub fn save(cfg: &LoadcellCalibrationFile) -> Result<(), String> {
-    save_at(cfg, &calibration_path())
+/// Persist a change to the station's calibration as a new revision: `cfg`
+/// leaves with its revision advanced past the one it was built from (and
+/// unchanged when the write fails). Every runtime writer goes through this or
+/// `save_guarded`, so every write moves the revision clients edit against.
+pub fn save(cfg: &mut LoadcellCalibrationFile) -> Result<(), String> {
+    let previous = next_revision(cfg);
+    save_at(cfg, &calibration_path()).inspect_err(|_| cfg.revision = previous)
+}
+
+/// Advance `cfg.revision`, returning the previous one.
+fn next_revision(cfg: &mut LoadcellCalibrationFile) -> u64 {
+    let previous = cfg.revision;
+    cfg.revision = previous.wrapping_add(1);
+    previous
 }
 
 #[derive(Debug)]
@@ -1020,11 +1149,13 @@ pub(crate) fn save_at(cfg: &LoadcellCalibrationFile, path: &std::path::Path) -> 
 /// Calibration format/backups remain identical. Only this guarded path owns
 /// a unique create_new temporary, so a refusal cannot remove another writer's
 /// historical fixed json.tmp file. No SDK/DISPATCH/Stop/GSE guard is involved.
+/// Like `save`, a new revision; a published but uncertain write keeps it.
 pub(crate) fn save_guarded(
-    cfg: &LoadcellCalibrationFile,
+    cfg: &mut LoadcellCalibrationFile,
     guard: impl FnMut(SaveBoundary) -> Result<(), String>,
 ) -> Result<GuardedSaveOutcome, String> {
-    save_at_checked(cfg, &calibration_path(), true, guard)
+    let previous = next_revision(cfg);
+    save_at_checked(cfg, &calibration_path(), true, guard).inspect_err(|_| cfg.revision = previous)
 }
 #[cfg(test)]
 type GuardedReplaceTestHook = (std::path::PathBuf, Box<dyn FnOnce() + Send>);
@@ -2182,6 +2313,9 @@ pub fn capture_thermal_zero(
         return Err("At most 64 thermal points are supported".into());
     }
     t.points.push([temperature, raw]);
+    // The caller checked the sample was taken under the station's reference
+    // (web::capture_thermal_zero); the points are in it.
+    t.fitted_mcp_vref_v = Some(cfg.mcp_vref_v);
     // Keep the saved correction/reference while accumulating an inconclusive fit.
     if !cfg.thermal.contains_key(sensor) {
         t.reference_c = temperature;
@@ -2467,14 +2601,7 @@ mod channel_save_tests {
         let mut stale = LoadcellCalibrationFile::default();
         normalize_calibration(&mut stale);
         stale.extra_channels.get_mut("kg50").unwrap().linear.m = Some(5678.0);
-        let saved = merge_channel_update(
-            &current,
-            &CalibrationUpdate {
-                channel: "kg50".into(),
-                calibration: stale,
-            },
-        )
-        .unwrap();
+        let saved = merge_channel_update(&current, &CalibrationUpdate::based_on(&current, "kg50", stale)).unwrap();
         assert_eq!(
             json(&saved)["extra_channels"]["ch1"],
             original["extra_channels"]["ch1"]
@@ -2487,10 +2614,7 @@ mod channel_save_tests {
         assert_eq!(saved.extra_channels["kg50"].linear.m, Some(5678.0));
         let reset = merge_channel_update(
             &saved,
-            &CalibrationUpdate {
-                channel: "ch1".into(),
-                calibration: LoadcellCalibrationFile::default(),
-            },
+            &CalibrationUpdate::based_on(&saved, "ch1", LoadcellCalibrationFile::default()),
         )
         .unwrap();
         assert_eq!(
@@ -2545,28 +2669,168 @@ mod channel_save_tests {
         switch_kg50_input(&mut current, Kg50Input::P6Differential);
         let stale = LoadcellCalibrationFile::default();
         assert!(
-            merge_channel_update(
-                &current,
-                &CalibrationUpdate {
-                    channel: "kg50".into(),
-                    calibration: stale.clone()
-                }
-            )
-            .is_err()
+            merge_channel_update(&current, &CalibrationUpdate::based_on(&current, "kg50", stale.clone()))
+                .is_err()
         );
-        let saved = merge_channel_update(
-            &current,
-            &CalibrationUpdate {
-                channel: "ch1".into(),
-                calibration: stale,
-            },
-        )
-        .unwrap();
+        let saved = merge_channel_update(&current, &CalibrationUpdate::based_on(&current, "ch1", stale)).unwrap();
         assert_eq!(saved.kg50_input, Kg50Input::P6Differential);
         assert_eq!(
             json(&saved)["kg50_input_profiles"],
             json(&current)["kg50_input_profiles"]
         );
+    }
+}
+
+#[cfg(test)]
+mod revision_tests {
+    use super::*;
+
+    fn loaded() -> LoadcellCalibrationFile {
+        let mut cfg = LoadcellCalibrationFile::default();
+        normalize_calibration(&mut cfg);
+        cfg.revision = 7;
+        cfg
+    }
+
+    fn edit(base: &LoadcellCalibrationFile, m: f32) -> LoadcellCalibrationFile {
+        let mut cfg = base.clone();
+        let ch1 = cfg.extra_channels.entry("ch1".into()).or_default();
+        ch1.linear = ChannelLinear { m: Some(m), b: Some(0.0) };
+        ch1.fit = None;
+        cfg
+    }
+
+    #[test]
+    fn a_file_saved_before_revisions_loads_as_revision_zero_and_loading_does_not_bump_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "gs-calibration-revision-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("calibration.json");
+        let mut legacy = serde_json::to_value(LoadcellCalibrationFile::default()).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        object.remove("revision");
+        object.remove("mcp_vref_changed_ms");
+        object.insert("kg50_input_stamp_ms".into(), 5.into());
+        std::fs::write(&path, legacy.to_string()).unwrap();
+        let cfg = load_or_default_at(&path, false);
+        assert_eq!((cfg.revision, cfg.mcp_vref_changed_ms), (0, 0));
+        assert_eq!(load_or_default_at(&path, false).revision, 0, "a restart is not a write");
+        let written: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(written["revision"], 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn save_moves_the_revision_and_a_failed_save_does_not() {
+        // Its own process: other tests save the same scratch calibration.
+        if crate::operator_queue::isolated_case(module_path!(), "save_moves_the_revision_and_a_failed_save_does_not") {
+            return;
+        }
+        let mut cfg = load_or_default();
+        let before = cfg.revision;
+        save(&mut cfg).unwrap();
+        assert_eq!(cfg.revision, before + 1);
+        assert_eq!(load_or_default().revision, before + 1, "persisted");
+        let mut guarded = cfg.clone();
+        let outcome = save_guarded(&mut guarded, |_| Err("refused".into()));
+        assert!(outcome.is_err());
+        assert_eq!(guarded.revision, before + 1, "a refused write keeps the revision");
+        save_guarded(&mut guarded, |_| Ok(())).unwrap();
+        assert_eq!(guarded.revision, before + 2);
+    }
+
+    #[test]
+    fn an_editor_save_must_be_based_on_the_current_revision() {
+        let current = loaded();
+        let saved = merge_channel_update(&current, &CalibrationUpdate::based_on(&current, "ch1", edit(&current, 900.0)))
+            .unwrap();
+        assert_eq!(saved.extra_channels["ch1"].linear.m, Some(900.0));
+        assert_eq!(saved.revision, current.revision, "merge does not bump; save does");
+
+        let mut older = current.clone();
+        older.revision = 6;
+        let refusal = merge_channel_update(&current, &CalibrationUpdate::based_on(&older, "ch1", edit(&current, 900.0)))
+            .unwrap_err();
+        assert!(matches!(refusal, UpdateRefusal::Stale(_)), "{refusal:?}");
+        let text = refusal.to_string();
+        assert!(text.contains("changed on the station since it was loaded") && text.contains("reload"), "{text}");
+        assert!(text.contains("revision 6") && text.contains("revision 7"), "{text}");
+
+        let mut missing = CalibrationUpdate::based_on(&current, "ch1", edit(&current, 900.0));
+        missing.revision = None;
+        assert!(matches!(merge_channel_update(&current, &missing), Err(UpdateRefusal::RevisionRequired(_))));
+        // A body from a client that predates revisions.
+        let old_client: CalibrationUpdate = serde_json::from_value(serde_json::json!({
+            "channel": "iadc",
+            "calibration": serde_json::to_value(&current).unwrap(),
+        }))
+        .unwrap();
+        assert!(matches!(merge_channel_update(&current, &old_client), Err(UpdateRefusal::RevisionRequired(_))));
+    }
+
+    #[test]
+    fn a_fit_is_stamped_with_the_reference_it_was_made_at_never_the_current_setting() {
+        // The editor loaded at the nominal reference; the station then moved
+        // to 2.2 V (converting its own copy). The old fit is refused, not
+        // stamped 2.2 V, even if it names the current revision.
+        let loaded_at_nominal = loaded();
+        let mut current = loaded_at_nominal.clone();
+        mcp_reference::set_reference(&mut current, 2.2).unwrap();
+        let mut update = CalibrationUpdate::based_on(&current, "ch1", edit(&loaded_at_nominal, 900.0));
+        update.fitted_mcp_vref_v = Some(2.4);
+        let refusal = merge_channel_update(&current, &update).unwrap_err();
+        assert!(matches!(refusal, UpdateRefusal::Stale(_)), "{refusal:?}");
+        let text = refusal.to_string();
+        assert!(text.contains("2.4 V") && text.contains("2.2 V") && text.contains("reload"), "{text}");
+
+        update.fitted_mcp_vref_v = None;
+        assert!(matches!(merge_channel_update(&current, &update), Err(UpdateRefusal::ReferenceRequired(_))));
+
+        // A nested per-channel stamp cannot stand in for the explicit one.
+        let mut nested = edit(&current, 900.0);
+        nested.extra_channels.get_mut("ch1").unwrap().fitted_mcp_vref_v = Some(2.2);
+        let mut update = CalibrationUpdate::based_on(&current, "ch1", nested);
+        update.fitted_mcp_vref_v = None;
+        assert!(matches!(merge_channel_update(&current, &update), Err(UpdateRefusal::ReferenceRequired(_))));
+
+        let mut thermal = edit(&current, 900.0);
+        thermal.thermal.insert(
+            "KG1000".into(),
+            ThermalCalibration { reference_c: 20.0, raw_per_c: 1e-4, points: vec![], fitted_mcp_vref_v: None },
+        );
+        let saved = merge_channel_update(&current, &CalibrationUpdate::based_on(&current, "ch1", thermal)).unwrap();
+        assert_eq!(saved.extra_channels["ch1"].fitted_mcp_vref_v, Some(2.2));
+        assert_eq!(saved.thermal["KG1000"].fitted_mcp_vref_v, Some(2.2));
+        assert_eq!(saved.extra_channels["ch1"].linear.m, Some(900.0), "not converted");
+
+        // IADC is not an MCP3564R input: no reference needed or stamped.
+        let mut iadc = CalibrationUpdate::based_on(&current, "iadc", current.clone());
+        iadc.fitted_mcp_vref_v = None;
+        let saved = merge_channel_update(&current, &iadc).unwrap();
+        assert_eq!(saved.extra_channels["iadc"].fitted_mcp_vref_v, None);
+    }
+
+    #[test]
+    fn capture_checks_share_the_revision_and_reference_rules() {
+        let current = loaded();
+        assert!(check_base(&current, Some(7), Some(2.4), true).is_ok());
+        assert!(matches!(check_base(&current, None, Some(2.4), true), Err(UpdateRefusal::RevisionRequired(_))));
+        assert!(matches!(check_base(&current, Some(8), Some(2.4), true), Err(UpdateRefusal::Stale(_))));
+        assert!(matches!(check_base(&current, Some(7), None, true), Err(UpdateRefusal::ReferenceRequired(_))));
+        assert!(matches!(check_base(&current, Some(7), Some(2.2), true), Err(UpdateRefusal::Stale(_))));
+        assert!(check_base(&current, Some(7), None, false).is_ok());
+        assert!(uses_mcp_reference("KG1000") && uses_mcp_reference("kg50") && !uses_mcp_reference("iadc"));
+    }
+
+    #[test]
+    fn a_thermal_point_is_stamped_with_the_reference_it_was_taken_under() {
+        let mut cfg = loaded();
+        mcp_reference::set_reference(&mut cfg, 2.2).unwrap();
+        capture_thermal_zero(&mut cfg, "KG1000", 0.2, 21.0).unwrap();
+        assert_eq!(cfg.thermal["KG1000"].fitted_mcp_vref_v, Some(2.2));
     }
 }
 
@@ -2879,7 +3143,7 @@ mod rail_tests {
                 .map(|expected| TemperatureCapture { expected: *expected, raw: 0.013 * K, temperature_c: Some(21.0) })
                 .collect(),
         );
-        CalibrationUpdate { channel: "ch1".into(), calibration }
+        CalibrationUpdate::based_on(&LoadcellCalibrationFile::default(), "ch1", calibration)
     }
 
     #[test]
@@ -2924,10 +3188,12 @@ mod rail_tests {
     fn save_rejects_points_or_zero_captured_at_a_rail() {
         let current = LoadcellCalibrationFile::default();
         let err = merge_channel_update(&current, &kg1000_update(&[(100.0, CLIP_V)], Some(ZERO_V), &[]))
-            .unwrap_err();
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("rail") && err.contains("100") && err.contains(" V "), "{err}");
         let err = merge_channel_update(&current, &kg1000_update(&[(100.0, LOAD_V)], Some(0.001935 * K), &[]))
-            .unwrap_err();
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("zero") && err.contains("rail"), "{err}");
         let ok = merge_channel_update(&current, &kg1000_update(&[(100.0, LOAD_V)], Some(ZERO_V), &[]))
             .unwrap();
@@ -2944,7 +3210,7 @@ mod rail_tests {
                 ..Default::default()
             },
         );
-        assert!(merge_channel_update(&p6, &CalibrationUpdate { channel: "kg50".into(), calibration: update }).is_ok());
+        assert!(merge_channel_update(&p6, &CalibrationUpdate::based_on(&p6, "kg50", update)).is_ok());
     }
 
     #[test]
@@ -2952,7 +3218,7 @@ mod rail_tests {
         let current = LoadcellCalibrationFile::default();
         let mut update = kg1000_update(&[(100.0, LOAD_V)], Some(ZERO_V), &[]);
         update.calibration.version = 1;
-        let err = merge_channel_update(&current, &update).unwrap_err();
+        let err = merge_channel_update(&current, &update).unwrap_err().to_string();
         assert!(err.contains("reload"), "{err}");
         // A save without a version field is a legacy client.
         let legacy: CalibrationUpdate =

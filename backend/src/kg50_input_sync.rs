@@ -274,7 +274,7 @@ fn restamp_if_due(
     }
     let mut next = current.clone();
     next.kg50_input_stamp_ms = wall.max(next.kg50_input_stamp_ms.saturating_add(1));
-    match crate::loadcell::save(&next) {
+    match crate::loadcell::save(&mut next) {
         Ok(()) => {
             *current = next;
             log::warn!(

@@ -247,6 +247,16 @@ struct Session {
     stop: Arc<AtomicBool>,
     dropped: Arc<AtomicU64>,
     last_source_ms: Option<crate::network_stamp::Stamp>,
+    /// MCP3564R reference (V) of the calibration the capture started under:
+    /// the volts it averages are in this reference.
+    mcp_vref_v: f32,
+}
+/// A long zero captured under one MCP3564R reference cannot be applied to a
+/// calibration converted to another.
+pub fn reference_changed_message(captured: f32, current: f32) -> String {
+    format!(
+        "This zero capture was taken at DAQ MCP3564R reference {captured} V but the station reference is now {current} V. Nothing was applied: run the capture again."
+    )
 }
 #[derive(Default)]
 pub struct Service {
@@ -360,6 +370,7 @@ impl Service {
         let worker_stop = stop.clone();
         let worker_dropped = dropped.clone();
         let sensor = sensor.to_string();
+        let mcp_vref_v = cfg.mcp_vref_v;
         std::thread::Builder::new()
             .name("loadcell-zero-capture".into())
             .spawn(move || {
@@ -430,8 +441,15 @@ impl Service {
             stop,
             dropped,
             last_source_ms: None,
+            mcp_vref_v,
         });
         Ok(result)
+    }
+    /// The MCP3564R reference the capture `id` was taken under.
+    pub fn captured_mcp_vref_v(&self, id: &str) -> Option<f32> {
+        let slot = self.session.lock().unwrap();
+        let session = slot.as_ref()?;
+        (session.status.lock().unwrap().session_id == id).then_some(session.mcp_vref_v)
     }
     pub fn stop(&self, id: &str) -> Result<(), String> {
         let slot = self.session.lock().unwrap();
@@ -544,6 +562,10 @@ impl Service {
         if !tau_ms.is_finite() || !(0.0..=2000.0).contains(&tau_ms) {
             return Err("Filter time constant must be 0–2000 ms (0 disables)".into());
         }
+        let captured_vref = self.captured_mcp_vref_v(id).ok_or("Capture changed; refresh status")?;
+        if captured_vref != cfg.mcp_vref_v {
+            return Err(reference_changed_message(captured_vref, cfg.mcp_vref_v));
+        }
         let r = &s.report;
         if thermal {
             if !r.thermal_ready {
@@ -561,7 +583,7 @@ impl Service {
                     reference_c: reference,
                     raw_per_c: r.raw_per_c as f32,
                     points: vec![],
-                    fitted_mcp_vref_v: None,
+                    fitted_mcp_vref_v: Some(captured_vref),
                 },
             );
         }
@@ -801,6 +823,16 @@ mod lifecycle_tests {
                 .apply(&status.session_id, &mut cfg, true, 100.)
                 .is_err()
         );
+        // Taken at the nominal reference: not applicable to a calibration
+        // converted to another one, and nothing is changed.
+        let mut converted = cfg.clone();
+        crate::loadcell::mcp_reference::set_reference(&mut converted, 2.2).unwrap();
+        let before = serde_json::to_value(&converted).unwrap();
+        let err = service.apply(&status.session_id, &mut converted, false, 100.).unwrap_err();
+        assert!(err.contains("2.4 V") && err.contains("2.2 V"), "{err}");
+        assert_eq!(serde_json::to_value(&converted).unwrap(), before);
+        assert_eq!(service.captured_mcp_vref_v(&status.session_id), Some(2.4));
+        assert_eq!(service.captured_mcp_vref_v("wrong-id"), None);
         service
             .apply(&status.session_id, &mut cfg, false, 100.)
             .unwrap();

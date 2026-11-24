@@ -419,7 +419,7 @@ fn commit_tare_captured(
     // CaptureClock may read the explicit model clock file. These are the
     // EXISTING zero/calibration persistence locks, never DISPATCH/Stop/GSE.
     // The final guard executes immediately before atomic file replacement.
-    let saved = loadcell::save_guarded(&updated, |_| {
+    let saved = loadcell::save_guarded(&mut updated, |_| {
         if original_capture.within(window) { Ok(()) }
         else { Err("Original automatic-zero deadline expired before calibration replacement".into()) }
     })?;

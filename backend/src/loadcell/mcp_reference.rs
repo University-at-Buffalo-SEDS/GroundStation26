@@ -350,17 +350,18 @@ mod tests {
     }
 
     #[test]
-    fn a_ui_save_is_fitted_under_the_current_reference() {
+    fn a_ui_save_is_stamped_with_the_reference_it_says_it_was_fitted_at() {
         let mut cfg = fitted_file();
         set_reference(&mut cfg, 2.2).unwrap();
-        // The frontend does not echo the field: it deserializes as nominal.
+        // A nested per-channel field is ignored (missing deserializes as the
+        // nominal); the top-level reference the editor loaded is what counts.
         let mut incoming: LoadcellCalibrationFile = serde_json::from_value(serde_json::json!({
             "version": CALIBRATION_VERSION,
             "extra_channels": {"ch1": {"linear": {"m": 900.0, "b": 1.0}, "points": []}}
         }))
         .unwrap();
         incoming.kg50_input = cfg.kg50_input;
-        let merged = merge_channel_update(&cfg, &CalibrationUpdate { channel: "ch1".into(), calibration: incoming }).unwrap();
+        let merged = merge_channel_update(&cfg, &CalibrationUpdate::based_on(&cfg, "ch1", incoming)).unwrap();
         assert_eq!(merged.extra_channels["ch1"].linear.m, Some(900.0), "not reinterpreted");
         assert_eq!(merged.extra_channels["ch1"].fitted_mcp_vref_v, Some(2.2));
     }

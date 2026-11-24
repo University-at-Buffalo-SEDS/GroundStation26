@@ -203,15 +203,15 @@ pub fn replace(
 pub fn apply_and_save(
     cfg: &mut LoadcellCalibrationFile,
     pending: &paired_settings::coordinator::Pending,
-    save: impl FnOnce(&LoadcellCalibrationFile) -> Result<(), String>,
+    save: impl FnOnce(&mut LoadcellCalibrationFile) -> Result<(), String>,
 ) -> anyhow::Result<()> {
-    let next = replace(
+    let mut next = replace(
         cfg,
         &pending.key,
         &pending.expected_local,
         &pending.revision.value,
     )?;
-    save(&next).map_err(anyhow::Error::msg)?;
+    save(&mut next).map_err(anyhow::Error::msg)?;
     *cfg = next;
     Ok(())
 }
