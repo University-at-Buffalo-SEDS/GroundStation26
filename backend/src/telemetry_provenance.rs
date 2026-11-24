@@ -142,7 +142,7 @@ mod tests {
             timestamp_ms: 11,
             data_type: "provenance-test".into(),
             sender_id: "DAQ".into(),
-            values: vec![Some(5.)],
+            values: vec![Some(5.)], over_range: 0, over_range_low: 0,
         };
         assert!(
             serde_json::to_value(&row)

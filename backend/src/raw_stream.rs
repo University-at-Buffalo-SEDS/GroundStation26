@@ -503,9 +503,18 @@ pub(crate) struct RowOut {
     pub source_ms: Option<i64>,
     pub network_ms: Option<i64>,
     pub values: Vec<Option<f32>>,
+    /// ADC over-range bits of `values` (null there); omitted when 0.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub over_range: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub over_range_low: u32,
     pub fields: &'static [&'static str],
     pub units: &'static [&'static str],
     pub provenance: &'static str,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 /// The whole station runs on simulated firmware or the internal flight sim.
@@ -551,6 +560,8 @@ fn row_out(state: &AppState, row: &TelemetryRow) -> RowOut {
         source_ms: crate::telemetry_provenance::source(row),
         network_ms: network_now(state),
         values: row.values.clone(),
+        over_range: row.over_range,
+        over_range_low: row.over_range_low,
         fields,
         units,
         provenance: provenance(state, &row.data_type, &row.sender_id),

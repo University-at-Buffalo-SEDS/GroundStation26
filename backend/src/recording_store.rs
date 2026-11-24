@@ -1325,8 +1325,9 @@ pub(crate) async fn copy_window(
     let mut sources = Vec::new();
     for segment in &segments {
         attach(db, &segment.path).await?;
+        let (into, from) = crate::over_range::copy_columns(db, "src").await;
         let result: Result<(), sqlx::Error> = async {
-            sqlx::query("INSERT INTO telemetry (timestamp_ms,source_timestamp_ms,data_type,sender_id,values_json,payload_json) SELECT timestamp_ms,source_timestamp_ms,data_type,sender_id,values_json,payload_json FROM src.telemetry WHERE timestamp_ms>=? AND timestamp_ms<=? ORDER BY id")
+            sqlx::query(sqlx::AssertSqlSafe(format!("INSERT INTO telemetry (timestamp_ms,source_timestamp_ms,data_type,sender_id,values_json,payload_json{into}) SELECT timestamp_ms,source_timestamp_ms,data_type,sender_id,values_json,payload_json{from} FROM src.telemetry WHERE timestamp_ms>=? AND timestamp_ms<=? ORDER BY id")))
                 .bind(start).bind(end).execute(db).await?;
             sqlx::query("INSERT INTO alerts (timestamp_ms,severity,message,condition_json) SELECT timestamp_ms,severity,message,condition_json FROM src.alerts WHERE timestamp_ms>=? AND timestamp_ms<=? ORDER BY id")
                 .bind(start).bind(end).execute(db).await?;

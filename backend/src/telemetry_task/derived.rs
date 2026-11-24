@@ -582,7 +582,7 @@ pub(super) async fn emit_derived_battery_rows(
                 timestamp_ms: ts_ms,
                 data_type,
                 sender_id: sender_id.to_string(),
-                values,
+                values, over_range: 0, over_range_low: 0,
             };
             crate::telemetry_provenance::note(
                 &row,
@@ -635,6 +635,41 @@ pub(super) fn prepare_derived_loadcell_rows(
         sample.sender_id,
         sample.ts_ms,
     );
+    // An over-range input (±Inf marker from the DAQ) carries no value: the
+    // derived weight (and fill percentage) are published as over range, the
+    // filters and zero/noise captures see no sample, and the operator alert
+    // comes from DAQ_INPUT_HEALTH (daq_input_health.rs).
+    if sample.raw_value.is_infinite() {
+        let _ = state.loadcell_processing.filter(&cfg, sample.sender_id, calibration_sensor_id, sample.ts_ms, f32::NAN);
+        state.loadcell_processing.observe_source(crate::loadcell_zero::SourceSample {
+            sender: sample.sender_id,
+            sensor: calibration_sensor_id,
+            timestamp_ms: sample.ts_ms,
+            source_timestamp_ms: sample.source_timestamp_ms,
+            source_epoch: sample.receipt.source_epoch,
+            received_network_ms: sample.receipt.network_ms,
+            raw: sample.raw_value,
+            temperature,
+        });
+        let is_fill_source = calibration_sensor_id == fill_source.sensor();
+        if is_fill_source && sample.sender_id == crate::types::Board::DaqBoard.sender_id() {
+            *state.latest_fill_mass_kg.lock().unwrap() = None;
+            state.gse.lock().unwrap().observe_mass(None);
+        }
+        let config_json = serde_json::json!({"calibration":cfg,
+            "fill_targets":fill_targets,"flight_state":format!("{:?}", *state.state.lock().unwrap())})
+        .to_string();
+        let marker = Some(sample.raw_value);
+        let rows = railed_loadcell_rows(calibration_sensor_id, is_fill_source)
+            .into_iter()
+            .map(|(kind, _)| (kind, vec![marker]))
+            .collect();
+        return Some(PreparedLoadcellRows {
+            rows,
+            calibration_sensor_id: calibration_sensor_id.into(),
+            config_json,
+        });
+    }
     // A clipped load-cell input carries no load information. The raw row is
     // still recorded by the caller; only the converted weight is withheld.
     let railed = loadcell::daq_rails_apply()
@@ -905,19 +940,14 @@ pub(super) async fn emit_derived_loadcell_rows(
                     source_timestamp_ms: sample.source_timestamp_ms,
                     data_type: data_type.to_string(),
                     sender_id: sample.sender_id.to_string(),
-                    values_json: telemetry_values_json(&values),
+                    values_json: crate::over_range::marked_values_json(&values),
                     payload_json: sample.payload_json.to_string(),
                 },
             )
             .await;
         }
 
-        let row = TelemetryRow {
-            timestamp_ms: sample.ts_ms,
-            data_type: data_type.to_string(),
-            sender_id: sample.sender_id.to_string(),
-            values,
-        };
+        let row = TelemetryRow::marked(sample.ts_ms, data_type.to_string(), sample.sender_id.to_string(), values);
         crate::telemetry_provenance::note(
             &row,
             sample.source_timestamp_ms.and_then(|source| {
@@ -1003,7 +1033,7 @@ pub(super) async fn emit_derived_vehicle_speed_row(
         timestamp_ms: ts_ms,
         data_type: VEHICLE_SPEED_DATA_TYPE.to_string(),
         sender_id: String::new(),
-        values,
+        values, over_range: 0, over_range_low: 0,
     };
     crate::telemetry_provenance::note(
         &row,
@@ -1066,6 +1096,15 @@ pub(super) fn telemetry_f32_values(pkt: &Packet) -> Option<Vec<Option<f32>>> {
     }
 }
 
+/// Like [`telemetry_f32_values`], but a DAQ over-range type keeps its ±Inf
+/// over-range markers (crate::over_range); NaN is still "no data".
+pub(super) fn telemetry_f32_values_marked(pkt: &Packet, sender_id: &str) -> Option<Vec<Option<f32>>> {
+    if !crate::over_range::daq_type_carries_markers(sender_id, &pkt.data_type().as_str()) {
+        return telemetry_f32_values(pkt);
+    }
+    pkt.data_as_f32().ok().map(|values| values.into_iter().map(|v| (!v.is_nan()).then_some(v)).collect())
+}
+
 type TelemetryValues = Vec<Option<f32>>;
 
 pub(super) fn split_imu_values(
@@ -1096,7 +1135,8 @@ fn chamber_pressure_rows(
     let mut rows = vec![("DAQ_LOADCELL_CHAMBER".into(), values.to_vec())];
     // The pressure input is independent of the load cell. A failed load-cell
     // conversion must not hide an otherwise valid chamber-pressure sample.
-    if values[0].is_some_and(f32::is_finite) {
+    // An over-range KG1000 (±Inf marker) is published as over range.
+    if values[0].is_some_and(|v| !v.is_nan()) {
         rows.push(("KG1000".into(), vec![values[0]]));
     }
     if !chamber_pt_installed {
@@ -1105,6 +1145,17 @@ fn chamber_pressure_rows(
         rows.push(("COMBUSTION_CHAMBER_PRESSURE".into(), vec![None]));
         rows.push(("COMBUSTION_CHAMBER_RANGE_STATUS".into(), vec![None]));
         rows.push((CHAMBER_PT_INSTALLED_DATA_TYPE.into(), vec![Some(0.0)]));
+        return rows;
+    }
+    // CH6 over range (±Inf from the DAQ in psig and/or volts): every chamber
+    // row derived from it is over range too, never a number.
+    let marker = [values[1], values[2]].into_iter().flatten().find(|x| x.is_infinite());
+    if let Some(marker) = marker {
+        rows.push(("COMBUSTION_CHAMBER_PRESSURE".into(), vec![Some(marker)]));
+        let volts = values[2].filter(|x| x.is_infinite()).unwrap_or(marker);
+        rows.push(("COMBUSTION_CHAMBER_VOLTAGE".into(), vec![Some(volts)]));
+        rows.push(("COMBUSTION_CHAMBER_RANGE_STATUS".into(), vec![Some(marker)]));
+        rows.push((CHAMBER_PT_INSTALLED_DATA_TYPE.into(), vec![Some(1.0)]));
         return rows;
     }
     if values[1].is_some_and(|x| x.is_finite() && (-5280.0..=5280.0).contains(&x))
@@ -1231,14 +1282,40 @@ mod chamber_pressure_tests {
         for (pressure, voltage) in [
             (None, None),
             (Some(f32::NAN), Some(0.015)),
-            (Some(f32::INFINITY), Some(0.015)),
             (Some(0.0), Some(f32::NAN)),
-            (Some(0.0), Some(f32::INFINITY)),
+            (Some(f32::NAN), Some(f32::NAN)),
         ] {
             let rows = chamber_pressure_rows("DAQ", &[Some(1.25), pressure, voltage], true);
             assert_eq!(rows.len(), 2);
             assert_eq!(rows[1], ("KG1000".into(), vec![Some(1.25)]));
         }
+    }
+
+    #[test]
+    fn over_range_chamber_and_loadcell_publish_markers_never_numbers() {
+        // CH6 above +full scale: the DAQ publishes +Inf psig and +Inf V.
+        let rows = chamber_pressure_rows("DAQ", &[Some(1.25), Some(f32::INFINITY), Some(f32::INFINITY)], true);
+        let get = |kind: &str| rows.iter().find(|(k, _)| k == kind).map(|(_, v)| v.clone());
+        assert_eq!(get("COMBUSTION_CHAMBER_PRESSURE"), Some(vec![Some(f32::INFINITY)]));
+        assert_eq!(get("COMBUSTION_CHAMBER_VOLTAGE"), Some(vec![Some(f32::INFINITY)]));
+        assert_eq!(get("COMBUSTION_CHAMBER_RANGE_STATUS"), Some(vec![Some(f32::INFINITY)]));
+        assert_eq!(get("KG1000"), Some(vec![Some(1.25)]));
+        // KG1000 below -full scale with a valid chamber.
+        let rows = chamber_pressure_rows("DAQ", &[Some(f32::NEG_INFINITY), Some(500.0), Some(2.5)], true);
+        let get = |kind: &str| rows.iter().find(|(k, _)| k == kind).map(|(_, v)| v.clone());
+        assert_eq!(get("KG1000"), Some(vec![Some(f32::NEG_INFINITY)]));
+        assert_eq!(get("COMBUSTION_CHAMBER_PRESSURE"), Some(vec![Some(500.0)]));
+        // The markers become None plus over-range bits in the published row.
+        let row = crate::types::TelemetryRow::marked(1, "KG1000".into(), "DAQ".into(), get("KG1000").unwrap());
+        assert_eq!((row.values.clone(), row.over_range, row.over_range_low), (vec![None], 1, 1));
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(json["values"], serde_json::json!([null]));
+        assert_eq!((json["over_range"].as_u64(), json["over_range_low"].as_u64()), (Some(1), Some(1)));
+        let plain = crate::types::TelemetryRow::marked(1, "KG1000".into(), "DAQ".into(), vec![Some(1.0)]);
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("over_range").is_none() && json.get("over_range_low").is_none(), "omitted when 0");
+        let back: crate::types::TelemetryRow = serde_json::from_value(serde_json::to_value(&row).unwrap()).unwrap();
+        assert_eq!((back.over_range, back.over_range_low), (1, 1));
     }
 
     #[test]
@@ -1392,7 +1469,7 @@ pub(super) async fn handle_gps_satellite_count_packet(
         timestamp_ms: ts_ms,
         data_type: GPS_SATELLITES_DATA_TYPE.to_string(),
         sender_id,
-        values,
+        values, over_range: 0, over_range_low: 0,
     })
 }
 

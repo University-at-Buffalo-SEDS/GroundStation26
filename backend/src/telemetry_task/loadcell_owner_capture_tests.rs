@@ -82,7 +82,7 @@ async fn original_source_owner_cannot_count_twice_after_sdk_duplicate_cache_turn
                 timestamp_ms: at,
                 data_type: "DAQ_ADC_TEMPERATURE".into(),
                 sender_id: "DAQ".into(),
-                values: vec![Some(20.0)],
+                values: vec![Some(20.0)], over_range: 0, over_range_low: 0,
             });
             let rows = handle_packet(&state, &db_tx, &overflow, packet).await;
             original_raw_rows += rows.iter().filter(|row| row.data_type == "KG1000").count();

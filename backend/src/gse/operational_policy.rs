@@ -1682,7 +1682,7 @@ mod tests {
             timestamp_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
             data_type: "GPS_DATA".into(),
             sender_id: "RF".into(),
-            values: vec![Some(43.0), Some(-78.0), Some(150.0)],
+            values: vec![Some(43.0), Some(-78.0), Some(150.0)], over_range: 0, over_range_low: 0,
         });
         crate::igt::ready_for_test(&state);
         assert!(operational_launch_allowed(

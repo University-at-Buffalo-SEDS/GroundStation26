@@ -43,7 +43,7 @@ are opened read only.
 
 - `GET …/replay`, `…/replay/window`, `…/replay/flight`, `…/replay/trajectory`,
   `…/replay/export`: as before, for every id above. Window rows of
-  DAQ_INPUT_HEALTH carry `decoded` (version 1 and version 2 layouts).
+  DAQ_INPUT_HEALTH carry `decoded` (version 1, 2 and 3 layouts; version 3 adds the ADC over-range channels, VDDA and the applied MCP3564R reference). Rows with ADC over-range values carry `over_range`/`over_range_low` bits (values `null`), read from the recording's `over_range` column.
 - `GET …/replay/context`: the recorded context: `recorded_mode` (from the
   GS_STATION_MODE rows, else the capture manifest, else inferred for
   recordings made before that row), `mode_timeline` (every mode change in the
@@ -89,7 +89,7 @@ and recorded alerts are listed as RECORDED history, never as live alerts.
   temperature); the shipped layouts label it that way, and a layout saved
   before the label fix (in an SD import manifest or a portable replay) is
   relabelled.
-- DAQ_INPUT_HEALTH version 1 and 2 rows are both decoded.
+- DAQ_INPUT_HEALTH version 1, 2 and 3 rows are all decoded.
 - Load-cell rows recorded on the DAQ's legacy raw scale are converted as before.
 - DAQ SD files in the microsecond (daq-20261123) format are read through the
   network-time `timestamp_ms` column, like the older format.

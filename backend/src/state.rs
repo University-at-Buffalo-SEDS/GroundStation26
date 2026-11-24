@@ -480,7 +480,7 @@ impl AppState {
                 timestamp_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
                 data_type: data_type.into(),
                 sender_id: "DAQ".into(),
-                values: vec![None],
+                values: vec![None], over_range: 0, over_range_low: 0,
             };
             self.cache_recent_telemetry(row.clone());
             let _ = self.ws_tx.send(row);

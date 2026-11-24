@@ -94,7 +94,7 @@ fn telemetry(data_type: &str, sender: &str, ts: i64, values: Vec<Option<f32>>) -
         timestamp_ms: ts,
         data_type: data_type.into(),
         sender_id: sender.into(),
-        values,
+        values, over_range: 0, over_range_low: 0,
     }
 }
 
@@ -109,6 +109,8 @@ fn out(data_type: &str, sender: &str, ts: i64) -> RowOut {
         source_ms: None,
         network_ms: None,
         values: vec![Some(ts as f32)],
+        over_range: 0,
+        over_range_low: 0,
         fields,
         units,
         provenance: "live",

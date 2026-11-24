@@ -63,7 +63,7 @@ fn flight_maxima_takes_barometer_altitude() {
         timestamp_ms: 1_000,
         data_type: "BAROMETER_DATA".into(),
         sender_id: "FC".into(),
-        values: fc_frame([ALT_M, PRESSURE_PA, TEMP_C]).into_iter().map(Some).collect(),
+        values: fc_frame([ALT_M, PRESSURE_PA, TEMP_C]).into_iter().map(Some).collect(), over_range: 0, over_range_low: 0,
     };
     let samples = crate::flight_maxima::samples(&row);
     assert_eq!(samples.len(), 1);

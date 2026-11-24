@@ -69,6 +69,9 @@ def read_recording(path):
                 if not isinstance(values, list) or len(values) != 1:
                     raise ValueError("expected one value in values_json")
                 value = values[0]
+                if value in ("OVR", "-OVR"):
+                    # ADC over range (the station's CSV export marker): no value.
+                    value = None
                 if value is not None:
                     if isinstance(value, bool) or not isinstance(value, (int, float)):
                         raise ValueError("expected a numeric value or null")

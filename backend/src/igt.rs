@@ -1249,7 +1249,7 @@ pub(crate) fn sim_rows(state: &AppState, sender_id: &str, ts_ms: i64, values: &[
         timestamp_ms: ts_ms,
         data_type: sample.series.into(),
         sender_id: sender_id.to_string(),
-        values: sample.values.into_iter().map(Some).collect(),
+        values: sample.values.into_iter().map(Some).collect(), over_range: 0, over_range_low: 0,
     }]
 }
 

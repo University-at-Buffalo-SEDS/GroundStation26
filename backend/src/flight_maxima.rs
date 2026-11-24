@@ -426,7 +426,7 @@ mod tests {
             timestamp_ms: 1,
             data_type: data_type.into(),
             sender_id: "FC".into(),
-            values: values.iter().copied().map(Some).collect(),
+            values: values.iter().copied().map(Some).collect(), over_range: 0, over_range_low: 0,
         }
     }
 

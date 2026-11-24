@@ -42,9 +42,12 @@ pub async fn export_recording_csv(
 ) -> Result<()> {
     let db = SqlitePool::connect(&format!("sqlite://{db_path}")).await?;
     let volts_from_id = crate::telemetry_db::loadcell_volts_from_id(&db).await;
-    let rows = sqlx::query(
+    // Over-range values (null + over_range column) are exported as OVR/-OVR.
+    let over_range = if crate::over_range::table_has_column(&db, "telemetry").await { "over_range" } else { "NULL AS over_range" };
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         r#"
         SELECT
+            {over_range},
             id,
             timestamp_ms,
             source_timestamp_ms AS original_source_timestamp_ms,
@@ -70,8 +73,8 @@ pub async fn export_recording_csv(
             'DAQ_POWER_MONITOR'
         )
         ORDER BY id ASC
-        "#,
-    )
+        "#
+    )))
     .fetch_all(&db)
     .await?;
 
@@ -88,11 +91,11 @@ pub async fn export_recording_csv(
         {
             continue;
         }
-        let value = parse_values_json(row.get::<Option<String>, _>("values_json").as_deref())
+        let value = marked_values(row)
             .first()
             .copied()
             .flatten()
-            .filter(|value| value.is_finite());
+            .filter(|value| !value.is_nan());
         let sample = chamber_samples.entry(chamber_packet_key(row)).or_default();
         let slot = if kind == "COMBUSTION_CHAMBER_PRESSURE" {
             &mut sample.pressure
@@ -135,7 +138,7 @@ pub async fn export_recording_csv(
     let mut temperatures: Vec<crate::types::TelemetryRow> = Vec::new();
     for row in rows {
         let data_type: String = row.get("data_type");
-        let mut values = parse_values_json(row.get::<Option<String>, _>("values_json").as_deref());
+        let mut values = marked_values(&row);
         if row.get::<i64, _>("id") < volts_from_id {
             // Recorded on the DAQ legacy raw scale: export volts throughout.
             crate::loadcell::legacy_loadcell_row_to_volts(
@@ -150,12 +153,7 @@ pub async fn export_recording_csv(
             "DAQ_ADC_TEMPERATURE" => {
                 let sender: String = row.get("sender_id");
                 temperatures.retain(|r| r.sender_id != sender);
-                temperatures.push(crate::types::TelemetryRow {
-                    timestamp_ms: row.get("timestamp_ms"),
-                    data_type,
-                    sender_id: sender,
-                    values,
-                });
+                temperatures.push(crate::types::TelemetryRow::marked(row.get("timestamp_ms"), data_type, sender, values));
             }
             // FUEL_TANK_PRESSURE: the ox tank PT's name in older recordings.
             "OX_TANK_PRESSURE" | "FUEL_TANK_PRESSURE" | "IADC" => {
@@ -190,6 +188,7 @@ pub async fn export_recording_csv(
                 );
                 let sender: String = row.get("sender_id");
                 let calibrated = first_value
+                    .filter(|raw| raw.is_finite())
                     .filter(|raw| !railed(calibration, &filters, &sender, "KG50", row.get("timestamp_ms"), *raw))
                     .and_then(|raw| {
                         crate::loadcell::temperature_corrected_raw(
@@ -219,7 +218,7 @@ pub async fn export_recording_csv(
                     seq % 256,
                     source_timestamp_ms,
                     display_opt(first_value),
-                    display_opt(calibrated),
+                    display_opt(calibrated.or(first_value.filter(|v| v.is_infinite()))),
                     display_opt(temperature)
                 )?;
                 seq = seq.wrapping_add(1);
@@ -240,6 +239,7 @@ pub async fn export_recording_csv(
                 );
                 let sender: String = row.get("sender_id");
                 let calibrated = Some(raw_loadcell)
+                    .filter(|raw| raw.is_finite())
                     .filter(|raw| !railed(calibration, &filters, &sender, "KG1000", row.get("timestamp_ms"), *raw))
                     .and_then(|raw| {
                         crate::loadcell::temperature_corrected_raw(calibration, "KG1000", raw, temperature)
@@ -247,6 +247,8 @@ pub async fn export_recording_csv(
                     .map(|raw| filters.filter(calibration, &sender, "KG1000", row.get("timestamp_ms"), raw))
                     .and_then(|raw| calibrated_loadcell(calibration, raw));
                 let crc = crc16_ccitt_false(&parse_payload_json(&payload_json));
+                // An over-range input exports OVR/-OVR in its weight cells too.
+                let over = Some(raw_loadcell).filter(|v| v.is_infinite());
                 writeln!(
                     writer,
                     "{},{},{},{},{},{},{},{},{},{},{},{},,,{},{},{},,",
@@ -254,13 +256,13 @@ pub async fn export_recording_csv(
                     TEST_FIRE_HEADER,
                     seq % 256,
                     source_timestamp_ms,
-                    raw_loadcell,
+                    display_opt(Some(raw_loadcell)),
                     display_opt(state.pressure_raw),
                     display_opt(state.battery_voltage),
                     crc,
-                    display_opt(calibrated),
+                    display_opt(calibrated.or(over)),
                     0.0_f32,
-                    display_opt(calibrated),
+                    display_opt(calibrated.or(over)),
                     display_opt(state.pressure_calibrated),
                     display_opt(temperature),
                     display_opt(chamber.0),
@@ -327,7 +329,19 @@ fn parse_payload_json(raw: &str) -> Vec<u8> {
 }
 
 fn display_opt(value: Option<f32>) -> String {
-    value.map(|v| v.to_string()).unwrap_or_default()
+    match value {
+        Some(v) if v.is_infinite() => crate::over_range::csv_marker(v < 0.0).to_string(),
+        Some(v) => v.to_string(),
+        None => String::new(),
+    }
+}
+
+/// values_json with over-range positions as ±Inf markers.
+fn marked_values(row: &sqlx::sqlite::SqliteRow) -> Vec<Option<f32>> {
+    let mut values = parse_values_json(row.get::<Option<String>, _>("values_json").as_deref());
+    let (mask, low) = crate::over_range::unpack(row.try_get::<Option<i64>, _>("over_range").ok().flatten());
+    crate::over_range::mark(&mut values, mask, low);
+    values
 }
 
 fn crc16_ccitt_false(bytes: &[u8]) -> u16 {

@@ -780,7 +780,7 @@ mod tests {
                 timestamp_ms: 100_000,
                 data_type: "GPS_DATA".into(),
                 sender_id: "RF".into(),
-                values: vec![Some(42.0), Some(-78.0), Some(125.0)],
+                values: vec![Some(42.0), Some(-78.0), Some(125.0)], over_range: 0, over_range_low: 0,
             });
         let fresh = telemetry_snapshot(&app, &profile, 100_500);
         assert_eq!(fresh["stats"][0]["binding"]["data_type"], "GPS_DATA");
@@ -799,7 +799,7 @@ mod tests {
                     timestamp_ms: now as i64,
                     data_type: "GPS_DATA".into(),
                     sender_id: "RF".into(),
-                    values: vec![Some(42.0), Some(-78.0), Some(sample as f32)],
+                    values: vec![Some(42.0), Some(-78.0), Some(sample as f32)], over_range: 0, over_range_low: 0,
                 });
             assert_eq!(
                 telemetry_snapshot(&app, &profile, now)["stats"][0]["value"].as_f64(),
@@ -827,7 +827,7 @@ mod tests {
             rows.clear();
             rows.push_back(crate::types::TelemetryRow {
                 timestamp_ms: at, data_type: "GPS_DATA".into(), sender_id: "RF".into(),
-                values: vec![Some(42.0), Some(-78.0), Some(125.0)],
+                values: vec![Some(42.0), Some(-78.0), Some(125.0)], over_range: 0, over_range_low: 0,
             });
             drop(rows);
             assert_eq!(telemetry_snapshot(&app, &presentation, now)["stats"][0]["value"].as_f64(), expected, "row={at}, now={now}");
@@ -839,7 +839,7 @@ mod tests {
         for at in [9_999, 10_001] {
             rows.push_back(crate::types::TelemetryRow {
                 timestamp_ms: at, data_type: "GPS_DATA".into(), sender_id: "RF".into(),
-                values: vec![Some(42.0), Some(-78.0), Some(125.0)],
+                values: vec![Some(42.0), Some(-78.0), Some(125.0)], over_range: 0, over_range_low: 0,
             });
         }
         drop(rows);

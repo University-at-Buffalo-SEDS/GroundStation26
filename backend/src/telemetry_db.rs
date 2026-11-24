@@ -279,6 +279,14 @@ pub async fn ensure_telemetry_schema(db: &SqlitePool) -> Result<()> {
             .await?;
     }
 
+    // Packed ADC over-range masks of the row's values (crate::over_range);
+    // NULL when nothing is over range or the row predates over-range support.
+    if !cols.iter().any(|row| row.get::<String, _>("name") == "over_range") {
+        sqlx::query("ALTER TABLE telemetry ADD COLUMN over_range INTEGER")
+            .execute(db)
+            .await?;
+    }
+
     mark_loadcell_volts(db).await?;
 
     sqlx::query(

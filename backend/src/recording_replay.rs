@@ -71,9 +71,18 @@ pub struct Sample {
     pub diagnostic: Option<serde_json::Value>,
     #[serde(default,skip_serializing_if="Option::is_none")]
     pub valid_until_ms: Option<i64>,
-    /// Version-aware decoding of a packed status row (DAQ_INPUT_HEALTH v1/v2).
+    /// Version-aware decoding of a packed status row (DAQ_INPUT_HEALTH v1/v2/v3).
     #[serde(default, skip_serializing_if="Option::is_none")]
     pub decoded: Option<serde_json::Value>,
+    /// ADC over-range bits of `values` (null there), as on a live
+    /// TelemetryRow; omitted when 0.
+    #[serde(default, skip_serializing_if="is_zero")]
+    pub over_range: u32,
+    #[serde(default, skip_serializing_if="is_zero")]
+    pub over_range_low: u32,
+}
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Page {
@@ -95,7 +104,7 @@ pub(crate) fn payload_words(payload: &str) -> Option<Vec<u32>> {
         .then(|| bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
 }
 /// DAQ_INPUT_HEALTH decoded with the station's decoder, which reads both the
-/// version-1 (10 word) and version-2 (18 word) layouts.
+/// version-1 (10 word), version-2 (18 word) and version-3 (28 word) layouts.
 fn decode_input_health(payload: &str) -> Option<serde_json::Value> {
     let words = payload_words(payload)?;
     let report = crate::daq_input_health::Report::decode(&words)?;
@@ -111,6 +120,22 @@ fn decode_input_health(payload: &str) -> Option<serde_json::Value> {
         value["excitation_mv"] = serde_json::to_value(v2.excitation_mv).unwrap_or_default();
         value["frames_skipped"] = v2.frames_skipped.into();
         value["scans_restarted"] = v2.scans_restarted.into();
+    }
+    if let Some(v3) = &report.v3 {
+        let names = |bits: u16| -> Vec<&str> {
+            (0..crate::daq_input_health::ADC_CHANNELS)
+                .filter(|i| bits & (1 << i) != 0)
+                .map(|i| crate::daq_input_health::ADC_CHANNEL_NAMES[i].1)
+                .collect()
+        };
+        value["over_range_now"] = serde_json::json!(names(v3.over_now));
+        value["over_range_latched"] = serde_json::json!(names(v3.over_latched));
+        value["over_range_low"] = serde_json::json!(names(v3.over_low & v3.over_now));
+        value["over_range_counts"] = serde_json::json!(v3.over_counts);
+        value["vdda_mv"] = serde_json::to_value(v3.vdda_mv).unwrap_or_default();
+        value["vdda_max_mv"] = serde_json::to_value(v3.vdda_max_mv).unwrap_or_default();
+        value["mcp_vref_mv"] = v3.mcp_vref_mv.into();
+        value["mcp_vref_source"] = v3.mcp_vref_source.key().into();
     }
     Some(value)
 }
@@ -153,6 +178,8 @@ async fn page_from(db: &SqlitePool, window: &Window) -> anyhow::Result<Page> {
 
     apply_sd_validity(db,&mut samples).await?;
     apply_sd_validity(db,&mut seeds).await?;
+    apply_over_range(db, &mut samples).await?;
+    apply_over_range(db, &mut seeds).await?;
     Ok(Page {
         upper_id: window.upper_id,
         next_id,
@@ -217,7 +244,34 @@ fn decode(row: sqlx::sqlite::SqliteRow, volts_from_id: i64) -> anyhow::Result<Sa
         diagnostic,
         valid_until_ms:None,
         decoded,
+        over_range: 0,
+        over_range_low: 0,
     })
+}
+
+/// The recorded over-range masks (telemetry.over_range; absent in
+/// recordings made before over-range support).
+async fn apply_over_range(db: &SqlitePool, samples: &mut [Sample]) -> anyhow::Result<()> {
+    if samples.is_empty() || !crate::over_range::table_has_column(db, "telemetry").await {
+        return Ok(());
+    }
+    for chunk in samples.chunks_mut(512) {
+        let ids = serde_json::to_string(&chunk.iter().map(|s| s.id).collect::<Vec<_>>())?;
+        let masks = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT id,over_range FROM telemetry WHERE id IN (SELECT value FROM json_each(?)) AND over_range IS NOT NULL",
+        )
+        .bind(ids)
+        .fetch_all(db)
+        .await?;
+        for (id, packed) in masks {
+            let (mask, low) = crate::over_range::unpack(Some(packed));
+            for sample in chunk.iter_mut().filter(|s| s.id == id) {
+                sample.over_range = mask;
+                sample.over_range_low = low;
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn apply_sd_validity(db:&SqlitePool,samples:&mut [Sample])->anyhow::Result<()>{
@@ -1239,7 +1293,7 @@ mod loadcell_volts_replay_tests {
                 timestamp_ms: sample.timestamp_ms,
                 data_type: sample.data_type.clone(),
                 sender_id: sample.sender_id.clone(),
-                values: sample.values.clone(),
+                values: sample.values.clone(), over_range: 0, over_range_low: 0,
             };
             let after = replay.project(row)[1].values[0];
             match (before, after) {

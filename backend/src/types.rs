@@ -690,6 +690,62 @@ pub struct DaqInputHealthStatus {
     pub adc_fast_scan_end_us: Option<u16>,
     #[serde(default)]
     pub adc_slot_end_us: Option<u16>,
+    /// DAQ_INPUT_HEALTH v3: ADC channels over range now or within the last
+    /// 10 minutes (empty when none).
+    #[serde(default)]
+    pub adc_channels: Vec<DaqAdcChannelStatus>,
+    /// STM32 VDDA (+3V3A) measured from VREFINT, now and the maximum since
+    /// the DAQ's previous report.
+    #[serde(default)]
+    pub vdda_v: Option<Volts>,
+    #[serde(default)]
+    pub vdda_max_v: Option<Volts>,
+    /// Applied MCP3564R reference reported by the DAQ (v3 word 27) and where
+    /// it came from: "station" | "flash" | "default".
+    #[serde(default)]
+    pub mcp_vref_v: Option<Volts>,
+    #[serde(default)]
+    pub mcp_vref_source: Option<String>,
+}
+
+/// An f32 reading that serializes as a plain JSON number; Eq/Hash compare
+/// its bits so status structs keep their derives.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[serde(transparent)]
+pub struct Volts(pub f32);
+
+impl Eq for Volts {}
+
+impl std::hash::Hash for Volts {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.to_bits().hash(state);
+    }
+}
+
+/// One MCP3564R input (or its die temperature / the P6 x16 scan) that is
+/// over range now or was within the last 10 minutes.
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default, Hash)]
+pub struct DaqAdcChannelStatus {
+    /// "kg1000", "kg50_amp2", "p6_plus", "p6_minus", "ch4", "ch5",
+    /// "chamber", "ch7", "temperature", "kg50_p6".
+    pub key: String,
+    pub label: String,
+    /// Bit in the DAQ_INPUT_HEALTH v3 over-range masks.
+    pub bit: u8,
+    /// The channel's most recent conversion was over range.
+    pub over_range_now: bool,
+    /// Below -full scale (direction of the latest over-range conversion).
+    pub low: bool,
+    /// Over range at some point since the DAQ's previous report.
+    pub latched: bool,
+    /// Over-range conversions counted by the station since it first saw
+    /// this DAQ boot.
+    pub count_total: u64,
+    /// Over-range conversions in the last 60 s.
+    pub count_recent: u64,
+    /// Start of the current episode (None when back in range).
+    pub first_over_range_ms: Option<i64>,
+    pub last_over_range_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default, Hash)]
@@ -1052,20 +1108,55 @@ pub struct TelemetryRow {
     #[serde(default)]
     pub sender_id: String,
     pub values: Vec<Option<f32>>,
+    /// Bit i set: values[i] is over range (ADC beyond full scale) and is
+    /// None in `values` (docs/data-pipeline.md "Over-range values").
+    #[serde(default)]
+    pub over_range: u32,
+    /// Bit i set: that over-range value was below -full scale.
+    #[serde(default)]
+    pub over_range_low: u32,
+}
+
+impl TelemetryRow {
+    /// A row from marked values (`Some(±Inf)` = over range): the markers
+    /// become None plus the over-range bits.
+    pub fn marked(timestamp_ms: i64, data_type: String, sender_id: String, mut values: Vec<Option<f32>>) -> Self {
+        let (over_range, over_range_low) = crate::over_range::split(&mut values);
+        Self { timestamp_ms, data_type, sender_id, values, over_range, over_range_low }
+    }
+
+    /// The values with over-range positions as `Some(±Inf)` again.
+    pub fn marked_values(&self) -> Vec<Option<f32>> {
+        let mut values = self.values.clone();
+        crate::over_range::mark(&mut values, self.over_range, self.over_range_low);
+        values
+    }
+
+    /// values[i] is over range.
+    pub fn is_over_range(&self, i: usize) -> bool {
+        i < 32 && self.over_range & (1 << i) != 0
+    }
 }
 
 impl Serialize for TelemetryRow {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
         let source = crate::telemetry_provenance::source(self);
-        let mut row =
-            serializer.serialize_struct("TelemetryRow", if source.is_some() { 5 } else { 4 })?;
+        let fields = 4 + usize::from(source.is_some()) + usize::from(self.over_range != 0) + usize::from(self.over_range != 0 && self.over_range_low != 0);
+        let mut row = serializer.serialize_struct("TelemetryRow", fields)?;
         row.serialize_field("timestamp_ms", &self.timestamp_ms)?;
         row.serialize_field("data_type", &self.data_type)?;
         row.serialize_field("sender_id", &self.sender_id)?;
         row.serialize_field("values", &self.values)?;
         if let Some(source) = source {
             row.serialize_field("source_timestamp_ms", &source)?;
+        }
+        // Omitted when 0 (serde `skip_serializing_if = "is_zero"`).
+        if self.over_range != 0 {
+            row.serialize_field("over_range", &self.over_range)?;
+            if self.over_range_low != 0 {
+                row.serialize_field("over_range_low", &self.over_range_low)?;
+            }
         }
         row.end()
     }

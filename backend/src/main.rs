@@ -7,6 +7,7 @@ mod sequence_access;
 mod panel_control;
 mod daq_launch_log;
 mod daq_input_health;
+mod over_range;
 mod daq_dac;
 mod daq_sd;
 mod radio_voice;

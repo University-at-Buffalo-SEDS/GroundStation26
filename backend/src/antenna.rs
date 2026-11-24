@@ -687,7 +687,7 @@ mod tests {
             timestamp_ms: now as i64,
             data_type: "GPS_DATA".into(),
             sender_id: "RF".into(),
-            values: vec![Some(43.0), Some(-78.0), Some(150.0)],
+            values: vec![Some(43.0), Some(-78.0), Some(150.0)], over_range: 0, over_range_low: 0,
         };
         observe_at(&row, Some(now - 15_001), Some(now));
         assert!(cache().lock().unwrap().rocket[0].is_none());
@@ -729,7 +729,7 @@ mod tests {
             timestamp_ms: now as i64,
             data_type: "GPS_DATA".into(),
             sender_id: "RF".into(),
-            values: vec![Some(43.0), Some(-78.0), Some(150.0)],
+            values: vec![Some(43.0), Some(-78.0), Some(150.0)], over_range: 0, over_range_low: 0,
         };
         let locked = || cache().lock().unwrap().rocket[0].is_some();
         clear_rocket_fix_for_test();

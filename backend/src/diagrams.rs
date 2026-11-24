@@ -216,7 +216,16 @@ pub fn program_inputs(app: &AppState, now: u64) -> Value {
                 break;
             }
             if types.contains(&row.data_type) && seen.insert((row.data_type.clone(), row.sender_id.clone())) {
-                rows.push(serde_json::json!({"t": row.data_type, "s": row.sender_id, "v": row.values, "age_ms": age}));
+                let mut entry = serde_json::json!({"t": row.data_type, "s": row.sender_id, "v": row.values, "age_ms": age});
+                // ADC over range: value i is null in "v" and bit i set here
+                // (same masks as TelemetryRow over_range/over_range_low).
+                if row.over_range != 0 {
+                    entry["over_range"] = row.over_range.into();
+                    if row.over_range_low != 0 {
+                        entry["over_range_low"] = row.over_range_low.into();
+                    }
+                }
+                rows.push(entry);
             }
         }
     }
@@ -310,11 +319,22 @@ mod tests {
                 timestamp_ms: at as i64,
                 data_type: data_type.into(),
                 sender_id: "VB".into(),
-                values: vec![Some(1.0), Some(0.0)],
+                values: vec![Some(1.0), Some(0.0)], over_range: 0, over_range_low: 0,
             });
         }
+        // An over-range chamber PT reaches the diagram as OVR, not a number.
+        state.cache_recent_telemetry(crate::types::TelemetryRow::marked(
+            now as i64 - 500,
+            "COMBUSTION_CHAMBER_PRESSURE".into(),
+            "DAQ".into(),
+            vec![Some(f32::INFINITY)],
+        ));
         let inputs = program_inputs(&state, now);
         let rows = inputs["rows"].as_array().unwrap();
+        let chamber = rows.iter().find(|r| r["t"] == "COMBUSTION_CHAMBER_PRESSURE").expect("chamber row");
+        assert_eq!((chamber["v"].clone(), chamber["over_range"].clone()), (serde_json::json!([null]), serde_json::json!(1)));
+        assert!(chamber.get("over_range_low").is_none());
+        let rows: Vec<_> = rows.iter().filter(|r| r["t"] != "COMBUSTION_CHAMBER_PRESSURE").collect();
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0]["t"], "VALVE_STATE");
         assert_eq!(rows[0]["age_ms"], 1_000, "the newest row wins");

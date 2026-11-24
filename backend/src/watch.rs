@@ -1254,7 +1254,7 @@ mod tests {
             timestamp_ms: ts,
             data_type: dt.into(),
             sender_id: sender.into(),
-            values,
+            values, over_range: 0, over_range_low: 0,
         };
         let rows: std::collections::VecDeque<_> = vec![
             row(1, "OX_TANK_PRESSURE", "VB", vec![Some(10.0)]),
