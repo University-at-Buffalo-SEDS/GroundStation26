@@ -811,7 +811,16 @@ mod tests {
         let mut confirm = AbortConfirmRefresh::default();
         confirm.start();
         assert_ne!(confirm.poll(&state), 0, "the umbilical boards are asked at once");
-        service.pump(&host);
+        // One router pass has a wall-clock TX budget, so a loaded host may put
+        // only some of the queries on the wire per pass. Pass until they are
+        // all out: a query held behind the RF one (never answered) would
+        // never leave however many passes run.
+        for _ in 0..1000 {
+            service.pump(&host);
+            if umbilical_queries.lock().unwrap().len() >= UMBILICAL.len() {
+                break;
+            }
+        }
         let sent = umbilical_queries.lock().unwrap().len();
         eprintln!("UNORDERED_CONFIRM umbilical_queries_sent={sent} rf_in_flight={}", av_bay_query_in_flight(&host));
         assert!(av_bay_query_in_flight(&host), "the RF query is still in flight");
