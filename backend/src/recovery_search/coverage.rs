@@ -31,6 +31,8 @@ pub const MIN_CELL_M: f64 = 2.0;
 pub const BASE_CELL_MAX_M: f64 = 5.0;
 /// Most points in one output ring (after simplification).
 pub const MAX_RING_POINTS: usize = 400;
+/// Holes smaller than this (cells) are filled in the drawn polygons.
+pub const MIN_HOLE_CELLS: usize = 8;
 /// Most polygons of each kind in one overlay (the largest are kept).
 pub const MAX_AREAS: usize = 64;
 /// A pause longer than this between two fixes breaks the track.
@@ -198,13 +200,16 @@ impl Grid {
 /// Traces the set cells of `inside` into rings of lattice vertices `(x, y)`
 /// (x = column edge, y = row edge), counter-clockwise, one ring per
 /// 4-connected component, holes bridged to the outside (see the module docs).
-fn trace(nx: usize, ny: usize, inside: impl Fn(i64, i64) -> bool) -> Vec<(Vec<(i64, i64)>, usize)> {
+/// Holes smaller than `min_hole` cells are filled (drawing only: a speck
+/// between two overlapping lanes is not worth a bridge).
+fn trace(nx: usize, ny: usize, min_hole: usize, inside: impl Fn(i64, i64) -> bool) -> Vec<(Vec<(i64, i64)>, usize)> {
     // 1. Label the unset cells (8-connected) on a grid padded by one cell:
     //    the component touching the padding is the outside, the others are holes.
     let (pw, ph) = (nx + 2, ny + 2);
     let pidx = |r: i64, c: i64| (r + 1) as usize * pw + (c + 1) as usize;
     let mut label = vec![u32::MAX; pw * ph];
     let mut tops: Vec<(i64, i64)> = Vec::new();
+    let mut sizes: Vec<usize> = Vec::new();
     let mut queue = VecDeque::new();
     let mut next = 0u32;
     for start in 0..pw * ph {
@@ -214,8 +219,10 @@ fn trace(nx: usize, ny: usize, inside: impl Fn(i64, i64) -> bool) -> Vec<(Vec<(i
         }
         label[start] = next;
         let mut top = (sr, sc);
+        let mut size = 0usize;
         queue.push_back((sr, sc));
         while let Some((r, c)) = queue.pop_front() {
+            size += 1;
             if r > top.0 || (r == top.0 && c < top.1) {
                 top = (r, c);
             }
@@ -234,13 +241,24 @@ fn trace(nx: usize, ny: usize, inside: impl Fn(i64, i64) -> bool) -> Vec<(Vec<(i
             }
         }
         tops.push(top);
+        sizes.push(size);
         next += 1;
     }
+    let inside = |r: i64, c: i64| -> bool {
+        if inside(r, c) {
+            return true;
+        }
+        if r < -1 || c < -1 || r > ny as i64 || c > nx as i64 {
+            return false;
+        }
+        let l = label[pidx(r, c)];
+        l != 0 && l != u32::MAX && sizes[l as usize] < min_hole
+    };
     // 2. A zero-width wall up from the top of each hole (label 0 is the outside,
     //    labelled first from the padding corner). Wall (x, r): the vertical edge
     //    at column edge x between cells (r, x-1) and (r, x).
     let mut walls: HashSet<(i64, i64)> = HashSet::new();
-    for &(r, c) in tops.iter().skip(1) {
+    for (&(r, c), _) in tops.iter().zip(&sizes).skip(1).filter(|(_, size)| **size >= min_hole) {
         let mut row = r + 1;
         while inside(row, c - 1) && inside(row, c) {
             walls.insert((c, row));
@@ -377,7 +395,7 @@ fn round7(v: f64) -> f64 {
 /// Rings of a grid's set cells as `[lat, lon]` polygons, largest first,
 /// components smaller than `min_cells` dropped.
 fn polygons(grid: &Grid, frame: &Frame, min_cells: usize) -> Vec<Vec<[f64; 2]>> {
-    let mut rings = trace(grid.nx, grid.ny, |r, c| grid.get(r, c));
+    let mut rings = trace(grid.nx, grid.ny, MIN_HOLE_CELLS, |r, c| grid.get(r, c));
     rings.retain(|(_, area)| *area >= min_cells);
     rings.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     rings.truncate(MAX_AREAS);
@@ -612,12 +630,18 @@ pub(crate) mod tests {
     fn tracing_bridges_holes_and_keeps_diagonals_apart() {
         // A 5x5 ring of cells with a 1-cell hole: one ring, area 24.
         let set = |r: i64, c: i64| (0..5).contains(&r) && (0..5).contains(&c) && !(r == 2 && c == 2);
-        let rings = trace(5, 5, set);
+        let rings = trace(5, 5, 1, set);
         assert_eq!(rings.len(), 1);
         assert_eq!(rings[0].1, 24);
         // Two diagonal cells are two components.
         let diag = |r: i64, c: i64| (r == 0 && c == 0) || (r == 1 && c == 1);
-        let rings = trace(2, 2, diag);
+        let rings = trace(2, 2, 1, diag);
+        assert_eq!(rings.len(), 2);
+        assert!(rings.iter().all(|r| r.1 == 1));
+        // A hole under the threshold is filled for drawing: area 25, no bridge.
+        let rings = trace(5, 5, 2, set);
+        assert_eq!(rings[0].1, 25);
+        let rings = trace(2, 2, 1, diag);
         assert_eq!(rings.len(), 2);
         assert!(rings.iter().all(|r| r.1 == 1));
     }

@@ -155,7 +155,10 @@ The work is done on a bounded raster in a local east/north frame in metres
    patch inside a searched area stays visible as a hole. Rings are simplified
    (Douglas–Peucker, starting at half a cell) to at most 400 points. At most
    64 polygons of each kind are drawn, the largest first. Uncovered specks
-   under 2 cells are not drawn but are still counted.
+   under 2 cells are not drawn, and holes under 8 cells (a gap between two
+   overlapping lanes) are filled in the drawing. Both are still counted
+   exactly. Renderers should fill these areas without an outline: an outline
+   would trace the zero-width bridges.
 
 The cell size is the swath width / 8, clamped to 2–5 m (3.75 m for the
 default 30 m swath). It grows only when an area would need more than 250,000
