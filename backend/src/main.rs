@@ -118,6 +118,8 @@ mod primary_mirror;
 mod qualification_requests;
 mod recording_bundle;
 mod recording_bundle_exports;
+mod recording_bundle_records;
+mod recording_bundle_sd;
 mod recording_export;
 mod recording_import;
 mod recording_store;

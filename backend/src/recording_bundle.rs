@@ -56,6 +56,14 @@ pub(crate) struct Options {
     pub tiles_max_mb: Option<u32>,
     /// Include the cached DEM heightmap around the track (default: with tiles).
     pub terrain: Option<bool>,
+    /// Include the station records (checklists, recovery history;
+    /// `recording_bundle_records`). Default: included.
+    pub records: Option<bool>,
+    /// SD-resolved recordings: include the original SD files (`recording_bundle_sd`).
+    #[serde(default)]
+    pub sd_files: bool,
+    /// SD file budget in MiB (default 16, at most 64).
+    pub sd_files_max_mb: Option<u32>,
 }
 
 pub(crate) fn routes() -> Router<Arc<AppState>> {
@@ -101,10 +109,12 @@ fn sources(state: Arc<AppState>) -> Router {
         .merge(crate::apogee_planner::routes())
         .merge(crate::recovery_search::routes())
         .merge(crate::web::bundle_config_routes())
+        .merge(crate::checklists::routes())
+        .merge(crate::launch_history::api::routes())
         .with_state(state)
 }
 
-async fn fetch(router: &Router, headers: &HeaderMap, path: &str) -> Result<Vec<u8>, u16> {
+pub(crate) async fn fetch(router: &Router, headers: &HeaderMap, path: &str) -> Result<Vec<u8>, u16> {
     let mut request = Request::get(path);
     if let Some(auth) = headers.get(header::AUTHORIZATION) {
         request = request.header(header::AUTHORIZATION, auth.clone());
@@ -290,6 +300,25 @@ pub(crate) async fn build(
     // Ground-station and RRLS positions at export (the replay scene's
     // station camera and masts); small, so always included when served.
     entries.optional(&router, headers, "/api/antenna/status", "derived/stations.json").await;
+    // An SD-resolved recording's receipt rows and SD sources (recording_bundle_sd).
+    let mut sd_summary = Value::Null;
+    if let Ok(path) = crate::recording_export::recording_path(&crate::recording_export::directory(&state), id).await
+        && let Some(sd) = crate::recording_bundle_sd::entries(&router, headers, id, &path, options.sd_files, options.sd_files_max_mb).await
+    {
+        for added in sd.entries {
+            entries.add(&added.path, added.bytes, added.media_type, added.route.as_deref());
+        }
+        entries.missing.extend(sd.missing);
+        sd_summary = sd.summary;
+    }
+    // Station records (recording_bundle_records).
+    if options.records != Some(false) {
+        let (found, missing) = crate::recording_bundle_records::entries(&router, headers).await;
+        for (path, bytes, media_type, route) in found {
+            entries.add(&path, bytes, media_type, Some(&route));
+        }
+        entries.missing.extend(missing);
+    }
 
     // The replay document carries what a client needs even if it reads nothing else.
     if replay["layout"].is_null() && let Some(layout) = &layout {
@@ -368,7 +397,7 @@ pub(crate) async fn build(
         route: Some(format!("/api/recordings/{id}/replay/export")),
     };
     entries.files.splice(0..0, [replay_entry, csv_entry]);
-    let manifest = json!({
+    let mut manifest = json!({
         "format": FORMAT,
         "version": VERSION,
         "created_ms": now_ms,
@@ -487,6 +516,9 @@ pub(crate) async fn build_plan(state: Arc<AppState>, headers: &HeaderMap, plan: 
             listed
         }).collect::<Vec<_>>(),
     });
+    if !sd_summary.is_null() {
+        manifest["sd"] = sd_summary;
+    }
     let mut zip = crate::flight_review::zip::Zip::new(now_ms);
     zip.add("manifest.json", &serde_json::to_vec_pretty(&manifest).unwrap_or_default());
     for entry in &entries.files {

@@ -290,9 +290,49 @@ async fn csv_page(
     db: &SqlitePool,
     last: i64,
     upper: i64,
-    mut provenance: Option<&mut Provenance>,
+    provenance: Option<&mut Provenance>,
 ) -> Result<(String, i64), sqlx::Error> {
-    let resolved=sqlx::query_scalar::<_,i64>("SELECT COUNT(*) FROM main.sqlite_master WHERE name='sd_replay_telemetry'").fetch_one(db).await?>0;
+    csv_page_of(db, last, upper, provenance, false).await
+}
+
+/// The recording's receipt rows (`main.telemetry`) as the CSV of a recording
+/// that was never SD-resolved: for an SD-resolved recording, the rows its
+/// time-range CSV reads (`recording_range`), which its own CSV does not
+/// carry. `None` once the CSV would exceed `max_bytes`.
+pub(crate) async fn receipt_csv(path: &FsPath, max_bytes: usize) -> anyhow::Result<Option<(Vec<u8>, i64)>> {
+    let options = SqliteConnectOptions::new().filename(path).read_only(true).create_if_missing(false);
+    let db = SqlitePoolOptions::new().max_connections(1).connect_with(options).await?;
+    let (upper, rows): (i64, i64) = sqlx::query_as("SELECT COALESCE(MAX(id), 0), COUNT(*) FROM main.telemetry").fetch_one(&db).await?;
+    let mut provenance = integrated_ground_test(&db).await.then(Provenance::default);
+    let mut csv = match provenance {
+        Some(_) => format!("{},{PROVENANCE_COLUMN}\r\n", HEADER.trim_end_matches("\r\n")),
+        None => HEADER.to_owned(),
+    };
+    let mut last = 0i64;
+    loop {
+        let (chunk, next) = csv_page_of(&db, last, upper, provenance.as_mut(), true).await?;
+        if next == last {
+            break;
+        }
+        csv.push_str(&chunk);
+        if csv.len() > max_bytes {
+            db.close().await;
+            return Ok(None);
+        }
+        last = next;
+    }
+    db.close().await;
+    Ok(Some((csv.into_bytes(), rows)))
+}
+
+async fn csv_page_of(
+    db: &SqlitePool,
+    last: i64,
+    upper: i64,
+    mut provenance: Option<&mut Provenance>,
+    receipt: bool,
+) -> Result<(String, i64), sqlx::Error> {
+    let resolved=!receipt&&sqlx::query_scalar::<_,i64>("SELECT COUNT(*) FROM main.sqlite_master WHERE name='sd_replay_telemetry'").fetch_one(db).await?>0;
     // Over-range values are exported as "OVR"/"-OVR" in values_json.
     let over_range = |table: &'static str| async move {
         if crate::over_range::table_has_column(db, table).await { "over_range" } else { "NULL AS over_range" }
@@ -320,7 +360,8 @@ async fn csv_page(
         return Ok((csv,next));
     }
     let over = over_range("telemetry").await;
-    let rows = sqlx::query(sqlx::AssertSqlSafe(format!("SELECT id, timestamp_ms, source_timestamp_ms, sender_id, data_type, values_json, payload_json, {over} FROM telemetry WHERE id > ? AND id <= ? ORDER BY id LIMIT ?")))
+    let table = if receipt { "main.telemetry" } else { "telemetry" };
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!("SELECT id, timestamp_ms, source_timestamp_ms, sender_id, data_type, values_json, payload_json, {over} FROM {table} WHERE id > ? AND id <= ? ORDER BY id LIMIT ?")))
         .bind(last).bind(upper).bind(PAGE_SIZE).fetch_all(db).await?;
     let mut chunk = String::new();
     let mut next = last;
