@@ -104,6 +104,11 @@ SD_FORMATS={
       'declare':{'input_voltage_v':{'raw_value':['V'],'calibrated_value':['V']},
                  'input_current_a':{'raw_value':['V'],'calibrated_value':['A']}}}),
  }},
+ # v4: every MCP3564R raw record declares value=ovr, its over-range flag
+ # (empty in range, 1 above +full scale, -1 below -full scale; see
+ # _over_range_flag). Flagged rows never become numbers. The ADC1 supply rows
+ # use the measured VDDA, and vdda_v is a new record no mapping reads.
+ ('daq',4):{'name':'daq-v4','board':'DAQ','mappings':{}},
  # FC rows hold the converted vector in both value and calibrated_value; the
  # header declares value. Accelerations are m/s^2 (FC docs gap 8).
  ('fc',2):{'name':'fc-v2','board':'FC','mappings':{
@@ -116,6 +121,27 @@ SD_FORMATS={
   'DKF':('value',[0,1,2,3],'DESCENT_STATE',['deg','deg','m','m/s'],{'declare':_declare('value',['deg','deg','m','m/s'],('DKF',))}),
  }},
 }
+
+
+# DAQ v4 MCP3564R raw records: each declares value=ovr.
+DAQ_OVER_RANGE_LABELS=('kg1000_v','kg50_v','kg50_p6_v','chamber_pressure_v','excitation_v',
+                       *(f'mcp3564r_ch{n}_v' for n in range(2,8)))
+
+
+def _with_over_range_flag(mappings):
+    """The same mappings, also requiring value=ovr of each MCP3564R raw label they read."""
+    out={}
+    for name,mapping in mappings.items():
+        options=dict(mapping[4] if len(mapping)>4 else {})
+        for key in ('declare','optional'):
+            if key in options:
+                options[key]={label:({'value':['ovr'],**columns} if label in DAQ_OVER_RANGE_LABELS else columns)
+                              for label,columns in options[key].items()}
+        out[name]=tuple(mapping[:4])+(options,)
+    return out
+
+
+SD_FORMATS[('daq',4)]['mappings']=_with_over_range_flag(SD_FORMATS[('daq',3)]['mappings'])
 
 
 def _supported_formats_text():
@@ -208,23 +234,32 @@ class MedianBin:
     for an even count), then the mean of each fixed bin of uptime microseconds,
     summed in double precision in record order and rounded once to binary32.
     A bin is complete when a record of a later bin arrives; it is dated at the
-    bin centre."""
+    bin centre. Over-range records (over=+-1) enter neither the median nor the
+    mean; a bin holding only those is the over-range marker +-inf in the
+    direction of its last one (daq_median.h daq_bin_us_add_over)."""
     def __init__(self,size,period_us):
         self.size=size;self.period=period_us;self.reset()
     def reset(self):
-        self.window=[];self.bin=None;self.sum=0.0;self.count=0;self.last=None;self.first=None
-    def add(self,value,uptime_us,sample):
-        """Returns (mean, count, first sample, last sample, centre_us) of a completed bin, or None."""
-        value=_f32(value)
-        if not math.isfinite(value):return None
-        self.window=(self.window+[value])[-self.size:]
-        median=sorted(self.window)[(len(self.window)-1)//2]
+        self.window=[];self.bin=None;self.sum=0.0;self.count=0;self.over=0;self.over_dir=1;self.last=None;self.first=None
+    def add(self,value,uptime_us,sample,over=0):
+        """Returns (mean or +-inf, count, first sample, last sample, centre_us,
+        over-range records) of a completed bin, or None."""
+        if not over:
+            value=_f32(value)
+            if not math.isfinite(value):return None
         bin_=uptime_us//self.period;done=None
-        if self.count and bin_!=self.bin:
-            done=(_f32(self.sum/self.count),self.count,self.first,self.last,self.bin*self.period+self.period//2)
-            self.sum=0.0;self.count=0;self.first=None
-        self.bin=bin_;self.sum+=median;self.count+=1;self.last=sample
+        if (self.count or self.over) and bin_!=self.bin:
+            mean=_f32(self.sum/self.count) if self.count else (math.inf if self.over_dir>0 else -math.inf)
+            done=(mean,self.count,self.first,self.last,self.bin*self.period+self.period//2,self.over)
+            self.sum=0.0;self.count=0;self.over=0;self.first=None
+        self.bin=bin_;self.last=sample
         if self.first is None:self.first=sample
+        if over:
+            # As daq_bin_us_add_over: the last flagged row sets the direction.
+            self.over+=1;self.over_dir=1 if over>0 else -1
+        else:
+            self.window=(self.window+[value])[-self.size:]
+            self.sum+=sorted(self.window)[(len(self.window)-1)//2];self.count+=1
         return done
 
 
@@ -241,6 +276,27 @@ def _boxcar_ms(metadata):
                 found.add(int(text))
     if len(found)>1:raise ValueError('One SD file states two load-cell boxcar widths')
     return found.pop() if found else DAQ_BOXCAR_MS
+
+
+# MCP3564R reference the DAQ converts codes with (volts = code*VREF/2^23).
+# Files state it as mcp_vref_v on their # calibration lines (again whenever
+# it changes); older files do not, and used 2.4 V.
+DEFAULT_MCP_VREF_V=2.4
+
+
+def _mcp_vref_v(metadata):
+    """(mcp_vref_v values in file order, True when the file states none)."""
+    found=[]
+    for item in metadata or []:
+        fields=item.get('fields') if isinstance(item,dict) else None
+        if not fields or fields[0]!='# calibration':continue
+        for field in fields[1:]:
+            if field.startswith('mcp_vref_v='):
+                try:value=float(field.split('=',1)[1])
+                except ValueError:value=math.nan
+                if not math.isfinite(value) or not 0.5<=value<=5.0:raise ValueError('Invalid mcp_vref_v')
+                if not found or found[-1]!=value:found.append(value)
+    return (found,False) if found else ([DEFAULT_MCP_VREF_V],True)
 
 
 def legacy_raw_to_volts(raw):
@@ -268,6 +324,31 @@ def _network_values_to_volts(kind,values,payload):
         return values
     vector[0]=legacy_raw_to_volts(vector[0])
     return canonical(vector)
+
+
+def _over_range_flag(block,sensor,fields):
+    """A header file's over-range flag for one row: 0 in range (or the record
+    declares no value=ovr), 1 above +full scale, -1 below -full scale."""
+    record=declared_record(block,sensor) if block is not None else None
+    if record is None or record['columns'].get('value')!=['ovr']:return 0
+    flag=fields['value'].strip()
+    if flag in ('','0'):return 0
+    if flag in ('1','-1'):return int(flag)
+    raise ValueError('Bad over-range flag')
+
+
+def split_over_range(values):
+    """values with +-inf (over range) as JSON-ready values (null there) and
+    the packed over_range column (mask | low_mask << 32; None if none)."""
+    mask=low=0;stored=[]
+    for i,value in enumerate(values):
+        if isinstance(value,float) and math.isinf(value):
+            stored.append(None)
+            if i<32:
+                mask|=1<<i
+                if value<0:low|=1<<i
+        else:stored.append(value)
+    return stored,(mask|low<<32) if mask else None
 
 
 def canonical_utc(value):
@@ -355,7 +436,7 @@ def resolve_recording(db,max_database_bytes=MAX_DATABASE_BYTES):
       DROP TABLE IF EXISTS sd_resolution_candidates;
       CREATE TABLE sd_resolution_candidates(timestamp_ms INTEGER,sender_id TEXT,data_type TEXT,
         values_json TEXT,payload_json TEXT,provenance_json TEXT,sort_key INTEGER,
-        board_id TEXT,boot_id TEXT,launch_session TEXT);
+        board_id TEXT,boot_id TEXT,launch_session TEXT,over_range INTEGER);
       CREATE UNIQUE INDEX sd_candidate_physical ON sd_resolution_candidates(sort_key,sender_id,data_type,board_id,boot_id,COALESCE(launch_session,'')) WHERE board_id IS NOT NULL;
       DROP TABLE IF EXISTS sd_coverage_segments;
       CREATE TABLE sd_coverage_segments(id INTEGER PRIMARY KEY,import_id INTEGER,sender_id TEXT,data_type TEXT,
@@ -377,6 +458,10 @@ def resolve_recording(db,max_database_bytes=MAX_DATABASE_BYTES):
             manifest=json.loads(encoded)
             metadata_json=db.execute('SELECT metadata_json FROM sd_imports WHERE id=?',(import_id,)).fetchone()[0]
             assignment,profile,selected=_resolution_manifest(manifest,format_block_from_metadata(json.loads(metadata_json)))
+            # Recorded only: SD rows already carry volts, so nothing here
+            # rebuilds them from codes.
+            vref,vref_default=_mcp_vref_v(json.loads(metadata_json))
+            profile['sd_format']={**profile['sd_format'],'mcp_vref_v':vref,'mcp_vref_v_default':vref_default}
             sd_formats.append({'import_id':import_id,**profile['sd_format']})
             lo,hi=assignment['start_utc_ms'],assignment['end_utc_ms'];previous_record=None
             records=db.execute('SELECT s.record_sequence,s.timestamp_ms,s.time_source FROM sd_sample_origins o '
@@ -420,9 +505,10 @@ def resolve_recording(db,max_database_bytes=MAX_DATABASE_BYTES):
                 if extra:provenance['mapping'].update(extra)
                 processed+=1
                 if processed%4096==0:check_disk_limit(db,max_database_bytes)
-                db.execute('INSERT OR IGNORE INTO sd_resolution_candidates VALUES(?,?,?,?,?,?,?,?,?,?)',
+                values,over_range=split_over_range(values)
+                db.execute('INSERT OR IGNORE INTO sd_resolution_candidates VALUES(?,?,?,?,?,?,?,?,?,?,?)',
                     (stamp,key[0],kind,canonical(values),None,canonical(provenance),sample['sample_id'],
-                     manifest['board_id'],manifest['boot_id'],manifest.get('launch_session')))
+                     manifest['board_id'],manifest['boot_id'],manifest.get('launch_session'),over_range))
 
             def number(text):
                 value=float(text)
@@ -434,6 +520,9 @@ def resolve_recording(db,max_database_bytes=MAX_DATABASE_BYTES):
                     mapping=profile['mappings'][name];field,indices,kind,units=mapping[:4];options=_options(mapping)
                     stamp=sample['utc_timestamp_ms']
                     try:
+                        # Over range: never read the row's numbers (raw_value is
+                        # the invalid linear conversion, calibrated_value +-inf).
+                        over=_over_range_flag(profile['block'],sensor,fields)
                         expected_hz=profile['hz'][sensor] if profile['hz'] is not None else options.get('uptime_hz',1000)
                         if int(fields['uptime_frequency_hz'])!=expected_hz:raise ValueError('Uptime scale')
                         if options.get('median_bin'):
@@ -441,15 +530,17 @@ def resolve_recording(db,max_database_bytes=MAX_DATABASE_BYTES):
                             box=boxcars.get(name)
                             if box is None:box=boxcars[name]=[MedianBin(size,period),sensor]
                             if box[1]!=sensor:box[0].reset();box[1]=sensor
-                            done=box[0].add(float(fields[field]),int(fields['uptime_ticks']),sample)
+                            done=box[0].add(None if over else float(fields[field]),int(fields['uptime_ticks']),sample,over)
                             if done:
-                                mean,count,first,last,centre_us=done
+                                mean,count,first,last,centre_us,over_count=done
                                 # Dated at the bin centre, like the DAQ's packet.
                                 age_ms=int(last['fields']['uptime_ticks'])//1000-centre_us//1000
                                 stamp=last['utc_timestamp_ms']
-                                emit(name,None if stamp is None else stamp-age_ms,[mean if math.isfinite(mean) else None],last,
-                                     {'derived':'median_bin','median':size,'bin_us':period,'records':count,'source_sensor':last['sensor'],
-                                      'first_sd_sample_id':first['sample_id'],'last_sd_sample_id':last['sample_id']},last['ambiguous'])
+                                extra={'derived':'median_bin','median':size,'bin_us':period,'records':count,'source_sensor':last['sensor'],
+                                       'first_sd_sample_id':first['sample_id'],'last_sd_sample_id':last['sample_id']}
+                                if over_count:extra['over_range_records']=over_count
+                                emit(name,None if stamp is None else stamp-age_ms,[None if math.isnan(mean) else mean],last,
+                                     extra,last['ambiguous'])
                             continue
                         if options.get('boxcar'):
                             # Accumulate every record whatever its clock; a bin is
@@ -477,6 +568,11 @@ def resolve_recording(db,max_database_bytes=MAX_DATABASE_BYTES):
                             emit(name,first['utc_timestamp_ms'],values,first,
                                  {'derived':'pair','paired_sd_sample_id':sample['sample_id']},first['ambiguous'] or sample['ambiguous'])
                             continue
+                        if over:
+                            # A scalar MCP3564R record: the marker, whatever the column holds.
+                            if len(indices)!=1:raise ValueError('Vector width mismatch')
+                            emit(name,stamp,[math.inf if over>0 else -math.inf],sample,{'over_range':over},ambiguous=sample['ambiguous'])
+                            continue
                         vector=[float(x) for x in fields[field].split()]
                         values=[vector[i] if math.isfinite(vector[i]) else None for i in indices]
                         if len(vector)!=len(indices):raise ValueError('Vector width mismatch')
@@ -487,7 +583,10 @@ def resolve_recording(db,max_database_bytes=MAX_DATABASE_BYTES):
                         if name in boxcars:boxcars[name][0].reset()
                         unresolved+=1;continue
                     emit(name,stamp,values,sample,ambiguous=sample['ambiguous'])
-        for row_id,received,source,sender,kind,values,payload in db.execute('SELECT id,timestamp_ms,source_timestamp_ms,sender_id,data_type,values_json,payload_json FROM main.telemetry ORDER BY id'):
+        # Recordings made before over-range support have no over_range column.
+        network_over_range='over_range' if any(column[1]=='over_range' for column in db.execute('PRAGMA main.table_info(telemetry)')) else 'NULL'
+        for row_id,received,source,sender,kind,values,payload,over_range in db.execute(
+                f'SELECT id,timestamp_ms,source_timestamp_ms,sender_id,data_type,values_json,payload_json,{network_over_range} FROM main.telemetry ORDER BY id'):
             if not canonical_utc(source):unresolved+=1;continue
             identities=db.execute("SELECT DISTINCT board_id,boot_id,launch_session FROM sd_coverage_segments s WHERE sender_id=? AND data_type=? AND start_ms<=? AND end_ms>=? AND NOT EXISTS(SELECT 1 FROM sd_sequence_holes h WHERE h.import_id=s.import_id AND h.start_ms<=? AND h.end_ms>=?) LIMIT 2",(sender,kind,source,source,source,source)).fetchall()
             if len(identities)==1:suppressed+=1;continue
@@ -498,8 +597,8 @@ def resolve_recording(db,max_database_bytes=MAX_DATABASE_BYTES):
                 if converted!=values:
                     provenance['converted_from']={'units':'legacy_raw','volts_per_raw':'16000/921','values_json':values}
                     values=converted
-            db.execute('INSERT INTO sd_resolution_candidates VALUES(?,?,?,?,?,?,?,?,?,?)',
-                (source,sender,kind,values or '[]',payload,canonical(provenance),row_id,None,None,None))
+            db.execute('INSERT INTO sd_resolution_candidates VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                (source,sender,kind,values or '[]',payload,canonical(provenance),row_id,None,None,None,over_range or None))
         # Overlapping unproven boot assignments remain separately labelled SD
         # series while the canonical network channel remains available.
         db.execute("""UPDATE sd_resolution_candidates AS c SET
@@ -509,9 +608,9 @@ def resolve_recording(db,max_database_bytes=MAX_DATABASE_BYTES):
               WHERE s.sender_id=c.sender_id AND s.data_type=c.data_type AND s.start_ms<=c.timestamp_ms AND s.end_ms>=c.timestamp_ms
               AND (s.board_id!=c.board_id OR s.boot_id!=c.boot_id OR COALESCE(s.launch_session,'')!=COALESCE(c.launch_session,'')))""")
         db.execute('DROP TABLE IF EXISTS sd_replay_telemetry')
-        db.execute('CREATE TABLE sd_replay_telemetry(id INTEGER PRIMARY KEY,timestamp_ms INTEGER NOT NULL,source_timestamp_ms INTEGER,data_type TEXT NOT NULL,sender_id TEXT,values_json TEXT,payload_json TEXT,provenance_json TEXT NOT NULL)')
+        db.execute('CREATE TABLE sd_replay_telemetry(id INTEGER PRIMARY KEY,timestamp_ms INTEGER NOT NULL,source_timestamp_ms INTEGER,data_type TEXT NOT NULL,sender_id TEXT,values_json TEXT,payload_json TEXT,provenance_json TEXT NOT NULL,over_range INTEGER)')
         db.execute("""INSERT INTO sd_replay_telemetry SELECT ROW_NUMBER() OVER(ORDER BY timestamp_ms,sender_id,data_type,sort_key),timestamp_ms,
-            json_extract(provenance_json,'$.source_timestamp_ms'),data_type,sender_id,values_json,payload_json,provenance_json FROM sd_resolution_candidates""")
+            json_extract(provenance_json,'$.source_timestamp_ms'),data_type,sender_id,values_json,payload_json,provenance_json,over_range FROM sd_resolution_candidates""")
         db.execute("CREATE INDEX sd_replay_sample_origin ON sd_replay_telemetry(json_extract(provenance_json,'$.sd_sample_id'))")
         db.execute('CREATE INDEX sd_replay_time ON sd_replay_telemetry(timestamp_ms)')
         db.execute('CREATE INDEX sd_replay_series ON sd_replay_telemetry(data_type,sender_id,timestamp_ms)')

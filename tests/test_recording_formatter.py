@@ -159,6 +159,8 @@ class Formatter(unittest.TestCase):
 
     def test_actual_daq_c_formatter_golden_fields_and_float_precision(self):
         daq = next(parent/"DAQ-Board" for parent in Path(__file__).resolve().parents if (parent/"DAQ-Board/Core/Inc/sd_record_format.h").is_file())
+        # SD format v4 adds the over-range flag argument (value column).
+        over_arg="0," if "int8_t over_range" in (daq/"Core/Inc/sd_raw_record_format.h").read_text() else ""
         program=r'''
 #include "sd_record_format.h"
 #include "sd_raw_record_format.h"
@@ -170,7 +172,7 @@ int main(void) {
  sd_format_csv_record(line,sizeof(line),1793491200000ULL,4294967297ULL,"kg1000_v",value,42);fputs(line,stdout);
  sd_format_csv_record(line,sizeof(line),0,4294967298ULL,"Message","a,\"quoted\"\nsecond line",43);fputs(line,stdout);
  /* MCP3564R rows carry microsecond uptime_ticks (uptime_frequency_hz 1000000). */
- sd_format_csv_raw_record(line,sizeof(line),1793491200001ULL,4294967299ULL,4294967299537ULL,1000000U,"kg1000_v",-123,1.25f,250.0f,26.125f,-5,44,&cache);fputs(line,stdout);
+ sd_format_csv_raw_record(line,sizeof(line),1793491200001ULL,4294967299ULL,4294967299537ULL,1000000U,"kg1000_v",'''+over_arg+r'''-123,1.25f,250.0f,26.125f,-5,44,&cache);fputs(line,stdout);
  const uint32_t bits[]={0,0x80000000U,1,0x7f7fffffU,0x00800000U,0x3eaaaaabU};
  fputs("__FLOATS__\n",stdout);
  for (unsigned i=0;i<sizeof(bits)/sizeof(bits[0]);++i) {float v;memcpy(&v,&bits[i],4);sd_format_float(value,v);printf("%u:%s\n",bits[i],value);}

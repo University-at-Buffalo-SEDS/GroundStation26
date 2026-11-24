@@ -2,6 +2,7 @@ import test_recording_sd_import as fixture
 ROOT,sd=fixture.ROOT,fixture.sd
 import csv
 import json
+import math
 from pathlib import Path
 import sqlite3
 import struct
@@ -177,7 +178,7 @@ int main(void){
         subprocess.run(['cc','-std=c11','-O2','-I',str(daq/'Core/Inc'),'-x','c','-','-o',str(binary)],input=program.encode(),check=True)
         output=[line.rstrip('\r') for line in subprocess.check_output([str(binary)]).decode().split('\n') if line]
         daq_bins={}
-        for mark in (line for line in output if line.startswith('#')):
+        for mark in (line for line in output if line.startswith('#K')):
             kind,uptime,bits=mark[1:].split(',')
             daq_bins.setdefault(kind,[]).append((BASE_UTC+int(uptime)-1000000,int(bits)))
         csv_rows=''.join(line+'\r\n' for line in output if not line.startswith('#'))
@@ -306,12 +307,35 @@ class LoadcellMedianBinTests(unittest.TestCase):
             self.skipTest('No DAQ-Board checkout with daq_median.h next to this GroundStation checkout')
         # Production DAQ code: daq_median_add + daq_bin_us_add as the drain uses
         # them (restarting KG50 when its input changes) and the SD raw formatter.
-        program=r"""
+        # With SD format v4 (an over_range argument) the file carries the
+        # firmware's own format block, some conversions are over range, and
+        # those join their bin through daq_bin_us_add_over instead.
+        v4='int8_t over_range' in (daq/'Core/Inc/sd_raw_record_format.h').read_text()
+        program=(r"""
+#define SD_V4 1
+#include "daq_over_range.h"
+#include "sd_format.h"
+""" if v4 else '#define SD_V4 0\n')+r"""
 #include "daq_median.h"
 #include "sd_raw_record_format.h"
 #include <stdio.h>
 #include <string.h>
+#if SD_V4
+#define FORMAT(...) sd_format_csv_raw_record(line,sizeof line,__VA_ARGS__)
+#define OVER(code) daq_adc_over_range(code)
+#else
+#define OVER(code) 0
+#endif
+static int add(daq_bin_us_t*b,daq_median_t*m,int over,float volts,uint64_t t_us,uint32_t period,daq_bin_out_t*out){
+#if SD_V4
+ if(over)return daq_bin_us_add_over(b,over,t_us,period,out);
+#endif
+ (void)over;return daq_bin_us_add(b,daq_median_add(m,volts),t_us,period,out);
+}
 int main(void){
+#if SD_V4
+ fputs(SD_FORMAT_BLOCK,stdout);
+#endif
  daq_median_t m1000,m50; daq_median_init(&m1000,3); daq_median_init(&m50,5);
  daq_bin_us_t b1000={0},b50={0}; unsigned kg50_channel=1; daq_bin_out_t out;
  sd_raw_format_cache_t cache={0};char line[256];uint32_t state=12345,seq=0;
@@ -322,18 +346,25 @@ int main(void){
    const unsigned channel=k==0?0:(frame>=2000&&frame<4000?9:1);   /* P6 selected mid-run */
    if(k==1&&frame%10>=8)continue;                                   /* temperature and aux slots */
    const uint64_t t_us=frame_us+(k==0?288:620);
-   const int32_t code=(int32_t)(state>>8)-8388608;
+   int32_t code=(int32_t)(state>>8)-8388608;
+   /* Over-range stretches (v4): some isolated, some filling whole bins. */
+   if(SD_V4&&(frame%97<3||(frame>=500&&frame<560)||(frame>=3000&&frame<3120)))code=code<0?code-8388608:code+8388608;
+   const int over=OVER(code);
    const float volts=(float)code*2.4f/8388608.0f/(channel==9?16.0f:1.0f);
    const char*name=channel==0?"kg1000_v":channel==1?"kg50_v":"kg50_p6_v";
    const uint64_t ms=t_us/1000;
+#if SD_V4
+   FORMAT(1800000000000ULL+(ms-1000000),ms,t_us,1000000,name,(int8_t)over,code,volts,over>0?INFINITY:over<0?-INFINITY:volts*2.0f,25.0f,7,++seq,&cache);
+#else
    sd_format_csv_raw_record(line,sizeof line,1800000000000ULL+(ms-1000000),ms,t_us,1000000,name,code,volts,volts*2.0f,25.0f,7,++seq,&cache);
+#endif
    fputs(line,stdout);
    uint32_t bits;
    if(channel==0){
-    if(daq_bin_us_add(&b1000,daq_median_add(&m1000,volts),t_us,20000,&out)){memcpy(&bits,&out.mean,4);printf("#KG1000,%llu,%u\n",(unsigned long long)(out.centre_us/1000),bits);}
+    if(add(&b1000,&m1000,over,volts,t_us,20000,&out)){memcpy(&bits,&out.mean,4);printf("#KG1000,%llu,%u\n",(unsigned long long)(out.centre_us/1000),bits);}
    }else{
     if(channel!=kg50_channel){b50=(daq_bin_us_t){0};daq_median_init(&m50,5);kg50_channel=channel;}
-    if(daq_bin_us_add(&b50,daq_median_add(&m50,volts),t_us,50000,&out)){memcpy(&bits,&out.mean,4);printf("#KG50,%llu,%u\n",(unsigned long long)(out.centre_us/1000),bits);}
+    if(add(&b50,&m50,over,volts,t_us,50000,&out)){memcpy(&bits,&out.mean,4);printf("#KG50,%llu,%u\n",(unsigned long long)(out.centre_us/1000),bits);}
    }
   }
  }
@@ -343,19 +374,30 @@ int main(void){
         subprocess.run(['cc','-std=c11','-O2','-I',str(daq/'Core/Inc'),'-x','c','-','-lm','-o',str(binary)],input=program.encode(),check=True)
         output=[line.rstrip('\r') for line in subprocess.check_output([str(binary)]).decode().split('\n') if line]
         daq_bins={}
-        for mark in (line for line in output if line.startswith('#')):
+        for mark in (line for line in output if line.startswith('#K')):
             kind,uptime_ms,bits=mark[1:].split(',')
             daq_bins.setdefault(kind,[]).append((BASE_UTC+int(uptime_ms)-1000000,int(bits)))
+        block=''.join(line+'\r\n' for line in output if line.startswith('# seds-sd'))
         csv_rows=''.join(line+'\r\n' for line in output if not line.startswith('#'))
         path=Path(self.temp.name)/'fire.csv'
-        path.write_bytes((HEADER+'# calibration,kg1000_slope=2.00000000e+00,loadcell_input=adc_volts,loadcell_report=median_bin\r\n'+csv_rows).encode())
-        sd.import_csv(self.db,path,self.median_manifest())
+        path.write_bytes((HEADER+block+'# calibration,kg1000_slope=2.00000000e+00,loadcell_input=adc_volts,loadcell_report=median_bin\r\n'+csv_rows).encode())
+        manifest=self.median_manifest()
+        if v4:
+            del manifest['mapping_profile'],manifest['firmware_head']
+            self.assertEqual(sd.read_format_block(path)['version'],4)
+        sd.import_csv(self.db,path,manifest)
         sd.resolve_recording(self.db)
-        resolved={}
-        for t,kind,values,provenance in [(t,k,json.loads(v),json.loads(p)) for t,k,v,p in self.db.execute(
-                'SELECT timestamp_ms,data_type,values_json,provenance_json FROM sd_replay_telemetry ORDER BY id')]:
+        resolved={};markers=0
+        for t,kind,values,over_range,provenance in [(t,k,json.loads(v),o,json.loads(p)) for t,k,v,o,p in self.db.execute(
+                'SELECT timestamp_ms,data_type,values_json,over_range,provenance_json FROM sd_replay_telemetry ORDER BY id')]:
             self.assertEqual(provenance['mapping']['derived'],'median_bin')
-            resolved.setdefault(kind,[]).append((t,struct.unpack('<I',struct.pack('<f',values[0]))[0]))
+            value=values[0]
+            if over_range:
+                # Stored as null plus the packed flag; the DAQ published +-inf.
+                self.assertIsNone(value);markers+=1
+                value=-math.inf if over_range>>32 else math.inf
+            resolved.setdefault(kind,[]).append((t,struct.unpack('<I',struct.pack('<f',value))[0]))
+        if v4:self.assertGreater(markers,4,'whole over-range bins were exercised')
         self.assertGreater(len(daq_bins['KG1000']),290)
         self.assertGreater(len(daq_bins['KG50']),100)
         # Every bin the DAQ closed: value bits, dated at the bin centre.
