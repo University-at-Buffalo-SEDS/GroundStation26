@@ -176,6 +176,14 @@ Other calibration-handling problems:
 
 ![Fire ignition window](loadcell-investigation-2026-11/fire-20261116-ignition.png)
 
+Data for the figure: `fire-20261116-ignition.csv`, every plotted sample of the window at
+full resolution. It is wide like the overview CSV: `t_s` (seconds from T0, the figure's
+x axis), `utc_ms` and `utc_iso` (GS receive time), then one column per panel:
+`kg1000_adc_pin_v`, `kg50_p6_input_mv`, `vmain_v`, `gb_battery_v`, `gb_battery_a` and
+`ox_tank_psi`. The series run at different rates (KG1000/KG50 ≈ 40 Hz, ox tank ≈ 48 Hz, VMAIN ≈ 4 Hz,
+gateway ≈ 1 Hz), so a cell is blank where that series has no sample at that time. The
+2.4 V full-scale line is a constant and is not a column.
+
 - **Fire, first 9.2 s.** VMAIN was 11.1 V and KG1000 pinned at code 0xB40000 (3.375 V,
   over the 2.4 V full scale). At 9.2 s VMAIN returned to 14.2 V at the same moment the
   tank started emptying. During the burn, KG1000 swung between the floor (0.02 V) and the
@@ -200,7 +208,8 @@ Other calibration-handling problems:
     supply or of the ground the gateway sees.
   - Caveat: the gateway samples at 1 Hz and cannot see sub-second transients. Only the
     multi-second 11 V plateaus are covered.
-  - Data for the window: `fire-20261116-gb-power.csv`.
+  - Data for the window: the `vmain_v`, `gb_battery_v` and `gb_battery_a` columns of
+    `fire-20261116-ignition.csv`.
 - **Whole fire recording.** There were four dip bursts. KG1000 went to the top clamp in
   every one: 1 358 of 1 730 samples with VMAIN < 12.5 V, and 732 clamp samples otherwise
   (the open lead). The ADC die temperature jumped about +5 °C in each dip, and KG50 showed

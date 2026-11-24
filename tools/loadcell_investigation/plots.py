@@ -33,9 +33,10 @@ def fire_ignition(d, out):
     """Ignition window: KG1000, KG50, DAQ VMAIN and the gateway (GB) battery rail in
     separate panels on one t - T0 axis. GB BATTERY_VOLTAGE is the gateway LTC2990 V1
     through its 91k/10k divider (volts); BATTERY_CURRENT is its LTC2990 current channel
-    (amps). Both arrive at about 1 Hz. Also writes the GB/VMAIN samples of the window to
-    fire-20261116-gb-power.csv."""
-    import csv
+    (amps). Both arrive at about 1 Hz. Also writes every plotted sample of the window to
+    fire-20261116-ignition.csv (wide, full resolution, t_s = t - T0; see write_wide_csv):
+    kg1000_adc_pin_v, kg50_p6_input_mv, vmain_v, gb_battery_v, gb_battery_a and
+    ox_tank_psi. The 2.4 V full-scale line is a constant and not a CSV column."""
     from datetime import datetime, timezone
     from matplotlib.ticker import MultipleLocator
     z = load(d, '2026-11-17_00-59-46_065')
@@ -48,11 +49,11 @@ def fire_ignition(d, out):
     fig.suptitle(f'2026-11-16 test fire, ignition window. T0 = burn start = {t0_utc} UTC '
                  f'(recording 2026-11-17 00:59:46 UTC + {FIRE_T0_OFFSET_MS / 1000:g} s)',
                  x=0.01, ha='left', fontsize=10, color=INK)
-    m = win(t1)
-    ax[0].plot(rel(t1)[m], k1[m] * K, color=BLUE); ax[0].axhline(2.4, color=RED, lw=0.8, ls='--')
+    m1 = win(t1)
+    ax[0].plot(rel(t1)[m1], k1[m1] * K, color=BLUE); ax[0].axhline(2.4, color=RED, lw=0.8, ls='--')
     ax[0].set_ylabel('DAQ KG1000\nADC-pin V'); ax[0].text(lo_s + 0.2, 2.55, 'ADC full scale 2.4 V', color=RED, fontsize=8)
-    t5, k5 = s(z, 'DAQ|KG50'); m = win(t5)
-    ax[1].plot(rel(t5)[m], k5[m] * 1000, color=ORANGE); ax[1].set_ylabel('DAQ KG50 (P6)\ninput mV')
+    t5, k5 = s(z, 'DAQ|KG50'); m5 = win(t5)
+    ax[1].plot(rel(t5)[m5], k5[m5] * 1000, color=ORANGE); ax[1].set_ylabel('DAQ KG50 (P6)\ninput mV')
     tp, vm = s(z, 'DAQ|DAQ_POWER_MONITOR', 2); mp = win(tp)
     ax[2].plot(rel(tp)[mp], vm[mp], color=AQUA, marker='.', ms=2, lw=0.8); ax[2].set_ylabel('DAQ VMAIN V\n(4 Hz)')
     tg, vg = s(z, 'GB|BATTERY_VOLTAGE'); mg = win(tg)
@@ -65,8 +66,8 @@ def fire_ignition(d, out):
     ti, ig = s(z, 'GB|BATTERY_CURRENT'); mi = win(ti)
     ax[4].plot(rel(ti)[mi], ig[mi], color=MUTED, marker='o', ms=3, lw=0.8); ax[4].set_ylabel('Gateway (GB)\nbattery A (1 Hz)')
     ax[4].set_ylim(0, max(1.0, np.nanmax(ig[mi]) * 1.3))
-    tf, fp = s(z, 'VB|OX_TANK_PRESSURE'); m = win(tf)
-    ax[5].plot(rel(tf)[m], fp[m], color=YELLOW); ax[5].set_ylabel('Ox tank psi')
+    tf, fp = s(z, 'VB|OX_TANK_PRESSURE'); mf = win(tf)
+    ax[5].plot(rel(tf)[mf], fp[mf], color=YELLOW); ax[5].set_ylabel('Ox tank psi')
     ax[5].set_xlabel('t − T0 (s)')
     ax[5].set_xlim(lo_s, hi_s)
     ax[5].xaxis.set_major_locator(MultipleLocator(1)); ax[5].xaxis.set_minor_locator(MultipleLocator(0.25))
@@ -76,13 +77,10 @@ def fire_ignition(d, out):
     ax[0].text(0, 1.01, 'T0', transform=ax[0].get_xaxis_transform(), ha='center', va='bottom', fontsize=8, color=RED)
     ax[5].text(0.2, 300, 'supply restored /\nburn starts', fontsize=8, color=MUTED)
     fig.tight_layout(); fig.savefig(os.path.join(out, 'fire-20261116-ignition.png'), dpi=110); plt.close(fig)
-    with open(os.path.join(out, 'fire-20261116-gb-power.csv'), 'w', newline='') as f:
-        w = csv.writer(f); w.writerow(['t_minus_T0_s', 'sender', 'data_type', 'value', 'unit'])
-        rows = [(rel(t), snd, typ, v, u) for tt, vv, snd, typ, u, mm in
-                ((tp, vm, 'DAQ', 'DAQ_POWER_MONITOR[2] VMAIN', 'V', mp), (tg, vg, 'GB', 'BATTERY_VOLTAGE', 'V', mg),
-                 (ti, ig, 'GB', 'BATTERY_CURRENT', 'A', mi)) for t, v in zip(tt[mm], vv[mm])]
-        for r in sorted(rows, key=lambda r: r[0]):
-            w.writerow([f'{r[0]:.3f}', r[1], r[2], f'{r[3]:.4f}', r[4]])
+    write_wide_csv(os.path.join(out, 'fire-20261116-ignition.csv'), T0,
+                   [('kg1000_adc_pin_v', t1[m1], k1[m1] * K), ('kg50_p6_input_mv', t5[m5], k5[m5] * 1000),
+                    ('vmain_v', tp[mp], vm[mp]), ('gb_battery_v', tg[mg], vg[mg]),
+                    ('gb_battery_a', ti[mi], ig[mi]), ('ox_tank_psi', tf[mf], fp[mf])])
 
 def write_wide_csv(path, t_ref, series):
     """Write series of different rates to one wide CSV: a row per receive timestamp
