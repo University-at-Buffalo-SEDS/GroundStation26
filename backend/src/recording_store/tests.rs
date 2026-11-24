@@ -156,7 +156,7 @@ fn settings_normalize_into_safe_ranges_and_keep_every_event_type() {
     assert_eq!(settings.ring_budget_mb, 256);
     assert_eq!(settings.segment_mb, 64, "a segment is at most a quarter of the ring");
     assert!(settings.warn_free_mb >= settings.critical_free_mb);
-    assert_eq!(settings.events.len(), EventKind::ALL.len());
+    assert_eq!(settings.events.len(), EventKind::CAPTURED.len());
     let defaults = Settings::default();
     assert_eq!(defaults.ring_budget_mb, 50 * 1024, "50 GB unless the disk fills first");
     assert!(defaults.reserve_free_mb >= defaults.warn_free_mb);

@@ -118,6 +118,7 @@ mod primary_mirror;
 mod qualification_requests;
 mod recording_bundle;
 mod recording_export;
+mod recording_import;
 mod recording_store;
 mod host_power;
 mod recovery_events;

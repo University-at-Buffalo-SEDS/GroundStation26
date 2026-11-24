@@ -32,7 +32,7 @@ pub(crate) const EVENTS_DIR: &str = "events";
 pub(crate) const SEGMENT_PREFIX: &str = "segment_";
 pub(crate) const CAPTURE_FILE: &str = "recording.db";
 pub(crate) const MANIFEST_FILE: &str = "manifest.json";
-const PARTIAL_FILE: &str = "recording.partial.db";
+pub(crate) const PARTIAL_FILE: &str = "recording.partial.db";
 const PENDING_FILE: &str = "pending-captures.json";
 const SETTINGS_FILE: &str = "settings.json";
 const MIB: u64 = 1024 * 1024;
@@ -72,10 +72,29 @@ pub enum EventKind {
     GroundTest,
     DaqDac,
     Manual,
+    /// A recording imported from a replay bundle (`recording_import`); never captured here.
+    Imported,
 }
 
 impl EventKind {
-    pub const ALL: [EventKind; 12] = [
+    /// Every kind a capture folder can have.
+    pub const ALL: [EventKind; 13] = [
+        Self::Launch,
+        Self::Hitl,
+        Self::Abort,
+        Self::Fill,
+        Self::NitrogenTest,
+        Self::ValveSelfTest,
+        Self::Turbocharge,
+        Self::ColdFlow,
+        Self::Igniter,
+        Self::GroundTest,
+        Self::DaqDac,
+        Self::Manual,
+        Self::Imported,
+    ];
+    /// The kinds this station captures, each with a capture policy in [`Settings`].
+    pub const CAPTURED: [EventKind; 12] = [
         Self::Launch,
         Self::Hitl,
         Self::Abort,
@@ -103,6 +122,7 @@ impl EventKind {
             Self::GroundTest => "ground_test",
             Self::DaqDac => "daq_dac",
             Self::Manual => "manual",
+            Self::Imported => "imported",
         }
     }
     pub fn from_id(id: &str) -> Option<Self> {
@@ -122,6 +142,7 @@ impl EventKind {
             Self::GroundTest => "Integrated ground test",
             Self::DaqDac => "DAQ DAC validation",
             Self::Manual => "Manual snapshot",
+            Self::Imported => "Imported replay bundle",
         }
     }
     fn default_policy(self) -> EventPolicy {
@@ -139,6 +160,7 @@ impl EventKind {
             Self::GroundTest => (120, 120, 8 * 3600),
             Self::DaqDac => (30, 30, 2 * 3600),
             Self::Manual => (120, 0, 3600),
+            Self::Imported => (0, 0, 24 * 3600),
         };
         EventPolicy {
             auto: true,
@@ -201,7 +223,7 @@ impl Default for Settings {
             warn_free_mb: 2048,
             critical_free_mb: 512,
             reserve_free_mb: 8 * 1024,
-            events: EventKind::ALL
+            events: EventKind::CAPTURED
                 .into_iter()
                 .map(|kind| (kind, kind.default_policy()))
                 .collect(),
@@ -220,7 +242,8 @@ impl Settings {
         self.warn_free_mb = self.warn_free_mb.clamp(self.critical_free_mb, 4 * 1024 * 1024);
         // The ring stops before captures could push the disk into a warning.
         self.reserve_free_mb = self.reserve_free_mb.clamp(self.warn_free_mb, 4 * 1024 * 1024);
-        for kind in EventKind::ALL {
+        self.events.retain(|kind, _| EventKind::CAPTURED.contains(kind));
+        for kind in EventKind::CAPTURED {
             let policy = self.events.entry(kind).or_insert_with(|| kind.default_policy());
             policy.pre_roll_s = policy.pre_roll_s.min(4 * 3600);
             policy.post_roll_s = policy.post_roll_s.min(4 * 3600);
@@ -265,7 +288,7 @@ pub(crate) fn save_settings(root: &Path, settings: &Settings) -> std::io::Result
     )
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -405,7 +428,7 @@ pub(crate) fn stamp(ms: i64) -> String {
     crate::telemetry_db::human_readable_session_stamp(ms)
 }
 
-fn slug(label: &str) -> String {
+pub(crate) fn slug(label: &str) -> String {
     let mut out = String::new();
     for c in label.chars() {
         if c.is_ascii_alphanumeric() {
@@ -1150,7 +1173,7 @@ pub struct CaptureSaved {
     pub telemetry_rows: i64,
 }
 
-fn unique_folder(dir: &Path, base: &str) -> (String, PathBuf) {
+pub(crate) fn unique_folder(dir: &Path, base: &str) -> (String, PathBuf) {
     let mut name = base.to_owned();
     let mut n = 2;
     loop {
