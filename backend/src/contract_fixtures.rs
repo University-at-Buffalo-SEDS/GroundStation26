@@ -659,8 +659,9 @@ async fn self_test_confirmation(out: &mut Fixtures) {
 /// A portable replay file as the app saves it: the actual
 /// `GET /api/recordings/{id}/replay/export` body for a recording of the IGT
 /// `nominal_10k` mock flight (thinned to 0.5 Hz), plus the configuration the
-/// app attaches from the same station (`layout`, `boards`, `mode`). The UI
-/// opens this with no station connected (offline replay).
+/// app attaches from the same station (`layout`, `boards`, `view_config`,
+/// `vehicle_geometry`, `valve_mappings`, `mode`). The UI opens this with no station connected
+/// (offline replay).
 async fn replay_export(app: &axum::Router, out: &mut Fixtures) {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../test-data/igt/nominal_10k/IGT");
     let read = |name: &str| -> Vec<Vec<f64>> {
@@ -695,6 +696,13 @@ async fn replay_export(app: &axum::Router, out: &mut Fixtures) {
     file["mode"] = "flight".into();
     file["layout"] = get_ok(app, "/api/layout", Some("viewer")).await;
     file["boards"] = get_ok(app, "/api/boards", Some("viewer")).await["boards"].clone();
+    file["view_config"] = get_ok(app, "/api/vehicle_visualization", Some("viewer")).await;
+    file["vehicle_geometry"] = get_ok(app, crate::vehicle_geometry::PATH, Some("viewer")).await;
+    file["valve_mappings"] = json!([
+        {"label": "Pilot valve", "data_type": "VALVE_STATE", "index": 0, "true_label": "Open", "false_label": "Closed"},
+        {"label": "Normally-open valve", "data_type": "VALVE_STATE", "index": 1, "true_label": "Open", "false_label": "Closed"},
+        {"label": "Dump valve", "data_type": "VALVE_STATE", "index": 2, "true_label": "Open", "false_label": "Closed"}
+    ]);
     file["configuration_provenance"] = "Station configuration at export; not a claim of historical capture-time configuration.".into();
     out.add("replay-export/flight", file);
 }

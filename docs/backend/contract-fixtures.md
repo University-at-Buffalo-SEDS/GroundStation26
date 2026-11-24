@@ -24,9 +24,9 @@ request, `requests/gse-self-test-confirmation`: the isolation checkbox's
 reply. The UI checks that its checkbox sends exactly that request. Also
 `replay-export/flight`: a portable replay file as the app saves it, i.e. the
 real `GET /api/recordings/{id}/replay/export` body for a recording of the IGT
-`nominal_10k` mock flight (thinned to 0.5 Hz) plus the `layout`, `boards` and
-`mode` the app attaches; the UI opens it with no station connected (offline
-replay).
+`nominal_10k` mock flight (thinned to 0.5 Hz) plus the `layout`, `boards`,
+`view_config`, `vehicle_geometry`, `valve_mappings` and `mode` the app attaches; the UI opens
+it with no station connected (offline replay).
 
 Values that change from run to run (tickets, boot epochs, random ids, clock
 readings, process-wide counters) are replaced by fixed values of the same type
