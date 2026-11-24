@@ -5,142 +5,142 @@
     "altitude_curve": [
       [
         -4.0,
-        0.02
+        -0.02
       ],
       [
         -2.0,
-        -0.04
+        0.02
       ],
       [
         0.0,
-        -0.04
+        -0.06
       ],
       [
         2.0,
-        97.77
+        97.88
       ],
       [
         4.0,
-        414.9
+        415.08
       ],
       [
         6.0,
-        845.36
+        845.5
       ],
       [
         8.0,
-        1269.79
+        1269.78
       ],
       [
         10.0,
-        1649.61
+        1649.65
       ],
       [
         12.0,
-        1978.22
+        1977.84
       ],
       [
         14.0,
-        2257.98
+        2257.71
       ],
       [
         16.0,
-        2492.59
+        2491.88
       ],
       [
         18.0,
-        2683.5
+        2683.39
       ],
       [
         20.0,
-        2833.6
+        2832.83
       ],
       [
         22.0,
-        2942.86
+        2942.3
       ],
       [
         24.0,
-        3012.86
+        3012.11
       ],
       [
         26.0,
-        3044.56
+        3043.82
       ],
       [
         28.0,
-        3035.97
+        3035.33
       ],
       [
         30.0,
-        3001.24
+        3000.25
       ],
       [
         32.0,
-        2953.69
+        2951.92
       ],
       [
         34.0,
-        2902.28
+        2899.69
       ],
       [
         36.0,
-        2849.57
+        2847.39
       ],
       [
         38.0,
-        2796.46
+        2795.66
       ],
       [
         40.0,
-        2743.4
+        2743.86
       ],
       [
         42.0,
-        2689.95
+        2691.39
       ],
       [
         44.0,
-        2636.54
+        2639.14
       ],
       [
         46.0,
-        2583.4
+        2587.75
       ],
       [
         48.0,
-        2530.56
+        2535.97
       ],
       [
         50.0,
-        2477.71
+        2483.59
       ]
     ],
     "altitude_maxima": [
       {
         "source": "Barometer altitude",
         "t_ms": 1767225636000,
-        "value": 3044.557
+        "value": 3043.82
       },
       {
         "source": "GPS altitude above the pad",
         "t_ms": 1767225636000,
-        "value": 3046.3900000000003
+        "value": 3045.66
       }
     ],
     "altitude_source": "barometer altitude",
     "apogee": {
       "source": "barometer altitude",
       "t_ms": 1767225636000,
-      "value": 3044.557
+      "value": 3043.82
     },
     "apogee_detected_ms": null,
     "curve_zero_ms": 1767225610000,
     "data_label": "FC telemetry",
-    "descent_rate_drogue_mps": 26.3,
+    "descent_rate_drogue_mps": 25.9,
     "descent_rate_main_mps": null,
     "drogue": {
-      "altitude_m": 3042.0,
+      "altitude_m": 3041.3,
       "altitude_source": "barometer altitude",
       "dry_run": false,
       "evidence": "FC phase Descent",
@@ -164,7 +164,7 @@
         "t_plus_s": 0.0
       },
       {
-        "altitude_m": -0.0,
+        "altitude_m": -0.1,
         "name": "Liftoff",
         "source": "barometer altitude rising 10 m",
         "t_launch_s": 0.0,
@@ -172,7 +172,7 @@
         "t_plus_s": 0.0
       },
       {
-        "altitude_m": 3044.6,
+        "altitude_m": 3043.8,
         "name": "Apogee (max altitude)",
         "source": "barometer altitude",
         "t_launch_s": 26.0,
@@ -180,7 +180,7 @@
         "t_plus_s": 26.0
       },
       {
-        "altitude_m": 3042.0,
+        "altitude_m": 3041.3,
         "name": "Drogue deploy",
         "source": "FC phase Descent",
         "t_launch_s": 26.6,
@@ -194,13 +194,13 @@
     "landed_ms": null,
     "landed_source": "",
     "landing": {
-      "alt_msl_m": 3603.8900000000003,
-      "lat": 31.7623947,
-      "lon": -102.0434076,
+      "alt_msl_m": 3604.3599999999997,
+      "lat": 31.7622234,
+      "lon": -102.04333455,
       "source": "GPS, last 10 fixes"
     },
-    "landing_bearing_deg": 27.0,
-    "landing_distance_m": 544.0,
+    "landing_bearing_deg": 28.0,
+    "landing_distance_m": 535.0,
     "latest_phase": "Descent",
     "launch_accepted_ms": 1767225610000,
     "launch_source": "FC flight state",
@@ -213,9 +213,9 @@
     "max_velocity": null,
     "notes": [],
     "pad": {
-      "alt_msl_m": 889.37,
-      "lat": 31.758015,
-      "lon": -102.0459776,
+      "alt_msl_m": 887.69,
+      "lat": 31.7579913,
+      "lon": -102.0460255,
       "source": "GPS before launch"
     },
     "simulated": false,

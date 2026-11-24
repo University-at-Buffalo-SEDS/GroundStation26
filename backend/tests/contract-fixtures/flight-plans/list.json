@@ -9,7 +9,7 @@
     "label": null,
     "launch": {
       "azimuth_deg": 60.0,
-      "rail_length_m": 5.18,
+      "rail_length_m": 9.144,
       "tilt_deg": 5.0
     },
     "motor_model": "physics",
@@ -42,22 +42,22 @@
   },
   "plans": [
     {
-      "apogee_m": 3766.5,
+      "apogee_m": 3768.4,
       "created_by": "operator",
       "created_ms": 1767225600000,
       "dispersion_samples": 20,
       "fill_kg": 8.5,
-      "id": "fp-1767225600000-7c0a141b",
+      "id": "fp-1767225600000-c3564843",
       "kind": "flight",
       "label": "8.5 kg nominal",
       "landing": {
-        "bearing_deg": 90.3,
-        "drift_m": 1230.5,
-        "lat_deg": 31.7579382,
-        "lon_deg": -102.0329859
+        "bearing_deg": 91.1,
+        "drift_m": 1242.9,
+        "lat_deg": 31.7577889,
+        "lon_deg": -102.032856
       },
       "supercharge_psi": 750.0,
-      "warnings": 1
+      "warnings": 0
     }
   ]
 }
