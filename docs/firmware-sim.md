@@ -180,11 +180,35 @@ their internal state:
 * AB drive enables `N2_Valve_EN` (PB3), `N20_Valve_EN` (PB4), `Igniter_EN` (PB7) (PB12-14, the `*_Sig` lines, are ribbon inputs) and VB `Solenoid` (PB11, pilot) from the boards' GPIO
   reports; VB vent (normally-open servo, TIM2 CH2) and dump (TIM2 CH1) from the timer compare registers in the VB's
   mapped peripheral page, open below 860 us (open ~530 us, closed ~1200 us on the VB's 500-2500 us/270 degree
-  mapping); FC `CO2` (PB5, drogue) and `REEF` (PB6, main) pyro outputs.
+  mapping); FC `CO2` (PB5, drogue) and `REEF` (PB6, main) pyro outputs; the AB `Backup_Valve_EN` (PD2) output that
+  powers the QD actuator in the auxiliary fill drive (QD retract below).
 * Operator inputs (`POST /api/firmware-sim/control`, administrators): `plant` (QD connected, nitrogen bottle open,
-  nitrous bottle open), `conditions` (ambient temperature, wind speed, direction, gusts), `loads` (calibration
+  nitrous bottle open, `qd_travel_s`: the QD actuator's travel to its limit switch, 1-300 s), `conditions` (ambient temperature, wind speed, direction, gusts), `loads` (calibration
   masses on the KG50 and KG1000), `faults` (below). Every change is logged and the current control is written into
   saved captures (`versions.simulated_conditions`).
+
+QD retract (the mechanism timing):
+
+* **Auxiliary drive** (how the QD retracts on the hardware): `RetractPlumbing` makes the AB hold `Backup_Valve_EN`
+  (PD2, the P4 solenoid-driver output) on for 45 s (ActuatorBoard26 `fill_motion.h` `FILL_DURATION_MS`). That is a
+  deliberate overdrive: the QD actuator's own limit switch stops it at the end of its travel, 20-30 s on the
+  hardware. The plant integrates the powered time and trips the switch at `qd_travel_s` (default 25 s): the QD
+  disconnects there (no more nitrogen/nitrous into the tank) and `/api/firmware-sim` `bay.plant.qd` shows
+  `limit_switch`, `limit_switch_after_s`, `travel_s` and the AB output's `last_output_on_s`. Re-mating the QD
+  (`plant.qd_connected` false, then true) puts the actuator back at the start of its travel. Only a change of
+  `qd_connected` acts, so a control rewritten for another section does not undo a retraction.
+* The AB has **no input from the limit switch** (the actuator's two power leads are all that reach P4): it ends the
+  retraction on its 45 s timer and reports it complete whether or not the switch tripped. The station's Launch gate
+  follows the AB (45 s minimum after the AB accepted the retraction, then its completion), so Launch is admitted about
+  45 s after the retract, not at the switch. Fault `qd_switch_never_trips`: the actuator jams short of its switch and
+  the QD stays connected; the AB still reports the retraction complete at 45 s (whether that should be a fault is an
+  open question for the AB, not a sim gap).
+* **Legacy stepper drive** (the AB's factory default with no saved selection): 20 000 000 STEP pulses at 30 us
+  (`main_task.c` `PLUMBING_RETRACT_MOTOR_STEPS` 200000 x `PLUMBING_RETRACT_GEARBOX_RATIO` 100) = 600 s, through the
+  stepper's 100:1 gearbox, which turns very slowly. TIM1 counts at 1 MHz (170 MHz / (PSC 169 + 1)), ARR 29 gives one
+  CH3N pulse and one update interrupt per 30 us; the DRV8825's MODE0-2 are strapped high (1/32 microstep). The native
+  shim models this exactly (the sim's 600 s is the firmware's 600 s). The plant does not move the QD for the stepper
+  drive, and the stepper has no limit-switch input either.
 
 Fill system:
 
@@ -380,10 +404,14 @@ Per mode (the e2e: `python3 tools/firmware_sim_e2e.py --out DIR --mode <mode>`):
   boards end on it); the station then fetches the DAQ's SD launch file (only in Idle, Landed or Recovery) and the burn
   report goes final.
 * **Normal**: the RF NEO-M9N fix reaches the station, so the GPS gate passes; while the station is Idle the e2e runs
-  the DAC patch (below), then the full procedure (self-test, nitrogen test, fill, QD retract, Launch). The QD retract
-  is the AB's stepper move: 200000 motor steps x 100 gearbox at 30 us (ActuatorBoard26 `main_task.c`), i.e. 600 s
-  before the AB reports it complete and the station's retraction proof admits Launch (`/api/board_abort`
-  `retraction.allowed`). The e2e then follows the flight on the map (`/api/antenna/status` rocket positions from the
+  the DAC patch (below), selects the auxiliary fill drive (`/api/actuator/plumbing/settings`, releasing the
+  default stepper's holding torque), then runs the full procedure (self-test, nitrogen test, fill, QD retract,
+  Launch). The QD retract checks that the plant's actuator stops at its limit switch 20-30 s after the AB powers it,
+  that the QD disconnects there and that the AB holds its output the full 45 s; Launch follows the AB's 45 s
+  retraction and the station's retraction proof (`/api/board_abort` `retraction.allowed`).
+  `FIRMWARE_SIM_E2E_QD_DRIVE=stepper` keeps the legacy stepper (600 s before Launch);
+  `FIRMWARE_SIM_E2E_QD_FAULT=never_trips` jams the actuator and records what the AB and the station report
+  (`result.json` `normal.qd_fault_finding`). The e2e then follows the flight on the map (`/api/antenna/status` rocket positions from the
   RF GPS) through drogue, main and Landed, and the automatic FC SD collection of the launch file.
 * **IGT**: the FC ground-test variant. The e2e powers on with one dataset on the card, then swaps the card for
   another while the FC runs (card out, dataset, card in, Retry SD; FlightComputer26 34c7835 mounts the swapped card
@@ -456,7 +484,7 @@ simclock).
   Launch, the AB igniter on PB7, the hybrid motor on the stand (chamber about 370 psi, the KG50 unloading from +5 to
   -37 kg, the KG1000 0.21 to 0.94 V), burnout, burn report about 3.95 kN peak / 7.9 kN s, back to Idle. The final
   report does not arrive (open issue 1).
-* **Normal**: GPS gate, the DAC patch and sweep, the GSE procedure, QD retract (600 s), Launch, the FC's flight
+* **Normal**: GPS gate, the DAC patch and sweep, the GSE procedure, QD retract (600 s, stepper drive), Launch, the FC's flight
   (apogee about 1386 m, drogue T+19 s, main T+56 s, Landed), the map track (122 points, 662 m drift, 1386 m altitude
   span) and the FC SD launch file downloaded (1.7 MB at about 10 KB/s); its attachment waits behind the DAQ launch
   fetch (open issue 1).
@@ -508,9 +536,10 @@ Issues these runs found, and their fixes (r6b):
    (abort, recovery, store, busy fill configuration, command floor, stale stamp, launch inhibit, queue), the station
    shows it ("Igniter sequence: refused by AB because ..."), and a stale Launch is acknowledged so retries stop.
 
-The QD retract constant (`main_task.c`: 200000 motor steps x 100 gearbox at 30 us = 600 s) came with "better driver
-for stepper" (cd329ab; before it 200000 steps at 40 us, 8 s); `docs/data-pipeline.md` records the 20 000 000 steps but
-not the duration. Unchanged: worth confirming the gearbox factor against the mechanism.
+The 600 s QD retract of those runs was the legacy stepper drive, the AB's factory default when no drive is saved:
+20 000 000 pulses at 30 us (`main_task.c`, "better driver for stepper" cd329ab; before it 200000 steps at 40 us, 8 s),
+the stepper's 100:1 gearbox included. The hardware retracts the QD with the auxiliary drive instead (45 s output, the
+actuator's limit switch at 20-30 s); the e2e now selects it and the plant models the switch (QD retract above).
 
 ### Valve-report time stamps and the bay's pace (2026-11-23)
 
@@ -568,7 +597,8 @@ frame engine waveforms up to about 250 Hz come through faithfully (500 Hz Nyquis
 * Testing establishes no network time (`network UTC is not available` for station controls).
 * Test fire: no automatic return to a download-permitting state after the burn; the final burn report waits for the
   operator's rewind to Idle.
-* The AB's QD retract takes 600 s (200000 x 100 steps at 30 us): check the gearbox constant against the mechanism.
+* The AB cannot see the QD actuator's limit switch: it reports the retraction complete after its 45 s whether or not
+  the switch tripped (`qd_switch_never_trips`). Whether that should be a fault is open for the AB.
 * Thermocouples (no board reads one yet), power rails and battery discharge (the LTC2990 monitors still read static
   values), weathercocking/3-DOF attitude, SAR inputs in the DAC patch.
 * An actual remote bundle run, the armhf cross build and a run on the Pi station.

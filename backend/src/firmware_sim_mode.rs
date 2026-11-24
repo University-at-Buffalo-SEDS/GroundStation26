@@ -238,6 +238,13 @@ pub(crate) fn validate_control(body: &Value) -> Result<Value, String> {
             "plant" => {
                 let plant = value.as_object().ok_or("plant must be an object")?;
                 for (k, v) in plant {
+                    // qd_travel_s: the QD actuator's powered travel to its limit switch (FirmwareSimulator native_plant.rs)
+                    if k == "qd_travel_s" {
+                        if !v.as_f64().is_some_and(|x| (1.0..=300.0).contains(&x)) {
+                            return Err("qd_travel_s must be 1-300 s".into());
+                        }
+                        continue;
+                    }
                     if !matches!(k.as_str(), "qd_connected" | "nitrogen_bottle_open" | "nitrous_bottle_open") || !v.is_boolean() {
                         return Err(format!("unknown or non-boolean plant input {k}"));
                     }
@@ -250,6 +257,7 @@ pub(crate) fn validate_control(body: &Value) -> Result<Value, String> {
                     match k.as_str() {
                         "dead_tank_pt" | "dead_chamber_pt" | "radio_drop" | "kg1000_supply_dip" | "kg1000_open_lead"
                         | "kg50_open_lead" | "p10_inputs_swapped" | "fc_sd_missing" | "gps_no_fix"
+                        | "qd_switch_never_trips"
                             if v.is_boolean() => {}
                         "kg50_bypass" | "kg1000_bypass" if v.as_f64().is_some_and(|x| (0.0..=1.0).contains(&x)) => {}
                         "kg50_drift_kg_per_c" | "kg1000_drift_kg_per_c" if v.as_f64().is_some_and(|x| x.abs() <= 5.0) => {}
@@ -498,7 +506,8 @@ mod tests {
 
     #[test]
     fn control_validation_accepts_plant_inputs_and_faults_only() {
-        let ok = json!({"plant": {"qd_connected": false}, "faults": {"stuck_valves": {"vent": "closed"}, "dead_tank_pt": true,
+        let ok = json!({"plant": {"qd_connected": false, "qd_travel_s": 25.0}, "faults": {"stuck_valves": {"vent": "closed"}, "dead_tank_pt": true,
+                        "qd_switch_never_trips": true,
                         "kg50_bypass": 0.2, "kg1000_supply_dip": true},
                         "conditions": {"ambient_c": 35.0, "wind_mps": 9.0, "wind_from_deg": 300.0,
                                        "wind_levels": [{"alt_m": 0.0, "speed_mps": 4.0, "from_deg": 300.0}, {"alt_m": 3000.0, "speed_mps": 15.0, "from_deg": 270.0}]},
@@ -508,6 +517,8 @@ mod tests {
         for bad in [
             json!({"plant": {"qd_connected": "no"}}),
             json!({"plant": {"tank_pressure_psi": 500}}),
+            json!({"plant": {"qd_travel_s": 0.0}}),
+            json!({"plant": {"qd_travel_s": true}}),
             json!({"faults": {"stuck_valves": {"igniter": "open"}}}),
             json!({"faults": {"stuck_valves": {"vent": "half"}}}),
             json!({"faults": {"fire": true}}),

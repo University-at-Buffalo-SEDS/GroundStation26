@@ -97,5 +97,34 @@ class Helpers(unittest.TestCase):
         e2e.burn_report(st, lambda name, ok, **kw: checks.append((name, bool(ok))), {})
         self.assertEqual([ok for _, ok in checks], [False, False])
 
+    def test_qd_drive_selection_releases_the_stepper_and_waits_for_the_ab_to_report_auxiliary(self):
+        class Plumbing(FakeStation):
+            def __init__(self):
+                super().__init__()
+                self.mode, self.settings = "stepper", []
+
+            def api(self, path, body=None):
+                if path == "/api/actuator/plumbing/settings":
+                    self.settings.append(body)
+                    self.mode = body["mode"]
+                    return 202, {"message": "saving"}
+                if path == "/api/actuator/plumbing/status":
+                    return 200, {"backend_instance": "b", "reset_epoch": "r", "desired": {"revision": 3}, "pending": False,
+                                 "board": {"fresh": True, "ready": True, "mode": self.mode, "generation": "2a", "epoch": 1}}
+                return 200, {}
+        st = Plumbing()
+        checks, result = [], {}
+        board = e2e.select_qd_drive(st, lambda name, ok, **kw: checks.append((name, bool(ok))), result, "auxiliary")
+        self.assertEqual(board["mode"], "auxiliary")
+        self.assertEqual(len(st.settings), 1)
+        self.assertEqual(st.settings[0], {"mode": "auxiliary", "expected_generation": "2a", "expected_epoch": 1,
+                                          "backend_instance": "b", "expected_revision": 3, "expected_reset_epoch": "r",
+                                          "release_stepper": True})
+        self.assertEqual(checks, [("AB fill drive set to auxiliary (the QD retract drive)", True)])
+
+    def test_the_stepper_retract_is_the_firmwares_600_s(self):
+        self.assertAlmostEqual(e2e.STEPPER_RETRACT_S, 600.0)
+        self.assertEqual(e2e.AUX_RETRACT_S, 45.0)
+
 if __name__ == "__main__":
     unittest.main()

@@ -211,6 +211,7 @@ def main() -> int:
     st = Station(f"http://127.0.0.1:{a.port}", key, out)
     st.mode = a.mode
     result = {"checks": [], "mode": a.mode}
+    st.result = result
 
     def check(name, ok, **extra):
         result["checks"].append({"name": name, "pass": bool(ok), **extra})
@@ -359,10 +360,56 @@ def launch_started(st: Station):
     return state not in (None, "Startup", "Idle", "Fill", "Armed") or st.plant().get("igniter_fired")
 
 
+# The QD fill drive the Normal e2e selects (FIRMWARE_SIM_E2E_QD_DRIVE): "auxiliary", the drive the QD retracts with on
+# the hardware: the AB powers the QD actuator from Backup_Valve_EN PD2 for 45 s (ActuatorBoard26 fill_motion.h
+# FILL_DURATION_MS, deliberately longer than the travel) and the actuator's own limit switch stops it after 20-30 s
+# (the plant's qd_travel_s, 25 s). "stepper" keeps the factory-default legacy stepper drive: 20 000 000 pulses at 30 us
+# (main_task.c), 600 s through its 100:1 gearbox, which the plant does not model mechanically.
+QD_DRIVE = os.environ.get("FIRMWARE_SIM_E2E_QD_DRIVE", "auxiliary")
+AUX_RETRACT_S = 45.0
+STEPPER_RETRACT_S = 20_000_000 * 30e-6
+QD_TRAVEL_S = (20.0, 30.0)
+
+
+def select_qd_drive(st: Station, check, result, mode=QD_DRIVE):
+    """The operator's fill-drive selection (only in Startup/Idle; FirmwareSimulator test-operational-flight-sim.py):
+    a fresh actuator query, then /api/actuator/plumbing/settings until the AB reports the drive. Stepper ->
+    auxiliary explicitly releases the idle stepper's holding torque."""
+    attempts = []
+
+    def selected():
+        st.api("/api/actuator/plumbing/query", {})
+        code, plumbing = st.api("/api/actuator/plumbing/status")
+        if code != 200 or not isinstance(plumbing, dict):
+            return None
+        board = plumbing.get("board") or {}
+        if not board.get("fresh"):
+            return None
+        if board.get("mode") == mode and board.get("ready") and not plumbing.get("pending"):
+            return board
+        body = {"mode": mode, "expected_generation": board.get("generation"), "expected_epoch": board.get("epoch"),
+                "backend_instance": plumbing.get("backend_instance"),
+                "expected_revision": (plumbing.get("desired") or {}).get("revision"),
+                "expected_reset_epoch": plumbing.get("reset_epoch"),
+                "release_stepper": board.get("mode") == "stepper" and mode == "auxiliary"}
+        code, reply = st.api("/api/actuator/plumbing/settings", body)
+        attempts.append({"http": code, "reply": reply if code >= 300 else (reply or {}).get("message")})
+        return None
+    board = st.wait(selected, 120, f"QD drive {mode}", poll=3)
+    result.setdefault("normal", {})["qd_drive"] = {"mode": mode, "board": board, "attempts": attempts[-5:]}
+    check(f"AB fill drive set to {mode} (the QD retract drive)", board, attempts=attempts[-3:])
+    return board
+
+
 def normal_launch(st: Station, check):
     """Normal mode after the fill (FirmwareSimulator test-operational-flight-sim.py): sign the checkout checklist,
     retract the QD (RetractPlumbing, refreshing the actuator readback until the station reports QD motion), then
-    Launch once every required board's state proof and the retraction proof are fresh (/api/board_abort)."""
+    Launch once every required board's state proof and the retraction proof are fresh (/api/board_abort).
+
+    Auxiliary drive: the plant's QD actuator reaches its limit switch 20-30 s after the AB powers it, then Launch
+    follows the AB's own 45 s retraction (the GS also holds Launch 45 s after the AB accepted it).
+    FIRMWARE_SIM_E2E_QD_FAULT=never_trips jams the actuator short of its switch: the QD stays connected and the e2e
+    records what the AB and the station report (the AB has no input from the switch)."""
     code, doc = st.api("/api/checklists")
     if code == 200 and isinstance(doc, dict):
         code, body = st.api("/api/checklists/sign", {"checklist_id": "checkout", "revision": doc.get("revision")})
@@ -375,8 +422,46 @@ def normal_launch(st: Station, check):
         st.api("/api/actuator/plumbing/query", {})
         st.command("RetractPlumbing")
         return None
+    fault = os.environ.get("FIRMWARE_SIM_E2E_QD_FAULT", "") == "never_trips"
+    if fault:
+        code, _ = st.api("/api/firmware-sim/control", {"faults": {"qd_switch_never_trips": True}})
+        st.log("QD fault: the actuator never reaches its limit switch", http=code)
+    t_cmd = st.now()
     qd = st.wait(retracting, 90, "QD retract dispatched", poll=3)
     check("the QD retracts (RetractPlumbing through the AB)", qd, qd=qd, umbilical=st.plant().get("umbilical_attached"))
+    if QD_DRIVE == "auxiliary":
+        # the limit switch, not the AB's 45 s output, ends the motion
+        def switch():
+            q = st.plant().get("qd") or {}
+            return q if q.get("limit_switch") else None
+        tripped = st.wait(switch, QD_TRAVEL_S[1] + 30, "QD limit switch", poll=1)
+        q = st.plant().get("qd") or {}
+        after = (tripped or {}).get("limit_switch_after_s")
+        st.log("QD actuator", qd=q, since_retract_s=round(st.now() - t_cmd, 1))
+        if fault:
+            check("QD fault: the limit switch never trips and the QD stays connected", not tripped
+                  and (st.plant().get("supply") or {}).get("qd_connected"), qd=q)
+        else:
+            check("the QD actuator stops at its limit switch 20-30 s after the AB powers it",
+                  after is not None and QD_TRAVEL_S[0] <= after <= QD_TRAVEL_S[1], qd=q)
+            check("the QD disconnects at the limit switch", not (st.plant().get("supply") or {}).get("qd_connected"),
+                  supply=st.plant().get("supply"))
+        def output_off():
+            q = st.plant().get("qd") or {}
+            return q if q.get("last_output_on_s") is not None and not q.get("output_on") else None
+        q = st.wait(output_off, AUX_RETRACT_S + 30, "AB QD output off", poll=1) or st.plant().get("qd") or {}
+        check("the AB powers the QD actuator for its 45 s (FILL_DURATION_MS)",
+              abs((q.get("last_output_on_s") or 0) - AUX_RETRACT_S) <= 2, qd=q)
+        if fault:
+            # the AB cannot see the switch: record what it and the station report once its timer ends
+            st.api("/api/actuator/plumbing/query", {})
+            st.sleep(3)
+            code, plumbing = st.api("/api/actuator/plumbing/status")
+            code2, snap = st.api("/api/board_abort")
+            finding = {"gse_qd": gse(st).get("qd"), "motion": (plumbing or {}).get("motion") if code == 200 else plumbing,
+                       "retraction": (snap or {}).get("retraction") if code2 == 200 else snap, "plant_qd": q}
+            st.log("QD fault finding: what the AB and the station report with the switch never tripped", **finding)
+            st.result.setdefault("normal", {})["qd_fault_finding"] = finding
     launched = [None]
     last_refresh = [st.now() - 30]
 
@@ -397,9 +482,10 @@ def normal_launch(st: Station, check):
         code, body = st.command("Launch")
         launched[0] = {"http": code, "body": body}
         return code == 200 and st.wait(lambda: launch_started(st), 15, "station in Launch")
-    # the AB drives the stepper the full retract (ActuatorBoard26 main_task.c: 200000 motor steps x 100 gearbox at
-    # 30 us, 600 s) before it reports the retraction complete
-    ok = st.wait(launch, 900, "Launch admitted", poll=2)
+    # Launch follows the AB's own retraction end: the auxiliary drive's 45 s output (the switch ends the motion
+    # earlier, but the AB cannot see it), or the legacy stepper's full 600 s move
+    move_s = AUX_RETRACT_S if QD_DRIVE == "auxiliary" else STEPPER_RETRACT_S
+    ok = st.wait(launch, max(0.0, move_s - (st.now() - t_cmd)) + 120, "Launch admitted", poll=2)
     check("Launch accepted by the station", ok, last=launched[0])
     return bool(ok)
 
@@ -705,6 +791,8 @@ def scenario_normal(st, check, result):
     # the DAQ DAC through the simulated loopback cable while the station is Idle (before the GSE procedure)
     if os.environ.get("FIRMWARE_SIM_E2E_DAC", "1") != "0":
         dac_patch(st, check, result)
+    # the QD retract drive, selected while the station is Idle (drive changes need Startup/Idle)
+    select_qd_drive(st, check, result)
     # the full launch procedure: the station's own GSE procedure to Armed, then QD retract and Launch
     gse_procedure(st, check, result)
     code, pol = st.api("/api/action_policy")
