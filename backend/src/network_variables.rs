@@ -45,6 +45,7 @@ const FLIGHT_BUZZER_TYPE: &str = "FLIGHT_BUZZER";
 const FLIGHT_STATE_TYPE: &str = "FLIGHT_STATE";
 const DAQ_CALIBRATION_TYPE: &str = "DAQ_LOADCELL_CALIBRATION";
 const DAQ_KG50_CALIBRATION_TYPE: &str = "DAQ_KG50_CALIBRATION";
+const DAQ_MCP_REFERENCE_TYPE: &str = "DAQ_MCP_REFERENCE";
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 struct PersistentVariables {
@@ -403,7 +404,7 @@ fn initialize_for_role(router: &Router, observer: bool) -> Result<()> {
 }
 /// The managed variables a primary station owns (READ_WRITE) and answers
 /// requests for itself. Every other node holds read-only replicas.
-const STATION_VARIABLES: [&str; 9] = [
+const STATION_VARIABLES: [&str; 10] = [
     UNDERGLOW_TYPE,
     FLIGHT_BUZZER_TYPE,
     FLIGHT_STATE_TYPE,
@@ -413,6 +414,7 @@ const STATION_VARIABLES: [&str; 9] = [
     "DAQ_THERMAL_CALIBRATION",
     "DAQ_FILTER_CALIBRATION",
     "DAQ_KG50_INPUT",
+    DAQ_MCP_REFERENCE_TYPE,
 ];
 /// Whether this station owns and serves `ty`, so a request for it needs no
 /// other node (an RRLS is a read-only observer and serves nothing).
@@ -602,6 +604,8 @@ fn initialize_for_role_seed(router: &Router, observer: bool, seed: bool) -> Resu
         router.seed_managed_variable(packet)?;
     }
     let selected = crate::loadcell::load_or_default();
+    crate::board_config_sync::note_daq_reference(selected.mcp_vref_v);
+    router.seed_managed_variable(mcp_reference_packet(&selected)?)?;
     router.seed_managed_variable(kg50_input_packet(&selected)?)?;
     let calibration = crate::loadcell::amp2_calibration(&selected);
     if let Ok(identity) = daq_calibration_identity(&selected) {
@@ -1289,33 +1293,91 @@ fn kg50_calibration_packet(cfg: &crate::loadcell::LoadcellCalibrationFile) -> Re
     packet_bytes(DAQ_KG50_CALIBRATION_TYPE, "SD_CARD", Arc::from(payload))
 }
 
-/// The config identity the DAQ reports for the calibration this station
-/// publishes from `cfg` (DAQ-Board `daq_calibration_identity`): CRC-32 of the
-/// four payloads in the order loadcell, KG50, thermal, filter. Opaque: it
-/// hashes the bytes on the wire, whatever their units.
-pub fn daq_calibration_identity(cfg: &crate::loadcell::LoadcellCalibrationFile) -> Result<u32> {
+/// The station's MCP3564R reference for the DAQ (`loadcell::mcp_reference`),
+/// 4 bytes f32 LE. The DAQ refuses one outside 1.9-2.6 V.
+fn mcp_reference_packet(cfg: &crate::loadcell::LoadcellCalibrationFile) -> Result<Packet> {
+    crate::loadcell::mcp_reference::validate(cfg.mcp_vref_v).map_err(anyhow::Error::msg)?;
+    packet_bytes(
+        DAQ_MCP_REFERENCE_TYPE,
+        "SD_CARD",
+        Arc::from(cfg.mcp_vref_v.to_le_bytes()),
+    )
+}
+
+/// The DAQ's flattened calibration floats in identity order: loadcell (4),
+/// KG50 (7), thermal (4), filter (2).
+fn daq_calibration_floats(cfg: &crate::loadcell::LoadcellCalibrationFile) -> Result<Vec<f32>> {
     let amp2 = crate::loadcell::amp2_calibration(cfg);
-    let mut hasher = crc32fast::Hasher::new();
+    let mut floats = Vec::with_capacity(17);
     for packet in [
         calibration_packet(&amp2)?,
         kg50_calibration_packet(&amp2)?,
         thermal_packet(&amp2)?,
         filter_packet(&amp2)?,
     ] {
-        hasher.update(packet.payload());
+        floats.extend(
+            packet
+                .payload()
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+        );
     }
-    Ok(hasher.finalize())
+    anyhow::ensure!(floats.len() == 17, "DAQ calibration payloads are not 17 floats");
+    Ok(floats)
+}
+
+/// CRC-32 of the calibration floats then the applied reference, all LE.
+fn daq_identity_of(floats: &[f32], vref: f32) -> u32 {
+    let mut hasher = crc32fast::Hasher::new();
+    for value in floats {
+        hasher.update(&value.to_le_bytes());
+    }
+    hasher.update(&vref.to_le_bytes());
+    hasher.finalize()
+}
+
+/// The config identity the DAQ reports for the calibration this station
+/// publishes from `cfg` (DAQ-Board `daq_calibration_identity`): CRC-32 of the
+/// four payloads in the order loadcell, KG50, thermal, filter, continued over
+/// the MCP3564R reference float the station sends (DAQ_MCP_REFERENCE).
+/// Opaque: it hashes the bytes on the wire, whatever their units.
+pub fn daq_calibration_identity(cfg: &crate::loadcell::LoadcellCalibrationFile) -> Result<u32> {
+    Ok(daq_identity_of(&daq_calibration_floats(cfg)?, cfg.mcp_vref_v))
+}
+
+/// The identity the DAQ reports when it took this station's calibration while
+/// still on reference `old_vref` and then converted it to the station's
+/// reference (DAQ-Board `apply_mcp_reference` / `daq_calibration_scale_input`,
+/// replicated in its float order). That happens when its requests are answered
+/// calibration first after a reference change; it is the station's own value,
+/// stale, and re-sending the calibration fixes it.
+pub fn daq_identity_after_board_rescale(
+    cfg: &crate::loadcell::LoadcellCalibrationFile,
+    old_vref: f32,
+) -> Result<u32> {
+    let mut c = daq_calibration_floats(cfg)?;
+    let vref = cfg.mcp_vref_v;
+    let k = vref as f64 / old_vref as f64;
+    c[0] = (c[0] as f64 / k) as f32;
+    let mut scale = 1.0_f64;
+    for i in 1..=4 {
+        scale *= k;
+        c[4 + i] = (c[4 + i] as f64 / scale) as f32;
+    }
+    c[4 + 5] = (c[4 + 5] as f64 * k) as f32;
+    c[11 + 1] = (c[11 + 1] as f64 * k) as f32;
+    c[11 + 3] = (c[11 + 3] as f64 * k) as f32;
+    Ok(daq_identity_of(&c, vref))
 }
 
 /// The identity of the DAQ's built-in calibration (a wiped store with nothing
 /// from the station yet): unit slopes, zero offsets, identity KG50 polynomial,
-/// no thermal compensation, no filtering.
+/// no thermal compensation, no filtering, at the nominal reference.
 pub fn daq_default_identity() -> u32 {
     let values: [f32; 17] = [
         1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
     ];
-    let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-    crc32fast::hash(&bytes)
+    daq_identity_of(&values, crate::loadcell::mcp_reference::NOMINAL_MCP_VREF_V)
 }
 
 pub fn set_daq_calibration(
@@ -1326,6 +1388,11 @@ pub fn set_daq_calibration(
         crate::board_config_sync::note_daq_published(router, identity);
     }
     let request = crate::qualification_requests::Request::begin("set_daq_calibration");
+    // The reference goes first and stands alone: the DAQ converts its own
+    // calibration copy when the reference changes, so it must not take the
+    // station's (already converted) calibration under the old reference.
+    crate::board_config_sync::note_daq_reference(cfg.mcp_vref_v);
+    let reference = mcp_reference_packet(cfg).and_then(|packet| request.submit(router, packet));
     // The input stands alone: unusable AMP2 coefficients must not hold back a
     // physical input selection, so it is sent even when they fail.
     let calibration = (|| -> Result<()> {
@@ -1339,7 +1406,7 @@ pub fn set_daq_calibration(
         request.submit(router, filter)
     })();
     let input = request.submit(router, kg50_input_packet(cfg)?);
-    calibration.and(input)
+    reference.and(calibration).and(input)
 }
 
 /// Stamped with the selection's revision rather than the time of sending. The
@@ -2669,6 +2736,7 @@ mod persistence_callback_tests {
             "DAQ_THERMAL_CALIBRATION",
             "DAQ_FILTER_CALIBRATION",
             "DAQ_KG50_INPUT",
+            DAQ_MCP_REFERENCE_TYPE,
         ];
         let now = Arc::new(AtomicU64::new(0));
         let clock = now.clone();

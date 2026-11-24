@@ -77,6 +77,9 @@ fn install(
     value: Channel,
 ) -> anyhow::Result<()> {
     check_channel(&value)?;
+    if matches!(channel, "ch1" | "kg50") {
+        super::mcp_reference::check_incoming(cfg, Some(&value.calibration), value.thermal.as_ref())?;
+    }
     cfg.extra_channels.insert(channel.into(), value.calibration);
     cfg.thermal.remove(sensor);
     cfg.noise.remove(sensor);
@@ -175,6 +178,9 @@ pub fn replace(
         )?,
         "calibration/kg50" => {
             let incoming: Kg50 = serde_json::from_value(value.clone())?;
+            for profile in incoming.profiles.values() {
+                super::mcp_reference::check_incoming(&next, profile.channel.as_ref(), profile.thermal.as_ref())?;
+            }
             install(&mut next, "kg50", "KG50", incoming.active)?;
             next.kg50_input = incoming.input;
             next.kg50_input_profiles = incoming.profiles;
@@ -329,5 +335,22 @@ mod persistence_tests {
             }
         }
         assert_eq!(cfg.full_mass_kg, Some(17.0));
+    }
+    #[test]
+    fn a_peer_calibration_under_another_mcp_reference_is_rejected() {
+        let mut local = LoadcellCalibrationFile::default();
+        normalize_calibration(&mut local);
+        let mut peer = local.clone();
+        peer.extra_channels.get_mut("ch1").unwrap().linear.m = Some(321.0);
+        super::super::mcp_reference::set_reference(&mut peer, 2.2).unwrap();
+        let key = "calibration/ch1";
+        let value = snapshot(&peer).unwrap()[key].clone();
+        let error = replace(&local, key, &snapshot(&local).unwrap()[key], &value).unwrap_err();
+        assert!(error.to_string().contains("reference"), "{error}");
+        super::super::mcp_reference::set_reference(&mut local, 2.2).unwrap();
+        let merged = replace(&local, key, &snapshot(&local).unwrap()[key], &value).unwrap();
+        assert_eq!(merged.extra_channels["ch1"].linear.m, peer.extra_channels["ch1"].linear.m);
+        // IADC is not an MCP3564R input and carries no reference.
+        assert!(snapshot(&local).unwrap()["calibration/iadc"]["calibration"].get("fitted_mcp_vref_v").is_none());
     }
 }

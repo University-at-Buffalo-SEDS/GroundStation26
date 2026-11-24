@@ -4,7 +4,8 @@
 //! The station is the source of truth. Each board reports a compact identity
 //! of the config it applied:
 //! - DAQ calibration: BOARD_HEALTH words 13..15 ("CFG1", CRC-32 of the four
-//!   calibration payloads as applied, flags), every 5 s
+//!   calibration payloads as applied continued over the applied MCP3564R
+//!   reference float, flags), every 5 s
 //!   (`network_variables::daq_calibration_identity`).
 //! - AB fill drive: AB_FILL_DRIVE_STATUS bytes 34..35, a 16-bit fold of the
 //!   request time of the station write that saved it (0: none), on the
@@ -45,6 +46,47 @@ pub(crate) const DAQ_CONFIG_TAG: u32 = 0x3147_4643;
 /// DAQ flags (word 15): the four calibration variables arrived from a station
 /// this boot.
 const DAQ_ALL_FROM_STATION: u32 = 0x0F;
+/// DAQ flags (word 15) bit 9: the MCP3564R reference (DAQ_MCP_REFERENCE)
+/// arrived from a station this boot.
+const DAQ_VREF_FROM_STATION: u32 = 0x200;
+/// DAQ flags (word 15) bit 10: the reference was restored from flash at boot.
+const DAQ_VREF_RESTORED: u32 = 0x400;
+
+/// Where the DAQ's applied MCP3564R reference came from, from its flags.
+pub(crate) fn daq_reference_source(flags: u32) -> &'static str {
+    if flags & DAQ_VREF_FROM_STATION != 0 {
+        "reference from the station this boot"
+    } else if flags & DAQ_VREF_RESTORED != 0 {
+        "reference restored from flash"
+    } else {
+        "built-in nominal reference"
+    }
+}
+
+/// MCP3564R references this station has published this run (bit patterns).
+static PUBLISHED_REFERENCES: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+/// This station published `vref` as DAQ_MCP_REFERENCE.
+pub(crate) fn note_daq_reference(vref: f32) {
+    let mut list = PUBLISHED_REFERENCES.lock().unwrap();
+    if !list.contains(&vref.to_bits()) {
+        list.push(vref.to_bits());
+        if list.len() > 16 {
+            list.remove(0);
+        }
+    }
+}
+/// The DAQ took the station's calibration under an older reference it held
+/// (nominal, or one this station sent before) and then converted it to the
+/// station's reference: the station's value, stale (see
+/// `network_variables::daq_identity_after_board_rescale`).
+fn daq_rescaled_from_station(calibration: &crate::loadcell::LoadcellCalibrationFile, identity: u32) -> bool {
+    let mut olds = PUBLISHED_REFERENCES.lock().unwrap().clone();
+    olds.push(crate::loadcell::mcp_reference::NOMINAL_MCP_VREF_V.to_bits());
+    olds.into_iter()
+        .map(f32::from_bits)
+        .filter(|old| *old != calibration.mcp_vref_v)
+        .any(|old| crate::network_variables::daq_identity_after_board_rescale(calibration, old).ok() == Some(identity))
+}
 /// Health reports come every 5 s; two missed ones is an outage.
 const DAQ_REPORT_FRESH: Duration = Duration::from_secs(12);
 /// The DAQ pulls the station's values after discovery; give it this long
@@ -484,7 +526,8 @@ fn daq_observed(state: &AppState, report: Option<DaqReport>, now: Instant) -> (O
     if report.identity == desired {
         return (Some(report.boot), Observed::Match, Some(desired));
     }
-    if report.flags & DAQ_ALL_FROM_STATION != DAQ_ALL_FROM_STATION && report.uptime_ms < DAQ_LOAD_GRACE_MS {
+    let loaded = DAQ_ALL_FROM_STATION | DAQ_VREF_FROM_STATION;
+    if report.flags & loaded != loaded && report.uptime_ms < DAQ_LOAD_GRACE_MS {
         return (
             Some(report.boot),
             Observed::Loading("The DAQ is loading the station's values after its boot.".into()),
@@ -502,12 +545,17 @@ fn daq_observed(state: &AppState, report: Option<DaqReport>, now: Instant) -> (O
     }
     let class = if report.identity == crate::network_variables::daq_default_identity() {
         Class::Default
-    } else if daq_known(report.identity) {
+    } else if daq_known(report.identity) || daq_rescaled_from_station(&calibration, report.identity) {
         Class::Known
     } else {
         Class::Unknown
     };
-    let board = format!("calibration {:08x} (station {:08x})", report.identity, desired);
+    let board = format!(
+        "calibration {:08x} (station {:08x}), {}",
+        report.identity,
+        desired,
+        daq_reference_source(report.flags)
+    );
     (
         Some(report.boot),
         Observed::Mismatch {

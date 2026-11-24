@@ -2215,7 +2215,7 @@ const SUPERSEDABLE_TYPES: &[&str] = &[
     "FLIGHT_STATE", "BOARD_RECOVERY_REQUEST", "AB_FILL_DRIVE_SETTINGS",
     "AV_BAY_UNDERGLOW", "FLIGHT_BUZZER", "DAQ_LOADCELL_CALIBRATION", "DAQ_KG50_CALIBRATION",
     "DAQ_LOG_CLOCK", "DAQ_THERMAL_CALIBRATION", "DAQ_FILTER_CALIBRATION", "DAQ_KG50_INPUT",
-    "DAQ_SD_RETRY",
+    "DAQ_MCP_REFERENCE", "DAQ_SD_RETRY",
 ];
 /// How long a recovery waits for supersedable control work owed to its own
 /// boards before superseding it. Short, so the board's PREPARE query (15 s)

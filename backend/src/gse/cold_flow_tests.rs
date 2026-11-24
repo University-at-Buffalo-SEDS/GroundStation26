@@ -512,6 +512,7 @@ async fn actual_cold_flow_routes_physical_edge_auth_cancel_and_no_launch_clock()
                     reference_c: 20.,
                     raw_per_c: 0.01,
                     points: vec![],
+                    fitted_mcp_vref_v: None,
                 },
             );
         }

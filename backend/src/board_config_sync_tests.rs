@@ -389,3 +389,68 @@ async fn a_daq_calibration_from_another_writer_is_a_conflict() {
     tick(state, t);
     assert_eq!(item_for_test(state, Item::DaqCalibration).phase, Phase::Synced);
 }
+
+#[test]
+fn the_daq_identity_continues_over_the_reference_float() {
+    let mut cfg = crate::loadcell::LoadcellCalibrationFile::default();
+    crate::loadcell::normalize_calibration(&mut cfg);
+    cfg.ch1.m = Some(1234.5);
+    cfg.extra_channels.get_mut("ch1").unwrap().linear.m = Some(1234.5);
+    let floats: [f32; 17] = [
+        1234.5, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    ];
+    let crc = |vref: f32| {
+        let mut bytes: Vec<u8> = floats.iter().flat_map(|v| v.to_le_bytes()).collect();
+        bytes.extend_from_slice(&vref.to_le_bytes());
+        crc32fast::hash(&bytes)
+    };
+    assert_eq!(crate::network_variables::daq_calibration_identity(&cfg).unwrap(), crc(2.4));
+    cfg.mcp_vref_v = 2.2;
+    assert_eq!(crate::network_variables::daq_calibration_identity(&cfg).unwrap(), crc(2.2));
+    let mut defaults = floats;
+    defaults[0] = 1.0;
+    let mut bytes: Vec<u8> = defaults.iter().flat_map(|v| v.to_le_bytes()).collect();
+    bytes.extend_from_slice(&2.4_f32.to_le_bytes());
+    assert_eq!(crate::network_variables::daq_default_identity(), crc32fast::hash(&bytes));
+    // The DAQ converting the station's 2.4 V calibration to 2.2 V on board.
+    let mut board = floats;
+    board[0] = (1234.5_f64 / (2.2_f32 as f64 / 2.4_f32 as f64)) as f32;
+    board[5] = (1.0_f64 / (2.2_f32 as f64 / 2.4_f32 as f64)) as f32;
+    let mut bytes: Vec<u8> = board.iter().flat_map(|v| v.to_le_bytes()).collect();
+    bytes.extend_from_slice(&2.2_f32.to_le_bytes());
+    assert_eq!(
+        crate::network_variables::daq_identity_after_board_rescale(&cfg, 2.4).unwrap(),
+        crc32fast::hash(&bytes)
+    );
+}
+
+#[test]
+fn the_reference_flags_are_decoded() {
+    assert_eq!(daq_reference_source(0x21F), "reference from the station this boot");
+    assert_eq!(daq_reference_source(0x41F), "reference restored from flash");
+    assert_eq!(daq_reference_source(0x1F), "built-in nominal reference");
+}
+
+/// The DAQ took the station's calibration before its new reference and then
+/// converted it on board: the station's own value, stale, so it is re-sent
+/// rather than raised as a conflict. Until the reference arrives it is loading.
+#[tokio::test]
+async fn a_calibration_the_daq_rescaled_is_resent_not_a_conflict() {
+    let fixture = Fixture::new().await;
+    let state = &fixture.state;
+    non_default_calibration(state);
+    let board = {
+        let mut calibration = state.loadcell_calibration.lock().unwrap();
+        calibration.mcp_vref_v = 2.2;
+        crate::network_variables::daq_identity_after_board_rescale(&calibration, 2.4).unwrap()
+    };
+    let t = Instant::now();
+    observe_daq_health_for_test(state, &daq_health_words(board, 0x1F, 5_000), t);
+    tick(state, t);
+    assert_eq!(item_for_test(state, Item::DaqCalibration).phase, Phase::Resyncing, "loading");
+    observe_daq_health_for_test(state, &daq_health_words(board, 0x21F, 60_000), t);
+    tick(state, t);
+    let item = item_for_test(state, Item::DaqCalibration);
+    assert_eq!(item.phase, Phase::Resyncing, "{}", item.message);
+    assert!(item.board_value.as_deref().unwrap_or_default().contains("reference from the station"), "{item:?}");
+}
