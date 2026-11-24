@@ -23,34 +23,34 @@ unscaled.
 
 Solved with the model (same seed):
 
-- dry mass that reaches 3048 m with the measured motor: none: the measured motor peaks at about 3414 m near 15 kg dry (lighter airframes are drag-limited); 5 kg: 3063 m, 10 kg: 3335 m, 15 kg: 3414 m, 20 kg: 3277 m, 25 kg: 2829 m, 40.84 kg: 1516 m
-- total impulse that reaches 3048 m with this airframe (measured curve shape): 14422 N s
-- apogee with a full 8 kg N2O fill (impulse and propellant scaled by 8/5.6 = 13.1 kN s): 2665 m
+- dry mass that reaches 3048 m with the measured motor: none: the measured motor peaks at about 3415 m near 15 kg dry (lighter airframes are drag-limited); 5 kg: 3063 m, 10 kg: 3336 m, 15 kg: 3415 m, 20 kg: 3278 m, 25 kg: 2830 m, 40.84 kg: 1518 m
+- total impulse that reaches 3048 m with this airframe (measured curve shape): 14414 N s
+- apogee with a full 8 kg N2O fill (impulse and propellant scaled by 8/5.6 = 13.1 kN s): 2667 m
 
 | | nominal_10k | measured_motor | high_wind | early_apogee_noise | off_nominal |
 |---|---|---|---|---|---|
 | purpose | nominal flight to 10,000 ft (measured curve shape, scaled impulse) | the 2026-11-16 measured motor, unscaled, on the SWEET_V6 airframe | nominal motor in 9 m/s (20 mph, the SA Cup launch limit) wind with 3 m/s gusts | Kalman stress: noisy baro, large Mach/port error, outliers, a false-descent pressure step before apogee, big ejection spikes | FC logic: late/hard main (opens at 300 m), IMU saturation glitch, baro freeze, GPS dropout and jump |
-| total impulse (kN s) | 14.42 scaled | 9.19 measured | 14.42 scaled | 14.42 scaled | 14.42 scaled |
+| total impulse (kN s) | 14.41 scaled | 9.19 measured | 14.41 scaled | 14.41 scaled | 14.41 scaled |
 | liftoff mass (kg) | 51.35 | 47.54 | 51.35 | 51.35 | 51.35 |
 | wind (m/s from deg, gust sigma) | 4.0 from 300.0, 1.0 | 4.0 from 300.0, 1.0 | 9.0 from 300.0, 3.0 | 4.0 from 300.0, 1.0 | 4.0 from 300.0, 1.0 |
 | liftoff (s) | 10.152 | 10.126 | 10.152 | 10.152 | 10.152 |
-| rail exit (s, m/s) | 10.646, 25.9 | 10.635, 24.0 | 10.646, 25.9 | 10.646, 25.9 | 10.646, 25.9 |
-| burnout: thrust < 5% peak / zero (s) | 17.265 / 19.395 | 15.8 / 17.5 | 17.265 / 19.395 | 17.265 / 19.395 | 17.265 / 19.395 |
-| max speed (m/s at s) | 220.5 at 15.82 | 144.9 at 14.68 | 219.6 at 15.82 | 220.5 at 15.82 | 220.6 at 15.82 |
+| rail exit (s, m/s) | 10.776, 34.8 | 10.775, 32.2 | 10.776, 34.8 | 10.776, 34.8 | 10.776, 34.8 |
+| burnout: thrust < 5% peak / zero (s) | 17.263 / 19.392 | 15.8 / 17.5 | 17.263 / 19.392 | 17.263 / 19.392 | 17.263 / 19.392 |
+| max speed (m/s at s) | 220.4 at 15.82 | 145.0 at 14.68 | 219.5 at 15.82 | 220.5 at 15.82 | 220.5 at 15.82 |
 | max Mach | 0.663 | 0.433 | 0.666 | 0.662 | 0.662 |
 | max boost accel (g) | 8.78 | 7.48 | 8.8 | 8.78 | 8.78 |
-| shocks: drogue / main / landing+tip-over (g) | 9.62 / 8.9 / 15.58 | 9.61 / 8.9 / 15.6 | 9.65 / 8.94 / 14.75 | 9.62 / 8.92 / 15.63 | 9.63 / 8.94 / 15.43 |
-| apogee (m AGL / ft) | 3048.4 / 10001 | 1512.1 / 4961 | 3013.0 / 9885 | 3038.5 / 9969 | 3038.0 / 9967 |
-| apogee time (s) | 36.584 | 29.407 | 36.421 | 36.557 | 36.544 |
-| drogue (s, m) | 37.785, 3041.5 | 30.607, 1505.1 | 37.621, 3006.1 | 37.758, 3031.6 | 37.744, 3031.2 |
-| drogue rate (m/s) | 25.1 | 24.3 | 25.4 | 25.2 | 25.0 |
-| main (s, m) | 141.272, 450.1 | 74.748, 449.9 | 138.222, 449.8 | 140.476, 450.2 | 147.512, 292.8 |
-| main rate (m/s) | 6.5 | 6.7 | 6.6 | 6.7 | 6.3 |
-| landing (s, m/s) | 204.03, 6.37 | 136.746, 6.66 | 203.208, 5.85 | 203.822, 6.62 | 189.998, 6.48 |
-| data end (s) | 235.76 | 168.58 | 234.29 | 235.72 | 221.43 |
-| landing drift (m, bearing) | 1012.1, 87.4 | 736.6, 87.5 | 1543.0, 107.7 | 991.8, 78.6 | 972.1, 77.9 |
-| rows IMU/BARO/GPS | 10257/11791/2242 | 8343/8430/1588 | 10162/11717/2227 | 10265/11789/2241 | 9940/11074/1948 |
-| size (kB) | 947 | 716 | 947 | 941 | 893 |
+| shocks: drogue / main / landing+tip-over (g) | 9.61 / 8.89 / 15.38 | 9.61 / 8.9 / 15.55 | 9.64 / 8.85 / 14.25 | 9.62 / 8.93 / 15.64 | 9.62 / 8.89 / 15.65 |
+| apogee (m AGL / ft) | 3047.7 / 9999 | 1514.0 / 4967 | 3017.4 / 9900 | 3039.1 / 9971 | 3038.0 / 9967 |
+| apogee time (s) | 36.579 | 29.415 | 36.441 | 36.556 | 36.542 |
+| drogue (s, m) | 37.779, 3040.8 | 30.615, 1507.1 | 37.642, 3010.6 | 37.756, 3032.2 | 37.743, 3031.1 |
+| drogue rate (m/s) | 25.2 | 24.3 | 24.7 | 25.1 | 25.1 |
+| main (s, m) | 140.947, 450.1 | 74.825, 449.9 | 141.001, 450.0 | 141.059, 450.0 | 147.199, 292.8 |
+| main rate (m/s) | 6.2 | 6.7 | 6.6 | 6.6 | 6.5 |
+| landing (s, m/s) | 207.912, 6.56 | 136.825, 6.66 | 204.609, 7.08 | 204.789, 6.49 | 188.772, 6.5 |
+| data end (s) | 239.31 | 168.47 | 235.57 | 236.83 | 221.09 |
+| landing drift (m, bearing) | 996.4, 90.7 | 733.3, 88.3 | 1565.7, 106.7 | 966.1, 79.3 | 973.1, 75.8 |
+| rows IMU/BARO/GPS | 10296/11968/2277 | 8328/8426/1588 | 10178/11781/2240 | 10300/11844/2252 | 10002/11055/1944 |
+| size (kB) | 957 | 714 | 950 | 946 | 895 |
 
 Event times are the truth model's. The scripted deployments are what the FC is expected to command (drogue about 1.2 s after apogee, main 0.3 s after crossing 457.2 m), except where a variant says otherwise; the replay is open loop, so the FC's own pyro decisions do not change the data. Each folder's summary.json has the full numbers, seed and glitch list.
 
