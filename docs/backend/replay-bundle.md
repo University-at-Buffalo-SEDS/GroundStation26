@@ -46,6 +46,30 @@ resource:
     the bundle's time and without raster charts, for the ones that apply;
   - `exports/index.json`: which review exports the bundle holds, with file
     name and window.
+- for an SD-resolved recording (`backend/src/recording_bundle_sd.rs`):
+  - `data/receipt_telemetry.csv`: the rows as received (`main.telemetry`),
+    in the CSV of a recording that was never resolved; the bundle's
+    `data/telemetry.csv` is the resolved timeline with each row's
+    provenance. At most 96 MiB (else listed as missing with 507);
+  - the SD source list's later pages (`derived/sd_sources/after_{n}.json`);
+  - with `sd_files`, the original SD files byte for byte
+    (`sd/sources/{sha256}.csv`, route `/api/recordings/{id}/sd/sources/{sha256}`);
+  - the manifest's `sd` object: resolved row count, receipt CSV rows and
+    bytes, the SD sources listed and their bytes, and the files included
+    within the budget.
+  The SD provenance the merge used (resolution summary, each import's
+  manifest and calibration metadata, per-row provenance, unresolved
+  samples) is already in `replay.json` `sd_provenance`.
+- the station records (`backend/src/recording_bundle_records.rs`), byte for
+  byte as their routes answer: `records/checklists.json`
+  (`GET /api/checklists`), `records/checklists_export.json` and
+  `records/checklist_signoffs.csv` (`/api/checklists/export`, `.csv`),
+  `records/recovery_history.json` and `.csv` (`/api/recovery/export.json`,
+  `.csv`). They are not filtered to the recording: the checklist document
+  is the station's one current document and its sign-offs have no recording
+  link, and recovery events name a launch session the station does not map
+  to recordings; both are small. The checklist routes refuse anonymous
+  callers, so an anonymous bundle lists them as missing (403).
 
 `replay.json` gains `layout`, `boards`, `view_config`, `valve_mappings` (from
 the layout's valve labels), `vehicle_geometry`, `mode` and
@@ -61,15 +85,19 @@ snapshot; a client computes them from `replay.json`.
 
 With these entries the UI answers the recording CSV, the time-range CSV
 (`GET /api/recordings/csv`), the report studio's preview, CSV and DAQ SD
-CSV/TSV, and the default-window review exports with no station, byte for
-byte as this station would (UI `docs/replay-bundle.md`, "Exports offline").
-Excel/PDF reports, review exports of a custom window, and exports of
-SD-resolved recordings still need the station.
+CSV/TSV, the default-window review exports, and the checklist and recovery
+exports with no station, byte for byte as this station would (UI
+`docs/replay-bundle.md`, "Exports offline"), SD-resolved recordings
+included. Excel/PDF reports and review exports of a custom window still need
+the station.
 
 The time-range CSV writes over-range values as `OVR`/`-OVR`, like the
 recording CSV, so its row cells are the recording CSV's. It reads each
 primary recording's receipt rows (`telemetry`), never an SD-resolved
-timeline.
+timeline; offline, an SD-resolved recording's range CSV therefore comes from
+`data/receipt_telemetry.csv`, and its reports from the resolved
+`data/telemetry.csv` (canonical UTC time and provenance per row, as the
+report worker reads `sd_replay_telemetry`).
 
 Options:
 
@@ -88,6 +116,9 @@ The trajectory entry (`derived/trajectory.json`) carries the flight-phase
 segmentation (`phases`, `events`, a `phase` on each point;
 docs/backend/terrain.md "Flight phases"), so a client colours the track by
 phase with no station.
+- `records=false` leaves out the station records (included by default).
+- `sd_files=1` adds an SD-resolved recording's original SD files, in listing
+  order within `sd_files_max_mb` (16 MiB by default, at most 64).
 
 The ZIP writer is `flight_review::zip` (deflate, no ZIP64). Bundles are
 reproducible: the same recording and time give the same bytes.
@@ -116,15 +147,29 @@ at most 256 MiB) stores the bundle's recording on this station
   Recorded alerts come from `derived/alerts.json`.
 - The bundle's configuration entries are not installed; the station's own
   configuration labels the replay.
+- An SD-resolved recording (its `data/telemetry.csv` has `canonical_utc_ms`
+  and `provenance_json`) imports from two CSVs: `data/receipt_telemetry.csv`
+  becomes `telemetry` and `data/telemetry.csv` becomes
+  `sd_replay_telemetry` (canonical time, provenance, over-range masks), with
+  `sd_replay_loadcell_units`. `sd_resolution_manifest` comes from
+  `replay.json` `sd_provenance.resolution`, `sd_imports` from
+  `sd_provenance.imports` and the bundled source list, and
+  `sd_source_chunks` from any bundled original SD files. The imported
+  recording's CSV, receipt rows, SD source list, original files, replay
+  rows and `sd_provenance` imports equal the source's. Not carried: the SD
+  samples (`sd_samples` stays empty; each resolved SD row keeps its record
+  in its provenance, and the unresolved ones remain only in the bundle's
+  `replay.json`) and the coverage segments, so the imported replay has no
+  `valid_until_ms`.
 
 Responses: `201` `{"id", "label", "rows", "alerts", "start_ms", "end_ms",
 "source", "csv_sha256"}`; `400` an unreadable or unsafe archive, a manifest
 that is not `gsreplay`, a listed entry missing or differing, or a malformed
 CSV; `401`/`403` not signed in or not an administrator; `409` `{"error",
 "id"}` the same source recording with the same CSV was already imported;
-`413` larger than 256 MiB; `422` a newer bundle version, or a recording
-merged with board SD data (its CSV has `canonical_utc_ms`), which cannot be
-imported yet.
+`413` larger than 256 MiB; `422` a newer bundle version, or an SD-resolved
+recording whose bundle lacks `data/receipt_telemetry.csv` (made by an older
+station).
 
 Checks:
 
@@ -133,13 +178,22 @@ Checks:
   route. It also writes this station's answers to the export requests the UI
   answers offline (`replay-bundle/exports/`, listed in
   `exports/requests.json`), for the bundled flight and for a second
-  recording with the report cases the flight lacks.
+  recording with the report cases the flight lacks. A third recording
+  (`contract_fixtures_sd.rs`) is SD-resolved, synthetic but with the SD
+  import and resolver's tables and row shapes: physical SD records,
+  median-bin and paired rows, an over-range row, an ambiguous boot's
+  labelled series, network rows (one converted from the legacy raw scale);
+  its bundle with the original SD file is `replay-bundle/sd.gsreplay` and
+  its exports are the `sd` case of `exports/requests.json`.
+- `recording_bundle_records::tests` checks each record entry against its
+  route byte for byte, the anonymous 403s and `records=false`.
 - `recording_import::tests` builds bundles of recordings with every CSV rule
   (over-range markers, legacy type names, formula-like text, quoted line
   breaks, NULLs, the IGT provenance column), imports them into a fresh store
   and checks the CSV export byte for byte, the replay samples, the alerts,
   the listing, the 409 on a second import, administrator-only access and
-  every refusal.
+  every refusal; and that an SD-resolved bundle imports with both
+  timelines (and is refused without its receipt rows).
 - `recording_bundle::tests::realistic_capture_bundle_size` (ignored; run it
   with `--ignored --nocapture`) reports sizes. A ten-minute capture of 154,200
   rows (a 20.3 MB database) makes a 4.3 MB bundle.

@@ -1,0 +1,142 @@
+{
+  "channels": [
+    {
+      "count": 3,
+      "data_type": "KG1000",
+      "finite_count": 2,
+      "index": 0,
+      "key": "[\"DAQ\",\"KG1000\",0]",
+      "label": "DAQ / KG1000 / 0",
+      "points": [
+        [
+          1767398401007,
+          0.375
+        ],
+        [
+          1767398402007,
+          0.5
+        ],
+        [
+          1767398403007,
+          null
+        ]
+      ],
+      "regression": {
+        "status": "not_applicable"
+      },
+      "sender": "DAQ",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_raw_input"
+    },
+    {
+      "count": 3,
+      "data_type": "LOADCELL_WEIGHT_KG",
+      "finite_count": 2,
+      "index": 0,
+      "key": "[\"DAQ\",\"LOADCELL_WEIGHT_KG\",0]",
+      "label": "DAQ / LOADCELL_WEIGHT_KG / 0",
+      "points": [
+        [
+          1767398401007,
+          1.75
+        ],
+        [
+          1767398402007,
+          2.0
+        ],
+        [
+          1767398403007,
+          null
+        ]
+      ],
+      "regression": {
+        "epochs": [
+          {
+            "channel": {
+              "fit": null,
+              "linear": {
+                "b": 1.0,
+                "m": 2.0
+              },
+              "points": [],
+              "zero_raw": null
+            },
+            "equation": "y = f(raw) - f(zero_raw) if tare exists, else f(raw); linear: f(x)=m*x+b; polyN: descending a..e coefficients evaluated at (x-x0)",
+            "first_sample_ms": 1767398401007,
+            "last_sample_ms": 1767398403007,
+            "recording": "groundstation_recording_2026-01-03_00-00-00_000.db",
+            "samples": 3
+          }
+        ],
+        "samples_without_metadata": 0,
+        "status": "recorded_calibration"
+      },
+      "sender": "DAQ",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_derived"
+    },
+    {
+      "count": 3,
+      "data_type": "OX_TANK_PRESSURE",
+      "finite_count": 3,
+      "index": 0,
+      "key": "[\"VB\",\"OX_TANK_PRESSURE\",0]",
+      "label": "VB / OX_TANK_PRESSURE / 0",
+      "points": [
+        [
+          1767398401003,
+          501.5
+        ],
+        [
+          1767398402003,
+          502.5
+        ],
+        [
+          1767398403003,
+          503.5
+        ]
+      ],
+      "regression": {
+        "status": "not_applicable"
+      },
+      "sender": "VB",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_raw_input"
+    },
+    {
+      "count": 3,
+      "data_type": "DAQ_POWER_MONITOR",
+      "finite_count": 3,
+      "index": 2,
+      "key": "[\"DAQ\",\"DAQ_POWER_MONITOR\",2]",
+      "label": "DAQ / DAQ_POWER_MONITOR / 2",
+      "points": [
+        [
+          1767398401008,
+          12.25
+        ],
+        [
+          1767398402008,
+          12.5
+        ],
+        [
+          1767398403008,
+          12.75
+        ]
+      ],
+      "regression": {
+        "status": "not_applicable"
+      },
+      "sender": "DAQ",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_unclassified"
+    }
+  ],
+  "end_ms": 1767398403009,
+  "recorded_rows": 20,
+  "start_ms": 1767398401003
+}

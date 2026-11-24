@@ -33,6 +33,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
 
+#[path = "contract_fixtures_sd.rs"]
+pub(crate) mod sd;
+
 const UPDATE_ENV: &str = "GS_UPDATE_CONTRACT_FIXTURES";
 /// Fixed clock reading used for alert events in the fixtures.
 const T0: i64 = 1_767_225_600_000;
@@ -709,7 +712,9 @@ async fn replay_bundle(root: &Path, state: &Arc<AppState>, app: &axum::Router, o
     // Loading a calibration file without a 50 kg input stamp stamps it with the
     // wall clock; pin it so the bundle's calibration entry is reproducible.
     state.loadcell_calibration.lock().unwrap().kg50_input_stamp_ms = T0 as u64;
-    let options = crate::recording_bundle::Options { tiles: true, tiles_max_mb: Some(1), ..Default::default() };
+    // Station records (checklists, recovery history) are process-wide state
+    // other tests change; recording_bundle_records tests them.
+    let options = crate::recording_bundle::Options { tiles: true, tiles_max_mb: Some(1), records: Some(false), ..Default::default() };
     let bundle = crate::recording_bundle::build(state.clone(), &headers, id, &options, T0).await.unwrap();
     let again = crate::recording_bundle::build(state.clone(), &headers, id, &options, T0).await.unwrap();
     assert_eq!(bundle_manifest(&bundle), bundle_manifest(&again), "a bundle's entries are reproducible");
@@ -734,7 +739,7 @@ async fn replay_bundle(root: &Path, state: &Arc<AppState>, app: &axum::Router, o
     out.add("replay-bundle/flight.manifest", manifest);
     binary_fixture("replay-bundle/flight.gsreplay", &bundle);
     binary_fixture("replay-bundle/flight.csv", &csv);
-    bundle_exports(root, app, id, &bundle, out).await;
+    bundle_exports(root, state, app, id, &bundle, out).await;
 }
 
 /// GET with the viewer's credentials; the report worker allows one job at a
@@ -841,7 +846,7 @@ async fn report_case_rows(db: &sqlx::SqlitePool, t0: i64) {
 /// the UI makes it, the status, and the file holding the station's answer;
 /// the UI answers the same requests from the bundle with no station and must
 /// produce the same bytes (JSON previews: the same JSON).
-async fn bundle_exports(root: &Path, app: &axum::Router, id: &str, bundle: &[u8], out: &mut Fixtures) {
+async fn bundle_exports(root: &Path, state: &Arc<AppState>, app: &axum::Router, id: &str, bundle: &[u8], out: &mut Fixtures) {
     let mut requests = Vec::new();
     let mut fetch = async |case: &str, path: String, file: &str| {
         let (status, body) = get_bytes(app, &path).await;
@@ -939,6 +944,8 @@ async fn bundle_exports(root: &Path, app: &axum::Router, id: &str, bundle: &[u8]
     for (request, file) in reports("cases", cases, t1 + 1_000, t1 + 6_000, &subset) {
         fetch(report_route(request), &file).await;
     }
+    // An SD-resolved recording two days after the flight (contract_fixtures_sd).
+    sd::fixtures(root, state, app, &mut requests, out).await;
     out.add("replay-bundle/exports/requests", Value::Array(requests));
 }
 

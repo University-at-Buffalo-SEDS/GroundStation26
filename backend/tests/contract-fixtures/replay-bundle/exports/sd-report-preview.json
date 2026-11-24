@@ -1,0 +1,744 @@
+{
+  "channels": [
+    {
+      "count": 6,
+      "data_type": "OX_TANK_PRESSURE",
+      "finite_count": 6,
+      "index": 0,
+      "key": "[\"VB\",\"OX_TANK_PRESSURE\",0]",
+      "label": "VB / OX_TANK_PRESSURE / 0",
+      "points": [
+        [
+          1767398400003,
+          500.5
+        ],
+        [
+          1767398401003,
+          501.5
+        ],
+        [
+          1767398402003,
+          502.5
+        ],
+        [
+          1767398403003,
+          503.5
+        ],
+        [
+          1767398404003,
+          504.5
+        ],
+        [
+          1767398405003,
+          505.5
+        ]
+      ],
+      "regression": {
+        "status": "not_applicable"
+      },
+      "sender": "VB",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_raw_input"
+    },
+    {
+      "count": 6,
+      "data_type": "BAROMETER_DATA",
+      "finite_count": 6,
+      "index": 0,
+      "key": "[\"FC\",\"BAROMETER_DATA\",0]",
+      "label": "FC / BAROMETER_DATA / 0",
+      "points": [
+        [
+          1767398400004,
+          0.0
+        ],
+        [
+          1767398401004,
+          10.5
+        ],
+        [
+          1767398402004,
+          21.0
+        ],
+        [
+          1767398403004,
+          31.5
+        ],
+        [
+          1767398404004,
+          42.0
+        ],
+        [
+          1767398405004,
+          52.5
+        ]
+      ],
+      "regression": {
+        "status": "not_applicable"
+      },
+      "sender": "FC",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_unclassified"
+    },
+    {
+      "count": 6,
+      "data_type": "BAROMETER_DATA",
+      "finite_count": 6,
+      "index": 1,
+      "key": "[\"FC\",\"BAROMETER_DATA\",1]",
+      "label": "FC / BAROMETER_DATA / 1",
+      "points": [
+        [
+          1767398400004,
+          90000.0
+        ],
+        [
+          1767398401004,
+          89987.5
+        ],
+        [
+          1767398402004,
+          89975.0
+        ],
+        [
+          1767398403004,
+          89962.5
+        ],
+        [
+          1767398404004,
+          89950.0
+        ],
+        [
+          1767398405004,
+          89937.5
+        ]
+      ],
+      "regression": {
+        "status": "not_applicable"
+      },
+      "sender": "FC",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_unclassified"
+    },
+    {
+      "count": 6,
+      "data_type": "BAROMETER_DATA",
+      "finite_count": 6,
+      "index": 2,
+      "key": "[\"FC\",\"BAROMETER_DATA\",2]",
+      "label": "FC / BAROMETER_DATA / 2",
+      "points": [
+        [
+          1767398400004,
+          25.5
+        ],
+        [
+          1767398401004,
+          25.5
+        ],
+        [
+          1767398402004,
+          25.5
+        ],
+        [
+          1767398403004,
+          25.5
+        ],
+        [
+          1767398404004,
+          25.5
+        ],
+        [
+          1767398405004,
+          25.5
+        ]
+      ],
+      "regression": {
+        "status": "not_applicable"
+      },
+      "sender": "FC",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_unclassified"
+    },
+    {
+      "count": 6,
+      "data_type": "KG50",
+      "finite_count": 6,
+      "index": 0,
+      "key": "[\"DAQ\",\"KG50\",0]",
+      "label": "DAQ / KG50 / 0",
+      "points": [
+        [
+          1767398400005,
+          160000.0
+        ],
+        [
+          1767398401005,
+          176000.0
+        ],
+        [
+          1767398402005,
+          192000.0
+        ],
+        [
+          1767398403005,
+          208000.0
+        ],
+        [
+          1767398404005,
+          224000.0
+        ],
+        [
+          1767398405005,
+          240000.0
+        ]
+      ],
+      "regression": {
+        "status": "not_applicable"
+      },
+      "sender": "DAQ",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_raw_input"
+    },
+    {
+      "count": 3,
+      "data_type": "VALVE_STATE",
+      "finite_count": 3,
+      "index": 0,
+      "key": "[\"VB\",\"VALVE_STATE\",0]",
+      "label": "Pilot",
+      "points": [
+        [
+          1767398400006,
+          0
+        ],
+        [
+          1767398402006,
+          1
+        ],
+        [
+          1767398404006,
+          0
+        ]
+      ],
+      "regression": {
+        "boolean_labels": {
+          "false_label": "Closed",
+          "true_label": "Open",
+          "unknown_label": "Unknown"
+        },
+        "channel_label": "Pilot",
+        "status": "not_applicable"
+      },
+      "sender": "VB",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_state"
+    },
+    {
+      "count": 3,
+      "data_type": "VALVE_STATE",
+      "finite_count": 3,
+      "index": 1,
+      "key": "[\"VB\",\"VALVE_STATE\",1]",
+      "label": "Vent",
+      "points": [
+        [
+          1767398400006,
+          1
+        ],
+        [
+          1767398402006,
+          1
+        ],
+        [
+          1767398404006,
+          1
+        ]
+      ],
+      "regression": {
+        "boolean_labels": {
+          "false_label": "Closed",
+          "true_label": "Open",
+          "unknown_label": "Unknown"
+        },
+        "channel_label": "Vent",
+        "status": "not_applicable"
+      },
+      "sender": "VB",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_state"
+    },
+    {
+      "count": 3,
+      "data_type": "VALVE_STATE",
+      "finite_count": 3,
+      "index": 2,
+      "key": "[\"VB\",\"VALVE_STATE\",2]",
+      "label": "Dump",
+      "points": [
+        [
+          1767398400006,
+          0
+        ],
+        [
+          1767398402006,
+          0
+        ],
+        [
+          1767398404006,
+          0
+        ]
+      ],
+      "regression": {
+        "boolean_labels": {
+          "false_label": "Closed",
+          "true_label": "Open",
+          "unknown_label": "Unknown"
+        },
+        "channel_label": "Dump",
+        "status": "not_applicable"
+      },
+      "sender": "VB",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_state"
+    },
+    {
+      "count": 3,
+      "data_type": "VALVE_STATE",
+      "finite_count": 3,
+      "index": 3,
+      "key": "[\"VB\",\"VALVE_STATE\",3]",
+      "label": "Igniter",
+      "points": [
+        [
+          1767398400006,
+          0
+        ],
+        [
+          1767398402006,
+          1
+        ],
+        [
+          1767398404006,
+          0
+        ]
+      ],
+      "regression": {
+        "boolean_labels": {
+          "false_label": "Closed",
+          "true_label": "Open",
+          "unknown_label": "Unknown"
+        },
+        "channel_label": "Igniter",
+        "status": "not_applicable"
+      },
+      "sender": "VB",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_state"
+    },
+    {
+      "count": 3,
+      "data_type": "VALVE_STATE",
+      "finite_count": 3,
+      "index": 4,
+      "key": "[\"VB\",\"VALVE_STATE\",4]",
+      "label": "Nitrogen",
+      "points": [
+        [
+          1767398400006,
+          0
+        ],
+        [
+          1767398402006,
+          0
+        ],
+        [
+          1767398404006,
+          0
+        ]
+      ],
+      "regression": {
+        "boolean_labels": {
+          "false_label": "Closed",
+          "true_label": "Open",
+          "unknown_label": "Unknown"
+        },
+        "channel_label": "Nitrogen",
+        "status": "not_applicable"
+      },
+      "sender": "VB",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_state"
+    },
+    {
+      "count": 3,
+      "data_type": "VALVE_STATE",
+      "finite_count": 3,
+      "index": 5,
+      "key": "[\"VB\",\"VALVE_STATE\",5]",
+      "label": "Nitrous",
+      "points": [
+        [
+          1767398400006,
+          0
+        ],
+        [
+          1767398402006,
+          0
+        ],
+        [
+          1767398404006,
+          0
+        ]
+      ],
+      "regression": {
+        "boolean_labels": {
+          "false_label": "Closed",
+          "true_label": "Open",
+          "unknown_label": "Unknown"
+        },
+        "channel_label": "Nitrous",
+        "status": "not_applicable"
+      },
+      "sender": "VB",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_state"
+    },
+    {
+      "count": 3,
+      "data_type": "VALVE_STATE",
+      "finite_count": 3,
+      "index": 6,
+      "key": "[\"VB\",\"VALVE_STATE\",6]",
+      "label": "Fill Lines",
+      "points": [
+        [
+          1767398400006,
+          1
+        ],
+        [
+          1767398402006,
+          1
+        ],
+        [
+          1767398404006,
+          1
+        ]
+      ],
+      "regression": {
+        "boolean_labels": {
+          "false_label": "Installed",
+          "true_label": "Removed",
+          "unknown_label": "Unknown"
+        },
+        "channel_label": "Fill Lines",
+        "status": "not_applicable"
+      },
+      "sender": "VB",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_state"
+    },
+    {
+      "count": 6,
+      "data_type": "KG1000",
+      "finite_count": 5,
+      "index": 0,
+      "key": "[\"DAQ\",\"KG1000\",0]",
+      "label": "DAQ / KG1000 / 0",
+      "points": [
+        [
+          1767398400007,
+          0.25
+        ],
+        [
+          1767398401007,
+          0.375
+        ],
+        [
+          1767398402007,
+          0.5
+        ],
+        [
+          1767398403007,
+          null
+        ],
+        [
+          1767398404007,
+          0.75
+        ],
+        [
+          1767398405007,
+          0.875
+        ]
+      ],
+      "regression": {
+        "status": "not_applicable"
+      },
+      "sender": "DAQ",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_raw_input"
+    },
+    {
+      "count": 6,
+      "data_type": "LOADCELL_WEIGHT_KG",
+      "finite_count": 5,
+      "index": 0,
+      "key": "[\"DAQ\",\"LOADCELL_WEIGHT_KG\",0]",
+      "label": "DAQ / LOADCELL_WEIGHT_KG / 0",
+      "points": [
+        [
+          1767398400007,
+          1.5
+        ],
+        [
+          1767398401007,
+          1.75
+        ],
+        [
+          1767398402007,
+          2.0
+        ],
+        [
+          1767398403007,
+          null
+        ],
+        [
+          1767398404007,
+          2.5
+        ],
+        [
+          1767398405007,
+          2.75
+        ]
+      ],
+      "regression": {
+        "epochs": [
+          {
+            "channel": {
+              "fit": null,
+              "linear": {
+                "b": 1.0,
+                "m": 2.0
+              },
+              "points": [],
+              "zero_raw": null
+            },
+            "equation": "y = f(raw) - f(zero_raw) if tare exists, else f(raw); linear: f(x)=m*x+b; polyN: descending a..e coefficients evaluated at (x-x0)",
+            "first_sample_ms": 1767398400007,
+            "last_sample_ms": 1767398405007,
+            "recording": "groundstation_recording_2026-01-03_00-00-00_000.db",
+            "samples": 6
+          }
+        ],
+        "samples_without_metadata": 0,
+        "status": "recorded_calibration"
+      },
+      "sender": "DAQ",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_derived"
+    },
+    {
+      "count": 6,
+      "data_type": "DAQ_POWER_MONITOR",
+      "finite_count": 6,
+      "index": 0,
+      "key": "[\"DAQ\",\"DAQ_POWER_MONITOR\",0]",
+      "label": "DAQ / DAQ_POWER_MONITOR / 0",
+      "points": [
+        [
+          1767398400008,
+          1.25
+        ],
+        [
+          1767398401008,
+          1.25
+        ],
+        [
+          1767398402008,
+          1.25
+        ],
+        [
+          1767398403008,
+          1.25
+        ],
+        [
+          1767398404008,
+          1.25
+        ],
+        [
+          1767398405008,
+          1.25
+        ]
+      ],
+      "regression": {
+        "status": "not_applicable"
+      },
+      "sender": "DAQ",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_unclassified"
+    },
+    {
+      "count": 6,
+      "data_type": "DAQ_POWER_MONITOR",
+      "finite_count": 6,
+      "index": 1,
+      "key": "[\"DAQ\",\"DAQ_POWER_MONITOR\",1]",
+      "label": "DAQ / DAQ_POWER_MONITOR / 1",
+      "points": [
+        [
+          1767398400008,
+          0.5
+        ],
+        [
+          1767398401008,
+          0.5
+        ],
+        [
+          1767398402008,
+          0.5
+        ],
+        [
+          1767398403008,
+          0.5
+        ],
+        [
+          1767398404008,
+          0.5
+        ],
+        [
+          1767398405008,
+          0.5
+        ]
+      ],
+      "regression": {
+        "status": "not_applicable"
+      },
+      "sender": "DAQ",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_unclassified"
+    },
+    {
+      "count": 6,
+      "data_type": "DAQ_POWER_MONITOR",
+      "finite_count": 6,
+      "index": 2,
+      "key": "[\"DAQ\",\"DAQ_POWER_MONITOR\",2]",
+      "label": "DAQ / DAQ_POWER_MONITOR / 2",
+      "points": [
+        [
+          1767398400008,
+          12.0
+        ],
+        [
+          1767398401008,
+          12.25
+        ],
+        [
+          1767398402008,
+          12.5
+        ],
+        [
+          1767398403008,
+          12.75
+        ],
+        [
+          1767398404008,
+          13.0
+        ],
+        [
+          1767398405008,
+          13.25
+        ]
+      ],
+      "regression": {
+        "status": "not_applicable"
+      },
+      "sender": "DAQ",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_unclassified"
+    },
+    {
+      "count": 6,
+      "data_type": "DAQ_POWER_MONITOR",
+      "finite_count": 6,
+      "index": 3,
+      "key": "[\"DAQ\",\"DAQ_POWER_MONITOR\",3]",
+      "label": "DAQ / DAQ_POWER_MONITOR / 3",
+      "points": [
+        [
+          1767398400008,
+          0.5
+        ],
+        [
+          1767398401008,
+          0.625
+        ],
+        [
+          1767398402008,
+          0.75
+        ],
+        [
+          1767398403008,
+          0.875
+        ],
+        [
+          1767398404008,
+          1.0
+        ],
+        [
+          1767398405008,
+          1.125
+        ]
+      ],
+      "regression": {
+        "status": "not_applicable"
+      },
+      "sender": "DAQ",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_unclassified"
+    },
+    {
+      "count": 1,
+      "data_type": "LOADCELL_WEIGHT_KG",
+      "finite_count": 1,
+      "index": 0,
+      "key": "[\"DAQ [SD boot-fixture-1]\",\"LOADCELL_WEIGHT_KG\",0]",
+      "label": "DAQ [SD boot-fixture-1] / LOADCELL_WEIGHT_KG / 0",
+      "points": [
+        [
+          1767398402500,
+          1.875
+        ]
+      ],
+      "regression": {
+        "reason": "Insufficient matched raw/calibrated samples; current calibration is not substituted.",
+        "status": "unavailable"
+      },
+      "sender": "DAQ [SD boot-fixture-1]",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_derived"
+    }
+  ],
+  "end_ms": 1767398405009,
+  "recorded_rows": 40,
+  "start_ms": 1767398400003
+}
