@@ -19,6 +19,9 @@ resource:
   fire-archive entry that names the recording.
 - the station's five newest flight plans (`derived/flight_plans.json`, when
   there are any), for a predicted-vs-actual overlay offline.
+- the recovery search tracks recorded from the recording's start until 6
+  hours after its end, as `derived/recovery_search.json`, only when there are
+  any ([recovery-search.md](recovery-search.md)).
 
 `GET /api/flight_plans/{id}/bundle` builds the same format for a flight plan
 (`recording_bundle::build_plan`, docs/flight-plans.md). It has

@@ -9,6 +9,11 @@ location.
 The frontend side (permission prompts, background reporting per platform,
 the device test checklist) is in the UI repository's `docs/proximity-lock.md`.
 
+The proximity lock never sends a location. The separate recovery search
+([backend/recovery-search.md](backend/recovery-search.md)) is the only
+feature that shares a track. It needs its own explicit opt-in on each device,
+only while an operator runs a search, and the proximity lock does not use it.
+
 ## Summary
 
 | | |
