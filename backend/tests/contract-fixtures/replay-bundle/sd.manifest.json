@@ -128,11 +128,11 @@
       "sha256": "895cf7b7a317d99f8578150007eff67bfcd5b1d384e619a254c11e17c8b46930"
     },
     {
-      "bytes": 961,
+      "bytes": 998,
       "media_type": "application/json",
       "path": "config/calibration.json",
       "route": "/api/calibration",
-      "sha256": "369cd9b5d97a8c0a741a2e73f77f54ae8254c629c7b576da56d2b3853f8e1923"
+      "sha256": "47fa7b25520b51ce628eb63889347f199ce9dc6d8701e980f01e45b3667dc594"
     },
     {
       "bytes": 1129,
