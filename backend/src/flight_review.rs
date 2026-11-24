@@ -12,7 +12,11 @@
 //!   segments and ranges, `merge-sd.*`, `sd-only.*`, `fire.*`).
 //! - `GET /api/flight_review/recording/{id}/motor_export?from_ms&to_ms` and
 //!   `.../flight_export`: ZIP bundles (`export`); without a range, the burn
-//!   window / the flight.
+//!   window / the flight. `raster=false` leaves the PNG charts and the PDF
+//!   report out (as a replay bundle's exports and the UI's offline answers).
+//!
+//! A replay bundle carries what these need for any range (`offline`), so a
+//! client answers custom windows with no station.
 //!
 //! Read only: nothing here writes a recording, a capture or station state.
 use crate::auth::Permission;
@@ -36,9 +40,10 @@ pub(crate) mod data;
 pub(crate) mod export;
 pub(crate) mod flight;
 pub(crate) mod motor;
+pub(crate) mod offline;
 pub(crate) mod plot;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 pub(crate) mod zip;
 
 pub(crate) use data::{LiveEntry, note};
@@ -106,6 +111,28 @@ pub(crate) fn sections(mode: &str, firmware_sim: bool) -> (bool, bool) {
 pub(crate) struct Range {
     pub from_ms: Option<i64>,
     pub to_ms: Option<i64>,
+    /// Exports only: `false` leaves the PNG charts and PDF report out.
+    pub raster: Option<bool>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static PINNED_NOW: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Pins the clock the review routes stamp (`created_ms`, `generated_ms`) on
+/// this thread, so fixtures made through the routes are reproducible.
+#[cfg(test)]
+pub(crate) fn pin_now(now_ms: Option<i64>) {
+    PINNED_NOW.with(|c| c.set(now_ms));
+}
+
+fn now_ms() -> i64 {
+    #[cfg(test)]
+    if let Some(now) = PINNED_NOW.with(std::cell::Cell::get) {
+        return now;
+    }
+    crate::telemetry_task::get_current_timestamp_ms() as i64
 }
 
 // ------------------------------------------------------------------ sources
@@ -171,6 +198,46 @@ fn archive_report(record: &crate::fire_archive::FireRecord, curve: Vec<[f64; 2]>
     }
 }
 
+/// What a review takes from the source besides its rows: the event
+/// capture's manifest (label, mode, provenance, applied plan) and the DAQ
+/// launch file attached to a plain capture (every row; a review keeps those
+/// in its range).
+#[derive(Default)]
+pub(crate) struct SourceContext {
+    pub label: Option<String>,
+    pub mode: Option<String>,
+    pub provenance: Option<String>,
+    pub simulated: bool,
+    pub plan: Option<serde_json::Value>,
+    pub extra_daq: Vec<(Channel, Sample)>,
+    /// The capture folder (for its saved burn report).
+    pub folder: Option<std::path::PathBuf>,
+}
+
+pub(crate) async fn source_context(root: &std::path::Path, source: &Source) -> SourceContext {
+    let mut out = SourceContext::default();
+    if let Some(capture) = source.capture_id()
+        && let Some(folder) = sources::capture_folder(root, &capture).await
+        && let Some(manifest) = crate::recording_store::read_manifest(&folder)
+    {
+        out.label = Some(manifest.label.clone());
+        out.mode = Some(manifest.station_mode.clone());
+        out.provenance = manifest.provenance.clone();
+        out.simulated = manifest.simulated;
+        out.plan = manifest.details.get("apogee_plan").cloned().filter(|v| !v.is_null());
+        // A plain capture: the attached DAQ launch file is merged in as the
+        // burn report does (a merged source already holds it).
+        if source.kind() == "capture" {
+            let (f, m) = (folder.clone(), manifest.clone());
+            out.extra_daq = tokio::task::spawn_blocking(move || burn_report::daq_rows(&f, &m))
+                .await
+                .unwrap_or_default();
+        }
+        out.folder = Some(folder);
+    }
+    out
+}
+
 /// Everything one recording review needs.
 pub(crate) struct Loaded {
     pub data: data::Data,
@@ -197,32 +264,20 @@ pub(crate) async fn load(root: &std::path::Path, id: &str, pool: &sqlx::SqlitePo
     review.integrated_ground_test = igt;
     review.provenance = provenance;
     let mut saved = None;
-    let mut plan = None;
     let mut archive = None;
-    let mut extra_daq = Vec::new();
-    let mut manifest_simulated = false;
-    if let Some(capture) = source.capture_id()
-        && let Some(folder) = sources::capture_folder(root, &capture).await
-        && let Some(manifest) = crate::recording_store::read_manifest(&folder)
-    {
-        review.label = manifest.label.clone();
-        review.mode = review.mode.or(Some(manifest.station_mode.clone()));
-        review.provenance = review.provenance.or(manifest.provenance.clone());
-        manifest_simulated = manifest.simulated;
-        plan = manifest.details.get("apogee_plan").cloned().filter(|v| !v.is_null());
-        if !custom_range {
-            saved = burn_report::read_report(&folder);
-        }
-        // A plain capture: the attached DAQ launch file is merged in as the
-        // burn report does (a merged source already holds it).
-        if source.kind() == "capture" {
-            let (f, m) = (folder.clone(), manifest.clone());
-            extra_daq = tokio::task::spawn_blocking(move || burn_report::daq_rows(&f, &m))
-                .await
-                .unwrap_or_default();
-            extra_daq.retain(|(_, s)| range.from_ms.is_none_or(|f| s.t_ms >= f) && range.to_ms.is_none_or(|t| s.t_ms <= t));
-        }
+    let context = source_context(root, &source).await;
+    if let Some(label) = context.label {
+        review.label = label;
     }
+    review.mode = review.mode.or(context.mode);
+    review.provenance = review.provenance.or(context.provenance);
+    let mut manifest_simulated = context.simulated;
+    let mut plan = context.plan;
+    if !custom_range && let Some(folder) = &context.folder {
+        saved = burn_report::read_report(folder);
+    }
+    let mut extra_daq = context.extra_daq;
+    extra_daq.retain(|(_, s)| range.from_ms.is_none_or(|f| s.t_ms >= f) && range.to_ms.is_none_or(|t| s.t_ms <= t));
     if let Source::Fire(fire) = &source
         && let Some(record) = crate::fire_archive::get(root, fire)
     {
@@ -276,7 +331,7 @@ fn error(status: StatusCode, text: &str) -> Response {
     (status, Json(serde_json::json!({"error": text}))).into_response()
 }
 
-async fn open_and_load(state: &Arc<AppState>, id: &str, range: &Range) -> Result<Loaded, Response> {
+pub(crate) async fn open_and_load(state: &Arc<AppState>, id: &str, range: &Range) -> Result<Loaded, Response> {
     if range.from_ms.zip(range.to_ms).is_some_and(|(a, b)| b <= a) {
         return Err(error(StatusCode::BAD_REQUEST, "The range must end after it starts."));
     }
@@ -291,8 +346,7 @@ async fn open_and_load(state: &Arc<AppState>, id: &str, range: &Range) -> Result
         )
     })?;
     let root = crate::recording_export::directory(state);
-    let now = crate::telemetry_task::get_current_timestamp_ms() as i64;
-    let result = load(&root, id, &pool, range, now).await;
+    let result = load(&root, id, &pool, range, now_ms()).await;
     if matches!(Source::parse(id), Some(Source::File(_))) {
         pool.close().await;
     }
@@ -451,11 +505,11 @@ async fn get_export(state: Arc<AppState>, headers: HeaderMap, id: String, range:
         Ok(loaded) => loaded,
         Err(response) => return response,
     };
-    let now = crate::telemetry_task::get_current_timestamp_ms() as i64;
+    let (now, raster) = (now_ms(), range.raster.unwrap_or(true));
     let built = if motor_kind {
-        motor_export_bytes(loaded, now, true).await
+        motor_export_bytes(loaded, now, raster).await
     } else {
-        flight_export_bytes(loaded, now, true).await
+        flight_export_bytes(loaded, now, raster).await
     };
     match built {
         Some((name, bytes)) => zip_response(name, bytes),

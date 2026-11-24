@@ -70,6 +70,19 @@ resource:
   link, and recovery events name a launch session the station does not map
   to recordings; both are small. The checklist routes refuse anonymous
   callers, so an anonymous bundle lists them as missing (403).
+    name and window;
+  - `derived/review_inputs.json`: what the motor/flight review reads from the
+    recording for its whole span (`flight_review::offline`): the review rows
+    as `data::read_pool` returns them (values as numbers, `null` or
+    `"OVR"`/`"-OVR"`; only `GS_STATION_MODE` and `GS_FLIGHT_MAXIMA` rows keep
+    their payload), the message log and station flight states, the DAQ
+    launch file rows of a plain event capture, and the capture manifest's
+    label, mode, provenance, simulated flag, applied plan and the planner's
+    motor for it (`planner_prediction`);
+  - `models/hybrid_motor/{hybrid_motor,sweet_v6_cea,sweet_v6_grain}.json`:
+    the hybrid motor model files (`apogee_planner::hybrid`), for the burn
+    report's predicted curve; only when the recording has load cells and a
+    tank PT (about 180 KB deflated).
 
 `replay.json` gains `layout`, `boards`, `view_config`, `valve_mappings` (from
 the layout's valve labels), `vehicle_geometry`, `mode` and
@@ -90,6 +103,23 @@ exports with no station, byte for byte as this station would (UI
 `docs/replay-bundle.md`, "Exports offline"), SD-resolved recordings
 included. Excel/PDF reports and review exports of a custom window still need
 the station.
+CSV/TSV, the default-window review exports, and the review and review
+exports of any window (`GET /api/flight_review/recording/{id}?from_ms&to_ms`,
+`.../motor_export` and `.../flight_export` with a window) with no station,
+byte for byte as this station would (UI `docs/replay-bundle.md`, "Exports
+offline"). A window is clipped from the inputs as `read_pool` clips its read
+and reviewed with the station's code (the UI copies `flight_review/zip.rs`,
+`plot.rs`, `burn_report/thrust.rs`, `merge.rs` and `apogee_planner/hybrid.rs`
+and ports the rest; its `scripts/check_review_port.py` checks the copies).
+Offline review exports carry no PNG charts or PDF report: they are this
+station's `?raster=false` answer. Excel/PDF reports and exports of
+SD-resolved recordings still need the station.
+
+`contract_fixtures` writes the station's reviews and review exports
+(`raster=false`, clock pinned) of custom windows of the bundled flight, a
+flight capture and a test-fire capture (DAQ launch file, applied plan) to
+`replay-bundle/review/`, with the two captures' bundles; the UI answers the
+same requests from the bundles and compares the bytes.
 
 The time-range CSV writes over-range values as `OVR`/`-OVR`, like the
 recording CSV, so its row cells are the recording CSV's. It reads each
@@ -119,6 +149,9 @@ phase with no station.
 - `records=false` leaves out the station records (included by default).
 - `sd_files=1` adds an SD-resolved recording's original SD files, in listing
   order within `sd_files_max_mb` (16 MiB by default, at most 64).
+- `review=false` leaves out `derived/review_inputs.json` and the hybrid
+  motor model (custom review windows then need the station). On by default:
+  a ten-minute capture at flight rates gains about 2 MB.
 
 The ZIP writer is `flight_review::zip` (deflate, no ZIP64). Bundles are
 reproducible: the same recording and time give the same bytes.

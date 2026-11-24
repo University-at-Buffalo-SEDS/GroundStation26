@@ -13,6 +13,9 @@
 //!   that apply to the recording.
 //! - `exports/index.json`: which exports the bundle holds, with the file name
 //!   and window of each.
+//! - `derived/review_inputs.json` (+ `models/hybrid_motor/*.json`): what the
+//!   motor/flight review and its exports read, for any window
+//!   (`flight_review::offline`).
 //!
 //! The recording CSV is already `data/telemetry.csv`; the time-range CSV and
 //! the report's preview, CSV and DAQ SD layouts are derived from it.
@@ -39,5 +42,6 @@ pub(crate) async fn entries(state: &Arc<AppState>, id: &str, now_ms: i64) -> Vec
         out.push((path, export.bytes, "application/zip"));
     }
     out.push(("exports/index.json".to_owned(), pretty(&Value::Object(index)), "application/json"));
+    out.extend(crate::flight_review::offline::bundle_entries(state, id).await);
     out
 }

@@ -478,6 +478,7 @@ async fn test_fire_capture_review_and_motor_bundle() {
         &Range {
             from_ms: Some(T0 - 3_000),
             to_ms: Some(T0 + 15_000),
+            ..Range::default()
         },
         T0,
     )
@@ -486,6 +487,12 @@ async fn test_fire_capture_review_and_motor_bundle() {
     pool.close().await;
     assert_eq!(ranged.review.motor.as_ref().unwrap().report_origin, "computed");
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The sample flight (`profile`) as an event capture under `root`, for
+/// other modules' fixtures.
+pub(crate) async fn sample_flight_capture(root: &std::path::Path, name: &str, mode: &str) -> std::path::PathBuf {
+    flight_capture(root, name, mode, &profile()).await
 }
 
 async fn flight_capture(root: &std::path::Path, name: &str, mode: &str, f: &Flight) -> std::path::PathBuf {

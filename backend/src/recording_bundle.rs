@@ -64,6 +64,9 @@ pub(crate) struct Options {
     pub sd_files: bool,
     /// SD file budget in MiB (default 16, at most 64).
     pub sd_files_max_mb: Option<u32>,
+    /// `false` leaves out the review inputs (`flight_review::offline`): the
+    /// review and review exports of a custom window then need the station.
+    pub review: Option<bool>,
 }
 
 pub(crate) fn routes() -> Router<Arc<AppState>> {
@@ -285,6 +288,9 @@ pub(crate) async fn build(
 
     // What the station's exports need beyond the CSV (recording_bundle_exports).
     for (path, bytes, media_type) in crate::recording_bundle_exports::entries(&state, id, now_ms).await {
+        if options.review == Some(false) && crate::flight_review::offline::is_entry(&path) {
+            continue;
+        }
         entries.add(&path, bytes, media_type, None);
     }
 
