@@ -292,3 +292,44 @@ fn validation_against_the_mock_flight() {
     assert!(miss < 0.25 * ref_drift, "{miss}");
     assert!((land.1 / ref_land_s - 1.0).abs() < 0.1);
 }
+
+/// CPU cost (run in release: `cargo test --release -p groundstation_backend cpu_cost -- --ignored --nocapture`).
+/// Prints the time of one dispersion flight on one core and of whole plans,
+/// so a Pi 5 figure can be estimated (4 cores, roughly 3-4x slower per core
+/// than a desktop core).
+#[tokio::test]
+#[ignore]
+async fn cpu_cost() {
+    let (_root, state) = station().await;
+    for model in ["scaling", "physics"] {
+        let mut req = request(8.5, 0);
+        req.motor_model = Some(model.into());
+        let r = resolve(&state, &req, 1).unwrap();
+        let (fm, _) = build_motor(&r);
+        let i = &r.prepared.input;
+        let env = i.weather.environment(i.cfg.environment.wind_shear_exponent, i.cfg.environment.wind_profile_cap);
+        let sig = Sigmas { wind_speed_rel: 0.3, wind_dir_deg: 15.0, impulse_rel: 0.1, cd_rel: 0.05, descent_rate_rel: 0.08 };
+        let t = std::time::Instant::now();
+        for k in 0..20 {
+            sample_flight(&i.cfg, &env, &fm.motor, &sig, 1, k);
+        }
+        let one = t.elapsed().as_secs_f64() / 20.0;
+        for samples in [0u32, 50, 200] {
+            let mut req = request(8.5, samples);
+            req.motor_model = Some(model.into());
+            let t = std::time::Instant::now();
+            compute(&state, &req, None, 1).unwrap();
+            println!("cpu_cost {model}: {samples} samples: {:.0} ms wall ({} threads); one dispersion flight {:.1} ms/core", t.elapsed().as_secs_f64() * 1000.0, std::thread::available_parallelism().map_or(1, |n| n.get()), one * 1000.0);
+        }
+    }
+    let m = crate::los_predict::Model::from_weather(
+        &weather::ManualWeather { wind_mps: 4.0, wind_from_deg: 300.0, ..Default::default() }.snapshot(weather::Site { lat_deg: 31.758, lon_deg: -102.046, alt_msl_m: 890.0 }, 0, 0),
+        weather::Site { lat_deg: 31.758, lon_deg: -102.046, alt_msl_m: 890.0 },
+    );
+    let fix = crate::los_predict::LastFix { t_ms: 0, lat_deg: 31.759, lon_deg: -102.04, alt_msl_m: 3900.0, ve_mps: Some(2.0), vn_mps: Some(0.0), vu_mps: Some(-25.0), source: None };
+    let t = std::time::Instant::now();
+    for _ in 0..10 {
+        crate::los_predict::predict(&m, &fix, Some(crate::los_predict::Phase::Drogue), 10.0, crate::los_predict::SAMPLES, 1);
+    }
+    println!("cpu_cost los: one prediction from apogee height ({} samples, one core): {:.1} ms", crate::los_predict::SAMPLES, t.elapsed().as_secs_f64() * 100.0);
+}
