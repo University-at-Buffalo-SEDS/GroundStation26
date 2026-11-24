@@ -179,6 +179,9 @@ async fn live_loss_and_return_of_signal() {
     assert!(v["overlay"]["markers"].is_array());
     assert!(v["since_fix_s"].as_f64().unwrap() >= 19.0);
     assert!(watch_target().is_some());
+    // The predicted landing area is now the recovery search's target.
+    let search = state.recovery_search.status_body(now);
+    assert_eq!(search["target"]["source"], "los_prediction", "{search}");
     // Signal back: a fix at the true position 20 s after the last one.
     let truth = gps_at(&gps, 120.0);
     observe_row(&TelemetryRow::marked(now, "GPS_DATA".into(), "FC".into(), vec![Some(truth.1 as f32), Some(truth.2 as f32), Some(truth.3 as f32)]));

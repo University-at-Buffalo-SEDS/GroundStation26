@@ -522,7 +522,18 @@ pub(crate) fn tick(state: &AppState) {
         view["signal_lost_ms"] = json!(lost);
         view["since_fix_s"] = json!(round(age, 1));
         view["last_fix"] = last_fix_json(&model, &fix);
+        // The predicted landing area becomes the recovery search's target (an
+        // operator's own area is kept).
+        let area: Option<Vec<[f64; 2]>> = view["overlay"]["areas"]
+            .as_array()
+            .and_then(|a| a.iter().find(|x| x["kind"] == "landing_ellipse"))
+            .and_then(|x| serde_json::from_value(x["polygon"].clone()).ok());
         rt().lock().unwrap().last_view = Some(view);
+        if let Some(polygon) = area
+            && let Err(e) = crate::recovery_search::set_target_area(state, &polygon, "los_prediction")
+        {
+            log::warn!("{LABEL}: the landing area was not passed to the recovery search: {e}");
+        }
     }
 }
 

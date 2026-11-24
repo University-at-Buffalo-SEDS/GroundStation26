@@ -597,7 +597,6 @@ pub(crate) fn update_settings(state: &AppState, principal: &AuthPrincipal, body:
 /// loss-of-signal prediction, a flight plan). `polygon` is `[lat, lon]`
 /// points, a closed ring without the first point repeated. Returns
 /// `Ok(false)` when an operator's manual area is kept instead.
-#[allow(dead_code)] // Called by the loss-of-signal prediction (integration).
 pub(crate) fn set_target_area(state: &AppState, polygon: &[[f64; 2]], source: &str) -> Result<bool, String> {
     set_target_area_at(state, polygon, source, now_ms())
 }
