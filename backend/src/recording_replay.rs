@@ -339,7 +339,7 @@ pub async fn export(State(state): State<Arc<AppState>>, headers: HeaderMap, Path
     match export_from(&db).await {
         Ok(mut value) => {
             if let Some(source) = sources::Source::parse(&id)
-                && let Ok(ctx) = context::context_from(&crate::recording_export::directory(&state), &id, &source, &db).await
+                && let Ok(ctx) = context::context_from(&recording_export::directory(&state), &id, &source, &db).await
             {
                 value["replay_context"] = serde_json::to_value(ctx).unwrap_or_default();
             }

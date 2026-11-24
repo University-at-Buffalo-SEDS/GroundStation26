@@ -111,7 +111,7 @@ pub struct ActionPolicyMsg {
     pub controls: Vec<ActionControl>,
 }
 
-fn backend_blink_for(cmd: &str, enabled: bool, recommended: Option<&BlinkMode>) -> BlinkMode {
+fn backend_blink_for(enabled: bool, recommended: Option<&BlinkMode>) -> BlinkMode {
     if !enabled {
         return BlinkMode::None;
     }
@@ -1404,7 +1404,7 @@ pub fn default_action_policy() -> ActionPolicyMsg {
                 ActionControl { disabled_reason: None, requested: None, network_note: None, progress: None,
                     cmd: cmd.to_string(),
                     enabled,
-                    blink: backend_blink_for(cmd, enabled, None),
+                    blink: backend_blink_for(enabled, None),
                     actuated: default_command_actuated(cmd),
                 }
             })
@@ -1447,7 +1447,7 @@ fn policy_with_overrides(
             ActionControl { disabled_reason: None, requested: None, network_note: None, progress: None,
                 cmd: cmd.to_string(),
                 enabled,
-                blink: backend_blink_for(cmd, enabled, recommended.get(cmd)),
+                blink: backend_blink_for(enabled, recommended.get(cmd)),
                 actuated: default_command_actuated(cmd).or_else(|| valves.actuated_for_cmd(cmd)),
             }
         })

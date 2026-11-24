@@ -4193,10 +4193,6 @@ impl UartComms {
             .then(|| radio_batch_control_contract(priority, payload))
             .flatten()
             .and_then(|(id, receipt)| receipt.then_some(id));
-        // Judged on the SDK frame: below it is wrapped in the RR envelope. An
-        // early copy of the Abort's FLIGHT_STATE (AbortStateBurst) takes the
-        // station's gap instead.
-        let sdk_payload = payload;
         if self.recovery.is_some() {
             self.enable_radio_capacity_control();
         }
@@ -4207,6 +4203,9 @@ impl UartComms {
             )
             .into());
         }
+        // Judged on the SDK frame: below it is wrapped in the RR envelope. An
+        // early copy of the Abort's FLIGHT_STATE (AbortStateBurst) takes the
+        // station's gap instead.
         let sdk_payload = payload;
         let routed = if let Some(shared) = &self.recovery {
             let mesh = shared.lock().unwrap();

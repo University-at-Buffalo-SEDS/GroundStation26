@@ -2500,7 +2500,7 @@ mod priority_tests {
                     backlog.push(255, abort.clone(), false);
                     backlog.push(255, aborted.clone(), false);
                 }
-                let mut pop = |backlog: &mut WireBacklog| {
+                let pop = |backlog: &mut WireBacklog| {
                     if critical { backlog.pop_critical() } else { backlog.pop() }.unwrap().1
                 };
                 assert_eq!(pop(&mut backlog), abort, "ABORT first (critical={critical})");
@@ -4465,7 +4465,7 @@ pub(super) fn spawn_comms_worker_threads(
                         let (p, f) = all.remove(index);
                         complete_skipped_heartbeat(comms_handle.tx_budget.as_deref(), comms_handle.transport_activity.as_deref(), p, &f);
                     }
-                    let mut extras = all.split_off(1);
+                    let extras = all.split_off(1);
                     let (priority, payload) = all.pop().expect("the first frame is never dropped alone");
                     let carries_heartbeat = is_station_heartbeat_frame(&payload)
                         || extras.iter().any(|(_, f)| is_station_heartbeat_frame(f));
@@ -5419,7 +5419,7 @@ impl OrderedExhaustion {
         let flight_state = crate::telemetry_schema::data_type("FLIGHT_STATE");
         let flight_command = crate::telemetry_schema::data_type("FLIGHT_COMMAND");
         let command_heads: Vec<u64>;
-        let mut flight_state_gone: Vec<(u64, Vec<u64>)> = Vec::new();
+        let flight_state_gone: Vec<(u64, Vec<u64>)>;
         let heads = {
             let mut guard = self.state.lock().unwrap();
             let (sampled, counts) = &mut *guard;
@@ -7190,7 +7190,7 @@ mod unordered_exhaustion_tests {
         station.add_side_packed("radio", move |bytes: &[u8]| { u.lock().unwrap().push(bytes.to_vec()); Ok(()) });
         let mut service = RouterServiceForTest::default();
         let lossy = std::sync::atomic::AtomicBool::new(false);
-        let mut pump = |service: &mut RouterServiceForTest| {
+        let pump = |service: &mut RouterServiceForTest| {
             service.pump(&board);
             let _ = station.process_all_queues_with_timeout(0);
             for frame in std::mem::take(&mut *down.lock().unwrap()) { let _ = station.rx_packed_from_side(&frame, 0); }
