@@ -740,6 +740,91 @@ async fn replay_bundle(root: &Path, state: &Arc<AppState>, app: &axum::Router, o
     binary_fixture("replay-bundle/flight.gsreplay", &bundle);
     binary_fixture("replay-bundle/flight.csv", &csv);
     bundle_exports(root, state, app, id, &bundle, out).await;
+    review_windows(root, state, app, out).await;
+}
+
+/// Custom-window motor/flight reviews and exports (`raster=false`) as the
+/// station answers them, for the bundled flight recording, a flight capture
+/// and a test-fire capture (DAQ launch file attached, applied plan), with the
+/// two captures' bundles (`replay-bundle/review/`). `review/requests.json`
+/// lists each request as the UI makes it (`path`; the station's request adds
+/// `raster=false`), the bundle that answers it offline, the status, and the
+/// file holding the station's answer (or its error text). The UI answers the
+/// same requests from the bundles with no station: the same bytes (summaries:
+/// the same JSON).
+async fn review_windows(root: &Path, state: &Arc<AppState>, app: &axum::Router, out: &mut Fixtures) {
+    use crate::burn_report::tests::T0 as T1;
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert("Authorization", "Bearer viewer-token".parse().unwrap());
+    // created_ms / generated_ms of what the routes answer from here on.
+    crate::flight_review::pin_now(Some(T0));
+    let flight_capture = "2027-01-15_08-00-00_flight";
+    crate::flight_review::tests::sample_flight_capture(root, flight_capture, "normal").await;
+    let fire_capture = "2027-01-15_09-00-00_fire";
+    let folder = crate::burn_report::tests::capture_folder(root, fire_capture, "test_fire", true).await;
+    // The plan applied before the burn: the planner's motor is the prediction of a window without a burn.
+    let manifest_path = folder.join(crate::recording_store::MANIFEST_FILE);
+    let mut manifest: Value = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["details"]["apogee_plan"] = json!({"plan_id": "fixture-plan", "impulse_ns": 9800.0, "impulse_sigma_ns": 450.0, "fill_mass_kg": 6.0});
+    std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+    let event = |name: &str| crate::recording_store::RecordingId::event_id(crate::recording_store::EventKind::Launch, name);
+    let (flight_id, fire_id) = (event(flight_capture), event(fire_capture));
+    for (id, file) in [(&flight_id, "review/flight_capture.gsreplay"), (&fire_id, "review/test_fire.gsreplay")] {
+        let options = crate::recording_bundle::Options::default();
+        let bundle = crate::recording_bundle::build(state.clone(), &headers, id, &options, T0).await.unwrap();
+        let again = crate::recording_bundle::build(state.clone(), &headers, id, &options, T0).await.unwrap();
+        assert_eq!(bundle_manifest(&bundle), bundle_manifest(&again), "{id}: a bundle's entries are reproducible");
+        assert!(bundle == again, "{id}: a bundle is reproducible");
+        assert!(zip_entry(&bundle, crate::flight_review::offline::INPUTS_PATH).is_some(), "{id}: the bundle carries the review inputs");
+        binary_fixture(&format!("replay-bundle/{file}"), &bundle);
+        let without = crate::recording_bundle::Options { review: Some(false), ..Default::default() };
+        let lean = crate::recording_bundle::build(state.clone(), &headers, id, &without, T0).await.unwrap();
+        let listed = bundle_manifest(&lean)["entries"].as_array().unwrap().iter().filter(|e| crate::flight_review::offline::is_entry(e["path"].as_str().unwrap())).count();
+        assert_eq!(listed, 0, "{id}: review=false leaves the review inputs out");
+    }
+    let recording = "groundstation_recording_2026-01-01_00-00-00_000.db";
+    // (bundle, recording, route kind, window, fixture name)
+    let cases: Vec<(&str, &str, &str, (i64, i64), &str)> = vec![
+        ("flight", recording, "flight_export", (T0 + 5_000, T0 + 60_000), "flight-launch"),
+        ("flight", recording, "flight_export", (T0 + 30_000, T0 + 240_000), "flight-descent"),
+        ("flight", recording, "summary", (T0 + 5_000, T0 + 60_000), "flight-launch"),
+        ("flight", recording, "motor_export", (T0 + 5_000, T0 + 60_000), "flight-motor"),
+        ("flight_capture", &flight_id, "flight_export", (T1 - 5_000, T1 + 60_000), "capture-ascent"),
+        ("flight_capture", &flight_id, "flight_export", (T1 + 20_000, T1 + 200_000), "capture-descent"),
+        ("flight_capture", &flight_id, "motor_export", (T1 - 5_000, T1 + 60_000), "capture-motor"),
+        ("test_fire", &fire_id, "motor_export", (T1 - 10_000, T1 + 20_000), "fire-burn"),
+        ("test_fire", &fire_id, "motor_export", (T1 + 1_000, T1 + 20_000), "fire-late"),
+        ("test_fire", &fire_id, "motor_export", (T1 - 10_000, T1 - 1_000), "fire-before"),
+        ("test_fire", &fire_id, "summary", (T1 - 10_000, T1 + 20_000), "fire-burn"),
+        ("test_fire", &fire_id, "flight_export", (T1 - 10_000, T1 + 20_000), "fire-flight"),
+    ];
+    let mut requests = Vec::new();
+    for (bundle, id, kind, (from, to), name) in cases {
+        let base = format!("/api/flight_review/recording/{id}");
+        let (path, station) = if kind == "summary" {
+            let path = format!("{base}?from_ms={from}&to_ms={to}");
+            (path.clone(), path)
+        } else {
+            let path = format!("{base}/{kind}?from_ms={from}&to_ms={to}");
+            (path.clone(), format!("{path}&raster=false"))
+        };
+        let (status, body) = get_bytes(app, &station).await;
+        let mut entry = json!({"bundle": bundle, "path": path, "station_path": station, "status": status.as_u16()});
+        if status != StatusCode::OK {
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            entry["body"] = body["error"].clone();
+        } else if kind == "summary" {
+            out.add(&format!("replay-bundle/review/{name}-summary"), serde_json::from_slice(&body).unwrap());
+            entry["file"] = format!("review/{name}-summary.json").into();
+        } else {
+            let file = format!("review/{name}-{}.zip", kind.trim_end_matches("_export"));
+            binary_fixture(&format!("replay-bundle/{file}"), &body);
+            entry["file"] = file.into();
+        }
+        requests.push(entry);
+    }
+    crate::flight_review::pin_now(None);
+    out.add("replay-bundle/review/requests", Value::Array(requests));
 }
 
 /// GET with the viewer's credentials; the report worker allows one job at a

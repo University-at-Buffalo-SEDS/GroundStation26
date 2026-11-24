@@ -1,0 +1,239 @@
+{
+  "data_from_ms": 1767225606000,
+  "data_to_ms": 1767225660000,
+  "flight": {
+    "altitude_curve": [
+      [
+        -4.0,
+        0.02
+      ],
+      [
+        -2.0,
+        -0.04
+      ],
+      [
+        0.0,
+        -0.04
+      ],
+      [
+        2.0,
+        97.77
+      ],
+      [
+        4.0,
+        414.9
+      ],
+      [
+        6.0,
+        845.36
+      ],
+      [
+        8.0,
+        1269.79
+      ],
+      [
+        10.0,
+        1649.61
+      ],
+      [
+        12.0,
+        1978.22
+      ],
+      [
+        14.0,
+        2257.98
+      ],
+      [
+        16.0,
+        2492.59
+      ],
+      [
+        18.0,
+        2683.5
+      ],
+      [
+        20.0,
+        2833.6
+      ],
+      [
+        22.0,
+        2942.86
+      ],
+      [
+        24.0,
+        3012.86
+      ],
+      [
+        26.0,
+        3044.56
+      ],
+      [
+        28.0,
+        3035.97
+      ],
+      [
+        30.0,
+        3001.24
+      ],
+      [
+        32.0,
+        2953.69
+      ],
+      [
+        34.0,
+        2902.28
+      ],
+      [
+        36.0,
+        2849.57
+      ],
+      [
+        38.0,
+        2796.46
+      ],
+      [
+        40.0,
+        2743.4
+      ],
+      [
+        42.0,
+        2689.95
+      ],
+      [
+        44.0,
+        2636.54
+      ],
+      [
+        46.0,
+        2583.4
+      ],
+      [
+        48.0,
+        2530.56
+      ],
+      [
+        50.0,
+        2477.71
+      ]
+    ],
+    "altitude_maxima": [
+      {
+        "source": "Barometer altitude",
+        "t_ms": 1767225636000,
+        "value": 3044.557
+      },
+      {
+        "source": "GPS altitude above the pad",
+        "t_ms": 1767225636000,
+        "value": 3046.3900000000003
+      }
+    ],
+    "altitude_source": "barometer altitude",
+    "apogee": {
+      "source": "barometer altitude",
+      "t_ms": 1767225636000,
+      "value": 3044.557
+    },
+    "apogee_detected_ms": null,
+    "curve_zero_ms": 1767225610000,
+    "data_label": "FC telemetry",
+    "descent_rate_drogue_mps": 26.3,
+    "descent_rate_main_mps": null,
+    "drogue": {
+      "altitude_m": 3042.0,
+      "altitude_source": "barometer altitude",
+      "dry_run": false,
+      "evidence": "FC phase Descent",
+      "t_ms": 1767225636600
+    },
+    "events": [
+      {
+        "altitude_m": null,
+        "name": "Launch accepted",
+        "source": "FC flight state",
+        "t_launch_s": 0.0,
+        "t_ms": 1767225610000,
+        "t_plus_s": 0.0
+      },
+      {
+        "altitude_m": null,
+        "name": "T-0",
+        "source": "main valve open",
+        "t_launch_s": 0.0,
+        "t_ms": 1767225610000,
+        "t_plus_s": 0.0
+      },
+      {
+        "altitude_m": -0.0,
+        "name": "Liftoff",
+        "source": "barometer altitude rising 10 m",
+        "t_launch_s": 0.0,
+        "t_ms": 1767225610000,
+        "t_plus_s": 0.0
+      },
+      {
+        "altitude_m": 3044.6,
+        "name": "Apogee (max altitude)",
+        "source": "barometer altitude",
+        "t_launch_s": 26.0,
+        "t_ms": 1767225636000,
+        "t_plus_s": 26.0
+      },
+      {
+        "altitude_m": 3042.0,
+        "name": "Drogue deploy",
+        "source": "FC phase Descent",
+        "t_launch_s": 26.6,
+        "t_ms": 1767225636600,
+        "t_plus_s": 26.6
+      }
+    ],
+    "fc_reported_apogee_m": null,
+    "fc_reported_max_velocity_mps": null,
+    "flight_time_s": null,
+    "landed_ms": null,
+    "landed_source": "",
+    "landing": {
+      "alt_msl_m": 3603.8900000000003,
+      "lat": 31.7623947,
+      "lon": -102.0434076,
+      "source": "GPS, last 10 fixes"
+    },
+    "landing_bearing_deg": 27.0,
+    "landing_distance_m": 544.0,
+    "latest_phase": "Descent",
+    "launch_accepted_ms": 1767225610000,
+    "launch_source": "FC flight state",
+    "liftoff_ms": 1767225610000,
+    "liftoff_source": "barometer altitude rising 10 m",
+    "main": null,
+    "max_acceleration": null,
+    "max_acceleration_g": null,
+    "max_mach": null,
+    "max_velocity": null,
+    "notes": [],
+    "pad": {
+      "alt_msl_m": 889.37,
+      "lat": 31.758015,
+      "lon": -102.0459776,
+      "source": "GPS before launch"
+    },
+    "simulated": false,
+    "t0_ms": 1767225610000,
+    "t0_source": "main valve open",
+    "time_to_apogee_from": "liftoff",
+    "time_to_apogee_s": 26.0,
+    "velocity_curve": [],
+    "velocity_source": ""
+  },
+  "from_ms": 1767225605000,
+  "id": "groundstation_recording_2026-01-01_00-00-00_000.db",
+  "integrated_ground_test": false,
+  "label": "groundstation_recording_2026-01-01_00-00-00_000.db",
+  "mode": null,
+  "motor": null,
+  "provenance": null,
+  "simulated": false,
+  "source_kind": "legacy",
+  "to_ms": 1767225660000
+}
