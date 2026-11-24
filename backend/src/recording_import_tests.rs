@@ -237,3 +237,57 @@ impl Records<'_> {
         self.next_record().unwrap().unwrap()
     }
 }
+
+/// An SD-resolved recording imports with both timelines: its CSV (resolved
+/// rows and provenance), receipt rows, SD source list and original SD file
+/// equal the source station's.
+#[tokio::test]
+async fn an_sd_resolved_bundle_imports_with_both_timelines() {
+    let source = TestDirectory::new();
+    let state = export_state(&source.0, true).await;
+    crate::contract_fixtures::sd::create(&source.0).await;
+    let id = crate::contract_fixtures::sd::ID;
+    let options = crate::recording_bundle::Options { records: Some(false), sd_files: true, ..Default::default() };
+    let bundle = crate::recording_bundle::build(state.clone(), &HeaderMap::new(), id, &options, T0).await.unwrap();
+    let files = unzip(&bundle).unwrap();
+    let (_, csv) = get(&state, &format!("/api/recordings/{id}/csv")).await;
+    let (_, sources) = get(&state, &format!("/api/recordings/{id}/sd/sources")).await;
+    let (_, replay) = get(&state, &format!("/api/recordings/{id}/replay/export")).await;
+    let replay: Value = serde_json::from_slice(&replay).unwrap();
+
+    let root = TestDirectory::new();
+    let imported_state = export_state(&root.0, true).await;
+    let imported = import_bundle(&root.0, &bundle, None, T0 + 1).await.unwrap();
+    let new_id = imported["id"].as_str().unwrap().to_owned();
+    let (status, exported) = get(&imported_state, &format!("/api/recordings/{new_id}/csv")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(String::from_utf8(exported).unwrap(), String::from_utf8(csv).unwrap(), "the resolved CSV round-trips byte for byte");
+    let path = crate::recording_export::recording_path(&root.0, &new_id).await.unwrap();
+    let (receipt, _) = crate::recording_export::receipt_csv(&path, 1 << 24).await.unwrap().unwrap();
+    assert_eq!(receipt, files[crate::recording_bundle_sd::RECEIPT_PATH], "the receipt rows round-trip byte for byte");
+    let (_, imported_sources) = get(&imported_state, &format!("/api/recordings/{new_id}/sd/sources")).await;
+    assert_eq!(serde_json::from_slice::<Value>(&imported_sources).unwrap(), serde_json::from_slice::<Value>(&sources).unwrap());
+    let listing: Value = serde_json::from_slice(&sources).unwrap();
+    let sha = listing["sources"][0]["file_sha256"].as_str().unwrap();
+    let (status, original) = get(&imported_state, &format!("/api/recordings/{new_id}/sd/sources/{sha}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(original, files[&format!("sd/sources/{sha}.csv")]);
+    let (status, imported_replay) = get(&imported_state, &format!("/api/recordings/{new_id}/replay/export")).await;
+    assert_eq!(status, StatusCode::OK);
+    let imported_replay: Value = serde_json::from_slice(&imported_replay).unwrap();
+    assert_eq!(imported_replay["snapshot"], replay["snapshot"]);
+    let strip = |samples: &Value| samples.as_array().unwrap().iter().map(|s| { let mut s = s.clone(); s.as_object_mut().unwrap().remove("valid_until_ms"); s }).collect::<Vec<_>>();
+    assert_eq!(strip(&imported_replay["samples"]), strip(&replay["samples"]), "the same resolved rows (coverage ends are not carried)");
+    assert_eq!(imported_replay["sd_provenance"]["imports"], replay["sd_provenance"]["imports"]);
+    assert_eq!(imported_replay["sd_provenance"]["sample_provenance"], replay["sd_provenance"]["sample_provenance"]);
+    assert_eq!(imported_replay["sd_provenance"]["resolution"], replay["sd_provenance"]["resolution"]);
+
+    // Without the receipt rows (an older station's bundle): refused, nothing stored.
+    let mut older = files.clone();
+    older.remove(crate::recording_bundle_sd::RECEIPT_PATH);
+    older.remove("manifest.json");
+    let listed: Vec<(&str, &[u8])> = older.iter().map(|(p, b)| (p.as_str(), b.as_slice())).collect();
+    let refused = import_bundle(&TestDirectory::new().0, &bundle_of(&listed, |m| m["source"]["recording"] = id.into()), None, T0).await.unwrap_err();
+    assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(refused.message.contains("does not hold the rows as received"), "{}", refused.message);
+}

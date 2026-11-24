@@ -17,6 +17,20 @@
 //! byte for byte. The recorded alerts come from `derived/alerts.json`.
 //! Configuration entries (layout, calibration, view configuration) are not
 //! installed: the importing station's own configuration labels the replay.
+//!
+//! An SD-resolved recording (`recording_sd`) imports from its two CSVs: the
+//! receipt rows (`data/receipt_telemetry.csv`, `recording_bundle_sd`) become
+//! `telemetry`, and the resolved rows with their provenance
+//! (`data/telemetry.csv`) become `sd_replay_telemetry`, so the imported
+//! recording's CSV, time-range rows and reports equal the source's. The SD
+//! imports' manifests and calibration metadata and the resolution summary
+//! come from `replay.json` (`sd_provenance`), the source names from the
+//! bundled SD source list, and the original SD files from `sd/sources/` when
+//! the bundle holds them. Not carried: the SD samples themselves (raw
+//! records stay in each row's provenance; the unresolved ones only in the
+//! bundle's `replay.json`) and the coverage segments, so the imported replay
+//! does not mark where SD coverage ends. A bundle with a resolved CSV but no
+//! receipt rows (made before they were bundled) is refused with 422.
 use crate::{auth::Permission, recording_store as store, state::AppState};
 use axum::{
     Json, Router,
@@ -37,6 +51,7 @@ const CSV_PATH: &str = "data/telemetry.csv";
 const ALERTS_PATH: &str = "derived/alerts.json";
 const PLAIN_HEADER: &str = "id,received_timestamp_ms,source_timestamp_ms,sender_id,data_type,values_json,payload_json";
 const PROVENANCE_HEADER: &str = "id,received_timestamp_ms,source_timestamp_ms,sender_id,data_type,values_json,payload_json,data_provenance";
+const RESOLVED_HEADER: &str = "id,received_timestamp_ms,source_timestamp_ms,sender_id,data_type,values_json,payload_json,canonical_utc_ms,provenance_json";
 /// Imports run one at a time so the duplicate check and the write agree.
 static IMPORTING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -321,14 +336,27 @@ pub(crate) async fn import_bundle(root: &Path, bytes: &[u8], operator: Option<&s
 
     let mut records = Records { bytes: csv, at: 0 };
     let header = records.next_record().transpose().map_err(bad)?.unwrap_or_default().join(",");
-    if header != PLAIN_HEADER && header != PROVENANCE_HEADER {
+    // An SD-resolved recording: data/telemetry.csv is the resolved timeline,
+    // and the receipt rows are their own entry.
+    let mut resolved = None;
+    let mut columns = header.split(',').count();
+    if header == RESOLVED_HEADER || header == format!("{RESOLVED_HEADER},data_provenance") {
+        let receipt = files.get(crate::recording_bundle_sd::RECEIPT_PATH).ok_or_else(|| {
+            refuse(StatusCode::UNPROCESSABLE_ENTITY, "This bundle's recording was merged with board SD data, but the bundle does not hold the rows as received (it was made by an older station). Make the bundle again on an updated station to import it.")
+        })?;
+        resolved = Some(Resolved { rows: std::mem::replace(&mut records, Records { bytes: receipt, at: 0 }), columns: header.split(',').count(), sd: SdRecords::of(&files) });
+        let receipt_header = records.next_record().transpose().map_err(bad)?.unwrap_or_default().join(",");
+        if receipt_header != PLAIN_HEADER && receipt_header != PROVENANCE_HEADER {
+            return Err(bad("data/receipt_telemetry.csv does not have the recording CSV header."));
+        }
+        columns = receipt_header.split(',').count();
+    } else if header != PLAIN_HEADER && header != PROVENANCE_HEADER {
         return Err(if header.contains("canonical_utc_ms") {
-            refuse(StatusCode::UNPROCESSABLE_ENTITY, "This bundle's recording was merged with board SD data; such recordings cannot be imported yet.")
+            refuse(StatusCode::UNPROCESSABLE_ENTITY, "This bundle's resolved CSV does not have the SD-resolved recording CSV header.")
         } else {
             bad("data/telemetry.csv does not have the recording CSV header.")
         });
     }
-    let columns = header.split(',').count();
 
     let _importing = IMPORTING.lock().await;
     if let Some(existing) = tokio::task::spawn_blocking({
@@ -350,7 +378,7 @@ pub(crate) async fn import_bundle(root: &Path, bytes: &[u8], operator: Option<&s
     let base = format!("{}_{}", store::stamp(start_hint), store::slug(stem));
     let (folder_name, folder) = store::unique_folder(&kind_dir, &base);
     std::fs::create_dir_all(&folder).map_err(|e| refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not create the import folder: {e}")))?;
-    let result = write_recording(&folder, &mut records, columns, files.get(ALERTS_PATH)).await;
+    let result = write_recording(&folder, &mut records, columns, files.get(ALERTS_PATH), resolved).await;
     let (rows, alerts, data_from, data_to) = match result {
         Ok(counts) => counts,
         Err(refusal) => {
@@ -430,6 +458,7 @@ async fn write_recording(
     records: &mut Records<'_>,
     columns: usize,
     alerts: Option<&Vec<u8>>,
+    resolved: Option<Resolved<'_>>,
 ) -> Result<(i64, i64, Option<i64>, Option<i64>), Refusal> {
     let storage = |e: &dyn std::fmt::Display| refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not write the imported recording: {e}"));
     let partial = folder.join(store::PARTIAL_FILE);
@@ -492,6 +521,9 @@ async fn write_recording(
                 .map_err(|e| storage(&e))?;
             alert_rows += 1;
         }
+        if let Some(resolved) = resolved {
+            write_resolved(&mut tx, resolved).await?;
+        }
         tx.commit().await.map_err(|e| storage(&e))?;
         Ok((rows, alert_rows, from, to))
     }
@@ -500,6 +532,143 @@ async fn write_recording(
     let counts = written?;
     std::fs::rename(&partial, folder.join(store::CAPTURE_FILE)).map_err(|e| storage(&e))?;
     Ok(counts)
+}
+
+/// The SD-resolved part of a bundle: the resolved CSV's rows (header read)
+/// and what describes the SD imports.
+struct Resolved<'a> {
+    rows: Records<'a>,
+    columns: usize,
+    sd: SdRecords,
+}
+
+/// The SD imports' descriptions a bundle carries.
+#[derive(Default)]
+struct SdRecords {
+    /// `replay.json` `sd_provenance.resolution`.
+    resolution: Option<Value>,
+    /// `replay.json` `sd_provenance.imports`.
+    imports: Vec<Value>,
+    /// The SD source list's rows (`derived/sd_sources.json` and its later pages), by import id.
+    sources: BTreeMap<i64, Value>,
+    /// Original SD files (`sd/sources/{sha256}.csv`).
+    files: BTreeMap<String, Vec<u8>>,
+}
+
+impl SdRecords {
+    fn of(files: &BTreeMap<String, Vec<u8>>) -> Self {
+        let json = |path: &str| files.get(path).and_then(|b| serde_json::from_slice::<Value>(b).ok());
+        let provenance = json("replay.json").map(|r| r["sd_provenance"].clone()).unwrap_or(Value::Null);
+        let mut out = SdRecords { resolution: provenance.get("resolution").cloned().filter(Value::is_object), imports: provenance["imports"].as_array().cloned().unwrap_or_default(), ..Default::default() };
+        for (path, bytes) in files {
+            if path == "derived/sd_sources.json" || (path.starts_with("derived/sd_sources/") && path.ends_with(".json")) {
+                let listing = serde_json::from_slice::<Value>(bytes).unwrap_or(Value::Null);
+                for source in listing["sources"].as_array().into_iter().flatten() {
+                    if let Some(id) = source["import_id"].as_i64() {
+                        out.sources.insert(id, source.clone());
+                    }
+                }
+            }
+            if let Some(sha) = path.strip_prefix("sd/sources/").and_then(|p| p.strip_suffix(".csv"))
+                && sha.len() == 64
+                && sha.bytes().all(|b| b.is_ascii_hexdigit())
+                && sha256_hex(bytes) == sha
+            {
+                out.files.insert(sha.to_owned(), bytes.clone());
+            }
+        }
+        out
+    }
+}
+
+/// Recreates the resolved timeline and the SD import records (`recording_sd` tables).
+async fn write_resolved(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, mut resolved: Resolved<'_>) -> Result<(), Refusal> {
+    let storage = |e: &dyn std::fmt::Display| refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not write the imported recording: {e}"));
+    for statement in [
+        "CREATE TABLE sd_replay_telemetry(id INTEGER PRIMARY KEY,timestamp_ms INTEGER NOT NULL,source_timestamp_ms INTEGER,data_type TEXT NOT NULL,sender_id TEXT,values_json TEXT,payload_json TEXT,provenance_json TEXT NOT NULL,over_range INTEGER)",
+        "CREATE INDEX sd_replay_sample_origin ON sd_replay_telemetry(json_extract(provenance_json,'$.sd_sample_id'))",
+        "CREATE INDEX sd_replay_time ON sd_replay_telemetry(timestamp_ms)",
+        "CREATE INDEX sd_replay_series ON sd_replay_telemetry(data_type,sender_id,timestamp_ms)",
+        "CREATE TABLE sd_replay_loadcell_units(id INTEGER PRIMARY KEY CHECK(id=1),unit TEXT NOT NULL)",
+        "INSERT INTO sd_replay_loadcell_units VALUES(1,'adc_volts')",
+        "CREATE TABLE sd_imports(id INTEGER PRIMARY KEY, file_sha256 TEXT NOT NULL, filename TEXT NOT NULL, board_id TEXT NOT NULL, boot_id TEXT NOT NULL, stream_id TEXT NOT NULL, launch_session TEXT, schema_version TEXT NOT NULL, config_json TEXT NOT NULL, metadata_json TEXT NOT NULL, manifest_json TEXT NOT NULL, UNIQUE(file_sha256,board_id,boot_id,stream_id))",
+        "CREATE TABLE sd_samples(id INTEGER PRIMARY KEY, identity_key TEXT NOT NULL, content_sha256 TEXT NOT NULL, sensor TEXT NOT NULL, data_type TEXT, timestamp_ms INTEGER NOT NULL, monotonic_ms INTEGER NOT NULL, time_source TEXT NOT NULL, uptime_ticks TEXT NOT NULL, uptime_frequency_hz INTEGER NOT NULL, record_sequence TEXT NOT NULL, fields_json TEXT NOT NULL, UNIQUE(identity_key,content_sha256))",
+        "CREATE TABLE sd_source_chunks(file_sha256 TEXT NOT NULL,offset INTEGER NOT NULL,data BLOB NOT NULL,PRIMARY KEY(file_sha256,offset))",
+    ] {
+        sqlx::query(statement).execute(&mut **tx).await.map_err(|e| storage(&e))?;
+    }
+    let (mut line, mut last_id) = (1, 0i64);
+    while let Some(record) = resolved.rows.next_record() {
+        line += 1;
+        let cells = record.map_err(bad)?;
+        if cells.len() == 1 && cells[0].is_empty() && resolved.rows.at >= resolved.rows.bytes.len() {
+            break;
+        }
+        if cells.len() != resolved.columns {
+            return Err(bad(format!("data/telemetry.csv line {line} has {} cells, not {}.", cells.len(), resolved.columns)));
+        }
+        let mut cells = cells.into_iter();
+        let mut next = || cells.next().unwrap_or_default();
+        let (id, _received, source) = (next(), next(), next());
+        let (sender, data_type, values, payload) = (stored_text(next()), stored_text(next()), stored_text(next()), stored_text(next()));
+        let (canonical, provenance) = (next(), stored_text(next()));
+        let id = parse_ms(&id, "id", line)?;
+        if id <= last_id {
+            return Err(bad(format!("data/telemetry.csv line {line}: row ids must increase.")));
+        }
+        last_id = id;
+        let source = if source.is_empty() { None } else { Some(parse_ms(&source, "source_timestamp_ms", line)?) };
+        if serde_json::from_str::<Value>(&provenance).map_or(true, |p| !matches!(p["origin"].as_str(), Some("sd" | "network"))) {
+            return Err(bad(format!("data/telemetry.csv line {line}: the row has no SD or network provenance.")));
+        }
+        let (values, over_range) = stored_values(&values);
+        sqlx::query("INSERT INTO sd_replay_telemetry VALUES(?,?,?,?,?,?,?,?,?)")
+            .bind(id)
+            .bind(parse_ms(&canonical, "canonical_utc_ms", line)?)
+            .bind(source)
+            .bind(data_type)
+            .bind((!sender.is_empty()).then_some(sender))
+            .bind(values)
+            .bind((!payload.is_empty()).then_some(payload))
+            .bind(provenance)
+            .bind(over_range)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| storage(&e))?;
+    }
+    let sd = resolved.sd;
+    if let Some(resolution) = &sd.resolution {
+        sqlx::query("CREATE TABLE sd_resolution_manifest(id INTEGER PRIMARY KEY CHECK(id=1),manifest_json TEXT NOT NULL)").execute(&mut **tx).await.map_err(|e| storage(&e))?;
+        sqlx::query("INSERT INTO sd_resolution_manifest VALUES(1,?)").bind(resolution.to_string()).execute(&mut **tx).await.map_err(|e| storage(&e))?;
+    }
+    for import in &sd.imports {
+        let (Some(id), Some(sha)) = (import["id"].as_i64(), import["file_sha256"].as_str()) else { continue };
+        let manifest = &import["manifest"];
+        let listed = sd.sources.get(&id);
+        let text = |value: &Value| value.as_str().map(str::to_owned);
+        let field = |name: &str| listed.and_then(|l| text(&l[name])).or_else(|| text(&manifest[name])).unwrap_or_default();
+        sqlx::query("INSERT OR IGNORE INTO sd_imports VALUES(?,?,?,?,?,?,?,?,?,?,?)")
+            .bind(id)
+            .bind(sha)
+            .bind(listed.and_then(|l| text(&l["filename"])).unwrap_or_else(|| format!("sd-{sha}.csv")))
+            .bind(field("board_id"))
+            .bind(field("boot_id"))
+            .bind(field("stream_id"))
+            .bind(listed.and_then(|l| text(&l["launch_session"])).or_else(|| text(&manifest["launch_session"])))
+            .bind("imported-replay-bundle")
+            .bind(manifest.get("config").map_or_else(|| "{}".to_owned(), Value::to_string))
+            .bind(import["calibration_metadata"].to_string())
+            .bind(manifest.to_string())
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| storage(&e))?;
+    }
+    for (sha, bytes) in &sd.files {
+        for (n, chunk) in bytes.chunks(64 * 1024).enumerate() {
+            sqlx::query("INSERT OR IGNORE INTO sd_source_chunks VALUES(?,?,?)").bind(sha).bind((n * 64 * 1024) as i64).bind(chunk).execute(&mut **tx).await.map_err(|e| storage(&e))?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
