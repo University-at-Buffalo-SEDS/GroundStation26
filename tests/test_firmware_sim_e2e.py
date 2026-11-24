@@ -126,5 +126,38 @@ class Helpers(unittest.TestCase):
         self.assertAlmostEqual(e2e.STEPPER_RETRACT_S, 600.0)
         self.assertEqual(e2e.AUX_RETRACT_S, 45.0)
 
+    def test_low_battery_drains_both_packs_and_sees_the_condition_and_the_alert(self):
+        class BatteryStation(FakeStation):
+            def __init__(self):
+                super().__init__()
+                self.v = {"GB": 15.2, "PB": 7.8}
+                self.posts = []
+
+            def api(self, path, body=None):
+                if path == "/api/firmware-sim/control":
+                    self.posts.append(body)
+                    soc = {k: e["soc"] for k, e in body["batteries"].items()}
+                    self.v = {"GB": 12.4 if soc["gateway"] < 0.1 else 15.2, "PB": 5.9 if soc["power"] < 0.1 else 7.8}
+                    return 200, {}
+                low = self.v["GB"] <= 13.0
+                if path == "/api/alert_conditions":
+                    return 200, {"records": [{"key": "gateway_low_voltage:GB", "state": "active" if low else "resolved"}]}
+                if path.startswith("/api/alerts"):
+                    return 200, [{"message": "Critical: Battery voltage out of range!"}] if self.v["PB"] < 6.3 else []
+                return 404, None
+
+            def plant(self):
+                return {"batteries": {"gateway": {"soc": 0.6}}}
+
+            def latest(self, data_type, sender=None):
+                return {"values": [self.v[sender]]} if data_type == "BATTERY_VOLTAGE" else None
+
+        st, checks, result = BatteryStation(), [], {}
+        e2e.low_battery(st, lambda name, ok, **kw: checks.append((name, bool(ok))), result)
+        self.assertEqual([ok for _, ok in checks], [True, True, True, True], checks)
+        self.assertEqual(result["batteries"]["low"], {"GB": 12.4, "PB": 5.9})
+        self.assertEqual(st.posts[0], {"batteries": {"gateway": {"soc": 0.02}, "power": {"soc": 0.01}}})
+
+
 if __name__ == "__main__":
     unittest.main()

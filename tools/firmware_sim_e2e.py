@@ -533,6 +533,46 @@ def scenario_testing(st, check, result):
     # the station declares its Startup FLIGHT_STATE in Testing, so the DAQ allows DAC output here too
     dac_patch(st, check, result)
     fill(st, check)
+    low_battery(st, check, result)
+
+
+def battery_v(st: Station, sender: str):
+    r = st.latest("BATTERY_VOLTAGE", sender)
+    return r["values"][0] if r else None
+
+
+def low_battery(st: Station, check, result):
+    """The plant's battery packs (FirmwareSimulator native_plant.rs): the boards report them through their LTC2990
+    monitors. Drain the fill-box pack and the AV-bay pack from the control: the gateway's BATTERY_VOLTAGE falls to the
+    fill-system warning (13.0 V, GatewayLowVoltage condition) and the PB's below its layout range (Battery voltage out
+    of range); restoring the charge brings both back."""
+    gb0, pb0 = battery_v(st, "GB"), battery_v(st, "PB")
+    packs = st.plant().get("batteries") or {}
+    check("battery telemetry follows the plant's packs (GB 14-16 V, PB 7-8.4 V)",
+          gb0 is not None and 14.0 < gb0 < 16.0 and pb0 is not None and 7.0 < pb0 < 8.4, gb=gb0, pb=pb0, packs=packs)
+    code, _ = st.api("/api/firmware-sim/control", {"batteries": {"gateway": {"soc": 0.02}, "power": {"soc": 0.01}}})
+    gb_low = st.wait(lambda: (v := battery_v(st, "GB")) is not None and v <= 13.0 and v, 30, "GB battery low")
+    pb_low = st.wait(lambda: (v := battery_v(st, "PB")) is not None and v < 6.3 and v, 30, "PB battery low")
+
+    def condition():
+        code, snap = st.api("/api/alert_conditions")
+        records = (snap or {}).get("records", []) if code == 200 else []
+        return next((r for r in records if r.get("key", "").startswith("gateway_low_voltage") and r.get("state") == "active"), None)
+
+    def warned():
+        code, alerts = st.api("/api/alerts?minutes=5")
+        return code == 200 and any("Battery voltage out of range" in (a.get("message") or "") for a in alerts or []) and alerts
+
+    cond = st.wait(condition, 30, "fill-system low-voltage condition")
+    alert = st.wait(warned, 30, "battery out-of-range alert")
+    check("drained fill-box pack: GB BATTERY_VOLTAGE at or below 13.0 V raises the fill-system low-voltage condition",
+          code == 200 and gb_low and cond, gb=gb_low, condition=cond)
+    check("drained AV-bay pack: PB BATTERY_VOLTAGE below its range raises the battery alert", pb_low and alert, pb=pb_low)
+    st.api("/api/firmware-sim/control", {"batteries": {"gateway": {"soc": 0.6}, "power": {"soc": 0.8}}})
+    gb1 = st.wait(lambda: (v := battery_v(st, "GB")) is not None and v > 15.0 and v, 30, "GB battery restored")
+    pb1 = st.wait(lambda: (v := battery_v(st, "PB")) is not None and v > 7.0 and v, 30, "PB battery restored")
+    check("recharged packs read normal again", gb1 and pb1, gb=gb1, pb=pb1)
+    result["batteries"] = {"before": {"GB": gb0, "PB": pb0}, "low": {"GB": gb_low, "PB": pb_low}, "after": {"GB": gb1, "PB": pb1}}
 
 
 def dac_patch(st: Station, check, result, frequency_hz=20.0, target=None, attenuation=None):

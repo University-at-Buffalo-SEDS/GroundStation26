@@ -184,7 +184,7 @@ their internal state:
   powers the QD actuator in the auxiliary fill drive (QD retract below).
 * Operator inputs (`POST /api/firmware-sim/control`, administrators): `plant` (QD connected, nitrogen bottle open,
   nitrous bottle open, `qd_travel_s`: the QD actuator's travel to its limit switch, 1-300 s), `conditions` (ambient temperature, wind speed, direction, gusts), `loads` (calibration
-  masses on the KG50 and KG1000), `faults` (below). Every change is logged and the current control is written into
+  masses on the KG50 and KG1000), `batteries` (below), `faults` (below). Every change is logged and the current control is written into
   saved captures (`versions.simulated_conditions`).
 
 QD retract (the mechanism timing):
@@ -247,21 +247,48 @@ Liftoff and flight: the motor lights once the igniter has fired (not required in
 fires no igniter) and the pilot opens with at least 0.5 kg of liquid; the main valve is assumed to stay open to
 burnout once lit (HITL opens the pilot for 1.5 s). On the test stand (test fire mode) the rocket stays put. In
 flight: the umbilical separates (the VB leaves the fill CAN bus, the continuity loop opens, the QD disconnects);
-1-D vertical dynamics with the vehicle of `tools/flight_profile/vehicle.json` (33.2 kg dry, 1.1 kg fuel, 6 in, Cd
-0.5), drag with ISA density shifted by the ambient temperature, horizontal wind drift with gusts (no weathercocking);
-descent 25 m/s under the drogue and 5.8 m/s under the main after the FC fires each output, ballistic without them.
+the vehicle runs up the launcher (`vehicle.json` `launch`: 5.18 m rail, 5 deg tilt towards 60 deg, friction 0.03),
+constrained to it, then flies 3-D with the apogee planner's pitch/yaw dynamics (`backend/src/apogee_planner/flight.rs`
+`fly_traced`): thrust on the body axis, drag on the air-relative velocity (ISA density shifted by the ambient
+temperature, Cd 0.5), the normal force qd A CNa limited at 15 deg of attack, the restoring moment with the static margin
+and damping at the pitch damping ratio (`vehicle.json` CNa 9.28/rad, 3.49 cal, inertia factor 0.85, ratio 0.08), so
+the vehicle weathercocks into the wind off the rail (unit-tested: from a vertical rail in a 9 m/s crosswind the
+ascent heads upwind and the descent drifts back downwind); winds follow the planner's power law (floored at 1 m) or the winds aloft, with gusts.
+Descent 25 m/s under the drogue and 5.8 m/s under the main after the FC fires each output, drifting with the wind
+under a canopy, ballistic without them. The status carries `rail_exit_m_s`, `pitch_deg` and `heading_deg`; the RF GPS
+speed and course are the horizontal velocity.
 The FC barometer reads true ISA pressure at the geometric altitude above the 890 m pad (FlightComputer26 baro_agl,
 659440e); the accelerometer reads the specific force on body Z; before liftoff the FC reads the stationary pad.
+
+Batteries (control `batteries: {"power"|"gateway"|"valve": {"soc": 0-1, "load_w": W}}`; a new `soc` sets the
+pack's charge once, `load_w` adds a constant load): each board's pack discharges under its draw through a first-order
+Thevenin model (Li-ion OCV(SoC) x cells, R0 and one RC branch, coulomb counting), the board's converters drawing
+constant power and the switched loads resistive. The plant writes the terminal voltage and current into the board's
+LTC2990 monitors with the firmware's own conversions, so `BATTERY_VOLTAGE`/`BATTERY_CURRENT` and the station's alarms
+follow:
+
+| Pack | Board monitors (firmware) | Assumed pack | Draw | Switched loads |
+| --- | --- | --- | --- | --- |
+| `power` (PB, AV bay) | 0x4C V1 x 2.8; 0x4D V1, 5 mOhm | 2S, 10 Ah, R0 50 mOhm, SoC 0.8 (about 7.8 V) | 32 W (the measured 4.05-4.37 A) | FC drogue/main pyro outputs, 2 Ohm |
+| `gateway` (GB, fill box) | 0x4D V1 x 10.1 - 0.07 V; 0x4C V1, 20 mOhm | 4S, 6 Ah, R0 80 mOhm, SoC 0.6 (about 15.2 V) | 15 W (measured 0.41-1.54 A) | AB N2/N2O solenoids 8 Ohm, igniter 2.5 Ohm |
+| `valve` (VB) | 0x4D V2 x 5.7 (V1 12 V rail /4, V3/V4 7 V rails /2.5, dropping out with the pack); 0x4C V1, 20 mOhm, x 0.580 - 1.427 A | 4S, 3 Ah, R0 100 mOhm, SoC 0.6 | 4 W | VB pilot solenoid 8 Ohm |
+
+Pack capacities, resistances and the gateway's share of the AB loads are assumptions (no pack data in the repos);
+brown-out resets are not modelled. Before this the monitors read static codes (PB 3.5 V and 130 A, GB 12.6 V), so
+simulated runs carried a permanent battery-current alarm and a fill-system low-voltage condition. Draining the
+gateway pack (`soc` 0.02, about 12.4 V) raises GatewayLowVoltage (13.0 V); the PB below 6.3 V raises "Battery
+voltage out of range".
 
 Fault injection (control `faults`): stuck valves (`nitrogen`, `nitrous`, `vent`, `dump`, `pilot` open/closed
 regardless of the board's output), dead tank PT (open input), dead chamber PT, radio link drop (both directions),
 `kg50_bypass`/`kg1000_bypass` (0-1), `kg1000_supply_dip`, `kg50_open_lead`/`kg1000_open_lead`,
 `kg50_drift_kg_per_c`/`kg1000_drift_kg_per_c`.
 
-Not modelled yet: thermocouples, igniter current and continuity resistance sensing, power rails and battery
-discharge (LTC2990 monitors read static values), RF link quality versus range (only a full drop), the RF board's
-NEO-M9N GPS, an SD card missing, weathercocking/3-DOF attitude, weather-shifted pad pressure, the DAQ DAC to ADC
-patch (section 7).
+Not modelled yet: igniter continuity resistance sensing, roll and full 6-DOF body dynamics (the attitude is
+pitch/yaw only; the FC accelerometer reads the specific force along the body axis), weather-shifted pad pressure,
+board brown-outs. Thermocouples: no board reads one (DAQ-Board, ValveBoard26 and the other boards at dev and main
+have no thermocouple front end or driver; the only temperatures are the MCUs' die sensors), so there is nothing to
+model.
 
 Additions since the MVP:
 
@@ -381,7 +408,8 @@ python3 run_groundstation.py --switchable-modes --hitl-mode      # or the statio
 # plant inputs, conditions, calibration masses and faults (administrators)
 curl -X POST .../api/firmware-sim/control -d '{"plant":{"qd_connected":false},
     "conditions":{"ambient_c":35,"wind_mps":9,"wind_from_deg":300,"gust_mps":3},
-    "loads":{"kg50_kg":10}, "faults":{"stuck_valves":{"vent":"closed"},"kg1000_supply_dip":true}}'
+    "loads":{"kg50_kg":10}, "batteries":{"gateway":{"soc":0.02}},
+    "faults":{"stuck_valves":{"vent":"closed"},"kg1000_supply_dip":true}}'
 
 # the end-to-end check (HITL: fill rules, Armed, Launch, flight through the real FC, recovery events)
 python3 tools/firmware_sim_e2e.py --out /tmp/fsim-e2e
@@ -422,8 +450,10 @@ Per mode (the e2e: `python3 tools/firmware_sim_e2e.py --out DIR --mode <mode>`):
   ec999d7 and reports it in BOARD_HEALTH word 6 bit 29), recording which `test-data/igt` dataset was on the card
   (`docs/data-pipeline.md` §3.4a); then IgtExit leaves ground test. The FC refuses Enter (reason 11, "refused (wrong state)") while it still counts the
   station as lost, e.g. a few seconds after the radio path came back at boot; press it again.
-* **Testing**: the mode's own logic against the simulated boards (the e2e checks the links, the DAC patch and the fill
-  rules). The station stays in Startup in Testing and declares it to the boards once all are seen, so the DAQ knows
+* **Testing**: the mode's own logic against the simulated boards (the e2e checks the links, the DAC patch, the fill
+  rules and the batteries: GB and PB voltages in range, then both packs drained from the control until the GB reads
+  13.0 V or less with the fill-system low-voltage condition active and the PB below its range with the battery alert,
+  then recharged). The station stays in Startup in Testing and declares it to the boards once all are seen, so the DAQ knows
   its flight state and allows DAC output.
 * **DAC patch** (in the Normal and Testing runs): a 2 Hz sine on DAC1 patched onto the KG1000 amplifier through a 1/1000
   attenuator (the simulated loopback cable), measured by the DAQ's frame engine and judged by the station's DAC
@@ -599,6 +629,6 @@ frame engine waveforms up to about 250 Hz come through faithfully (500 Hz Nyquis
   operator's rewind to Idle.
 * The AB cannot see the QD actuator's limit switch: it reports the retraction complete after its 45 s whether or not
   the switch tripped (`qd_switch_never_trips`). Whether that should be a fault is open for the AB.
-* Thermocouples (no board reads one yet), power rails and battery discharge (the LTC2990 monitors still read static
-  values), weathercocking/3-DOF attitude, SAR inputs in the DAC patch.
+* SAR inputs in the DAC patch; roll/6-DOF attitude; brown-outs on a flat pack; the Settings sim panel has no
+  battery inputs yet (the control route takes `batteries`).
 * An actual remote bundle run, the armhf cross build and a run on the Pi station.
