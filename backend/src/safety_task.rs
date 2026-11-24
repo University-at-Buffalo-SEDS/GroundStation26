@@ -310,6 +310,12 @@ pub(crate) fn check_baro_thresholds(values: &[f32], warnings: &mut HashSet<&'sta
     }
 }
 
+/// Testing: publish the station's Startup FLIGHT_STATE once every board is
+/// seen, when this station has written no FLIGHT_STATE yet.
+pub(crate) fn testing_startup_due(testing: bool, current: FlightState, all_boards_seen: bool, own_published: bool) -> bool {
+    testing && current == FlightState::Startup && all_boards_seen && !own_published
+}
+
 /// The station modes whose old builds ran the safety task. HITL and test fire
 /// builds had no safety task at all.
 fn mode_runs_safety_task(mode: crate::station_mode::Mode) -> bool {
@@ -592,6 +598,24 @@ async fn safety_loop(
                     crate::automatic_flight_state::publish(state, proposal);
                 }
             }
+
+        // Testing has no automatic flight-state authority (no Readiness Idle),
+        // and a fresh station has no retained FLIGHT_STATE to publish, so the
+        // boards never learned any state: the DAQ refuses DAC output with no
+        // known state. Declare the station's actual Startup once.
+        if let Some(router) = state.topology_router.get()
+            && testing_startup_due(
+                crate::runtime_mode::is_testing(),
+                current_state,
+                all_boards_seen,
+                router.own_network_variable(crate::telemetry_schema::data_type("FLIGHT_STATE")).is_some(),
+            )
+        {
+            match crate::network_variables::set_flight_state(router, FlightState::Startup as u8) {
+                Ok(()) => log::info!("Testing: published the station's Startup FLIGHT_STATE for the boards"),
+                Err(err) => log::warn!("Testing: could not publish the Startup FLIGHT_STATE: {err}"),
+            }
+        }
 
         let last_packet_ms = state.last_packet_received_ms();
         if current_state == FlightState::Startup {
@@ -1055,6 +1079,15 @@ mod tests {
             "persisted latch matches actual dispatch outcome"
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn testing_declares_startup_once_to_the_boards() {
+        assert!(testing_startup_due(true, FlightState::Startup, true, false));
+        assert!(!testing_startup_due(true, FlightState::Startup, true, true), "already published");
+        assert!(!testing_startup_due(true, FlightState::Startup, false, false), "boards not all seen");
+        assert!(!testing_startup_due(true, FlightState::Idle, true, false), "only Startup");
+        assert!(!testing_startup_due(false, FlightState::Startup, true, false), "Normal publishes Readiness Idle itself");
     }
 
     #[test]

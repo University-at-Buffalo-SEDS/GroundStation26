@@ -436,11 +436,8 @@ def scenario_testing(st, check, result):
     # testing mode's own logic against the simulated boards: the links and the fill rules (its launch flow is not
     # driven here)
     boards_up(st, check)
-    # The DAC patch runs in Normal (the station publishes Idle there): in Testing the station stays in Startup without
-    # publishing a FLIGHT_STATE, and a DAQ with no stored state refuses DAC output (gate "flight state unknown").
-    code, body = st.api("/api/daq/dac/config", {"channel": 0, "waveform": "dc", "offset_v": 1.0})
-    st.log("Testing: DAC output request", http=code, body=body)
-    result["testing_dac_refusal"] = {"http": code, "body": body}
+    # the station declares its Startup FLIGHT_STATE in Testing, so the DAQ allows DAC output here too
+    dac_patch(st, check, result)
     fill(st, check)
 
 
