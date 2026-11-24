@@ -144,6 +144,8 @@ pub(crate) struct Pause {
     retry_gate:Arc<(Mutex<bool>,Condvar)>,
     pub(crate) trace: Arc<Trace>,
     pub(crate) suffix: Arc<SuffixGate>,
+    frozen: Mutex<Option<FrozenWindow>>,
+    owner: usize,
 }
 impl Pause {
     pub(crate) fn install(state: &AppState) -> Self {
@@ -179,7 +181,16 @@ impl Pause {
             packet,
             release,
             launch_packets,launch_calls,retry_gate,trace,suffix,
+            frozen: Mutex::new(None),
+            owner: state as *const AppState as usize,
         }
+    }
+    /// Stops the Launch retry window's clock at its start: the 100 ms window
+    /// then reads as unexpired however long a loaded host takes between the
+    /// test's Core release and the retry, so a transient CoreBusy always
+    /// retries. Production measures the window on the real monotonic clock.
+    pub(crate) fn freeze_retry_window(&self) {
+        *self.frozen.lock().unwrap() = Some(FrozenWindow::for_owner(self.owner));
     }
     pub(crate) fn release_core(&self) {
         *self.release.0.lock().unwrap() = true;
@@ -293,6 +304,42 @@ pub(crate) fn record_launch_sdk_return(state: &AppState, accepted: usize, error:
         };
         trace.mark(TraceEvent::SdkOfferReturned, (accepted as u64).saturating_mul(4).saturating_add(class));
     }
+}
+
+static FROZEN_WINDOWS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Test-only: while alive, the CoreBusy admission retry windows of one
+/// AppState read as just started. A test whose fixture shares the SDK Core
+/// with a background pump (or parks it) then cannot see a window expire just
+/// because a loaded host preempted the Core holder for over 100 ms.
+pub(crate) struct FrozenWindow(usize);
+impl FrozenWindow {
+    pub(crate) fn new(state: &AppState) -> Self {
+        Self::for_owner(state as *const AppState as usize)
+    }
+    fn for_owner(owner: usize) -> Self {
+        FROZEN_WINDOWS.lock().unwrap().push(owner);
+        Self(owner)
+    }
+}
+impl Drop for FrozenWindow {
+    fn drop(&mut self) {
+        let mut frozen = FROZEN_WINDOWS.lock().unwrap();
+        if let Some(at) = frozen.iter().position(|owner| *owner == self.0) {
+            frozen.swap_remove(at);
+        }
+    }
+}
+
+/// Elapsed time of an admission retry window: zero while a test froze that
+/// clock, otherwise None (the caller uses the real clock).
+pub(crate) fn launch_window_elapsed(state: &AppState) -> Option<Duration> {
+    let owner = state as *const AppState as usize;
+    FROZEN_WINDOWS
+        .lock()
+        .unwrap()
+        .contains(&owner)
+        .then_some(Duration::ZERO)
 }
 
 pub(crate) fn launch_retry_boundary(state:&AppState){

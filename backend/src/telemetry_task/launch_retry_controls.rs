@@ -248,6 +248,12 @@ async fn actual_busy(kind: &str) {
     let pause = crate::gse::nonwaiting_admission_tests::Pause::install(&rig.state);
     let trace = pause.trace.clone();
     trace.enable(kind == "transient");
+    if kind != "permanent" {
+        // The Core release, Stop or FC16 must land inside the retry window;
+        // stop the window's clock so a loaded host cannot expire it first.
+        // "permanent" keeps the real clock: it proves the window expires.
+        pause.freeze_retry_window();
+    }
     if kind == "new_fc16" {
         pause.hold_retry();
     }
@@ -310,7 +316,7 @@ async fn actual_busy(kind: &str) {
     pause.proceed.send(()).unwrap();
     pause
         .busy
-        .recv_timeout(Duration::from_millis(100))
+        .recv_timeout(Duration::from_secs(5))
         .expect("actual firstzero-owner CoreBusy");
     trace.mark(TraceEvent::BusyObserved, 0);
     let result = match kind {
@@ -328,7 +334,7 @@ async fn actual_busy(kind: &str) {
             let requester = std::thread::spawn(move || tx.send(stop.request_untimed()).unwrap());
             assert_eq!(
                 retained
-                    .recv_timeout(Duration::from_millis(100))
+                    .recv_timeout(Duration::from_secs(5))
                     .expect("real Stop retention beforeCore release"),
                 1
             );

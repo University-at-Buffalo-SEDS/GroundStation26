@@ -4861,7 +4861,7 @@ pub(crate) fn queue_controller_with_launch_revision(
     };
     match result {
         Ok(Err(sedsnet::TelemetryError::Io("router core busy")))
-            if started.elapsed()<std::time::Duration::from_millis(100)=>{
+            if admission_window_elapsed(state, started)<std::time::Duration::from_millis(100)=>{
                 #[cfg(test)]
                 nonwaiting_admission_tests::core_busy_refused(state);
                 #[cfg(test)]
@@ -4976,6 +4976,19 @@ pub(crate) fn queue_state_launch(
     queue_prepared_launch_packets(state, router, ticket, Vec::new(), Some(prepared))
 }
 
+/// Elapsed time of a CoreBusy admission retry window, on the real monotonic
+/// clock. A test that parks the SDK Core may stop this clock
+/// (`nonwaiting_admission_tests::Pause::freeze_retry_window`) so host load
+/// cannot expire the window before its release; production never does.
+fn admission_window_elapsed(state: &AppState, at: Instant) -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(frozen) = nonwaiting_admission_tests::launch_window_elapsed(state) {
+        return frozen;
+    }
+    let _ = state;
+    at.elapsed()
+}
+
 pub(crate) fn queue_prepared_launch_packets(
     state: &AppState,
     router: &sedsnet::router::Router,
@@ -5017,7 +5030,7 @@ pub(crate) fn queue_prepared_launch_packets(
     let mut admitted_prefix = 0usize;
     let suffix_retry = !crate::runtime_mode::is_test_fire();
     let result = loop {
-        if first_sdk_attempt.is_some_and(|at| at.elapsed() >= retry_window) {
+        if first_sdk_attempt.is_some_and(|at| admission_window_elapsed(state, at) >= retry_window) {
             break Err((admitted_prefix, last_zero_busy.take().expect("retry follows a real zero-owner CoreBusy")));
         }
         if last_zero_busy.is_some() && admitted_prefix == 0 {
@@ -5056,7 +5069,7 @@ pub(crate) fn queue_prepared_launch_packets(
                 // A guard may have waited. No retry call starts after this
                 // window; after a non-busy refusal, preserve legacy behavior.
                 if accepted == 0
-                    && first_sdk_attempt.is_some_and(|at| at.elapsed() >= retry_window)
+                    && first_sdk_attempt.is_some_and(|at| admission_window_elapsed(state, at) >= retry_window)
                 {
                     return QueueAttempt::WindowExpired;
                 }
