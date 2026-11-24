@@ -47,11 +47,7 @@ impl Channel {
             Self::Chamber => ("COMBUSTION_CHAMBER_PRESSURE", ""),
         }
     }
-    /// DAQ SD sensor label (DAQ-Board `Core/Src/sd_card.c` scalar sensors).
-    pub(crate) fn daq_sensor(self) -> &'static str {
-        self.daq_sensors()[0]
-    }
-    /// Every DAQ SD label of this channel: the per-sample volts records of the
+    /// Every DAQ SD label of this channel (DAQ-Board `Core/Src/sd_card.c` scalar sensors): the per-sample volts records of the
     /// current DAQ file (`kg1000_v`, `kg50_v`, `chamber_pressure_v`: ADC-pin
     /// volts in `raw_value`, kg or psig in `calibrated_value`) and the older
     /// calibrated network records. The burn report read only the older ones,

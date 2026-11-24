@@ -3096,8 +3096,7 @@ async fn handle_packet_inner(
                 values: vec![Some(pkt_data as f32)], over_range: 0, over_range_low: 0,
             }];
         }
-        let mut relay_landed = false;
-        {
+        let relay_landed = {
             let mut fs = state.state.lock().unwrap();
             // The original snapshot is not final authority across a local Stop
             // admission or reset. A delayed FC phase must not undo either owner.
@@ -3114,8 +3113,8 @@ async fn handle_packet_inner(
             }
             let previous = *fs;
             *fs = new_flight_state;
-            relay_landed = relay_fc_landed(fc, previous, new_flight_state);
-        }
+            relay_fc_landed(fc, previous, new_flight_state)
+        };
         // The FC's own FLIGHT_STATE reaches the station over the radio only, and
         // the ground boards follow the station alone (the DAQ refuses any other
         // writer): without this the DAQ stayed in Launch after the landing and
