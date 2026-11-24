@@ -300,7 +300,7 @@ fn railed(
     volts: f32,
 ) -> bool {
     let railed = crate::loadcell::daq_rails_apply()
-        && crate::loadcell::loadcell_volts_at_rail(calibration.kg50_input, sensor, volts);
+        && crate::loadcell::loadcell_volts_at_rail_for(calibration, sensor, volts);
     if railed {
         let _ = filters.filter(calibration, sender, sensor, timestamp_ms, f32::NAN);
     }

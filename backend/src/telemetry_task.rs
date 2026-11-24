@@ -2202,6 +2202,24 @@ async fn insert_db_batch_once(
                 values_json,
                 payload_json,
             } => {
+                // Over-range markers in the in-flight values_json become null
+                // plus the packed `over_range` column (crate::over_range).
+                let (values_json, over_range) = crate::over_range::split_values_json(values_json.as_deref());
+                if over_range.is_some() {
+                    sqlx::query(
+                        "INSERT INTO telemetry (timestamp_ms, source_timestamp_ms, data_type, sender_id, values_json, payload_json, over_range) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    )
+                    .bind(*timestamp_ms)
+                    .bind(*source_timestamp_ms)
+                    .bind(data_type.as_str())
+                    .bind(sender_id.as_str())
+                    .bind(values_json.as_deref())
+                    .bind(payload_json.as_str())
+                    .bind(over_range)
+                    .execute(&mut *tx)
+                    .await?;
+                    continue;
+                }
                 sqlx::query(
                     "INSERT INTO telemetry (timestamp_ms, source_timestamp_ms, data_type, sender_id, values_json, payload_json) VALUES (?, ?, ?, ?, ?, ?)",
                 )
@@ -2481,7 +2499,7 @@ pub(crate) fn capture_umbilical_status_at_ingress(
                 timestamp_ms: get_current_timestamp_ms() as i64,
                 data_type: pkt.data_type().as_str().to_string(),
                 sender_id,
-                values: Vec::new(),
+                values: Vec::new(), over_range: 0, over_range_low: 0,
             };
             state.ring_buffer.lock().unwrap().push(
                 crate::ring_buffer::ReceivedPacket::AppliedStatus {
@@ -2590,7 +2608,7 @@ fn apply_captured_status_inner(
                 timestamp_ms: received_ms as i64,
                 data_type: VALVE_STATE_DATA_TYPE.to_string(),
                 sender_id,
-                values: valve_state_values(state).into_iter().collect(),
+                values: valve_state_values(state).into_iter().collect(), over_range: 0, over_range_low: 0,
             });
         }
     }
@@ -2777,7 +2795,10 @@ async fn handle_packet_inner(
         if let Ok(words) = pkt.data_as_u32() {
             // Station setting: without a chamber PT its no-signal fault is not
             // listed or announced (the DAQ cannot tell an absent 0-5 V PT).
-            let chamber_pt_installed = state.loadcell_calibration.lock().unwrap().chamber_pt_installed;
+            let (chamber_pt_installed, station_mcp_vref_v) = {
+                let cfg = state.loadcell_calibration.lock().unwrap();
+                (cfg.chamber_pt_installed, cfg.mcp_vref_v)
+            };
             let report = {
                 let mut health = state.network_health.lock().unwrap();
                 health.set_chamber_pt_installed(chamber_pt_installed);
@@ -2791,10 +2812,23 @@ async fn handle_packet_inner(
             if let Some(report) = report {
                 recording_diagnostics::raw_health(state, db_tx, &pkt, &sender_id);
                 let now_ms = get_current_timestamp_ms() as i64;
-                for alert in crate::daq_input_health::observe_alerts(&sender_id, &report, now_ms, chamber_pt_installed, |sensor| {
+                let context = crate::daq_input_health::Context {
+                    chamber_pt_installed,
+                    station_mcp_vref_mv: (station_mcp_vref_v.is_finite() && station_mcp_vref_v > 0.0)
+                        .then(|| (station_mcp_vref_v * 1000.0).round() as u16),
+                    in_burn: crate::daq_input_health::in_burn_window(
+                        launch_clock_t0_ms(&state.launch_clock_snapshot()),
+                        now_ms,
+                    ),
+                };
+                for alert in crate::daq_input_health::observe_alerts(&sender_id, &report, now_ms, context, |sensor| {
                     derived::claim_daq_rail_alert(&sender_id, sensor, now_ms)
                 }) {
-                    emit_warning(state, alert);
+                    if alert.critical {
+                        crate::web::emit_error(state, alert.text);
+                    } else {
+                        emit_warning(state, alert.text);
+                    }
                 }
             }
         }
@@ -3044,7 +3078,7 @@ async fn handle_packet_inner(
                 timestamp_ms: get_current_timestamp_ms() as i64,
                 data_type: "FLIGHT_STATE".into(),
                 sender_id,
-                values: vec![Some(pkt_data as f32)],
+                values: vec![Some(pkt_data as f32)], over_range: 0, over_range_low: 0,
             }];
         }
         {
@@ -3059,7 +3093,7 @@ async fn handle_packet_inner(
                 return vec![TelemetryRow {
                     timestamp_ms: get_current_timestamp_ms() as i64,
                     data_type: "FLIGHT_STATE".into(), sender_id,
-                    values: vec![Some(pkt_data as f32)],
+                    values: vec![Some(pkt_data as f32)], over_range: 0, over_range_low: 0,
                 }];
             }
             *fs = new_flight_state;
@@ -3185,7 +3219,7 @@ async fn handle_packet_inner(
             rows.push(TelemetryRow {
                 timestamp_ms: ts_ms, data_type: "IGNITER_SENSE_STATUS".into(), sender_id: sender_id.clone(),
                 // Capability1:model_supply_mismatch is information, not an Abort/error producer.
-                values: status_values,
+                values: status_values, over_range: 0, over_range_low: 0,
             });
             if let Some(signal) = observed.signal {
                 let mut signal_values=vec![signal.raw_counts,signal.volts,signal.amps];
@@ -3193,7 +3227,7 @@ async fn handle_packet_inner(
                 let row = TelemetryRow {
                     timestamp_ms: signal.source_utc_ms.unwrap_or(ts_ms),
                     data_type: "IGNITER_SENSE_SIGNAL".into(), sender_id: sender_id.clone(),
-                    values: signal_values,
+                    values: signal_values, over_range: 0, over_range_low: 0,
                 };
                 crate::telemetry_provenance::note(&row, signal.source_utc_ms);
                 rows.push(row);
@@ -3253,14 +3287,19 @@ async fn handle_packet_inner(
             .collect();
     }
 
-    if let Some(values_vec) = telemetry_f32_values(&pkt) {
-        crate::daq_dac::observe_values(
-            state,
-            &sender_id,
-            pkt.data_type(),
-            crate::network_stamp::Stamp::of(&pkt),
-            &values_vec,
-        );
+    if let Some(values_vec) = telemetry_f32_values_marked(&pkt, &sender_id) {
+        {
+            // Over-range markers are not samples for the DAC analysis.
+            let mut plain = values_vec.clone();
+            crate::over_range::split(&mut plain);
+            crate::daq_dac::observe_values(
+                state,
+                &sender_id,
+                pkt.data_type(),
+                crate::network_stamp::Stamp::of(&pkt),
+                &plain,
+            );
+        }
         let rows = telemetry_rows_from_packet_values(state, &pkt, &sender_id, values_vec);
         let live_receipt = crate::gse::ValveReceipt {
             network_ms: crate::network_stamp::receipt_ms_for_packet(
@@ -3379,7 +3418,7 @@ async fn handle_packet_inner(
                         source_timestamp_ms: Some(pkt.timestamp() as i64),
                         data_type: row_data_type.clone(),
                         sender_id: sender_id.clone(),
-                        values_json: telemetry_values_json(&row_values),
+                        values_json: crate::over_range::marked_values_json(&row_values),
                         payload_json: payload_json.clone(),
                     },
                 )
@@ -3446,12 +3485,7 @@ async fn handle_packet_inner(
                 .await;
             }
 
-            let row = TelemetryRow {
-                timestamp_ms: ts_ms,
-                data_type: row_data_type,
-                sender_id: sender_id.clone(),
-                values: row_values,
-            };
+            let row = TelemetryRow::marked(ts_ms, row_data_type, sender_id.clone(), row_values);
             if row.data_type == "GPS_DATA" {
                 crate::sd_download::fc::note_gps();
                 crate::antenna::observe_source_gps(&row, crate::network_stamp::Stamp::of(&pkt));
@@ -3483,7 +3517,7 @@ async fn handle_packet_inner(
                 timestamp_ms: ts_ms,
                 data_type: data_type_str,
                 sender_id,
-                values: Vec::new(),
+                values: Vec::new(), over_range: 0, over_range_low: 0,
             }];
         }
 
@@ -3629,6 +3663,16 @@ async fn reset_testing_simulation(state: &Arc<AppState>) {
         .board_status_tx
         .send(state.board_status_snapshot(now_ms));
     state.broadcast_dashboard_reset();
+}
+
+/// T0 on the station's launch clock (None while idle).
+fn launch_clock_t0_ms(clock: &crate::telemetry_db::LaunchClockMsg) -> Option<i64> {
+    use crate::telemetry_db::LaunchClockKind;
+    match clock.kind {
+        LaunchClockKind::Idle => None,
+        LaunchClockKind::TPlus => clock.anchor_timestamp_ms,
+        LaunchClockKind::TMinus => clock.anchor_timestamp_ms.map(|at| at.saturating_add(clock.duration_ms.unwrap_or(0))),
+    }
 }
 
 fn payload_json_from_pkt(pkt: &Packet) -> String {
@@ -6972,6 +7016,98 @@ mod tests {
         );
     }
 
+    /// An over-range KG1000 (+Inf from the DAQ) and an over-range chamber PT
+    /// (-Inf) travel as null plus over-range bits through the live rows, the
+    /// derived rows, the recording and replay; no number is ever computed
+    /// from the marker.
+    #[tokio::test]
+    async fn over_range_markers_reach_live_rows_derived_rows_recording_and_replay() {
+        let (db_tx, mut db_rx) = mpsc::channel(64);
+        let state = test_app_state(db_tx.clone()).await;
+        let db_overflow = test_db_overflow();
+        {
+            let mut cfg = state.loadcell_calibration.lock().unwrap();
+            cfg.ch1 = loadcell::ChannelLinear { m: Some(400.0), b: Some(0.0) };
+            cfg.chamber_pt_installed = true;
+        }
+        let mut ws_rx = state.ws_tx.subscribe();
+        let packet = |name: &str, timestamp, values: &[f32]| {
+            Packet::new(
+                crate::telemetry_schema::data_type(name),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                "DAQ",
+                timestamp,
+                f32_payload(values),
+            )
+            .unwrap()
+        };
+        let rows = handle_packet(&state, &db_tx, &db_overflow, packet("KG1000", 700_000, &[f32::INFINITY])).await;
+        assert_eq!((rows[0].values.clone(), rows[0].over_range, rows[0].over_range_low), (vec![None], 1, 0));
+        let rows = handle_packet(
+            &state,
+            &db_tx,
+            &db_overflow,
+            packet("DAQ_LOADCELL_CHAMBER", 700_020, &[0.25, f32::NEG_INFINITY, f32::NEG_INFINITY]),
+        )
+        .await;
+        let chamber = rows.iter().find(|r| r.data_type == "COMBUSTION_CHAMBER_PRESSURE").expect("chamber row");
+        assert_eq!((chamber.values.clone(), chamber.over_range, chamber.over_range_low), (vec![None], 1, 1));
+        let raw = rows.iter().find(|r| r.data_type == "DAQ_LOADCELL_CHAMBER").unwrap();
+        assert_eq!((raw.values.clone(), raw.over_range, raw.over_range_low), (vec![Some(0.25), None, None], 0b110, 0b110));
+        let mut derived = Vec::new();
+        while let Ok(row) = ws_rx.try_recv() {
+            if row.data_type == loadcell::DERIVED_WEIGHT_DATA_TYPE {
+                derived.push((row.values, row.over_range));
+            }
+        }
+        assert_eq!(derived[0], (vec![None], 1), "the derived weight is over range, not a number");
+        assert!(derived[1].0[0].is_some_and(f32::is_finite) && derived[1].1 == 0, "0.25 V is a weight again");
+        // The recording: drain the queued writes into a fresh database.
+        let mut writes = Vec::new();
+        while let Ok(item) = db_rx.try_recv() {
+            if let DbQueueItem::Write(write) = item {
+                writes.push(write);
+            }
+        }
+        let db = crate::telemetry_db::open_in_memory_telemetry_db().await.unwrap();
+        insert_db_batch_once(&db, &writes).await.unwrap();
+        let stored: Vec<(String, Option<String>, Option<i64>)> = sqlx::query_as(
+            "SELECT data_type,values_json,over_range FROM telemetry WHERE data_type IN ('KG1000','LOADCELL_WEIGHT_KG','COMBUSTION_CHAMBER_PRESSURE') ORDER BY id",
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        assert!(stored.iter().all(|(_, v, _)| !v.as_deref().unwrap_or("").contains("ovr")), "{stored:?}");
+        assert!(stored.contains(&("KG1000".into(), Some("[null]".into()), crate::over_range::pack(1, 0))), "{stored:?}");
+        assert!(stored.contains(&("COMBUSTION_CHAMBER_PRESSURE".into(), Some("[null]".into()), crate::over_range::pack(1, 1))), "{stored:?}");
+        assert!(stored.contains(&("LOADCELL_WEIGHT_KG".into(), Some("[null]".into()), crate::over_range::pack(1, 0))), "{stored:?}");
+        // Replay reproduces the masks.
+        let (start, end, upper): (i64, i64, i64) =
+            sqlx::query_as("SELECT MIN(timestamp_ms),MAX(timestamp_ms),MAX(id) FROM telemetry").fetch_one(&db).await.unwrap();
+        let page = crate::recording_replay::test_page_from(
+            &db,
+            &crate::recording_replay::Window {
+                upper_id: upper,
+                after_id: 0,
+                start_ms: start,
+                end_ms: end,
+                types: r#"["KG1000","COMBUSTION_CHAMBER_PRESSURE","DAQ_LOADCELL_CHAMBER"]"#.into(),
+            },
+        )
+        .await
+        .unwrap();
+        let get = |ty: &str| page.rows.iter().find(|r| r.data_type == ty).unwrap();
+        assert_eq!((get("KG1000").over_range, get("KG1000").over_range_low), (1, 0));
+        assert_eq!((get("COMBUSTION_CHAMBER_PRESSURE").over_range, get("COMBUSTION_CHAMBER_PRESSURE").over_range_low), (1, 1));
+        assert_eq!(get("DAQ_LOADCELL_CHAMBER").over_range, 0b110);
+        let json = serde_json::to_value(get("KG1000")).unwrap();
+        assert_eq!((json["values"].clone(), json["over_range"].clone()), (serde_json::json!([null]), serde_json::json!(1)));
+        assert!(json.get("over_range_low").is_none());
+        // The CSV export writes OVR/-OVR instead of a number.
+        let csv = crate::recording_export::test_csv_page(&db, upper).await;
+        assert!(csv.contains(r#""[""OVR""]""#) && csv.contains(r#""[0.25,""-OVR"",""-OVR""]""#), "{csv}");
+    }
+
     #[tokio::test]
     async fn railed_kg1000_records_raw_but_publishes_invalid_weight_and_warns_once() {
         let (db_tx, mut db_rx) = mpsc::channel(32);
@@ -7048,12 +7184,14 @@ mod tests {
         let mut warnings_rx = state.warnings_tx.subscribe();
         // Chamber no signal active (bit 7), one episode, CH6 at 0.012 V as in
         // the 2026-11-16 test fire; VMAIN healthy.
-        // Version 2: the first ten words, then noise/drift (none yet), no
-        // excitation monitor and zero frame-engine counters.
-        let words: [u32; 18] = [
-            2 | 0x200, 0x80 | (0x80 << 16), 0, 0, 0, 1 << 16,
+        // Version 3: the first ten words, then noise/drift (none yet), no
+        // excitation monitor and zero frame-engine counters, then nothing
+        // over range, VDDA 3.30 V and the station's 2.2 V reference.
+        let words: [u32; 28] = [
+            3 | 0x200, 0x80 | (0x80 << 16), 0, 0, 0, 1 << 16,
             14_180 | (14_200 << 16), 8 | (12 << 16), 0xFFFF_FFFF, 12_500 | (50 << 16),
             0x8000_FFFF, 0x8000_FFFF, 0x8000_FFFF, 0x8000_FFFF, 0xFFFF_FFFF, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 3_302 | (3_300 << 16), 0, 2_200 | (1 << 16),
         ];
         let packet = |timestamp| {
             Packet::new(
@@ -7083,6 +7221,8 @@ mod tests {
         let chamber = input.faults.iter().find(|f| f.key == "chamber_no_signal").unwrap();
         assert!(chamber.active && chamber.episodes == 1);
         assert_eq!((input.chamber_mv, input.vmain_mv), (Some(12), Some(14_200)));
+        assert_eq!(input.vdda_v, Some(crate::types::Volts(3.3)));
+        assert!(input.adc_channels.is_empty());
         let mut recorded = false;
         while let Ok(item) = db_rx.try_recv() {
             if let DbQueueItem::Write(DbWrite::Telemetry { data_type, .. }) = item {

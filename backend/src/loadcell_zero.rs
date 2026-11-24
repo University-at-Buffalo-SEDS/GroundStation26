@@ -218,6 +218,9 @@ pub struct Status {
     pub elapsed_s: u64,
     pub requested_duration_s: u64,
     pub rejected_samples: u64,
+    /// Over-range samples (DAQ ±Inf marker) seen during the capture; any
+    /// makes the capture invalid.
+    pub over_range_samples: u64,
     pub dropped_samples: u64,
     pub csv_path: String,
     pub report_path: String,
@@ -491,6 +494,13 @@ impl Service {
                         true
                     }
             });
+        if sample.raw.is_infinite() {
+            // Over range: never averaged in, and the capture is refused.
+            status.over_range_samples += 1;
+            status.rejected_samples += 1;
+            status.error = Some(crate::over_range::capture_refusal(&status.sensor_id, status.over_range_samples as usize));
+            return;
+        }
         if !source_valid
             || !sample.raw.is_finite()
             || sample.temperature.is_none_or(|value| !value.is_finite())
@@ -546,6 +556,7 @@ impl Service {
                     reference_c: reference,
                     raw_per_c: r.raw_per_c as f32,
                     points: vec![],
+                    fitted_mcp_vref_v: None,
                 },
             );
         }
@@ -834,6 +845,28 @@ mod source_provenance_tests {
             std::process::id(),
             time::OffsetDateTime::now_utc().unix_timestamp_nanos()
         ))
+    }
+
+    #[test]
+    fn an_over_range_sample_is_never_averaged_and_refuses_the_capture() {
+        let dir = directory("ovr");
+        let service = Service::default();
+        let capture = service.start_in_dir("KG1000", 60, dir.clone()).unwrap();
+        let epoch = 1_793_000_000_000;
+        service.observe_source(input(Some(epoch), epoch, 1000));
+        for (i, marker) in [f32::INFINITY, f32::NEG_INFINITY].into_iter().enumerate() {
+            let mut over = input(Some(epoch + 1 + i as i64), epoch + 1 + i as i64, 1001 + i as i64);
+            over.raw = marker;
+            service.observe_source(over);
+        }
+        service.observe_source(input(Some(epoch + 3), epoch + 3, 1003));
+        wait_samples(&service, 2);
+        let done = finish(&service, &capture);
+        assert_eq!((done.over_range_samples, done.rejected_samples), (2, 2));
+        assert_eq!(done.error.as_deref(), Some("KG1000 over range during the capture (2 samples); fix the input and repeat"));
+        let mut cfg = LoadcellCalibrationFile::default();
+        assert!(service.apply(&capture.session_id, &mut cfg, false, 0.0).is_err());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

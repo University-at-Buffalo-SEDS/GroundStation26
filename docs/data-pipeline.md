@@ -131,7 +131,7 @@ Health types bypass the cap.
 | `DAQ_SAR_VOLTAGES` | f32[8]: SAR_IN1..8 | ≈ 4/s (weight 1) | generic; `daq_dac::observe_values` | as received | V |
 | `DAQ_CURRENT_SENSE` | f32[4]: J7 V, J8 V, J7 A, J8 A | ≈ 4/s (weight 1) | generic | as received | V, A |
 | `DAQ_POWER_MONITOR` | f32[4]: VMON V, IMON V, VMAIN V, input A | ≈ 8/s (weight 2) | generic | as received | V, A |
-| `DAQ_INPUT_HEALTH` | u32[18], version 2 (layout in `daq_input_health.rs` header; version 1 u32[10] still decodes): faults plus per-channel noise/drift, excitation mV, ADC frame counters | 1/s, at most every 200 ms (`DAQ_INPUT_HEALTH_PERIOD_MS`, `Core/Inc/daq_input_fault_config.h:131`) | `network_health::observe_input_health`, `daq_input_health::observe_alerts` | raw payload row, `values_json` `[]`; alerts | mV fields |
+| `DAQ_INPUT_HEALTH` | u32[28], version 3 (layout in `daq_input_health.rs` header; version 2 u32[18] and version 1 u32[10] still decode from recordings): faults (8 VDDA_HIGH, 9 VDDA_LOW added in v3) plus per-channel noise/drift, excitation mV, ADC frame counters, ADC over-range now/latched/direction masks and per-channel counters, VDDA (+3V3A) max/now, applied MCP3564R reference | 1/s, at most every 200 ms (`DAQ_INPUT_HEALTH_PERIOD_MS`, `Core/Inc/daq_input_fault_config.h:131`) | `network_health::observe_input_health`, `daq_input_health::observe_alerts` | raw payload row, `values_json` `[]`; alerts; Board status `daq_input` (`adc_channels`, `vdda_v`, `vdda_max_v`, `mcp_vref_v`, `mcp_vref_source`) | mV fields |
 | `DAQ_SD_HEALTH` | u32[8] | every 5 s | `network_health::observe_sd_status` | raw payload row | |
 | `DAQ_LAUNCH_LOG_STATUS` | u32[7] | every 5 s | `network_health::observe_launch_log_status` | raw payload row; `/api/network_topology` `launch_log` | |
 | `DAQ_DAC_STATUS` | u8[80] | while the DAC runs | `network_health::observe_dac_status`, `daq_dac::observe_status` | raw payload row | |
@@ -170,6 +170,83 @@ The steps run in this order:
   - |psig| ≤ 5,280 and |V| ≤ 26.4 are required.
   - `RANGE_STATUS` = 1 outside 0 to 1,000 psig or 0 to 5 V.
 - With `chamber_pt_installed = false`, pressure and status are recorded as `null` and `PT_INSTALLED` as 0. The raw vector is still recorded.
+
+#### Over-range values (`over_range.rs`)
+
+The MCP3564R has no over-range status bit. The DAQ classifies a conversion
+as over range when |code| > 2^23 − 1 (beyond ±VREF/GAIN; accuracy holds
+only to about ±1.05 × VREF and codes clip at ±2 × VREF, DS20006391C §5.6).
+
+- **Wire.** A published value whose whole bin was over range is +Inf (above
+  +full scale) or −Inf (below −full scale). A bin with some in-range samples
+  carries the mean of those only. NaN still means no data. This applies to
+  `KG1000`, `DAQ_LOADCELL_CHAMBER` [0..2], `KG50`, `DAQ_KG50_SELECTED` [1] and
+  `DAQ_SDADC_VOLTAGES` [0..5]. `DAQ_ADC_TEMPERATURE` goes NaN instead.
+- **Station pipeline.** For those DAQ types the ±Inf markers are kept
+  (`telemetry_f32_values_marked`). A derived row from an over-range input is
+  over range as well: `LOADCELL_WEIGHT_KG`, `LOADCELL_50_WEIGHT_KG`,
+  `LOADCELL_FILL_PERCENT`, and `COMBUSTION_CHAMBER_PRESSURE`/`_VOLTAGE`/`_RANGE_STATUS`.
+  No number is ever computed from a marker, and the fill mass reads `None`.
+- **Rows.** `TelemetryRow` (WebSocket, `/api/recent`, the NDJSON stream),
+  replay samples and raw-stream rows carry the value as `null` plus
+  `over_range` (bit i: `values[i]` is over range) and `over_range_low` (bit
+  i: below −full scale). Both are omitted when 0.
+- **Recordings.** `values_json` holds `null`, and the nullable column
+  `telemetry.over_range` holds `mask | low_mask << 32` (also
+  `sd_replay_telemetry.over_range` for SD-resolved rows). Recordings made
+  before this have no such column; readers treat it as absent. Copies (ring
+  windows, captures) carry the column when both sides have it.
+- **CSV.** The recording CSV writes `"OVR"`/`"-OVR"` in `values_json`. The
+  test-fire CSV writes `OVR`/`-OVR` in the value and weight cells.
+  `export_telemetry_csv.py` adds the packed `over_range` column.
+- **Excluded from.**
+  - Known-mass/zero captures: refused with "KG1000 over range during the
+    capture (n samples); fix the input and repeat". The check covers
+    `capture_started_ms`, or else the last 10 s.
+  - The thermal zero, over its 132 s settling window.
+  - The long zero/noise capture (`loadcell_zero`), which is refused.
+  - Auto-zero: an over-range sample in the window blocks the zero, with a
+    reason.
+  - The burn report: up to 2 samples / 5 ms are bridged. Longer stretches
+    are a `kg1000_over_range` / `kg50_over_range` gap, with
+    `impulse_lower_bound` and `over_range_gap_s` set; `chamber_over_range`
+    is flagged too. Such a fire joins the archive excluded from the motor
+    fit until it is reviewed.
+- **Alerts** (`daq_input_health.rs`, DAQ_INPUT_HEALTH v3).
+  - A channel going over range warns once per episode with a 30 s holdoff,
+    e.g. "DAQ ADC over range: KG1000 (CH0) for 1.0 s (…)". The chamber PT
+    over range inside the burn window (T0 − 1 s to T0 + 20 s on the station
+    launch clock, PT installed) is CRITICAL: "overpressure or sensor fault".
+    So is any channel in `TANK_PRESSURE_BITS` (empty: the tank PTs are on
+    the VB).
+  - VDDA_HIGH warns "DAQ +3V3A high (x.xx V): likely clamp injection …" and
+    names the channels over range at the time. Above 3.6 V it is CRITICAL:
+    "exceeds the 3.6 V operating limit; hardware stress risk".
+  - VDDA_LOW warns.
+  - While VDDA_HIGH is active, the VMAIN supply-low alert notes that VMAIN
+    is now VDDA-corrected. The earlier ~11 V dips were most likely a VDDA
+    measurement artifact.
+  - The DAQ_POWER_MONITOR values arrive already VDDA-corrected; the station
+    does nothing further.
+  - The Board status lists every channel that is over range now or was in
+    the last 10 minutes (`adc_channels`). Its counts are accumulated by the
+    station from the wrapping u16 counters.
+
+#### MCP3564R reference (`DAQ_MCP_REFERENCE`, `loadcell/mcp_reference.rs`)
+
+The DAQ publishes every MCP3564R input as volts = code × VREF / 2^23. The P6 ×16 scan is divided by 16 again. VREF is a per-station DAQ setting that the GS owns.
+
+- **Setting.** `mcp_vref_v` (f32 volts) in the load-cell calibration file, with the free-text `mcp_vref_note`. The default is the nominal 2.4 V, and the valid range is 1.9–2.6 V, which the DAQ also enforces. `GET /api/calibration` returns both fields. `POST /api/calibration/mcp_vref` with `{"mcp_vref_v": x}` saves the value; an optional `"note"` sets the note, and leaving it out keeps the current one. The reply echoes `mcp_vref_v`, `mcp_vref_note`, `nominal_v`, `min_v` and `max_v`. A change is refused while a zero capture or a recording is running.
+- **Sending.** `DAQ_MCP_REFERENCE` is 4 bytes, f32 LE, to `SD_CARD`. It is a managed station variable like `DAQ_KG50_INPUT`. The DAQ requests it every boot until it has it. `set_daq_calibration` sends it first, then the calibrations. The value is per calibration file, so per station mode. Set it in each mode's file that drives the real DAQ (normal and test fire), and on both paired stations: a paired peer refuses calibration documents expressed under a different reference.
+- **Calibrations.** Each KG1000 and KG50 channel (both input profiles) and each thermal entry stores `fitted_mcp_vref_v`, the reference it is expressed in. A file saved before the field existed loads as 2.4. When the setting differs from a calibration's reference, that calibration is converted, with r = new / fitted:
+  - KG1000 slope / r; intercept unchanged.
+  - KG50 polynomial: c_i / r^i for i = 1–4, and x0 × r. c0 and the tare (kg) are unchanged.
+  - Thermal: V/°C × r; reference temperature unchanged.
+  - Zero, points, noise sigma and captures (volts) × r.
+
+  The result is that kg for the same ADC code does not change. This is the DAQ's `daq_calibration_scale_input`. The DAQ converts its on-board copy by the same rule when the reference changes, so after the GS re-sends, the two agree. The conversion is logged and saved. A calibration captured on the GS is fitted under the current setting. The rail limits are VREF at unity gain and VREF / 16 for P6 (`loadcell_rail_limits_for`). The chamber PT psig and all volt displays need no change.
+- **Config identity.** The CRC-32 in BOARD_HEALTH word 14 continues over the 4 LE bytes of the applied reference after the filter floats. Word 15 bit 9 means the reference came from the station this boot. Bit 10 means it was restored from flash. Board config sync treats the DAQ as loading until bit 9 and the calibration bits are set. A DAQ that took the calibration before the new reference and then converted it again is recognized as this station's stale value and re-sent, not raised as a conflict.
+- **Measuring VREF.** With the board powered and KG1000 in range, put a DMM between P7 (or P8) pin 6 (+VREF, the MCP3564R REFIN+/OUT) and pin 2 or 5 (GND). Enter the reading as `mcp_vref_v`. The current DAQ's reference drifted to about 2.2 V during a repair. Set 2.2 with the note "measured approx.; re-measure after the December repair", and measure again after the repair.
 
 ### 2.3 Valve board (fill CAN)
 

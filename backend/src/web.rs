@@ -110,6 +110,11 @@ fn values_from_row(row: &sqlx::sqlite::SqliteRow) -> Vec<Option<f32>> {
 
 /// Recorded values with load-cell rows written before `volts_from_id` (the
 /// DAQ legacy raw scale) converted to ADC-pin volts.
+/// The row's over-range masks (over_range column; (0, 0) when absent).
+fn over_range_from_row(row: &sqlx::sqlite::SqliteRow) -> (u32, u32) {
+    crate::over_range::unpack(row.try_get::<Option<i64>, _>("over_range").ok().flatten())
+}
+
 fn recorded_values_from_row(row: &sqlx::sqlite::SqliteRow, volts_from_id: i64) -> Vec<Option<f32>> {
     let mut values = values_from_row(row);
     if row.try_get::<i64, _>("id").is_ok_and(|id| id < volts_from_id) {
@@ -266,20 +271,20 @@ mod display_history_tests {
                     9999.0
                 } else {
                     (sample % 100) as f32
-                })],
+                })], over_range: 0, over_range_low: 0,
             });
         }
         input.push(TelemetryRow {
             timestamp_ms: 1,
             sender_id: "VB".into(),
             data_type: "OX_TANK_PRESSURE".into(),
-            values: vec![Some(12.0)],
+            values: vec![Some(12.0)], over_range: 0, over_range_low: 0,
         });
         input.push(TelemetryRow {
             timestamp_ms: 874_998,
             sender_id: "VB".into(),
             data_type: "OX_TANK_PRESSURE".into(),
-            values: vec![Some(42.0)],
+            values: vec![Some(42.0)], over_range: 0, over_range_low: 0,
         });
         input.sort_by_key(|row| row.timestamp_ms);
         let mut latest = HashMap::new();
@@ -428,6 +433,10 @@ pub fn router(state: Arc<AppState>, video_password: String) -> Router {
         .route(
             "/api/calibration/chamber_pt",
             get(get_chamber_pt).post(set_chamber_pt),
+        )
+        .route(
+            "/api/calibration/mcp_vref",
+            get(get_mcp_reference).post(set_mcp_reference),
         )
         .route(
             "/api/calibration/long_zero",
@@ -999,6 +1008,22 @@ struct CaptureLoadcellPointReq {
     /// KG1000/KG50: ADC-pin volts (the `raw` name is kept for the wire API).
     #[serde(alias = "volts")]
     raw: f32,
+    /// When the client started averaging (station ms); default: the last
+    /// over_range::CAPTURE_LOOKBACK_MS.
+    #[serde(default)]
+    capture_started_ms: Option<i64>,
+}
+
+/// Refuses a zero/span capture when its sensor was over range while the
+/// client averaged it: the client sees those samples as null and would
+/// average only the rest, so the station checks its own recent rows.
+fn capture_over_range_refusal(state: &AppState, sensor: &str, started_ms: Option<i64>) -> Option<Response> {
+    let now = crate::telemetry_task::get_current_timestamp_ms() as i64;
+    let since = started_ms
+        .filter(|start| *start <= now)
+        .unwrap_or(now - crate::over_range::CAPTURE_LOOKBACK_MS);
+    let n = crate::over_range::count_in(state.recent_telemetry_cache.lock().unwrap().iter(), sensor, since);
+    (n > 0).then(|| (StatusCode::CONFLICT, crate::over_range::capture_refusal(sensor, n)).into_response())
 }
 
 #[derive(Deserialize)]
@@ -1008,6 +1033,8 @@ struct CaptureLoadcellSpanReq {
     #[serde(alias = "volts")]
     raw: f32,
     known_kg: f32,
+    #[serde(default)]
+    capture_started_ms: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -1131,6 +1158,104 @@ async fn set_chamber_pt(
     Json(ChamberPtRequest { installed: req.installed }).into_response()
 }
 
+#[derive(serde::Deserialize)]
+struct McpReferenceRequest {
+    mcp_vref_v: f32,
+    /// Replaces the note when present (empty clears it); omitted keeps it.
+    #[serde(default)]
+    note: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct McpReferenceReply {
+    mcp_vref_v: f32,
+    mcp_vref_note: String,
+    nominal_v: f32,
+    min_v: f32,
+    max_v: f32,
+    /// Why sending DAQ_MCP_REFERENCE and the converted calibrations failed
+    /// (saved anyway; board config sync re-sends them).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    send_error: Option<String>,
+}
+
+fn mcp_reference_reply(cfg: &loadcell::LoadcellCalibrationFile, send_error: Option<String>) -> McpReferenceReply {
+    use loadcell::mcp_reference::*;
+    McpReferenceReply {
+        mcp_vref_v: cfg.mcp_vref_v,
+        mcp_vref_note: cfg.mcp_vref_note.clone(),
+        nominal_v: NOMINAL_MCP_VREF_V,
+        min_v: MIN_MCP_VREF_V,
+        max_v: MAX_MCP_VREF_V,
+        send_error,
+    }
+}
+
+/// The station's DAQ MCP3564R reference (V) and its note.
+async fn get_mcp_reference(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(mcp_reference_reply(&state.loadcell_calibration.lock().unwrap(), None)).into_response()
+}
+
+/// Station DAQ setting, saved with the calibration file and sent as
+/// DAQ_MCP_REFERENCE. A change converts every load-cell calibration to the new
+/// reference (kg for the same ADC code is unchanged) and re-sends them.
+async fn set_mcp_reference(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<McpReferenceRequest>,
+) -> axum::response::Response {
+    let admission_generation = crate::gse::capture_operator_origin(&state).unwrap_or(0);
+    let principal = match authorize_headers(&state, &headers, Permission::ViewData).await {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    if !principal_can_edit_calibration(&principal) {
+        return calibration_edit_forbidden_response();
+    }
+    if let Err(err) = loadcell::mcp_reference::validate(req.mcp_vref_v) {
+        return (StatusCode::BAD_REQUEST, err).into_response();
+    }
+    let note = req.note.map(|n| n.trim().to_string());
+    if note.as_ref().is_some_and(|n| n.len() > loadcell::mcp_reference::MAX_NOTE_LEN) {
+        return (StatusCode::BAD_REQUEST, "Reference note is too long").into_response();
+    }
+    let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
+        return admission_refused(&state, "Changing the DAQ reference");
+    };
+    let mut cfg = state.loadcell_calibration.lock().unwrap().clone();
+    let changed = cfg.mcp_vref_v != req.mcp_vref_v;
+    if changed {
+        if state.loadcell_processing.status().running {
+            return (StatusCode::CONFLICT, "Stop the zero capture before changing the DAQ reference").into_response();
+        }
+        if state.recording_status_snapshot().mode != crate::telemetry_db::RecordingModeWire::Idle {
+            return (StatusCode::CONFLICT, "Stop recording before changing the DAQ reference").into_response();
+        }
+        if let Err(err) = loadcell::mcp_reference::set_reference(&mut cfg, req.mcp_vref_v) {
+            return (StatusCode::BAD_REQUEST, err).into_response();
+        }
+    }
+    let note = note.unwrap_or_else(|| cfg.mcp_vref_note.clone());
+    if changed || cfg.mcp_vref_note != note {
+        cfg.mcp_vref_note = note;
+        if let Err(err) = loadcell::save(&cfg) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
+        }
+        *state.loadcell_calibration.lock().unwrap() = cfg.clone();
+    }
+    if changed {
+        log::info!("DAQ MCP3564R reference set to {} V; load-cell calibrations converted", cfg.mcp_vref_v);
+        state.clear_kg50_samples();
+        state.gse.lock().unwrap().observe_mass(None);
+        state.broadcast_fill_targets_snapshot();
+    }
+    let send_error = publish_daq_calibration(&state, &cfg).err();
+    if let Some(error) = &send_error {
+        log::warn!("sending the DAQ reference: {error}");
+    }
+    Json(mcp_reference_reply(&cfg, send_error)).into_response()
+}
+
 /// The operator's selection against what the DAQ is reporting right now.
 async fn get_kg50_input_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let selected = state.loadcell_calibration.lock().unwrap().kg50_input;
@@ -1211,6 +1336,9 @@ async fn capture_loadcell_zero(
     let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
         return admission_refused(&state, "Capturing the zero point");
     };
+    if let Some(refusal) = capture_over_range_refusal(&state, &req.sensor_id, req.capture_started_ms) {
+        return refusal;
+    }
     let updated = {
         let mut cfg = state.loadcell_calibration.lock().unwrap();
         let temperature = loadcell::recent_adc_temperature(
@@ -1258,6 +1386,9 @@ async fn capture_loadcell_span(
     let Some(_claim) = crate::gse::claim_operator_dispatch(&state, admission_generation) else {
         return admission_refused(&state, "Capturing the span point");
     };
+    if let Some(refusal) = capture_over_range_refusal(&state, &req.sensor_id, req.capture_started_ms) {
+        return refusal;
+    }
     let updated = {
         let mut cfg = state.loadcell_calibration.lock().unwrap();
         let temperature = loadcell::recent_adc_temperature(
@@ -1773,7 +1904,8 @@ async fn stream_recent_rows_response(state: Arc<AppState>) -> Response {
                     data_type,
                     sender_id,
                     values_json,
-                    payload_json
+                    payload_json,
+                    over_range
                 FROM telemetry
                 WHERE timestamp_ms BETWEEN ? AND ?
                 ORDER BY timestamp_ms ASC
@@ -1792,6 +1924,8 @@ async fn stream_recent_rows_response(state: Arc<AppState>) -> Response {
                     .to_string(),
                     sender_id: row.get::<String, _>("sender_id"),
                     values: recorded_values_from_row(&row, volts_from_id),
+                    over_range: over_range_from_row(&row).0,
+                    over_range_low: over_range_from_row(&row).1,
                 };
                 crate::telemetry_provenance::note(
                     &telemetry_row,
@@ -1865,7 +1999,8 @@ async fn load_recent_rows_from_db(
             data_type,
             sender_id,
             values_json,
-            payload_json
+            payload_json,
+            over_range
         FROM telemetry
         WHERE timestamp_ms BETWEEN ? AND ?
         ORDER BY timestamp_ms ASC
@@ -1887,6 +2022,8 @@ async fn load_recent_rows_from_db(
                     .to_string(),
             sender_id: row.get::<String, _>("sender_id"),
             values: recorded_values_from_row(&row, volts_from_id),
+                    over_range: over_range_from_row(&row).0,
+                    over_range_low: over_range_from_row(&row).1,
         };
         crate::telemetry_provenance::note(
             &telemetry_row,
@@ -5267,7 +5404,7 @@ mod ws_freshness_tests {
             timestamp_ms,
             data_type: ty.into(),
             sender_id: "DAQ".into(),
-            values: vec![Some(timestamp_ms as f32)],
+            values: vec![Some(timestamp_ms as f32)], over_range: 0, over_range_low: 0,
         }
     }
     #[tokio::test]
@@ -6737,6 +6874,12 @@ async fn capture_thermal_zero(
     let now = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
     let rows = state.recent_telemetry_snapshot();
     let calibration = state.loadcell_calibration.lock().unwrap().clone();
+    // The settling window (thermal_settling::from_rows, 132 s) must hold no
+    // over-range sample; such a sample also restarts the window.
+    let over = crate::over_range::count_in(rows.iter(), &req.sensor_id, now - 132_000);
+    if over > 0 {
+        return (StatusCode::CONFLICT, crate::over_range::capture_refusal(&req.sensor_id, over)).into_response();
+    }
     let settling = crate::thermal_settling::from_rows(&rows, &calibration, &req.sensor_id, now);
     if !settling.ready {
         return (StatusCode::CONFLICT, settling.message).into_response();
@@ -6947,6 +7090,7 @@ mod recovery_direct_ingress_tests {
                 Json(CaptureLoadcellPointReq {
                     sensor_id: "KG1000".into(),
                     raw: 0.123,
+                    capture_started_ms: None,
                 }),
             )
             .await
@@ -6958,6 +7102,7 @@ mod recovery_direct_ingress_tests {
                     sensor_id: "KG1000".into(),
                     raw: 1.234,
                     known_kg: 1.0,
+                    capture_started_ms: None,
                 }),
             )
             .await
@@ -7048,6 +7193,81 @@ mod recovery_direct_ingress_tests {
         assert_eq!(wire["state"], "synced");
     }
     #[tokio::test]
+    async fn mcp_reference_setting_converts_and_resends_the_calibration() {
+        if crate::operator_queue::isolated_case(
+            module_path!(),
+            "mcp_reference_setting_converts_and_resends_the_calibration",
+        ) {
+            return;
+        }
+        let (_root, state, headers, router, _) = fixture().await;
+        for name in ["DAQ_MCP_REFERENCE", "DAQ_LOADCELL_CALIBRATION", "DAQ_KG50_CALIBRATION", "DAQ_THERMAL_CALIBRATION", "DAQ_FILTER_CALIBRATION", "DAQ_KG50_INPUT"] {
+            router
+                .enable_network_variable(
+                    crate::telemetry_schema::data_type(name),
+                    sedsnet::router::NetworkVariablePermissions::READ_WRITE,
+                )
+                .unwrap();
+        }
+        let floats = |name: &str| -> Vec<f32> {
+            let ty = crate::telemetry_schema::data_type(name);
+            let packet = router.get_cached_network_variable(ty).unwrap().unwrap();
+            packet.payload().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
+        };
+        {
+            let mut cfg = state.loadcell_calibration.lock().unwrap();
+            assert_eq!(cfg.mcp_vref_v, 2.4, "nominal by default");
+            let ch1 = cfg.extra_channels.entry("ch1".into()).or_default();
+            ch1.linear = loadcell::ChannelLinear { m: Some(1200.0), b: Some(0.0) };
+            ch1.fit = None;
+            ch1.zero_raw = None;
+            ch1.fitted_mcp_vref_v = Some(2.4);
+            loadcell::normalize_calibration(&mut cfg);
+        }
+        for bad in [1.8, 2.7, f32::NAN] {
+            let response = set_mcp_reference(
+                State(state.clone()),
+                headers.clone(),
+                Json(McpReferenceRequest { mcp_vref_v: bad, note: None }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{bad}");
+        }
+        let note = "measured approx.; re-measure after the December repair";
+        let response = set_mcp_reference(
+            State(state.clone()),
+            headers.clone(),
+            Json(McpReferenceRequest { mcp_vref_v: 2.2, note: Some(note.into()) }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let saved = state.loadcell_calibration.lock().unwrap().clone();
+        assert_eq!(saved.mcp_vref_v, 2.2);
+        assert_eq!(loadcell::load_or_default().mcp_vref_v, 2.2, "a restarted station reads the same setting");
+        let r = 2.2_f64 / 2.4;
+        assert!((saved.ch1.m.unwrap() as f64 - 1200.0 / r).abs() < 1e-2);
+        assert_eq!(floats("DAQ_MCP_REFERENCE"), vec![2.2]);
+        assert_eq!(floats("DAQ_LOADCELL_CALIBRATION")[0], saved.ch1.m.unwrap(), "converted slope sent");
+        let body = axum::body::to_bytes(get_mcp_reference(State(state.clone())).await.into_response().into_body(), 4096)
+            .await
+            .unwrap();
+        let reply: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(reply["mcp_vref_note"], note);
+        // Omitting the note keeps it; the calibration file JSON carries both.
+        let response = set_mcp_reference(
+            State(state.clone()),
+            headers.clone(),
+            Json(serde_json::from_value(serde_json::json!({"mcp_vref_v": 2.2})).unwrap()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let file = serde_json::to_value(&*state.loadcell_calibration.lock().unwrap()).unwrap();
+        assert_eq!(file["mcp_vref_note"], note);
+        assert_eq!(file["mcp_vref_v"].as_f64().unwrap() as f32, 2.2);
+        assert_eq!(reply["nominal_v"].as_f64().unwrap() as f32, 2.4);
+        assert_eq!(reply["mcp_vref_v"].as_f64().unwrap() as f32, 2.2);
+    }
+    #[tokio::test]
     async fn chamber_pt_setting_persists_and_defaults_to_installed() {
         if crate::operator_queue::isolated_case(
             module_path!(),
@@ -7133,7 +7353,7 @@ mod recovery_direct_ingress_tests {
                             timestamp_ms: at,
                             data_type: data_type.into(),
                             sender_id: "DAQ".into(),
-                            values: vec![Some(value)],
+                            values: vec![Some(value)], over_range: 0, over_range_low: 0,
                         });
                     }
                 }

@@ -673,7 +673,7 @@ pub(super) fn prepare_derived_loadcell_rows(
     // A clipped load-cell input carries no load information. The raw row is
     // still recorded by the caller; only the converted weight is withheld.
     let railed = loadcell::daq_rails_apply()
-        && loadcell::loadcell_volts_at_rail(cfg.kg50_input, calibration_sensor_id, sample.raw_value);
+        && loadcell::loadcell_volts_at_rail_for(&cfg, calibration_sensor_id, sample.raw_value);
     if let Some(message) = observe_loadcell_rail(
         calibration_sensor_id,
         sample.sender_id,

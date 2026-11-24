@@ -175,7 +175,7 @@ mod tests {
             ("DAQ_SD_HEALTH", 8),
             ("DAQ_SD_RETRY", 1),
             ("DAQ_LAUNCH_LOG_STATUS", 7),
-            ("DAQ_INPUT_HEALTH", 18),
+            ("DAQ_INPUT_HEALTH", 28),
         ] {
             let good = vec![0u8; count * 4];
             assert!(
@@ -209,6 +209,24 @@ mod tests {
             .unwrap();
         assert_eq!(retry["reliable"], "Unordered");
         assert_eq!(retry["class"], "Data");
+    }
+
+    #[test]
+    fn daq_mcp_reference_keeps_the_firmware_id_and_shape() {
+        initialize().unwrap();
+        // DAQ-Board SEDS_DT_DAQ_MCP_REFERENCE: one f32, volts.
+        assert_eq!(data_type("DAQ_MCP_REFERENCE").as_u32(), 255135887);
+        let packet = |bytes: usize| {
+            sedsnet::packet::Packet::new(
+                data_type("DAQ_MCP_REFERENCE"),
+                &[endpoint("SD_CARD")],
+                "GS",
+                1,
+                vec![0u8; bytes].into(),
+            )
+        };
+        assert!(packet(4).is_ok());
+        assert!(packet(8).is_err());
     }
 
     #[test]

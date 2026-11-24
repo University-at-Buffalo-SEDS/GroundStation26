@@ -1,3 +1,4 @@
+pub mod mcp_reference;
 pub mod mission;
 use crate::fill_targets::FillTargetsConfig;
 use crate::layout::ValueFormatter;
@@ -117,6 +118,15 @@ pub struct GenericCalibrationChannel {
     pub points: Vec<CalibrationPoint>,
     #[serde(default)]
     pub fit: Option<FitMeta>,
+    /// MCP3564R reference (V) this KG1000/KG50 calibration is expressed in
+    /// (`mcp_reference`). Missing in a file: fitted under the nominal 2.4 V.
+    /// `None` in memory: made under the station's current reference. Other
+    /// channels do not carry it.
+    #[serde(
+        default = "mcp_reference::legacy_fitted",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub fitted_mcp_vref_v: Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,6 +202,15 @@ pub struct LoadcellCalibrationFile {
     /// input fault is not raised. Station-side only; missing means installed.
     #[serde(default = "default_chamber_pt_installed")]
     pub chamber_pt_installed: bool,
+    /// The DAQ's MCP3564R reference in volts, sent as DAQ_MCP_REFERENCE. Every
+    /// MCP3564R volt the DAQ publishes is code x this / 2^23; changing it
+    /// converts the load-cell calibrations (`mcp_reference`). Nominal 2.4.
+    #[serde(default = "mcp_reference::nominal")]
+    pub mcp_vref_v: f32,
+    /// Operator note shown with the reference (e.g. how it was measured);
+    /// empty for none.
+    #[serde(default)]
+    pub mcp_vref_note: String,
 }
 
 impl Default for LoadcellCalibrationFile {
@@ -228,6 +247,8 @@ impl Default for LoadcellCalibrationFile {
             weights_kg: Vec::new(),
             extra_channels: BTreeMap::new(),
             chamber_pt_installed: true,
+            mcp_vref_v: mcp_reference::NOMINAL_MCP_VREF_V,
+            mcp_vref_note: String::new(),
         }
     }
 }
@@ -666,6 +687,7 @@ pub fn normalize_calibration(cfg: &mut LoadcellCalibrationFile) {
             });
     }
     sync_legacy_channels_into_extra(cfg);
+    mcp_reference::rereference(cfg);
     sync_extra_channels_into_legacy(cfg);
     update_weights_kg(cfg);
 }
@@ -733,7 +755,8 @@ pub fn selected_kg50_value(
         }
         _ => None,
     }
-    .filter(|v| v.is_finite())
+    // NaN is no data; ±Inf is the DAQ's over-range marker and is kept.
+    .filter(|v| !v.is_nan())
 }
 
 /// Convert a recorded row written on the DAQ legacy raw scale to volts. Only
@@ -758,13 +781,12 @@ pub fn legacy_loadcell_row_to_volts(
     }
 }
 
-/// MCP3564R nominal full scale at unity gain: +/-2^23 codes is +/-VREF, so the
-/// amplified KG1000/AMP2 KG50 inputs clip at the 2.4 V internal reference.
+/// MCP3564R full scale at unity gain: +/-2^23 codes is +/-VREF, so the
+/// amplified KG1000/AMP2 KG50 inputs clip at the station's MCP3564R reference
+/// (`LoadcellCalibrationFile::mcp_vref_v`, nominal 2.4 V), and the P6
+/// differential input (PGA 16) at VREF / 16.
 /// In the 2026-11-16 test fire the KG1000 input sat at code 0xB40000
 /// (3.375 V nominal, legacy raw 0.19427338, published as 1726 kg), past this.
-const DAQ_ADC_FULL_SCALE_V: f32 = 2.4;
-/// DAQ P6 differential input: full scale 2.4 V / PGA 16 = 0.15 V.
-const DAQ_P6_FULL_SCALE_V: f32 = DAQ_ADC_FULL_SCALE_V / 16.0;
 /// KG1000 amplifier output floor. This analog limit cannot be derived from the
 /// ADC: the test fire showed the amplifier stuck at legacy raw 0.0012-0.0021
 /// (zero load is about raw 0.0120), which converted to -95 to -105 kg. The
@@ -773,23 +795,42 @@ const DAQ_P6_FULL_SCALE_V: f32 = DAQ_ADC_FULL_SCALE_V / 16.0;
 const KG1000_LOW_RAIL_V: f32 = (0.0025 * LEGACY_RAW_TO_VOLTS) as f32;
 
 /// ADC-pin volt limits outside of which a DAQ load-cell input is clipped, for
-/// the sensor and (for KG50) the selected input. `None` for other sensors.
-pub fn loadcell_rail_limits(kg50_input: Kg50Input, sensor: &str) -> Option<(f32, f32)> {
+/// the sensor, the MCP3564R reference `vref` and (for KG50) the selected
+/// input. `None` for other sensors.
+pub fn loadcell_rail_limits_at(vref: f32, kg50_input: Kg50Input, sensor: &str) -> Option<(f32, f32)> {
+    let unity = mcp_reference::unity_full_scale_v(vref);
+    let p6 = mcp_reference::p6_full_scale_v(vref);
     match (sensor, kg50_input) {
-        ("KG1000" | "ch1", _) => Some((KG1000_LOW_RAIL_V, DAQ_ADC_FULL_SCALE_V)),
-        ("KG50" | "kg50", Kg50Input::P6Differential) => {
-            Some((-DAQ_P6_FULL_SCALE_V, DAQ_P6_FULL_SCALE_V))
-        }
-        ("KG50" | "kg50", Kg50Input::Amp2) => Some((-DAQ_ADC_FULL_SCALE_V, DAQ_ADC_FULL_SCALE_V)),
+        ("KG1000" | "ch1", _) => Some((KG1000_LOW_RAIL_V, unity)),
+        ("KG50" | "kg50", Kg50Input::P6Differential) => Some((-p6, p6)),
+        ("KG50" | "kg50", Kg50Input::Amp2) => Some((-unity, unity)),
         _ => None,
     }
 }
 
-/// True when `volts` from a DAQ load cell is at an ADC or amplifier rail, so a
-/// converted weight would be meaningless.
+/// Rail limits under `cfg`'s reference and selected 50 kg input.
+pub fn loadcell_rail_limits_for(cfg: &LoadcellCalibrationFile, sensor: &str) -> Option<(f32, f32)> {
+    loadcell_rail_limits_at(cfg.mcp_vref_v, cfg.kg50_input, sensor)
+}
+
+/// Rail limits at the nominal 2.4 V reference. Prefer `loadcell_rail_limits_for`.
+pub fn loadcell_rail_limits(kg50_input: Kg50Input, sensor: &str) -> Option<(f32, f32)> {
+    loadcell_rail_limits_at(mcp_reference::NOMINAL_MCP_VREF_V, kg50_input, sensor)
+}
+
+fn volts_outside(limits: Option<(f32, f32)>, volts: f32) -> bool {
+    limits.is_some_and(|(low, high)| !volts.is_finite() || volts <= low || volts >= high)
+}
+
+/// True when `volts` from a DAQ load cell is at an ADC or amplifier rail under
+/// `cfg`'s reference and input, so a converted weight would be meaningless.
+pub fn loadcell_volts_at_rail_for(cfg: &LoadcellCalibrationFile, sensor: &str, volts: f32) -> bool {
+    volts_outside(loadcell_rail_limits_for(cfg, sensor), volts)
+}
+
+/// `loadcell_volts_at_rail_for` at the nominal 2.4 V reference.
 pub fn loadcell_volts_at_rail(kg50_input: Kg50Input, sensor: &str, volts: f32) -> bool {
-    loadcell_rail_limits(kg50_input, sensor)
-        .is_some_and(|(low, high)| !volts.is_finite() || volts <= low || volts >= high)
+    volts_outside(loadcell_rail_limits(kg50_input, sensor), volts)
 }
 
 /// DAQ rails describe the real ADC scale. FlightSim publishes the load-cell
@@ -803,7 +844,7 @@ fn reject_railed_points(cfg: &LoadcellCalibrationFile, channel: &str, sensor: &s
     let Some(entry) = cfg.extra_channels.get(channel).filter(|_| daq_rails_apply()) else {
         return Ok(());
     };
-    let railed = |volts: f32| loadcell_volts_at_rail(cfg.kg50_input, sensor, volts);
+    let railed = |volts: f32| loadcell_volts_at_rail_for(cfg, sensor, volts);
     if let Some(zero) = entry.zero_raw.filter(|volts| railed(*volts)) {
         return Err(format!(
             "{sensor} zero {zero} V is at the ADC/amplifier rail; recapture it with the input in range"
@@ -873,9 +914,16 @@ pub fn merge_channel_update(
             .cloned()
             .unwrap_or_default(),
     );
+    // The UI works in the volts the DAQ publishes now, whatever the (unechoed)
+    // field deserialized as: what it saves is fitted under the current reference.
+    if let Some(entry) = result.extra_channels.get_mut(channel) {
+        entry.fitted_mcp_vref_v = None;
+    }
     result.thermal.remove(sensor);
     if let Some(value) = incoming.thermal.get(sensor) {
-        result.thermal.insert(sensor.into(), value.clone());
+        let mut value = value.clone();
+        value.fitted_mcp_vref_v = None;
+        result.thermal.insert(sensor.into(), value);
     }
     result.noise.remove(sensor);
     if let Some(value) = incoming.noise.get(sensor) {
@@ -1997,6 +2045,13 @@ pub struct ThermalCalibration {
     pub raw_per_c: f32,
     #[serde(default)]
     pub points: Vec<[f32; 2]>, // [temperature C, unloaded raw]
+    /// MCP3564R reference (V) `raw_per_c` and `points` are expressed in; see
+    /// `GenericCalibrationChannel::fitted_mcp_vref_v`.
+    #[serde(
+        default = "mcp_reference::legacy_fitted",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub fitted_mcp_vref_v: Option<f32>,
 }
 
 fn thermal_key(sensor: &str) -> &str {
@@ -2123,6 +2178,7 @@ mod thermal_tests {
                 reference_c: 20.,
                 raw_per_c: 0.02,
                 points: vec![],
+                fitted_mcp_vref_v: None,
             },
         );
         for i in 0..5 {
@@ -2182,7 +2238,7 @@ mod thermal_tests {
             timestamp_ms: 1000,
             data_type: "DAQ_ADC_TEMPERATURE".into(),
             sender_id: "SD_CARD".into(),
-            values: vec![Some(25.0)],
+            values: vec![Some(25.0)], over_range: 0, over_range_low: 0,
         }];
         assert_eq!(
             recent_adc_temperature(rows.iter(), "SD_CARD", 2000),
@@ -2536,7 +2592,7 @@ impl HistoryCalibration {
             .first()
             .copied()
             .flatten()
-            .filter(|volts| !(daq_rails_apply() && loadcell_volts_at_rail(self.cfg.kg50_input, sensor, *volts)))
+            .filter(|volts| !(daq_rails_apply() && loadcell_volts_at_rail_for(&self.cfg, sensor, *volts)))
             .and_then(|raw| temperature_corrected_raw(&self.cfg, sensor, raw, temp))
             .map(|raw| {
                 self.processing
@@ -2592,6 +2648,7 @@ mod history_calibration_tests {
                 reference_c: 20.,
                 raw_per_c: 0.00390625,
                 points: vec![],
+                fitted_mcp_vref_v: None,
             },
         );
         let mut replay =
@@ -2600,7 +2657,7 @@ mod history_calibration_tests {
             timestamp_ms,
             data_type: kind.into(),
             sender_id: "DAQ".into(),
-            values: vec![value],
+            values: vec![value], over_range: 0, over_range_low: 0,
         };
         replay.project(row(100, "DAQ_ADC_TEMPERATURE", Some(22.)));
         assert_eq!(
@@ -2631,7 +2688,7 @@ mod history_calibration_tests {
             timestamp_ms: 100,
             data_type: "KG1000".into(),
             sender_id: "DAQ".into(),
-            values: vec![Some(0.25)],
+            values: vec![Some(0.25)], over_range: 0, over_range_low: 0,
         };
         let output = replay.project(raw.clone());
         assert_eq!(output[0].values, raw.values);
@@ -2759,6 +2816,7 @@ mod rail_tests {
                     .map(|(expected, raw)| CalibrationPoint { expected: *expected, raw: *raw })
                     .collect(),
                 fit: None,
+                fitted_mcp_vref_v: None,
             },
         );
         calibration.temperature_captures.insert(
@@ -2875,7 +2933,7 @@ mod rail_tests {
             timestamp_ms,
             data_type: "KG1000".into(),
             sender_id: "DAQ".into(),
-            values: vec![Some(value)],
+            values: vec![Some(value)], over_range: 0, over_range_low: 0,
         };
         let out = replay.project(row(100, CLIP_V));
         assert_eq!(out[0].values, vec![Some(CLIP_V)]);
@@ -2922,12 +2980,14 @@ mod volts_migration_tests {
                 CalibrationPoint { expected: 102.0, raw: 0.022947349 },
             ],
             fit: fit("linear", [0.0; 5], 0.0),
+            fitted_mcp_vref_v: None,
         };
         let kg50 = GenericCalibrationChannel {
             linear: ChannelLinear { m: Some(22799.14), b: Some(-89.81956) },
             zero_raw: Some(0.0040061),
             points: vec![CalibrationPoint { expected: 20.0, raw: 0.004845549 }],
             fit: kg50_fit,
+            fitted_mcp_vref_v: None,
         };
         let mut cfg = LoadcellCalibrationFile {
             version: 1,
@@ -2941,7 +3001,7 @@ mod volts_migration_tests {
         cfg.extra_channels.insert("ch1".into(), kg1000);
         cfg.thermal.insert(
             "KG1000".into(),
-            ThermalCalibration { reference_c: 25.0, raw_per_c: 1.5e-6, points: vec![[20.0, 0.0122]] },
+            ThermalCalibration { reference_c: 25.0, raw_per_c: 1.5e-6, points: vec![[20.0, 0.0122]], fitted_mcp_vref_v: None },
         );
         cfg.noise.insert(
             "KG1000".into(),

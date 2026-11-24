@@ -921,12 +921,12 @@
     },
     {
       "name": "DAQ_INPUT_HEALTH",
-      "doc": "DAQ live input faults (v2: noise/drift, excitation, frame-engine counters); layout in daq_input_health.rs. Warnings only.",
+      "doc": "DAQ live input faults (v3: ADC over-range now/latched/counters, VDDA, applied MCP3564R reference; v2: noise/drift, excitation, frame-engine counters); layout in daq_input_health.rs. Warnings only.",
       "class": "Data",
       "element": {
         "kind": "Static",
         "data_type": "UInt32",
-        "count": 18
+        "count": 28
       },
       "endpoints": [
         "GROUND_STATION"
@@ -1114,6 +1114,22 @@
       ],
       "reliable": "Off",
       "priority": 0
+    },
+    {
+      "rust": "DaqMcpReference",
+      "name": "DAQ_MCP_REFERENCE",
+      "doc": "Managed source: MCP3564R reference voltage in volts used to convert every MCP3564R code (1.9-2.6 V; nominal 2.4 V).",
+      "reliable": "Ordered",
+      "priority": 16,
+      "class": "Data",
+      "element": {
+        "kind": "Static",
+        "data_type": "Float32",
+        "count": 1
+      },
+      "endpoints": [
+        "SD_CARD"
+      ]
     }
   ]
 }
