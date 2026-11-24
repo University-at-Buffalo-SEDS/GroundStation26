@@ -177,11 +177,67 @@
       "sha256": "5a95aff7f5620245faa20f5a23a1e5de49dadb3a8712846df33279681eb58e21"
     },
     {
-      "bytes": 17178,
+      "bytes": 157,
+      "media_type": "application/json",
+      "path": "config/station/fill_targets.json",
+      "route": "/api/fill_targets",
+      "sha256": "f7a2656485c6dedb72695df1bf5c7c1ea79e72bebb9981bb9f294d02bbcfdf4d"
+    },
+    {
+      "bytes": 1457,
+      "media_type": "application/json",
+      "path": "config/station/flight_setup.json",
+      "route": "/api/flight_setup",
+      "sha256": "2ab81c764fc28f02ab236721c3a2098946b2622ac8abe3478d4ac62041c586b0"
+    },
+    {
+      "bytes": 16,
+      "media_type": "application/json",
+      "path": "config/station/auto_zero.json",
+      "route": "/api/auto_zero",
+      "sha256": "26b3426b2593763c96d0890b4a77a0bbf66d13fc512b0c6b138a23c290f30a2a"
+    },
+    {
+      "bytes": 80,
+      "media_type": "application/json",
+      "path": "config/station/kg50_input.json",
+      "route": "/api/calibration/kg50_input",
+      "sha256": "8ef1555c279c8b5a921d958163bd09578494781166469212646ac984df3d9844"
+    },
+    {
+      "bytes": 478,
+      "media_type": "application/json",
+      "path": "config/station/gse_config.json",
+      "route": "/api/gse/config",
+      "sha256": "f789ff9f0ab7bd50b1a317f9bdb41c3fd69ea1da6a059165e013d0dacbe5f1e1"
+    },
+    {
+      "bytes": 149,
+      "media_type": "application/json",
+      "path": "config/station/launch_site.json",
+      "route": "/api/fc/launch-site",
+      "sha256": "b9e73929b676999e847b3b3b9ea2a8b246bc8d4a9f6d723e438d85012aa8455b"
+    },
+    {
+      "bytes": 78280,
+      "media_type": "application/json",
+      "path": "config/station/safety_about.json",
+      "route": "/api/safety/about",
+      "sha256": "feb5020414fd21b85dbd58677d92ee001c457df422b90430eacd3b0c1f9661f1"
+    },
+    {
+      "bytes": 2268,
+      "media_type": "application/json",
+      "path": "config/station/i18n_catalog_en.json",
+      "route": "/api/i18n/catalog?lang=en",
+      "sha256": "f86083555c0a16c5e33815a1a3f255013aa90c8065aeb1beb84182e4f756c00d"
+    },
+    {
+      "bytes": 14299,
       "media_type": "application/json",
       "path": "derived/trajectory.json",
       "route": "/api/recordings/groundstation_recording_2026-01-01_00-00-00_000.db/replay/trajectory?upper_id=601",
-      "sha256": "931c4509d948fc54fcbb9dc5c76776d3e73980dc30584cca84ffa721bc7a752f"
+      "sha256": "782bfb3c64471a5c13a6e3f1307c50e37b95d2f303df472fda7b6f89b6e20fb2"
     },
     {
       "bytes": 3019,
@@ -200,19 +256,6 @@
       "media_type": "application/json",
       "path": "exports/index.json",
       "sha256": "a95dd70b2b879cd0cb80d56d515afd660b2d89d0e47081d7983099a5cff3c30e"
-    },
-    {
-      "bytes": 21337,
-      "media_type": "application/json",
-      "path": "derived/review_inputs.json",
-      "sha256": "e61e7d10609205018351a669fb88e97b70369737fd6bd8ee8846fa71cd7f6914"
-    },
-    {
-      "bytes": 85,
-      "media_type": "application/json",
-      "path": "derived/stations.json",
-      "route": "/api/antenna/status",
-      "sha256": "7606c466b13ec37e60c7d88d1802d39fa61813244e695a481c62bfc9aa14a41d"
     }
   ],
   "format": "gsreplay",
@@ -224,10 +267,6 @@
   "source": {
     "recording": "groundstation_recording_2026-01-01_00-00-00_000.db",
     "station_name": "Ground Station"
-  },
-  "terrain": {
-    "included": false,
-    "reason": "no DEM tiles are cached on this station"
   },
   "tiles": {
     "budget_bytes": 1048576,

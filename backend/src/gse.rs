@@ -2198,6 +2198,13 @@ pub fn panel_command(state: &AppState, cmd: TelemetryCommand) -> TelemetryComman
     let name = panel_name(state, crate::sequences::command_name(&cmd));
     serde_json::from_value(serde_json::Value::String(name)).unwrap_or(cmd)
 }
+/// The GSE configuration and safety rules alone, as a replay bundle snapshots them.
+pub(crate) fn bundle_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/api/gse/config", get(get_config))
+        .route("/api/safety/about", get(crate::safety_catalog::about_route))
+}
+
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .merge(progress::routes())

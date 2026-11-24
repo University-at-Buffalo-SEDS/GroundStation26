@@ -121,6 +121,7 @@ mod recording_bundle_exports;
 mod recording_bundle_records;
 mod recording_bundle_sd;
 mod recording_bundle_media;
+mod recording_bundle_settings;
 mod recording_export;
 mod recording_firmware;
 mod recording_import;

@@ -581,6 +581,12 @@ pub(crate) fn bundle_config_routes() -> Router<Arc<AppState>> {
         .route("/tiles/{z}/{x}/{y}", get(get_tile_jpg))
         .route("/api/antenna/status", get(get_antenna_status))
         .merge(crate::terrain::routes())
+        // Station settings a replay's Settings page shows (recording_bundle_settings).
+        .route("/api/auto_zero", get(get_auto_zero))
+        .route("/api/flight_setup", get(get_flight_setup))
+        .route("/api/fill_targets", get(get_fill_targets))
+        .route("/api/calibration/kg50_input", get(get_kg50_input_status))
+        .route("/api/i18n/catalog", get(get_translation_catalog))
 }
 
 /// Pulls a bearer token out of the Authorization header.

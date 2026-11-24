@@ -21,6 +21,13 @@ resource:
   trajectory, the first page of SD sources, and the recording's own entry of
   `GET /api/recordings`;
 - `derived/firmware.json` (`GET /api/recordings/{id}/firmware`, below);
+- the station settings a replay's Settings page shows, read-only, under
+  `config/station/` (`backend/src/recording_bundle_settings.rs`):
+  `GET /api/fill_targets`, `/api/flight_setup`, `/api/auto_zero`,
+  `/api/calibration/kg50_input`, `/api/gse/config`, `/api/fc/launch-site`,
+  `/api/safety/about` and `/api/i18n/catalog?lang=en`. Live state (sequence
+  status, shared-settings sync, board and radio status) is not snapshot;
+  those panels need a station;
 - the flight review, apogee planner state, and any burn report or
   fire-archive entry that names the recording.
 - the station's five newest flight plans (`derived/flight_plans.json`, when

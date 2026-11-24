@@ -138,6 +138,7 @@ fn sources(state: Arc<AppState>) -> Router {
     Router::new()
         .merge(crate::recording_export::routes())
         .merge(crate::recording_firmware::routes())
+        .merge(crate::recording_bundle_settings::routes())
         .merge(crate::media::view_config_routes(state.clone()))
         .merge(crate::diagrams::routes())
         .merge(crate::vehicle_geometry::routes())
@@ -295,6 +296,9 @@ pub(crate) async fn build(
     entries.optional(&router, headers, &format!("/api/recordings/{id}/replay/alerts"), "derived/alerts.json").await;
     entries.optional(&router, headers, &format!("/api/flight_review/recording/{id}"), "derived/flight_review.json").await;
     entries.optional(&router, headers, "/api/apogee_planner", "derived/apogee_planner.json").await;
+    for (route, path) in crate::recording_bundle_settings::ROUTES {
+        entries.optional(&router, headers, route, path).await;
+    }
     let upper = replay["snapshot"]["upper_id"].as_i64().unwrap_or(0);
     let trajectory = entries
         .optional(&router, headers, &format!("/api/recordings/{id}/replay/trajectory?upper_id={upper}"), "derived/trajectory.json")
