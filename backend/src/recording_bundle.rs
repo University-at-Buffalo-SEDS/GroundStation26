@@ -36,6 +36,9 @@ const DEFAULT_TILE_BUDGET_MB: u32 = 8;
 const MAX_TILE_BUDGET_MB: u32 = 32;
 /// Largest body read from one internal route (the replay export caps itself at 64 MiB).
 const MAX_ENTRY_BYTES: usize = 96 << 20;
+/// The terrain heightmap entry is at most this large (a 129 x 129 grid is about 45 KB).
+const MAX_TERRAIN_BYTES: usize = 1 << 20;
+const TERRAIN_GRID_SIZE: u32 = 129;
 /// The views the replay page offers (`/replay/layout?view=`).
 const REPLAY_VIEWS: [&str; 5] = ["normal", "test_fire", "testing", "hitl", "integrated_ground_test"];
 
@@ -51,6 +54,8 @@ pub(crate) struct Options {
     pub tiles: bool,
     /// Tile budget in MiB (default 8, at most 32).
     pub tiles_max_mb: Option<u32>,
+    /// Include the cached DEM heightmap around the track (default: with tiles).
+    pub terrain: Option<bool>,
 }
 
 pub(crate) fn routes() -> Router<Arc<AppState>> {
@@ -94,6 +99,7 @@ fn sources(state: Arc<AppState>) -> Router {
         .merge(crate::burn_report::routes())
         .merge(crate::fire_archive::routes())
         .merge(crate::apogee_planner::routes())
+        .merge(crate::recovery_search::routes())
         .merge(crate::web::bundle_config_routes())
         .with_state(state)
 }
@@ -120,6 +126,22 @@ fn tile_of(lat: f64, lon: f64, z: u32) -> (u32, u32) {
     let rad = lat.clamp(-85.05, 85.05).to_radians();
     let y = ((1.0 - (rad.tan() + 1.0 / rad.cos()).ln() / std::f64::consts::PI) / 2.0 * n).floor().clamp(0.0, n - 1.0) as u32;
     (x, y)
+}
+
+/// The heightmap request for a track: centred on its first fix (the pad),
+/// wide enough for the whole track plus a margin, 2..30 km.
+fn terrain_route(points: &[Value]) -> Option<(String, f64)> {
+    let fix = |p: &Value| Some((p["latitude"].as_f64()?, p["longitude"].as_f64()?));
+    let (lat0, lon0) = points.iter().find_map(fix)?;
+    let mut reach = 0.0f64;
+    for (lat, lon) in points.iter().filter_map(fix) {
+        let north = (lat - lat0).to_radians() * crate::terrain::EARTH_RADIUS_M;
+        let east = (lon - lon0).to_radians() * crate::terrain::EARTH_RADIUS_M * lat0.to_radians().cos();
+        reach = reach.max(north.abs()).max(east.abs());
+    }
+    let extent = ((reach * 2.0 + 2_000.0) / 1_000.0).ceil() * 1_000.0;
+    let extent = extent.clamp(2_000.0, 30_000.0);
+    Some((format!("/api/terrain/heightmap?lat={lat0}&lon={lon0}&extent_m={extent}&size={TERRAIN_GRID_SIZE}"), extent))
 }
 
 struct Entry {
@@ -256,6 +278,19 @@ pub(crate) async fn build(
         entries.add(&path, bytes, media_type, None);
     }
 
+    // Recovery search tracks from the recording's start until a few hours
+    // after its last row (searches often outlast the capture). Only when
+    // there are any: an empty search adds nothing to the bundle.
+    if let Some(start) = replay["snapshot"]["start_ms"].as_i64() {
+        let end = replay["snapshot"]["end_ms"].as_i64().unwrap_or(start) + crate::recovery_search::BUNDLE_AFTER_END_MS;
+        if let Ok(bytes) = fetch(&router, headers, &format!("/api/recovery_search/export?from_ms={start}&to_ms={end}")).await {
+            entries.add("derived/recovery_search.json", bytes, "application/json", None);
+        }
+    }
+    // Ground-station and RRLS positions at export (the replay scene's
+    // station camera and masts); small, so always included when served.
+    entries.optional(&router, headers, "/api/antenna/status", "derived/stations.json").await;
+
     // The replay document carries what a client needs even if it reads nothing else.
     if replay["layout"].is_null() && let Some(layout) = &layout {
         replay["layout"] = layout.clone();
@@ -292,35 +327,37 @@ pub(crate) async fn build(
         && let Some(points) = trajectory.as_ref().and_then(|t| t["points"].as_array())
         && !points.is_empty()
     {
-        let budget = (options.tiles_max_mb.unwrap_or(DEFAULT_TILE_BUDGET_MB).min(MAX_TILE_BUDGET_MB) as usize) << 20;
-        let max_zoom = map_config.as_ref().and_then(|m| m["max_native_zoom"].as_u64()).unwrap_or(16).min(17) as u32;
-        let (mut la0, mut la1, mut lo0, mut lo1) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
-        for p in points {
-            let (Some(la), Some(lo)) = (p["latitude"].as_f64(), p["longitude"].as_f64()) else { continue };
-            (la0, la1, lo0, lo1) = (la0.min(la), la1.max(la), lo0.min(lo), lo1.max(lo));
-        }
-        let (mut used, mut count, mut complete) = (0usize, 0u64, true);
-        'zoom: for z in 10..=max_zoom {
-            let (x0, y0) = tile_of(la1, lo0, z);
-            let (x1, y1) = tile_of(la0, lo1, z);
-            for x in x0.saturating_sub(1)..=x1 + 1 {
-                for y in y0.saturating_sub(1)..=y1 + 1 {
-                    let Ok(bytes) = fetch(&router, headers, &format!("/tiles/{z}/{x}/{y}.jpg")).await else { continue };
-                    if bytes.is_empty() {
-                        continue;
-                    }
-                    if used + bytes.len() > budget {
-                        complete = false;
-                        break 'zoom;
-                    }
-                    used += bytes.len();
-                    count += 1;
-                    let route = format!("/tiles/{z}/{x}/{y}.jpg");
-                    entries.add(&route[1..], bytes, "image/jpeg", Some(&route));
+        let track: Vec<(f64, f64)> = points.iter().filter_map(|p| Some((p["latitude"].as_f64()?, p["longitude"].as_f64()?))).collect();
+        tiles = add_tiles(&mut entries, &router, headers, &track, map_config.as_ref(), options.tiles_max_mb).await;
+    }
+    // The station's most recent flight plans, for a predicted-vs-actual overlay offline.
+    let plans = crate::flight_plan::list(&crate::flight_plan::directory(&state));
+    if !plans.is_empty() {
+        entries.add_json("derived/flight_plans.json", &json!({"plans": plans.into_iter().take(5).collect::<Vec<_>>()}));
+    }
+
+    // Optional DEM heightmap around the pad, covering the track.
+    let mut terrain = json!({"included": false});
+    if options.terrain.unwrap_or(options.tiles)
+        && let Some(points) = trajectory.as_ref().and_then(|t| t["points"].as_array())
+        && let Some((route, extent_m)) = terrain_route(points)
+    {
+        match fetch(&router, headers, &route).await {
+            Ok(bytes) if bytes.len() <= MAX_TERRAIN_BYTES => {
+                let value = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
+                if value["available"] == true {
+                    terrain = json!({
+                        "included": true, "bytes": bytes.len(), "extent_m": extent_m, "size": value["size"],
+                        "zoom": value["zoom"], "source": value["source"], "attribution": value["attribution"],
+                    });
+                    entries.add("terrain/heightmap.json", bytes, "application/json", Some(&route));
+                } else {
+                    terrain = json!({"included": false, "reason": value["reason"]});
                 }
             }
+            Ok(bytes) => terrain = json!({"included": false, "reason": format!("heightmap of {} bytes exceeds the {MAX_TERRAIN_BYTES}-byte cap", bytes.len())}),
+            Err(status) => entries.missing.push(json!({"path": "terrain/heightmap.json", "route": route, "status": status})),
         }
-        tiles = json!({"included": count, "bytes": used, "budget_bytes": budget, "complete": complete});
     }
 
     let csv_entry = Entry { path: "data/telemetry.csv".into(), bytes: csv, media_type: "text/csv", route: Some(format!("/api/recordings/{id}/csv")) };
@@ -339,6 +376,103 @@ pub(crate) async fn build(
         "source": {"station_name": crate::host_power::station_name(), "recording": id},
         "mode": replay["mode"],
         "recorded_mode": context.as_ref().map(|c| c["recorded_mode"].clone()).unwrap_or(Value::Null),
+        "time_range": {"start_ms": replay["snapshot"]["start_ms"], "end_ms": replay["snapshot"]["end_ms"]},
+        "rows": rows,
+        "tiles": tiles,
+        "terrain": terrain,
+        "missing": entries.missing,
+        "entries": entries.files.iter().map(|entry| {
+            let mut listed = json!({
+                "path": entry.path, "bytes": entry.bytes.len(), "sha256": sha256_hex(&entry.bytes), "media_type": entry.media_type,
+            });
+            if let Some(route) = &entry.route {
+                listed["route"] = route.as_str().into();
+            }
+            listed
+        }).collect::<Vec<_>>(),
+    });
+    let mut zip = crate::flight_review::zip::Zip::new(now_ms);
+    zip.add("manifest.json", &serde_json::to_vec_pretty(&manifest).unwrap_or_default());
+    for entry in &entries.files {
+        zip.add(&entry.path, &entry.bytes);
+    }
+    Ok(zip.finish())
+}
+
+/// Cached map tiles around a track, lowest zoom first, within the budget.
+async fn add_tiles(entries: &mut Entries, router: &Router, headers: &HeaderMap, track: &[(f64, f64)], map_config: Option<&Value>, max_mb: Option<u32>) -> Value {
+    let budget = (max_mb.unwrap_or(DEFAULT_TILE_BUDGET_MB).min(MAX_TILE_BUDGET_MB) as usize) << 20;
+    let max_zoom = map_config.and_then(|m| m["max_native_zoom"].as_u64()).unwrap_or(16).min(17) as u32;
+    let (mut la0, mut la1, mut lo0, mut lo1) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+    for &(la, lo) in track {
+        (la0, la1, lo0, lo1) = (la0.min(la), la1.max(la), lo0.min(lo), lo1.max(lo));
+    }
+    let (mut used, mut count, mut complete) = (0usize, 0u64, true);
+    'zoom: for z in 10..=max_zoom {
+        let (x0, y0) = tile_of(la1, lo0, z);
+        let (x1, y1) = tile_of(la0, lo1, z);
+        for x in x0.saturating_sub(1)..=x1 + 1 {
+            for y in y0.saturating_sub(1)..=y1 + 1 {
+                let Ok(bytes) = fetch(router, headers, &format!("/tiles/{z}/{x}/{y}.jpg")).await else { continue };
+                if bytes.is_empty() {
+                    continue;
+                }
+                if used + bytes.len() > budget {
+                    complete = false;
+                    break 'zoom;
+                }
+                used += bytes.len();
+                count += 1;
+                let route = format!("/tiles/{z}/{x}/{y}.jpg");
+                entries.add(&route[1..], bytes, "image/jpeg", Some(&route));
+            }
+        }
+    }
+    json!({"included": count, "bytes": used, "budget_bytes": budget, "complete": complete})
+}
+
+/// A flight plan as a replay bundle (docs/flight-plans.md): the predicted
+/// trajectory as FC rows in `replay.json`, the station's configuration and
+/// geometry as for a recording, the plan itself, and tiles around its track.
+pub(crate) async fn build_plan(state: Arc<AppState>, headers: &HeaderMap, plan: &Value, now_ms: i64) -> Result<Vec<u8>, (StatusCode, String)> {
+    let router = sources(state);
+    let mut entries = Entries { files: Vec::new(), missing: Vec::new() };
+    let mut replay = crate::flight_plan::replay_document(plan);
+    let layout = entries.optional(&router, headers, "/api/layout", "config/layout.json").await;
+    // The live layout route serializes some maps in hash order: store it canonically.
+    let boards = entries.optional(&router, headers, "/api/boards", "config/boards.json").await;
+    let geometry = entries.optional(&router, headers, crate::vehicle_geometry::PATH, "models/vehicle_geometry.json").await;
+    entries.optional(&router, headers, "/api/diagrams", "config/diagrams.json").await;
+    let map_config = entries.optional(&router, headers, "/api/map_config", "config/map_config.json").await;
+    let trajectory = crate::flight_plan::replay_trajectory(&replay);
+    entries.add_json("derived/trajectory.json", &trajectory);
+    entries.add_json("derived/flight_plan.json", plan);
+    if let Some(layout) = &layout {
+        replay["layout"] = layout.clone();
+    }
+    if let Some(boards) = &boards {
+        replay["boards"] = boards["boards"].clone();
+    }
+    if let Some(geometry) = &geometry {
+        replay["vehicle_geometry"] = geometry.clone();
+    }
+    let track: Vec<(f64, f64)> = plan["points"].as_array().into_iter().flatten().filter_map(|p| Some((p["lat_deg"].as_f64()?, p["lon_deg"].as_f64()?))).collect();
+    let tiles = add_tiles(&mut entries, &router, headers, &track, map_config.as_ref(), None).await;
+    let csv = crate::flight_plan::replay_csv(&replay);
+    let rows = replay["samples"].as_array().map_or(0, Vec::len);
+    let csv_entry = Entry { path: "data/telemetry.csv".into(), bytes: csv.into_bytes(), media_type: "text/csv", route: None };
+    let replay_entry = Entry { path: "replay.json".into(), bytes: serde_json::to_vec(&replay).unwrap_or_default(), media_type: "application/json", route: None };
+    entries.files.splice(0..0, [replay_entry, csv_entry]);
+    let manifest = json!({
+        "format": FORMAT,
+        "version": VERSION,
+        "created_ms": now_ms,
+        "generator": format!("groundstation_backend {}", env!("CARGO_PKG_VERSION")),
+        "source": {"station_name": crate::host_power::station_name(), "recording": replay["recording"], "flight_plan": plan["id"]},
+        "predicted": true,
+        "label": replay["label"],
+        "mode": "flight",
+        "recorded_mode": "normal",
         "time_range": {"start_ms": replay["snapshot"]["start_ms"], "end_ms": replay["snapshot"]["end_ms"]},
         "rows": rows,
         "tiles": tiles,

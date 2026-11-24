@@ -578,6 +578,7 @@ pub(crate) fn bundle_config_routes() -> Router<Arc<AppState>> {
         .route("/api/map_config", get(get_map_config))
         .route("/api/calibration", get(get_loadcell_calibration))
         .route("/tiles/{z}/{x}/{y}", get(get_tile_jpg))
+        .route("/api/antenna/status", get(get_antenna_status))
         .merge(crate::terrain::routes())
 }
 
