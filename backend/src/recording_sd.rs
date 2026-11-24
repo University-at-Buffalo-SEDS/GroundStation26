@@ -371,7 +371,13 @@ pub(crate) async fn activate_resolved(db: &SqlitePool) -> Result<(), sqlx::Error
     .fetch_one(db)
     .await?;
     if exists > 0 {
-        sqlx::query("CREATE TEMP VIEW IF NOT EXISTS telemetry AS SELECT id,timestamp_ms,source_timestamp_ms,data_type,sender_id,values_json,payload_json FROM main.sd_replay_telemetry").execute(db).await?;
+        // Views resolved before over-range support have no over_range column.
+        let over_range = if crate::over_range::table_has_column(db, "sd_replay_telemetry").await {
+            "over_range"
+        } else {
+            "NULL AS over_range"
+        };
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE TEMP VIEW IF NOT EXISTS telemetry AS SELECT id,timestamp_ms,source_timestamp_ms,data_type,sender_id,values_json,payload_json,{over_range} FROM main.sd_replay_telemetry"))).execute(db).await?;
     }
     Ok(())
 }
@@ -1130,5 +1136,29 @@ mod portable_disk_budget_tests {
         assert_eq!(super::available_disk_bytes(7_u64, 4096_u64), 28_672);
         assert_eq!(super::available_disk_bytes(u64::MAX, 2_u32), u64::MAX);
         assert_eq!(super::available_disk_bytes(0_u32, u64::MAX), 0);
+    }
+}
+
+#[cfg(test)]
+mod resolved_view_tests {
+    async fn db_with(create: &str) -> sqlx::SqlitePool {
+        let db = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(create.to_owned())).execute(&db).await.unwrap();
+        db
+    }
+
+    #[tokio::test]
+    async fn resolved_view_carries_over_range_or_null_for_older_files() {
+        let db = db_with("CREATE TABLE sd_replay_telemetry(id INTEGER PRIMARY KEY,timestamp_ms INTEGER NOT NULL,source_timestamp_ms INTEGER,data_type TEXT NOT NULL,sender_id TEXT,values_json TEXT,payload_json TEXT,provenance_json TEXT NOT NULL,over_range INTEGER)").await;
+        sqlx::query("INSERT INTO sd_replay_telemetry VALUES(1,5,5,'KG1000','DAQ','[null]',NULL,'{}',4294967297)").execute(&db).await.unwrap();
+        super::activate_resolved(&db).await.unwrap();
+        let got: (String, Option<i64>) = sqlx::query_as("SELECT values_json,over_range FROM telemetry").fetch_one(&db).await.unwrap();
+        assert_eq!(got, ("[null]".into(), Some(1 | 1 << 32)));
+
+        let old = db_with("CREATE TABLE sd_replay_telemetry(id INTEGER PRIMARY KEY,timestamp_ms INTEGER NOT NULL,source_timestamp_ms INTEGER,data_type TEXT NOT NULL,sender_id TEXT,values_json TEXT,payload_json TEXT,provenance_json TEXT NOT NULL)").await;
+        sqlx::query("INSERT INTO sd_replay_telemetry VALUES(1,5,5,'KG1000','DAQ','[1.5]',NULL,'{}')").execute(&old).await.unwrap();
+        super::activate_resolved(&old).await.unwrap();
+        let got: (String, Option<i64>) = sqlx::query_as("SELECT values_json,over_range FROM telemetry").fetch_one(&old).await.unwrap();
+        assert_eq!(got, ("[1.5]".into(), None));
     }
 }

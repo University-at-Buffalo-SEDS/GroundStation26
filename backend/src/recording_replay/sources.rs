@@ -253,7 +253,8 @@ async fn copy_capture(db: &SqlitePool, path: &Path, rows: bool) -> anyhow::Resul
                 .execute(db).await?;
             return Ok(());
         }
-        sqlx::query("INSERT INTO telemetry(id,timestamp_ms,source_timestamp_ms,data_type,sender_id,values_json,payload_json) SELECT id,timestamp_ms,source_timestamp_ms,data_type,sender_id,values_json,payload_json FROM src.telemetry ORDER BY id")
+        let (into, from) = crate::over_range::copy_columns(db, "src").await;
+        sqlx::query(sqlx::AssertSqlSafe(format!("INSERT INTO telemetry(id,timestamp_ms,source_timestamp_ms,data_type,sender_id,values_json,payload_json{into}) SELECT id,timestamp_ms,source_timestamp_ms,data_type,sender_id,values_json,payload_json{from} FROM src.telemetry ORDER BY id")))
             .execute(db).await?;
         sqlx::query("INSERT INTO alerts(timestamp_ms,severity,message,condition_json) SELECT timestamp_ms,severity,message,condition_json FROM src.alerts ORDER BY id").execute(db).await?;
         sqlx::query("INSERT INTO flight_state(timestamp_ms,f_state) SELECT timestamp_ms,f_state FROM src.flight_state ORDER BY id").execute(db).await?;
@@ -276,13 +277,48 @@ async fn copy_capture(db: &SqlitePool, path: &Path, rows: bool) -> anyhow::Resul
     result
 }
 
-/// One telemetry row converted from a board SD CSV line.
+/// One telemetry row converted from a board SD CSV line. An over-range
+/// value (DAQ SD format v4) is `f32::INFINITY` / `f32::NEG_INFINITY`; it is
+/// stored as JSON null plus the `over_range` column.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct SdRow {
     pub timestamp_ms: i64,
     pub data_type: String,
     pub sender_id: String,
     pub values: Vec<f32>,
+}
+
+/// Record labels whose `value` column is an over-range flag (`v=ovr` on the
+/// file's `# seds-sd-records` lines, DAQ SD format v4): empty in range, `1`
+/// above +full scale, `-1` below -full scale.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct OverRangeRecords {
+    exact: Vec<String>,
+    prefixes: Vec<String>,
+}
+
+impl OverRangeRecords {
+    /// Adds the `v=ovr` entries of one `# seds-sd-records,...` line.
+    pub(crate) fn add_records_line(&mut self, line: &str) {
+        let Some(rest) = line.trim_end_matches(['\r', '\n']).strip_prefix("# seds-sd-records,") else {
+            return;
+        };
+        for entry in rest.split(',') {
+            let body = entry.split('@').next().unwrap_or("");
+            let mut parts = body.split(':');
+            let label = parts.next().unwrap_or("");
+            if label.is_empty() || !parts.any(|column| column == "v=ovr") {
+                continue;
+            }
+            match label.strip_suffix('*') {
+                Some(prefix) => self.prefixes.push(prefix.to_owned()),
+                None => self.exact.push(label.to_owned()),
+            }
+        }
+    }
+    fn declares(&self, sensor: &str) -> bool {
+        self.exact.iter().any(|l| l == sensor) || self.prefixes.iter().any(|p| sensor.starts_with(p.as_str()))
+    }
 }
 
 fn sd_type_name(board: &str, sensor: &str) -> String {
@@ -300,7 +336,16 @@ fn sd_type_name(board: &str, sensor: &str) -> String {
 /// cells and chamber PT become the station's own data types (sender `DAQ_SD`),
 /// every other sensor `<BOARD>_SD_<SENSOR>`. `Err(())` marks a data row on the
 /// board's local clock.
+#[cfg(test)]
 pub(crate) fn sd_row(board: &str, line: &str) -> Option<Result<SdRow, ()>> {
+    sd_row_with(board, line, &OverRangeRecords::default())
+}
+
+/// [`sd_row`] for a file whose format block declares the `over_range`
+/// records: a flagged row is the over-range marker and its numbers (the
+/// invalid linear conversion, calibrated `inf`) are never read; an in-range
+/// row of such a record reads `calibrated_value`.
+pub(crate) fn sd_row_with(board: &str, line: &str, over_range: &OverRangeRecords) -> Option<Result<SdRow, ()>> {
     if line.is_empty() || line.starts_with('#') || line.starts_with("timestamp_ms") {
         return None;
     }
@@ -322,7 +367,15 @@ pub(crate) fn sd_row(board: &str, line: &str) -> Option<Result<SdRow, ()>> {
             .collect()
     };
     let channel = (board == "DAQ").then(|| Channel::ALL.into_iter().find(|c| c.daq_sensor() == sensor)).flatten();
-    let values = match channel {
+    let flagged = over_range.declares(sensor);
+    let values = match fields[3].trim() {
+        _ if !flagged => None,
+        "" | "0" => Some(parse(&fields[6])),
+        "1" => Some(vec![f32::INFINITY]),
+        "-1" => Some(vec![f32::NEG_INFINITY]),
+        _ => return None,
+    };
+    let values = values.unwrap_or_else(|| match channel {
         // The burn report's reading of the same row: value, else calibrated.
         Some(_) => [3usize, 6]
             .iter()
@@ -334,7 +387,7 @@ pub(crate) fn sd_row(board: &str, line: &str) -> Option<Result<SdRow, ()>> {
             let v = parse(&fields[3]);
             if v.is_empty() { parse(&fields[6]) } else { v }
         }
-    };
+    });
     if values.is_empty() {
         return None;
     }
@@ -350,8 +403,12 @@ pub(crate) fn sd_row(board: &str, line: &str) -> Option<Result<SdRow, ()>> {
 pub(crate) fn read_sd_file(board: &str, path: &Path, limit: usize) -> anyhow::Result<(Vec<SdRow>, u64)> {
     let reader = BufReader::new(std::fs::File::open(path)?);
     let (mut rows, mut local) = (Vec::new(), 0u64);
+    let mut over_range = OverRangeRecords::default();
     for line in reader.lines() {
-        match sd_row(board, line?.trim_end()) {
+        let line = line?;
+        let line = line.trim_end();
+        over_range.add_records_line(line);
+        match sd_row_with(board, line, &over_range) {
             Some(Ok(row)) => {
                 if rows.len() >= limit {
                     return Err(SourceError::TooLarge.into());
@@ -368,12 +425,16 @@ pub(crate) fn read_sd_file(board: &str, path: &Path, limit: usize) -> anyhow::Re
 async fn insert_sd_rows(db: &SqlitePool, rows: &[SdRow]) -> anyhow::Result<()> {
     let mut tx = db.begin().await?;
     for row in rows {
-        sqlx::query("INSERT INTO telemetry(timestamp_ms,source_timestamp_ms,data_type,sender_id,values_json) VALUES(?,?,?,?,?)")
+        // Over-range markers: JSON null plus the packed over_range column.
+        let mut values: Vec<Option<f32>> = row.values.iter().copied().map(Some).collect();
+        let (mask, low) = crate::over_range::split(&mut values);
+        sqlx::query("INSERT INTO telemetry(timestamp_ms,source_timestamp_ms,data_type,sender_id,values_json,over_range) VALUES(?,?,?,?,?,?)")
             .bind(row.timestamp_ms)
             .bind(row.timestamp_ms)
             .bind(&row.data_type)
             .bind(&row.sender_id)
-            .bind(serde_json::to_string(&row.values)?)
+            .bind(serde_json::to_string(&values)?)
+            .bind(crate::over_range::pack(mask, low))
             .execute(&mut *tx)
             .await?;
     }
@@ -484,4 +545,56 @@ pub(crate) async fn tests_open(root: &Path, id: &str) -> SqlitePool {
 #[cfg(test)]
 pub(crate) async fn clear_cache() {
     CACHE.lock().await.clear();
+}
+
+#[cfg(test)]
+mod sd_row_tests {
+    use super::*;
+
+    const V4_RECORDS: &str = "# seds-sd-records,kg1000_v:v=ovr:a=code:r=V:c=kg@1000000,kg50_v:v=ovr:a=code:r=V:c=kg@1000000";
+
+    #[test]
+    fn v4_over_range_flag_is_a_marker_never_a_number() {
+        let mut ovr = OverRangeRecords::default();
+        ovr.add_records_line("# seds-sd-records,input_voltage_v:a=code:r=V:c=V,vdda_v:a=code:r=V:c=V\r");
+        ovr.add_records_line(V4_RECORDS);
+        let row = |line: &str| match sd_row_with("DAQ", line, &ovr) {
+            Some(Ok(row)) => Some(row.values),
+            _ => None,
+        };
+        // In range: the calibrated value, as in v3.
+        assert_eq!(row("1800000000000,5,kg1000_v,,123,0.5,250,network,,,5000,1000000,1"), Some(vec![250.0]));
+        assert_eq!(row("1800000000000,5,kg1000_v,1,9000000,2.57,inf,network,,,5000,1000000,2"), Some(vec![f32::INFINITY]));
+        assert_eq!(row("1800000000000,5,kg1000_v,-1,-9000000,-2.57,-inf,network,,,5000,1000000,3"), Some(vec![f32::NEG_INFINITY]));
+        assert_eq!(row("1800000000000,5,kg1000_v,2,9000000,2.57,inf,network,,,5000,1000000,4"), None, "bad flag");
+        // vdda_v is its own series.
+        let vdda = sd_row_with("DAQ", "1800000000000,5,vdda_v,,1497,3.301,3.301,network,,,5,1000,5", &ovr);
+        assert_eq!(vdda.unwrap().unwrap().data_type, "DAQ_SD_VDDA_V");
+        // v3 (no v=ovr): the value column is read as before.
+        assert_eq!(sd_row("DAQ", "1800000000000,5,kg1000_v,1,9000000,2.57,inf,network,,,5000,1000000,2").unwrap().unwrap().values, vec![1.0]);
+    }
+
+    #[tokio::test]
+    async fn over_range_rows_store_null_and_the_packed_column() {
+        let db = memory_db().await.unwrap();
+        let row = |values: Vec<f32>| SdRow { timestamp_ms: 1, data_type: "DAQ_SD_KG1000_V".into(), sender_id: "DAQ_SD".into(), values };
+        insert_sd_rows(&db, &[row(vec![2.5]), row(vec![f32::INFINITY]), row(vec![f32::NEG_INFINITY])]).await.unwrap();
+        let stored: Vec<(String, Option<i64>)> =
+            sqlx::query_as("SELECT values_json,over_range FROM telemetry ORDER BY id").fetch_all(&db).await.unwrap();
+        assert_eq!(stored, vec![("[2.5]".into(), None), ("[null]".into(), Some(1)), ("[null]".into(), Some(1 | 1 << 32))]);
+    }
+
+    #[tokio::test]
+    async fn sd_file_block_declares_the_flagged_records() {
+        let dir = std::env::temp_dir().join(format!("gs-sd-ovr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("DAQ.CSV");
+        std::fs::write(&path, format!("timestamp_ms,monotonic_ms,sensor,value,raw_adc_code,raw_value,calibrated_value,time_source,adc_temperature_c,adc_temperature_code,uptime_ticks,uptime_frequency_hz,record_sequence\r\n\
+# seds-sd,format=daq,version=4,board=DAQ,firmware=x,tick_hz=1000,schema=00000000\r\n{V4_RECORDS}\r\n\
+1800000000000,5,kg50_v,-1,-9000000,-2.57,-inf,network,,,5000,1000000,1\r\n")).unwrap();
+        let (rows, local) = read_sd_file("DAQ", &path, 10).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(local, 0);
+        assert_eq!(rows[0].values, vec![f32::NEG_INFINITY]);
+    }
 }
