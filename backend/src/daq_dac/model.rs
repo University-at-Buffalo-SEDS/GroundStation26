@@ -303,6 +303,7 @@ impl Target {
         )
     }
     /// Valid V_in for this polarity.
+    #[cfg(test)]
     pub fn valid_vin_for(&self, polarity: Polarity) -> (f64, f64) {
         let (intercept, gain) = self.vin_gain(polarity);
         let (lo, hi) = self.reported_range();

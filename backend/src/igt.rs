@@ -402,6 +402,7 @@ impl Tracker {
         self.inner.lock().unwrap().settings
     }
 
+    #[cfg(test)]
     pub fn fc_image(&self) -> FcImage {
         self.inner.lock().unwrap().image
     }

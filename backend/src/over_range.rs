@@ -18,10 +18,6 @@ pub const DAQ_OVER_RANGE_TYPES: [&str; 5] =
 const HIGH_MARK: &str = "ovr";
 const LOW_MARK: &str = "-ovr";
 
-pub fn is_marker(value: f32) -> bool {
-    value.is_infinite()
-}
-
 /// True when `data_type` from `sender` may carry ±Inf over-range markers.
 pub fn daq_type_carries_markers(sender: &str, data_type: &str) -> bool {
     crate::types::canonical_sender_id(sender.trim()) == "DAQ" && DAQ_OVER_RANGE_TYPES.contains(&data_type)
@@ -53,11 +49,6 @@ pub fn mark(values: &mut [Option<f32>], mask: u32, low: u32) {
             *value = Some(if low & (1 << i) != 0 { f32::NEG_INFINITY } else { f32::INFINITY });
         }
     }
-}
-
-/// Masks for the bits set in the marked `values`, without changing them.
-pub fn masks(values: &[Option<f32>]) -> (u32, u32) {
-    split(&mut values.to_vec())
 }
 
 /// The `over_range` column value: `mask | low << 32`, None when nothing is

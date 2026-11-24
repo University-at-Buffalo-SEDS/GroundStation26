@@ -251,6 +251,7 @@ mod recovery_tests {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn refresh_host_network_time(router: &Router, utc_ms: u64) {
     let utc_ms = procedure_clock::for_wall(utc_ms).utc_ms();
     // Calendar range shared with DAQ's timestamped logging validation.
@@ -274,12 +275,6 @@ pub(crate) fn reset_absolute_time_correction() {
 
 /// Station host UTC in ns: the model clock in simulation (ms resolution, the
 /// simulator's truth), else CLOCK_REALTIME at full resolution.
-/// The station's host UTC in milliseconds: the clock network time is built
-/// on (the simulator clock under simulation).
-pub(crate) fn station_host_utc_ms() -> u64 {
-    host_utc_ns().max(0).div_euclid(1_000_000) as u64
-}
-
 fn host_utc_ns() -> i64 {
     if crate::simulation_clock_ms().is_some() {
         return (procedure_clock::now().utc_ms() as i64).saturating_mul(1_000_000);
@@ -343,6 +338,7 @@ pub(crate) fn refresh_station_network_time(router: &Router) {
 /// The same, with the host clock read by the caller: `host_utc_ms` from the
 /// same clock keeps the full nanosecond reading; another value (a caller's
 /// own host time) is taken as given.
+#[cfg(test)]
 pub(crate) fn refresh_station_network_time_from_host_ms(router: &Router, host_utc_ms: u64) {
     let now_ns = host_utc_ns();
     let host_ns = if now_ns.div_euclid(1_000_000) == host_utc_ms as i64 {

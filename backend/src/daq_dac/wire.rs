@@ -297,6 +297,8 @@ pub struct Status {
 }
 
 pub const FLAG_HARDWARE_READY: u8 = 1;
+// Wire flag the DAQ sets in its status; the station does not act on it yet.
+#[cfg_attr(not(test), allow(dead_code))]
 pub const FLAG_READBACK: u8 = 2;
 
 impl Status {

@@ -582,6 +582,7 @@ impl AlertTracker {
     /// operator (and records that this alert did), so a rail is never
     /// announced twice. Without a chamber PT installed (station setting) the
     /// chamber no-signal fault is never announced.
+    #[cfg(test)]
     pub fn observe(
         &mut self,
         report: &Report,

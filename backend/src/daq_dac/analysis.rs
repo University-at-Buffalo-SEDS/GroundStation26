@@ -26,6 +26,7 @@ pub struct Wave {
     pub duty_q16: u16,
 }
 impl Wave {
+    #[cfg(test)]
     pub fn dc(offset_v: f64) -> Self {
         Self {
             offset_v,

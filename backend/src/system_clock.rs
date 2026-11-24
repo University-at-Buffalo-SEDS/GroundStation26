@@ -91,6 +91,7 @@ fn retain_live_client_sources(sources: &mut Vec<std::sync::Weak<sedsnet::router:
     sources.retain(|source| source.strong_count() != 0);
 }
 
+#[cfg(test)]
 pub(crate) fn refresh_network_source(router: &sedsnet::router::Router, host_utc_ms: u64) {
     if client_source_holds(router) {
         return;

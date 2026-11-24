@@ -864,6 +864,7 @@ pub fn loadcell_rail_limits_for(cfg: &LoadcellCalibrationFile, sensor: &str) -> 
 }
 
 /// Rail limits at the nominal 2.4 V reference. Prefer `loadcell_rail_limits_for`.
+#[cfg(test)]
 pub fn loadcell_rail_limits(kg50_input: Kg50Input, sensor: &str) -> Option<(f32, f32)> {
     loadcell_rail_limits_at(mcp_reference::NOMINAL_MCP_VREF_V, kg50_input, sensor)
 }
@@ -879,6 +880,7 @@ pub fn loadcell_volts_at_rail_for(cfg: &LoadcellCalibrationFile, sensor: &str, v
 }
 
 /// `loadcell_volts_at_rail_for` at the nominal 2.4 V reference.
+#[cfg(test)]
 pub fn loadcell_volts_at_rail(kg50_input: Kg50Input, sensor: &str, volts: f32) -> bool {
     volts_outside(loadcell_rail_limits(kg50_input, sensor), volts)
 }

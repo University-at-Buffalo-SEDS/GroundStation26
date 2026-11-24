@@ -230,6 +230,7 @@ impl Rundown {
         }
         Ok(())
     }
+    #[cfg(test)]
     pub fn profile(&self, phase: FlightState, test_fire: bool) -> (&str, &Profile) {
         self.profile_with_fc(phase, None, test_fire)
     }

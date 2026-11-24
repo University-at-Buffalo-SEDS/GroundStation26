@@ -372,6 +372,7 @@ impl Owner {
     }
     /// Existing host history is the durability authority. A fresh model identity
     /// cannot erase an unclean/closed/pending host hold or an observed board Abort.
+    #[cfg(test)]
     pub(crate) fn initialize(&mut self, hold_mask: u8, abort_mask: u8, floor: u64) {
         self.initialize_at(hold_mask, abort_mask, Stamp::new(0, floor.min(i64::MAX as u64) as i64));
     }

@@ -1,14 +1,12 @@
 use anyhow::Result;
 use sqlx::sqlite::{SqliteConnection, SqlitePoolOptions};
 use sqlx::{Connection, Row, SqlitePool};
-use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 use time::format_description::FormatItem;
 use tokio::time::Duration;
 
-pub const RECORDING_BUFFER_WINDOW_MS: i64 = 2 * 60 * 1000;
 pub const DEFAULT_TELEMETRY_DB_FILENAME: &str = "groundstation.db";
 
 #[derive(Debug, Clone)]
@@ -46,18 +44,6 @@ pub enum DbWrite {
     },
 }
 
-impl DbWrite {
-    pub fn timestamp_ms(&self) -> i64 {
-        match self {
-            Self::FlightState { timestamp_ms, .. }
-            | Self::Calibration { timestamp_ms, .. }
-            | Self::Message { timestamp_ms, .. }
-            | Self::Telemetry { timestamp_ms, .. }
-            | Self::Alert { timestamp_ms, .. } => *timestamp_ms,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordingMode {
     Idle,
@@ -71,7 +57,10 @@ pub enum RecordingCommand {
     /// ignores StartNow and refuses Pause/Stop; no operator command reaches
     /// them.
     StartNow,
+    // Constructed only by fixtures (see above); the recorder still handles them.
+    #[cfg_attr(not(test), allow(dead_code))]
     Pause,
+    #[cfg_attr(not(test), allow(dead_code))]
     Stop,
     /// Clear the live history: the rolling recorder opens a fresh segment
     /// instead of deleting rows.
@@ -572,17 +561,6 @@ pub async fn recover_sqlite_sidecars_in_dir(dir: &Path) -> Result<()> {
         }
     }
     Ok(())
-}
-
-pub fn prune_recent_writes(buffer: &mut VecDeque<DbWrite>, newest_ts_ms: i64) {
-    let cutoff = newest_ts_ms.saturating_sub(RECORDING_BUFFER_WINDOW_MS);
-    while let Some(front) = buffer.front() {
-        if front.timestamp_ms() < cutoff {
-            buffer.pop_front();
-        } else {
-            break;
-        }
-    }
 }
 
 #[cfg(test)]
