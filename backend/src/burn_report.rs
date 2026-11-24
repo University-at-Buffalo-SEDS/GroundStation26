@@ -361,10 +361,14 @@ fn ignition(inputs: &Inputs) -> Option<(i64, &'static str)> {
     let k1k = inputs.series(Channel::Kg1000);
     let mut valves = inputs.valve_open_ms.clone();
     valves.sort();
-    if let Some(t) = valves
+    let near: Vec<i64> = valves
         .into_iter()
-        .find(|t| k50.iter().any(|s| (s.t_ms - t).abs() < 5_000))
-    {
+        .filter(|t| k50.iter().any(|s| (s.t_ms - t).abs() < 5_000))
+        .collect();
+    // A capture can hold earlier main-valve openings with no burn (the valve self-test of the GSE procedure): the
+    // ignition is the opening the load cells answer within 3 s (KG50 unloading or load on KG1000); without a clear
+    // answer, the first opening as before.
+    if let Some(&t) = near.iter().find(|&&t| load_answers(k50, k1k, t)).or(near.first()) {
         return Some((t, "main_valve_open"));
     }
     // Over-range markers carry no level for the unloading detection.
@@ -393,6 +397,15 @@ fn ignition(inputs: &Inputs) -> Option<(i64, &'static str)> {
         }
     }
     None
+}
+
+/// The load cells answer a main-valve opening at `t`: within 3 s the KG50 falls 3 kg below its median of the second
+/// before, or the KG1000 reads more than 20 kg.
+fn load_answers(k50: &[Sample], k1k: &[Sample], t: i64) -> bool {
+    let before = median(k50.iter().filter(|s| s.t_ms > t - 1_000 && s.t_ms <= t).map(|s| s.value).collect());
+    let after: Vec<&Sample> = k50.iter().filter(|s| s.t_ms > t && s.t_ms <= t + 3_000).collect();
+    let unloads = before.is_some_and(|b| after.windows(5).any(|w| median(w.iter().map(|s| s.value).collect()).is_some_and(|m| m < b - 3.0)));
+    unloads || k1k.iter().any(|s| s.t_ms > t && s.t_ms <= t + 3_000 && s.value > 20.0 && s.value < 1_200.0)
 }
 
 pub(crate) struct Meta {

@@ -674,6 +674,29 @@ fn reports_keep_the_tank_trace_and_the_hybrid_model_prediction() {
     assert!(r.chamber_curve.is_empty(), "no chamber PT in this window");
 }
 
+/// The GSE procedure's valve self-test opens the main valve minutes before the burn in the same capture: the
+/// ignition is the opening the load cells answer, not the first one (firmware-sim test fire, 2026-11-23).
+#[test]
+fn an_earlier_valve_self_test_opening_is_not_the_ignition() {
+    let t0 = 1_800_000_000_000i64;
+    let self_test = t0 - 280_000;
+    let mut inputs = Inputs { valve_open_ms: vec![self_test, t0], ..Default::default() };
+    for i in 0..400 {
+        // the fill cell at rest around the self-test, the KG1000 at zero
+        inputs.push_gs(self_test - 5_000 + i * 25, "LOADCELL_50_WEIGHT_KG", "DAQ", &[Some(5.0)]);
+        inputs.push_gs(self_test - 5_000 + i * 25, "LOADCELL_WEIGHT_KG", "DAQ", &[Some(0.0)]);
+    }
+    for (name, ty, sender) in [("kg1000_kg", "LOADCELL_WEIGHT_KG", "DAQ"), ("kg50_kg", "LOADCELL_50_WEIGHT_KG", "DAQ"), ("tank_psi", "PRESSURE_TRANSDUCER_CALIBRATED", "VB")] {
+        for (t, v) in window_channel(name) {
+            inputs.push_gs(t0 + (t * 1000.0).round() as i64, ty, sender, &[Some(v)]);
+        }
+    }
+    let meta = Meta { id: "fire".into(), capture_id: None, capture_label: "fire".into(), mode: "test_fire".into(), simulated: true, created_ms: 0 };
+    let r = compute(&inputs, meta).unwrap();
+    assert_eq!(r.ignition_ms, t0);
+    assert!((r.total_impulse_ns - real_fire_report().total_impulse_ns).abs() < 1.0, "{}", r.total_impulse_ns);
+}
+
 #[test]
 fn no_burn_means_no_report() {
     let mut inputs = Inputs::default();
