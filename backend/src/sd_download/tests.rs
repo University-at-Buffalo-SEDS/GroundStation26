@@ -168,13 +168,25 @@ fn serve(daq: &Arc<Router>, board: Arc<MockCard>) {
     serve_card(daq, board, 1024);
 }
 
+/// One pass of a router's queues for a test pump. A station run the test
+/// aborted (a restart) drops its stream receiver; a frame still in flight to
+/// it then fails its handler, as it does on a real station, which drops it.
+/// The pump must carry on like the station's router task, not die (killing
+/// every later run of the test, more often the more loaded the host).
+pub(super) fn process(router: &Router) {
+    match router.process_all_queues() {
+        Ok(_) | Err(sedsnet::TelemetryError::HandlerError("SD stream receiver closed")) => {}
+        Err(error) => panic!("router pump: {error:?}"),
+    }
+}
+
 pub(super) fn pump(gs: Arc<Router>, daq: Arc<Router>) -> (Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
     let running = Arc::new(AtomicBool::new(true));
     let flag = running.clone();
     let task = tokio::spawn(async move {
         while flag.load(Ordering::Relaxed) {
-            gs.process_all_queues().unwrap();
-            daq.process_all_queues().unwrap();
+            process(&gs);
+            process(&daq);
             tokio::task::yield_now().await;
         }
     });
@@ -189,8 +201,8 @@ pub(super) fn pump_link(gs: Arc<Router>, board: Arc<Router>, up: Arc<AtomicBool>
     let task = tokio::spawn(async move {
         while flag.load(Ordering::Relaxed) {
             if up.load(Ordering::SeqCst) {
-                gs.process_all_queues().unwrap();
-                board.process_all_queues().unwrap();
+                process(&gs);
+                process(&board);
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
