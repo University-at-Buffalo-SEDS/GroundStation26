@@ -60,7 +60,7 @@ RUN sed -i 's/^Types: deb$/Types: deb\nArchitectures: amd64/' /etc/apt/sources.l
       build-essential gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross \
       clang lld cmake nasm perl pkg-config python3 python3-venv curl ca-certificates git \
       libssl-dev libudev-dev:arm64 \
-      gcc-multilib g++-multilib gcc-arm-none-eabi libnewlib-arm-none-eabi ninja-build binutils \
+      gcc-i686-linux-gnu g++-i686-linux-gnu libc6-dev-i386-cross gcc-arm-none-eabi libnewlib-arm-none-eabi ninja-build binutils \
       gcc-arm-linux-gnueabihf libc6-dev-armhf-cross binutils-arm-linux-gnueabihf \
  && rm -rf /var/lib/apt/lists/*
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal \

@@ -183,10 +183,12 @@ class SimBundleTests(unittest.TestCase):
             self.assertEqual(out, repo / "target" / "firmware-sim-bundle.tar.gz")
 
     def test_builder_image_carries_the_native_sim_toolchain_and_keeps_the_station_one(self) -> None:
-        for need in ("gcc-multilib", "gcc-arm-none-eabi", "ninja-build", "i686-unknown-linux-gnu", "gcc-arm-linux-gnueabihf",
+        for need in ("gcc-i686-linux-gnu", "libc6-dev-i386-cross", "gcc-arm-none-eabi", "ninja-build", "i686-unknown-linux-gnu", "gcc-arm-linux-gnueabihf",
                      "armv7-unknown-linux-gnueabihf",
                      "gcc-aarch64-linux-gnu", "aarch64-unknown-linux-gnu", "wasm32-unknown-unknown"):
             self.assertIn(need, remote_build.DOCKERFILE)
+        # Ubuntu's gcc-multilib conflicts with the aarch64/armhf cross compilers, so apt cannot install both.
+        self.assertNotIn("gcc-multilib", remote_build.DOCKERFILE)
 
 
 class BuildWrapperTests(unittest.TestCase):
