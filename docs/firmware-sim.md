@@ -375,8 +375,9 @@ Per mode (the e2e: `python3 tools/firmware_sim_e2e.py --out DIR --mode <mode>`):
   on its drive enable (PB7), the VB pilot, the hybrid motor's burn on the stand (the KG50 unloads, then the KG1000
   carries the thrust once the gap closes; the DAQ chamber PT), burnout and the provisional burn report. Then the
   operator steps the station back to Idle (RewindFlightState down to Idle: a test fire has no FC to land, and the
-  return to Idle ends the launch capture); the station then fetches the DAQ's SD launch file (only in Idle, Landed or
-  Recovery) and the burn report goes final.
+  return to Idle ends the launch capture; the station re-sends its final Idle once the steps settle, so the fill-CAN
+  boards end on it); the station then fetches the DAQ's SD launch file (only in Idle, Landed or Recovery) and the burn
+  report goes final.
 * **Normal**: the RF NEO-M9N fix reaches the station, so the GPS gate passes; while the station is Idle the e2e runs
   the DAC patch (below), then the full procedure (self-test, nitrogen test, fill, QD retract, Launch). The QD retract
   is the AB's stepper move: 200000 motor steps x 100 gearbox at 30 us (ActuatorBoard26 `main_task.c`), i.e. 600 s
@@ -392,16 +393,15 @@ Per mode (the e2e: `python3 tools/firmware_sim_e2e.py --out DIR --mode <mode>`):
   ec999d7 and reports it in BOARD_HEALTH word 6 bit 29), recording which `test-data/igt` dataset was on the card
   (`docs/data-pipeline.md` §3.4a); then IgtExit leaves ground test. The FC refuses Enter (reason 11, "refused (wrong state)") while it still counts the
   station as lost, e.g. a few seconds after the radio path came back at boot; press it again.
-* **Testing**: the mode's own logic against the simulated boards (the e2e checks the links and the fill rules). The
-  station stays in Startup in Testing and publishes no FLIGHT_STATE, so a DAQ without a stored flight state (fresh
-  flash, as every sim start is) refuses DAC output ("does not know the flight state yet"); the DAC patch is therefore
-  checked in Normal.
-* **DAC patch** (in the Normal run): a 2 Hz sine on DAC1 patched onto the KG1000 amplifier through a 1/1000
+* **Testing**: the mode's own logic against the simulated boards (the e2e checks the links, the DAC patch and the fill
+  rules). The station stays in Startup in Testing and declares it to the boards once all are seen, so the DAQ knows
+  its flight state and allows DAC output.
+* **DAC patch** (in the Normal and Testing runs): a 2 Hz sine on DAC1 patched onto the KG1000 amplifier through a 1/1000
   attenuator (the simulated loopback cable), measured by the DAQ's frame engine and judged by the station's DAC
   validation, then the station's linearity sweep (11 DC steps) through the same patch: both pass (gain error -0.26 %,
   sweep nonlinearity 0.003 % FS). The load-cell items are 20 ms bin means, so a 20 Hz sine reads 0.76 of its
-  amplitude there (sinc(0.4 pi)); stay below a quarter of the stream rate. MCP CH2-CH7 targets read NaN (open issue
-  2 below). `FIRMWARE_SIM_E2E_DAC_TARGET` / `_ATTENUATION` pick another target.
+  amplitude there (sinc(0.4 pi)); stay below a quarter of the stream rate. The MCP CH2-CH7 targets read again since
+  the DAQ ages its auxiliary samples on their own clock (issue 2 below). `FIRMWARE_SIM_E2E_DAC_TARGET` / `_ATTENUATION` pick another target.
 
 Sim panel: Settings shows it while the station runs simulated firmware (revisions, pace, plant for everyone; plant
 inputs, conditions, calibration masses, faults and the IGT dataset for administrators). The DAQ DAC page shows the
@@ -460,26 +460,39 @@ simclock).
   span) and the FC SD launch file downloaded (1.7 MB at about 10 KB/s); its attachment waits behind the DAQ launch
   fetch (open issue 1).
 
-Open issues found by these runs:
+Issues these runs found, and their fixes (r6b):
 
-1. **The DAQ does not follow the station back to Idle.** After the burn (test fire: Launch, Armed, Fill x4, Idle in
-   3 s steps) the DAQ's flight-state cache stays at Fill (`g_flight_state_cache_value` 2; Launch, Armed and the Fill
-   writes were applied, the Idle write was not; one reliable refusal counted). In Normal it stays at Launch (the
-   station writes no Landed). The DAQ serves its SD stream only in Idle, Landed or Recovery, so the station's DAQ
-   launch-file listing times out, the burn report stays provisional and the FC SD attachment waits behind it. The
-   station now retries the listing four times and then lets the FC collection go on.
-2. **MCP CH2-CH7 (DAQ_SDADC_VOLTAGES) publish NaN.** The aux samples are fresh in the DAQ, but `daq_publish_analog`
-   ages them against `telemetry_now_ms()` (ThreadX ticks) while the samples carry HAL-tick milliseconds
-   (`mcp3564r.c` maps the TIM2 stamps onto HAL time). In the sim the ThreadX clock trails the HAL tick by about 50 ms,
-   so every sample looks newer than "now", `(uint32_t)(now - ms)` wraps and the value is dropped as stale. The same
-   mix of time bases could hit the board whenever ThreadX's tick starts after the HAL tick; to check on hardware.
-3. **Testing mode publishes no FLIGHT_STATE**, so a DAQ without a stored state refuses DAC output there.
-4. **A Launch right after the QD retract did nothing once.** In one of two Normal runs the station admitted Launch
-   0.7 s after the AB finished its 600 s stepper move (the retraction proof turns allowed at that moment); FLIGHT_STATE
-   Launch went out, but the AB never drove the igniter (PB7) nor the VB the pilot, with no board reset and nothing
-   in the station log. The other run sent Launch 3 s after the move ended and flew. Needs AB-side tracing of its launch
-   claim (`thread_comm_launch_claim`: station stamp window -5 s/+1 s) right after the move, during which the shim
-   delivered 20 million TIM1 update interrupts.
+1. **The ground boards did not follow the station back to Idle, nor to Landed.** Reproduced in a few steps: eight
+   FLIGHT_STATE writes 1 s apart reach the gateway whole (GB applied all 18 of the run), but the VB and the DAQ behind
+   it on the fill CAN apply only two and stay in Fill while the station is Idle; with 5 s between writes every one
+   arrives. It is a loss in the gateway's relay of a burst of managed-variable writes onto CAN (SEDSnet 7.0.0; not a
+   DAQ refusal: the DAQ's refusal counter does not move). In Normal the FC's FLIGHT_STATE reaches the station by radio
+   only and the DAQ accepts the station alone, so it stayed in Launch after landing. The DAQ serves its SD card only in
+   Idle, Landed or Recovery, so the launch-file listing timed out, the burn report stayed provisional and the FC SD
+   attachment waited behind it. Fixed in the station (GroundStation26): three seconds after FLIGHT_STATE writes go
+   quiet the station sends its latest value once more (same stamp, fresh identity, never Launch), and when the FC's
+   report moves the station from Launch or flight into Landed the station publishes Landed itself. The relay loss
+   itself is for SEDSnet (reproducer above).
+2. **MCP CH2-CH7 (DAQ_SDADC_VOLTAGES) published NaN.** `daq_publish_analog` aged the HAL-tick sample times against
+   `telemetry_now_ms()` (ThreadX ticks); with the ThreadX clock behind the HAL tick every sample looked newer than
+   "now", the unsigned age wrapped and the value was dropped. A real board bug whenever the two clocks start apart.
+   Fixed in DAQ-Board: the age is taken on the HAL tick with a signed, wrap-safe helper (`daq_acq_sample_fresh`,
+   host tests with the clocks 50 ms apart either way and across the 32-bit wrap); the sim now reads CH2-CH6.
+3. **Testing published no FLIGHT_STATE**, so the DAQ (DAC output only in a known Startup or Idle) refused the DAC.
+   Testing has no automatic flight-state authority and no network time of its own. Fixed in the station: Testing
+   declares its actual Startup once every board is seen, stamped like an ordinary control (wall clock until network
+   time exists). The DAQ's refusal of DAC output with no known state stays: a DAQ that rebooted in flight must not
+   drive its DAC.
+4. **A Launch right after the QD retract once did nothing.** Not reproduced in a later run (Launch 1.5 s after the
+   600 s move ended: igniter, pilot, flight). The AB admitted no Launch and said nothing: a new Launch that failed
+   admission only withheld its receipt, and one refused for good (its stamp aged past the -5 s/+1 s effect window
+   while it was retried) never recovered. Fixed in ActuatorBoard26: the admission records a board_refusal reason
+   (abort, recovery, store, busy fill configuration, command floor, stale stamp, launch inhibit, queue), the station
+   shows it ("Igniter sequence: refused by AB because ..."), and a stale Launch is acknowledged so retries stop.
+
+The QD retract constant (`main_task.c`: 200000 motor steps x 100 gearbox at 30 us = 600 s) came with "better driver
+for stepper" (cd329ab; before it 200000 steps at 40 us, 8 s); `docs/data-pipeline.md` records the 20 000 000 steps but
+not the duration. Unchanged: worth confirming the gearbox factor against the mechanism.
 
 ### Valve-report time stamps and the bay's pace (2026-11-23)
 
@@ -532,10 +545,9 @@ frame engine waveforms up to about 250 Hz come through faithfully (500 Hz Nyquis
 
 ## 7. Follow-ups
 
-* The open issues of the r6 runs above (DAQ flight state after the burn, the MCP aux time base).
-* Testing mode: the station publishes no FLIGHT_STATE in Startup, so a DAQ without a durable flight state refuses
-  DAC output there (gate 2). Either the station publishes Startup or the DAQ treats "no state yet" as Startup for the
-  DAC; to decide with the DAQ owner.
+* SEDSnet: a burst of managed-variable writes relayed by a router onto another side loses its latest writes (the
+  gateway onto the fill CAN; the station's settle re-send covers FLIGHT_STATE).
+* Testing establishes no network time (`network UTC is not available` for station controls).
 * Test fire: no automatic return to a download-permitting state after the burn; the final burn report waits for the
   operator's rewind to Idle.
 * The AB's QD retract takes 600 s (200000 x 100 steps at 30 us): check the gearbox constant against the mechanism.

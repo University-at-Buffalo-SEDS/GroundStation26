@@ -366,7 +366,7 @@ pub(crate) fn sd_row_with(board: &str, line: &str, over_range: &OverRangeRecords
             .take(64)
             .collect()
     };
-    let channel = (board == "DAQ").then(|| Channel::ALL.into_iter().find(|c| c.daq_sensor() == sensor)).flatten();
+    let channel = (board == "DAQ").then(|| Channel::ALL.into_iter().find(|c| c.daq_sensors().contains(&sensor))).flatten();
     let flagged = over_range.declares(sensor);
     let values = match fields[3].trim() {
         _ if !flagged => None,

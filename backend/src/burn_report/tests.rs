@@ -697,6 +697,26 @@ fn an_earlier_valve_self_test_opening_is_not_the_ignition() {
     assert!((r.total_impulse_ns - real_fire_report().total_impulse_ns).abs() < 1.0, "{}", r.total_impulse_ns);
 }
 
+/// The current DAQ SD file (format v4) records the load cells and the chamber PT as volts records with the
+/// calibrated value beside them; the merge takes the calibrated kg / psig (firmware sim, 2026-11-24).
+#[test]
+fn current_daq_volts_records_merge_their_calibrated_values() {
+    use super::merge::{Channel, parse_daq_line};
+    let kg1000 = "1795494886436,281587,kg1000_v,,3314943,9.48412836e-01,4.01599487e+02,network,,,281587576,1000000,830880";
+    let (channel, sample) = parse_daq_line(kg1000).unwrap();
+    assert_eq!(channel, Channel::Kg1000);
+    assert!((sample.value - 401.599487).abs() < 1e-6);
+    assert_eq!(sample.t_ms, 1795494886436);
+    let kg50 = "1795494876039,271190,kg50_v,,739536,2.11582959e-01,4.95847273e+00,network,,,271190678,1000000,794388";
+    assert_eq!(parse_daq_line(kg50).unwrap().0, Channel::Kg50);
+    let chamber = "1795494876039,271190,chamber_pressure_v,,0,0,3.5e+02,network,2.5e+01,305652,271190096,1000000,794384";
+    let (channel, sample) = parse_daq_line(chamber).unwrap();
+    assert_eq!((channel, sample.value), (Channel::Chamber, 350.0));
+    // an over-range bin keeps its marker; a local-clock row is not merged
+    assert!(parse_daq_line("1,1,kg1000_v,,0,inf,inf,network,,,1,1000000,1").unwrap().1.value.is_infinite());
+    assert!(parse_daq_line("1,1,kg1000_v,,0,0.2,10,local,,,1,1000000,1").is_none());
+}
+
 #[test]
 fn no_burn_means_no_report() {
     let mut inputs = Inputs::default();

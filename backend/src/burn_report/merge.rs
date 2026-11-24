@@ -49,11 +49,20 @@ impl Channel {
     }
     /// DAQ SD sensor label (DAQ-Board `Core/Src/sd_card.c` scalar sensors).
     pub(crate) fn daq_sensor(self) -> &'static str {
+        self.daq_sensors()[0]
+    }
+    /// Every DAQ SD label of this channel: the per-sample volts records of the
+    /// current DAQ file (`kg1000_v`, `kg50_v`, `chamber_pressure_v`: ADC-pin
+    /// volts in `raw_value`, kg or psig in `calibrated_value`) and the older
+    /// calibrated network records. The burn report read only the older ones,
+    /// so a current DAQ launch file merged no rows and the report never went
+    /// final (firmware sim, 2026-11-24).
+    pub(crate) fn daq_sensors(self) -> &'static [&'static str] {
         match self {
-            Self::Kg1000 => "kg1000_network",
-            Self::Kg50 => "kg50_network",
-            Self::Tank => "valve_pressure_psi",
-            Self::Chamber => "chamber_pressure_raw_volts_psi",
+            Self::Kg1000 => &["kg1000_network", "kg1000_v"],
+            Self::Kg50 => &["kg50_network", "kg50_v"],
+            Self::Tank => &["valve_pressure_psi"],
+            Self::Chamber => &["chamber_pressure_raw_volts_psi", "chamber_pressure_v"],
         }
     }
     /// The DAQ samples its load cells and the chamber PT itself; the tank PT
@@ -120,7 +129,7 @@ pub(crate) fn parse_daq_line(line: &str) -> Option<(Channel, Sample)> {
     let sensor = fields[2].trim();
     let channel = Channel::ALL
         .into_iter()
-        .find(|c| c.daq_sensor() == sensor)?;
+        .find(|c| c.daq_sensors().contains(&sensor))?;
     let t_ms = fields[0].trim().parse::<i64>().ok()?;
     // `inf` / `-inf` is an over-range bin (format v4): kept as the marker.
     let value = [3usize, 6]
