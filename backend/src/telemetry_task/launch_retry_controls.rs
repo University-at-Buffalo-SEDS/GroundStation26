@@ -79,7 +79,9 @@ fn isolated_child() -> bool {
         )
         .spawn()
         .unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    // A hang guard for the child, not a timing check: a loaded host can take
+    // several times the few seconds the seven cases need alone.
+    let deadline = std::time::Instant::now() + Duration::from_secs(300);
     let mut exceeded = false;
     while child.try_wait().unwrap().is_none() {
         if std::time::Instant::now() > deadline
@@ -519,6 +521,10 @@ async fn queue_policy(case: &str) {
             .unwrap();
     }
     let pause = crate::gse::nonwaiting_admission_tests::Pause::install(&state);
+    // These cases prove queue-capacity refusals. The warm ignition peers share
+    // the SDK Core, so a CoreBusy retry may come first; a loaded host must not
+    // expire its window and turn the capacity refusal into a CoreBusy one.
+    pause.freeze_retry_window();
     let packets = if case == "empty" {
         Vec::new()
     } else {
@@ -545,7 +551,10 @@ async fn queue_policy(case: &str) {
     pause.prepared.recv_timeout(Duration::from_secs(2)).unwrap();
     pause.proceed.send(()).unwrap();
     let result = worker.join().unwrap();
-    let calls = pause.launch_calls.load(Ordering::Relaxed);
+    // Offers refused only for CoreBusy (a Core shared with the fixture) are
+    // retried by design; the capacity contract is about the other offers.
+    let calls = pause.launch_calls.load(Ordering::Relaxed)
+        - pause.launch_busy.load(Ordering::Relaxed);
     drop(pause);
     match case {
         "capacity" => {

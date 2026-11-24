@@ -107,6 +107,7 @@ struct Hook {
     core_release: Arc<(Mutex<bool>, Condvar)>,
     launch_packets:Arc<Mutex<Vec<sedsnet::packet::Packet>>>,
     launch_calls:Arc<std::sync::atomic::AtomicUsize>,
+    launch_busy:Arc<std::sync::atomic::AtomicUsize>,
     retry_gate:Arc<(Mutex<bool>,Condvar)>,
     trace: Arc<Trace>,
     suffix: Arc<SuffixGate>,
@@ -141,6 +142,8 @@ pub(crate) struct Pause {
     release: Arc<(Mutex<bool>, Condvar)>,
     pub(crate) launch_packets:Arc<Mutex<Vec<sedsnet::packet::Packet>>>,
     pub(crate) launch_calls:Arc<std::sync::atomic::AtomicUsize>,
+    /// SDK offers of the Launch vector refused only for CoreBusy.
+    pub(crate) launch_busy:Arc<std::sync::atomic::AtomicUsize>,
     retry_gate:Arc<(Mutex<bool>,Condvar)>,
     pub(crate) trace: Arc<Trace>,
     pub(crate) suffix: Arc<SuffixGate>,
@@ -159,6 +162,7 @@ impl Pause {
         let packet=Arc::new(Mutex::new(None));
         let launch_packets=Arc::new(Mutex::new(Vec::new()));
         let launch_calls=Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let launch_busy=Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let retry_gate=Arc::new((Mutex::new(false),Condvar::new()));
         let suffix=Arc::new(SuffixGate::default());
         *HOOK.get_or_init(Default::default).lock().unwrap() = Some(Arc::new(Hook {
@@ -169,7 +173,7 @@ impl Pause {
             busy,
             packet:packet.clone(),
             core_release: release.clone(),
-            launch_packets:launch_packets.clone(),launch_calls:launch_calls.clone(),retry_gate:retry_gate.clone(),
+            launch_packets:launch_packets.clone(),launch_calls:launch_calls.clone(),launch_busy:launch_busy.clone(),retry_gate:retry_gate.clone(),
             trace: trace.clone(),
             suffix: suffix.clone(),
         }));
@@ -180,7 +184,7 @@ impl Pause {
             busy:busy_received,
             packet,
             release,
-            launch_packets,launch_calls,retry_gate,trace,suffix,
+            launch_packets,launch_calls,launch_busy,retry_gate,trace,suffix,
             frozen: Mutex::new(None),
             owner: state as *const AppState as usize,
         }
@@ -286,6 +290,11 @@ pub(crate) fn record_holder_clock_return(owner: usize, sampled_at: Instant, orig
     }
 }
 pub(crate) fn record_launch_sdk_return(state: &AppState, accepted: usize, error: Option<&sedsnet::TelemetryError>) {
+    if matches!(error, Some(sedsnet::TelemetryError::Io("router core busy")))
+        && let Some(h) = hook(state as *const AppState as usize)
+    {
+        h.launch_busy.fetch_add(1, Ordering::Relaxed);
+    }
     if error.is_none() && let Some(h) = hook(state as *const AppState as usize) {
         let armed = { let mut after = h.suffix.after.lock().unwrap();
             if *after == Some(accepted + 1) { after.take(); true } else { false } };
