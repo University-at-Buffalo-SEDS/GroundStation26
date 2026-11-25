@@ -229,6 +229,13 @@ fn check_ox_tank_pressure(pkt: &sedsnet::packet::Packet, warnings: &mut HashSet<
     }
 }
 
+/// Whether a Launch attempt is on record, without ever waiting: a Launch save
+/// holds this lock across its disk write, and a slow disk must not hold up the
+/// safety loop. While the lock is busy (or poisoned) the last answer stands.
+fn launch_attempted_now(state: &AppState, last: bool) -> bool {
+    state.launch_history.try_lock().map_or(last, |history| history.launch_locked())
+}
+
 /// Vehicle health checks (PB/VB battery voltage, battery current, tank
 /// pressure) warn only while the vehicle is on the pad: a pre-Launch state, or
 /// Aborted, with no launch attempt on record. The launch lock is the station's
@@ -338,6 +345,8 @@ async fn safety_loop(
     let mut pending_abort = None;
     let mut first_abort_reason = None;
     let mut last_no_packet_warning_ms: u64 = 0;
+    // Off the pad until the record has been read once (a restart in flight).
+    let mut launch_attempted = true;
     let warning_cooldown_ms = env_u64(
         "GS_SAFETY_WARNING_COOLDOWN_MS",
         SAFETY_WARNING_COOLDOWN_MS_DEFAULT,
@@ -591,8 +600,8 @@ async fn safety_loop(
         // board that drops off can take every other packet with it (the
         // Gateway Board carries the whole umbilical).
         let mut cycle_warnings: HashSet<&'static str> = HashSet::new();
-        let vehicle_on_pad =
-            vehicle_checks_on_pad(current_state, state.launch_history.lock().unwrap().launch_locked());
+        launch_attempted = launch_attempted_now(state, launch_attempted);
+        let vehicle_on_pad = vehicle_checks_on_pad(current_state, launch_attempted);
         for pkt in packets {
             match pkt.data_type() {
                 ty if ty == crate::telemetry_schema::data_type("GENERIC_ERROR") => {
@@ -908,6 +917,20 @@ mod tests {
         assert!(vehicle_checks_on_pad(FlightState::Aborted, attempted()));
         state.launch_history.lock().unwrap().inhibit_automatic_actions().unwrap();
         assert!(!vehicle_checks_on_pad(FlightState::Aborted, attempted()));
+    }
+
+    /// A Launch save holds the record's lock across its disk write: the safety
+    /// loop keeps its last answer instead of waiting for it.
+    #[tokio::test]
+    async fn the_launch_attempt_check_never_waits_for_a_busy_record() {
+        let state = crate::state::tests::test_app_state().await;
+        assert!(!launch_attempted_now(&state, true));
+        let held = state.launch_history.lock().unwrap();
+        assert!(launch_attempted_now(&state, true));
+        assert!(!launch_attempted_now(&state, false));
+        drop(held);
+        state.launch_history.lock().unwrap().inhibit_automatic_actions().unwrap();
+        assert!(launch_attempted_now(&state, false));
     }
 
     /// The ingest drains the ring continuously: a packet it already took (a PB
