@@ -1310,6 +1310,44 @@ async fn terrain_and_phases(app: &axum::Router, out: &mut Fixtures) {
     out.add("flight-phases/live", serde_json::to_value(live).unwrap());
 }
 
+/// The visual stream manager: `GET /api/studio` (the default layouts, scenes
+/// and the source catalogue on a station without cameras), a take, and the
+/// programme page's resolved scene. The station's diagrams are pinned to one
+/// placeholder source, since the diagram files change on their own.
+async fn studio(root: &Path, state: &Arc<AppState>, out: &mut Fixtures) {
+    let dir = root.join("studio-fixture");
+    std::fs::create_dir_all(&dir).unwrap();
+    let app = crate::media::studio_fixture_router(state.clone(), &dir);
+    let pin = |mut value: Value| {
+        let mut diagram_seen = false;
+        if let Some(sources) = value["sources"].as_array_mut() {
+            sources.retain_mut(|source| {
+                if source["view"] != "diagram" {
+                    return true;
+                }
+                source["id"] = json!("diagram:fixture");
+                source["label"] = json!("Live diagram");
+                !std::mem::replace(&mut diagram_seen, true)
+            });
+        }
+        if value["program_url"].is_string() {
+            value["program_url"] = json!("/api/media-assets/program?ticket=TICKET");
+        }
+        value
+    };
+    out.add("studio/view", pin(get_ok(&app, "/api/studio", Some("administrator")).await));
+    let take = json!({"scene_id": "pad-camera", "transition": {"kind": "fade", "duration_ms": 800}});
+    let (status, taken) = call(app.clone(), "POST", "/api/studio/take", Some("administrator"), Some(take.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{taken}");
+    out.add("studio/take.request", take);
+    out.add("studio/take", pin(taken.clone()));
+    let ticket = taken["program_url"].as_str().unwrap().split("ticket=").nth(1).unwrap().to_owned();
+    let mut program = get_ok(&app, &format!("/api/media-assets/program/state?ticket={ticket}"), Some("administrator")).await;
+    let scene = program["studio"].take();
+    assert!(scene.is_object(), "{program}");
+    out.add("studio/program-scene", scene);
+}
+
 #[tokio::test]
 async fn contract_fixtures_match_the_backend() {
     let _mode = thread_mode(Mode::Normal);
@@ -1337,6 +1375,7 @@ async fn contract_fixtures_match_the_backend() {
     flight_plans(&state, &app, &mut out).await;
     recovery_search(&app, &mut out).await;
     terrain_and_phases(&app, &mut out).await;
+    studio(&root.0, &state, &mut out).await;
     drop(_mode);
     board_abort_hitl(&mut out).await;
     self_test_confirmation(&mut out).await;

@@ -1,0 +1,507 @@
+{
+  "layouts": [
+    {
+      "id": "full",
+      "name": "Full frame",
+      "slots": [
+        {
+          "height": 100.0,
+          "id": "main",
+          "width": 100.0,
+          "x": 0.0,
+          "y": 0.0,
+          "z": 0
+        }
+      ]
+    },
+    {
+      "id": "pip",
+      "name": "Picture in picture",
+      "slots": [
+        {
+          "height": 100.0,
+          "id": "main",
+          "width": 100.0,
+          "x": 0.0,
+          "y": 0.0,
+          "z": 0
+        },
+        {
+          "height": 28.0,
+          "id": "pip",
+          "width": 28.0,
+          "x": 68.0,
+          "y": 4.0,
+          "z": 1
+        }
+      ]
+    },
+    {
+      "id": "side_by_side",
+      "name": "Side by side",
+      "slots": [
+        {
+          "height": 100.0,
+          "id": "left",
+          "width": 50.0,
+          "x": 0.0,
+          "y": 0.0,
+          "z": 0
+        },
+        {
+          "height": 100.0,
+          "id": "right",
+          "width": 50.0,
+          "x": 50.0,
+          "y": 0.0,
+          "z": 0
+        }
+      ]
+    },
+    {
+      "id": "grid_2x2",
+      "name": "2 × 2",
+      "slots": [
+        {
+          "height": 50.0,
+          "id": "a",
+          "width": 50.0,
+          "x": 0.0,
+          "y": 0.0,
+          "z": 0
+        },
+        {
+          "height": 50.0,
+          "id": "b",
+          "width": 50.0,
+          "x": 50.0,
+          "y": 0.0,
+          "z": 0
+        },
+        {
+          "height": 50.0,
+          "id": "c",
+          "width": 50.0,
+          "x": 0.0,
+          "y": 50.0,
+          "z": 0
+        },
+        {
+          "height": 50.0,
+          "id": "d",
+          "width": 50.0,
+          "x": 50.0,
+          "y": 50.0,
+          "z": 0
+        }
+      ]
+    },
+    {
+      "id": "lower_third",
+      "name": "Full + lower third",
+      "slots": [
+        {
+          "height": 100.0,
+          "id": "main",
+          "width": 100.0,
+          "x": 0.0,
+          "y": 0.0,
+          "z": 0
+        },
+        {
+          "height": 25.0,
+          "id": "lower",
+          "width": 100.0,
+          "x": 0.0,
+          "y": 75.0,
+          "z": 2
+        }
+      ]
+    },
+    {
+      "id": "main_side",
+      "name": "Main + two side",
+      "slots": [
+        {
+          "height": 100.0,
+          "id": "main",
+          "width": 66.0,
+          "x": 0.0,
+          "y": 0.0,
+          "z": 0
+        },
+        {
+          "height": 50.0,
+          "id": "top",
+          "width": 34.0,
+          "x": 66.0,
+          "y": 0.0,
+          "z": 0
+        },
+        {
+          "height": 50.0,
+          "id": "bottom",
+          "width": 34.0,
+          "x": 66.0,
+          "y": 50.0,
+          "z": 0
+        }
+      ]
+    }
+  ],
+  "limits": {
+    "layouts": 32,
+    "max_transition_ms": 5000,
+    "min_slot_percent": 5.0,
+    "scenes": 24,
+    "slots": 12
+  },
+  "on_air": false,
+  "presets": [
+    {
+      "id": "full",
+      "slots": [
+        {
+          "height": 100.0,
+          "id": "main",
+          "width": 100.0,
+          "x": 0.0,
+          "y": 0.0,
+          "z": 0
+        }
+      ]
+    },
+    {
+      "id": "pip",
+      "slots": [
+        {
+          "height": 100.0,
+          "id": "main",
+          "width": 100.0,
+          "x": 0.0,
+          "y": 0.0,
+          "z": 0
+        },
+        {
+          "height": 28.0,
+          "id": "pip",
+          "width": 28.0,
+          "x": 68.0,
+          "y": 4.0,
+          "z": 1
+        }
+      ]
+    },
+    {
+      "id": "side_by_side",
+      "slots": [
+        {
+          "height": 100.0,
+          "id": "left",
+          "width": 50.0,
+          "x": 0.0,
+          "y": 0.0,
+          "z": 0
+        },
+        {
+          "height": 100.0,
+          "id": "right",
+          "width": 50.0,
+          "x": 50.0,
+          "y": 0.0,
+          "z": 0
+        }
+      ]
+    },
+    {
+      "id": "grid_2x2",
+      "slots": [
+        {
+          "height": 50.0,
+          "id": "a",
+          "width": 50.0,
+          "x": 0.0,
+          "y": 0.0,
+          "z": 0
+        },
+        {
+          "height": 50.0,
+          "id": "b",
+          "width": 50.0,
+          "x": 50.0,
+          "y": 0.0,
+          "z": 0
+        },
+        {
+          "height": 50.0,
+          "id": "c",
+          "width": 50.0,
+          "x": 0.0,
+          "y": 50.0,
+          "z": 0
+        },
+        {
+          "height": 50.0,
+          "id": "d",
+          "width": 50.0,
+          "x": 50.0,
+          "y": 50.0,
+          "z": 0
+        }
+      ]
+    },
+    {
+      "id": "lower_third",
+      "slots": [
+        {
+          "height": 100.0,
+          "id": "main",
+          "width": 100.0,
+          "x": 0.0,
+          "y": 0.0,
+          "z": 0
+        },
+        {
+          "height": 25.0,
+          "id": "lower",
+          "width": 100.0,
+          "x": 0.0,
+          "y": 75.0,
+          "z": 2
+        }
+      ]
+    }
+  ],
+  "program_scene_id": "",
+  "program_url": "/api/media-assets/program?ticket=TICKET",
+  "revision": 0,
+  "scenes": [
+    {
+      "id": "pad-camera",
+      "layout_id": "lower_third",
+      "name": "Pad camera",
+      "program_bar": true,
+      "sources": {
+        "lower": "overlay:lower-third",
+        "main": "camera-auto:1"
+      }
+    },
+    {
+      "id": "cameras",
+      "layout_id": "grid_2x2",
+      "name": "Camera grid",
+      "program_bar": true,
+      "sources": {
+        "a": "camera-auto:1",
+        "b": "camera-auto:2",
+        "c": "camera-auto:3",
+        "d": "camera-auto:4"
+      }
+    },
+    {
+      "id": "camera-diagram",
+      "layout_id": "side_by_side",
+      "name": "Camera + diagram",
+      "program_bar": true,
+      "sources": {
+        "left": "camera-auto:1",
+        "right": "diagram:mode"
+      }
+    },
+    {
+      "id": "diagram",
+      "layout_id": "lower_third",
+      "name": "Live diagram",
+      "program_bar": true,
+      "sources": {
+        "lower": "overlay:lower-third",
+        "main": "diagram:mode"
+      }
+    },
+    {
+      "id": "telemetry",
+      "layout_id": "main_side",
+      "name": "Telemetry",
+      "program_bar": true,
+      "sources": {
+        "bottom": "telemetry:stats",
+        "main": "telemetry:plot",
+        "top": "telemetry:tclock"
+      }
+    },
+    {
+      "id": "rocket",
+      "layout_id": "lower_third",
+      "name": "Rocket graphic",
+      "program_bar": true,
+      "sources": {
+        "lower": "overlay:lower-third",
+        "main": "telemetry:model"
+      }
+    },
+    {
+      "id": "interview",
+      "layout_id": "pip",
+      "name": "Interview",
+      "program_bar": true,
+      "sources": {
+        "main": "camera-auto:1",
+        "pip": "camera-auto:2"
+      }
+    },
+    {
+      "id": "map",
+      "layout_id": "lower_third",
+      "name": "Recovery map",
+      "program_bar": true,
+      "sources": {
+        "lower": "overlay:lower-third",
+        "main": "telemetry:map"
+      }
+    },
+    {
+      "id": "slate",
+      "layout_id": "full",
+      "name": "Stand by",
+      "program_bar": true,
+      "sources": {
+        "main": "graphic:slate"
+      }
+    }
+  ],
+  "sources": [
+    {
+      "id": "camera-auto:1",
+      "kind": "camera",
+      "label": "Auto camera 1",
+      "state": "no_signal",
+      "transparent": false,
+      "view": "camera"
+    },
+    {
+      "id": "camera-auto:2",
+      "kind": "camera",
+      "label": "Auto camera 2",
+      "state": "no_signal",
+      "transparent": false,
+      "view": "camera"
+    },
+    {
+      "id": "camera-auto:3",
+      "kind": "camera",
+      "label": "Auto camera 3",
+      "state": "no_signal",
+      "transparent": false,
+      "view": "camera"
+    },
+    {
+      "id": "camera-auto:4",
+      "kind": "camera",
+      "label": "Auto camera 4",
+      "state": "no_signal",
+      "transparent": false,
+      "view": "camera"
+    },
+    {
+      "id": "diagram:fixture",
+      "kind": "telemetry",
+      "label": "Live diagram",
+      "state": "no_signal",
+      "transparent": false,
+      "view": "diagram"
+    },
+    {
+      "id": "telemetry:stats",
+      "kind": "telemetry",
+      "label": "Key telemetry cards",
+      "state": "no_signal",
+      "transparent": false,
+      "view": "stats"
+    },
+    {
+      "id": "telemetry:plot",
+      "kind": "telemetry",
+      "label": "Telemetry plots",
+      "state": "no_signal",
+      "transparent": false,
+      "view": "plot"
+    },
+    {
+      "id": "telemetry:tclock",
+      "kind": "telemetry",
+      "label": "T-clock",
+      "state": "no_signal",
+      "transparent": false,
+      "view": "tclock"
+    },
+    {
+      "id": "telemetry:map",
+      "kind": "telemetry",
+      "label": "Recovery map",
+      "state": "no_signal",
+      "transparent": false,
+      "view": "map"
+    },
+    {
+      "id": "telemetry:model",
+      "kind": "telemetry",
+      "label": "Rocket graphic",
+      "state": "no_signal",
+      "transparent": false,
+      "view": "model"
+    },
+    {
+      "id": "telemetry:recorded-replay",
+      "kind": "telemetry",
+      "label": "Recorded flight replay",
+      "state": "no_signal",
+      "transparent": false,
+      "view": "recorded_replay"
+    },
+    {
+      "id": "overlay:lower-third",
+      "kind": "overlay",
+      "label": "T-clock + altitude lower third",
+      "state": "no_signal",
+      "transparent": true,
+      "view": "lower_third"
+    },
+    {
+      "id": "overlay:tclock-bug",
+      "kind": "overlay",
+      "label": "T-clock corner bug",
+      "state": "no_signal",
+      "transparent": true,
+      "view": "tclock_bug"
+    },
+    {
+      "id": "overlay:stats-bar",
+      "kind": "overlay",
+      "label": "Telemetry strip",
+      "state": "no_signal",
+      "transparent": true,
+      "view": "stats_bar"
+    },
+    {
+      "id": "graphic:title",
+      "kind": "graphic",
+      "label": "Mission title card",
+      "state": "ready",
+      "transparent": false,
+      "view": "title"
+    },
+    {
+      "id": "graphic:slate",
+      "kind": "graphic",
+      "label": "Stand-by slate",
+      "state": "ready",
+      "transparent": false,
+      "view": "slate"
+    }
+  ],
+  "take_seq": 0,
+  "transition": {
+    "duration_ms": 600,
+    "kind": "fade"
+  }
+}
