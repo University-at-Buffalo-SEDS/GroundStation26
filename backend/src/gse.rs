@@ -4908,6 +4908,62 @@ fn with_stop_admission<T>(
         .ok_or("Manual Abort invalidated launch admission; no launch effect was admitted")
 }
 
+const COLD_FLOW_LAUNCH_REFUSAL: &str = "Rocket Launch is inhibited while cold flow owns the valves";
+const OTHER_ROUTER_REFUSAL: &str = "Ignition route observation belongs to a different SDK router";
+
+/// Boards whose fresh state Launch admission requires: the mode's boards and,
+/// for a batch that ignites with the proof enforced, the ignition pair.
+fn launch_proof_boards(state: &AppState, pair: bool) -> u8 {
+    crate::board_abort::required_mask(state) | if pair { crate::ignition_pair::REQUIRED_MASK } else { 0 }
+}
+/// The ignition pair's proof, still fresh `ahead` from now.
+fn launch_pair_proof(state: &AppState, ahead: std::time::Duration) -> Result<(), String> {
+    if state.board_abort.launch_pair_current_ahead(crate::ignition_pair::REQUIRED_MASK, ahead) {
+        return Ok(());
+    }
+    state.board_abort.request_queries(launch_proof_boards(state, true));
+    Err(crate::ignition_pair::PAIR_PROOF_REFUSAL.into())
+}
+
+/// Up-front refusals for a Launch press: what `queue_admitted_launch_packets`
+/// would refuse once the intent is saved and Launch locked. Checked before
+/// anything is saved or prepared; every one is checked again at SDK admission.
+pub(crate) fn launch_preflight(state: &AppState, router: &sedsnet::router::Router) -> Result<(), String> {
+    simulated_launch_preflight(state)?;
+    if !crate::ignition_pair::same_router(state, router) {
+        return Err(OTHER_ROUTER_REFUSAL.into());
+    }
+    launch_network_time(router)
+}
+/// FLIGHT_STATE Launch needs network time; HITL sends none.
+fn launch_network_time(router: &sedsnet::router::Router) -> Result<(), String> {
+    if crate::runtime_mode::is_hitl() {
+        return Ok(());
+    }
+    crate::system_clock::required_control_network_stamp(router)
+        .map(|_| ())
+        .map_err(|error| format!("Launch was not dispatched: {error}"))
+}
+/// The part of `launch_preflight` a Testing model Launch has too.
+pub(crate) fn simulated_launch_preflight(state: &AppState) -> Result<(), String> {
+    crate::ignition_pair::launch_readiness(state)?;
+    if cold_flow::active(state) {
+        return Err(COLD_FLOW_LAUNCH_REFUSAL.into());
+    }
+    Ok(())
+}
+
+/// The board-state half of `with_launch_admission`, checked under the dispatch
+/// gate immediately before a Launch intent is saved, for proofs that outlast
+/// the save. A refusal here saves nothing and leaves Launch unlocked.
+fn admit_launch_intent(state: &AppState, ticket: LaunchAdmission) -> Result<(), String> {
+    let pair = crate::ignition_pair::proof_enforced(state);
+    let ahead = crate::ignition_pair::LAUNCH_COMMIT_ALLOWANCE;
+    state.board_abort.admit_launch_ahead(
+        state, launch_proof_boards(state, pair), ticket.board_abort_revision, ahead, || ())?;
+    if pair { launch_pair_proof(state, ahead) } else { Ok(()) }
+}
+
 fn with_launch_admission<T>(
     state: &AppState,
     ticket: LaunchAdmission,
@@ -4918,18 +4974,13 @@ fn with_launch_admission<T>(
     // publication retains its original mode policy; it is not an igniter command.
     let require_fresh_pair = ignition_pair_required && crate::ignition_pair::proof_enforced(state);
     let route_token = if require_fresh_pair {
-        if !state.board_abort.ignition_pair_current() {
-            state.board_abort.request_queries(crate::board_abort::required_mask(state)
-                | crate::ignition_pair::REQUIRED_MASK);
-            return Err("Ignition requires fresh non-Abort Actuator and Valve Board readbacks".into());
-        }
+        launch_pair_proof(state, std::time::Duration::ZERO)?;
         Some(crate::ignition_pair::capture_route_token(state).map_err(str::to_string)?)
     } else { None };
     let _dispatch = dispatch_gate();
-    if cold_flow::active(state){return Err("Rocket Launch is inhibited while cold flow owns the valves".into());}
+    if cold_flow::active(state){return Err(COLD_FLOW_LAUNCH_REFUSAL.into());}
     with_stop_admission(state, ticket, || ()).map_err(str::to_string)?;
-    let required = crate::board_abort::required_mask(state)
-        | if require_fresh_pair { crate::ignition_pair::REQUIRED_MASK } else { 0 };
+    let required = launch_proof_boards(state, require_fresh_pair);
     state
         .board_abort
         .admit_launch(state, required, ticket.board_abort_revision, || {
@@ -5002,7 +5053,7 @@ pub(crate) fn queue_prepared_launch_packets(
     let ignition_pair_required = packets.iter().any(|packet|
         crate::ignition_pair::packet_requires_pair(packet.data_type(), packet.payload()));
     if ignition_pair_required && !crate::ignition_pair::same_router(state,router) {
-        return Err("Ignition route observation belongs to a different SDK router".into());
+        return Err(OTHER_ROUTER_REFUSAL.into());
     }
     let total = packets.len();
     #[cfg(test)] nonwaiting_admission_tests::record_launch_packets(state,&packets);
@@ -5219,15 +5270,7 @@ pub(crate) fn inhibit_automatic_actions_for_pressed_launch(
     let controller_types=["ABORT","VALVE_COMMAND","ACTUATOR_COMMAND","FLIGHT_COMMAND"]
         .map(crate::telemetry_schema::data_type);
     let _dispatch=launch_preparation_gate(state,ticket,&controller_types)?;
-    state
-        .board_abort
-        .admit_launch(
-            state,
-            crate::board_abort::required_mask(state),
-            ticket.board_abort_revision,
-            || (),
-        )
-        .map_err(|error| error.to_string())?;
+    admit_launch_intent(state, ticket)?;
     let runtime = state.gse.lock().unwrap();
     if let Some(reason) = launch_journal_block(&state.launch_history.lock().unwrap()) {
         return Err(reason.into());
@@ -5282,15 +5325,7 @@ pub(crate) fn commit_fire_intent_for_pressed_launch(
     let controller_types=["ABORT","VALVE_COMMAND","ACTUATOR_COMMAND","FLIGHT_COMMAND"]
         .map(crate::telemetry_schema::data_type);
     let _dispatch=launch_preparation_gate(state,ticket,&controller_types)?;
-    state
-        .board_abort
-        .admit_launch(
-            state,
-            crate::board_abort::required_mask(state),
-            ticket.board_abort_revision,
-            || (),
-        )
-        .map_err(|error| error.to_string())?;
+    admit_launch_intent(state, ticket)?;
     let _clock_claim = claim_operator_dispatch_under_gate(state, ticket.generation)
         .ok_or_else(|| "Recovery admission is closed; Fire was not admitted".to_string())?;
     let mut rt = state.gse.lock().unwrap();
@@ -6550,6 +6585,23 @@ mod final_launch_admission_tests {
                 assert_eq!(state.manual_abort_intent.request(), u64::MAX);
                 assert!(state.manual_abort_intent.pending_epoch().is_some());
             }
+        }
+    }
+    /// Without network time the FLIGHT_STATE Launch cannot be stamped: refused
+    /// before the intent is saved. HITL publishes no FLIGHT_STATE.
+    #[test]
+    fn launch_without_network_time_is_refused_up_front() {
+        use crate::station_mode::Mode;
+        let untimed = Router::new(RouterConfig::new([]));
+        for mode in [Mode::Normal, Mode::TestFire, Mode::IntegratedGroundTest, Mode::Hitl] {
+            let _mode = crate::runtime_mode::test_support::thread_mode(mode);
+            let refused = launch_network_time(&untimed);
+            if mode == Mode::Hitl {
+                assert_eq!(refused, Ok(()));
+            } else {
+                assert!(refused.unwrap_err().contains("network UTC is not available"));
+            }
+            assert_eq!(launch_network_time(&clocked_router(RouterConfig::new([]))), Ok(()));
         }
     }
     /// HITL "no way out" paths: none of these can veto a fresh press when no

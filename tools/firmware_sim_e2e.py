@@ -359,9 +359,8 @@ def arm_and_launch(st: Station, check):
         code, snap = st.api("/api/board_abort")
         return code == 200 and isinstance(snap, dict) and not snap.get("missing_required_state") and snap
     for _ in range(8):
-        # Launch with fresh board-state proofs (as the Normal path does): a Launch admitted while the AB/VB
-        # readbacks are stale publishes FLIGHT_STATE Launch, is then refused at ignition ("Ignition requires fresh
-        # non-Abort Actuator and Valve Board readbacks") and locks Launch until a board reset (r7 tf2)
+        # Launch with fresh board-state proofs (as the Normal path does): the station refuses a Launch whose AB/VB
+        # readbacks are stale or about to be ("Ignition requires fresh non-Abort Actuator and Valve Board readbacks")
         st.api("/api/board_abort/refresh", {})
         st.sleep(1)
         st.wait(proofs_fresh, 20, "fresh board-state proofs", poll=0.5)

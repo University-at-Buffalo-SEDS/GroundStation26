@@ -126,6 +126,14 @@ state alone (the HITL column above).
 - **What sets it.** Only a real Launch or Fire attempt. A failed or unfinished board reset, an
   Abort, or a T-clock reset never sets it (`launch_history.rs:launch_locked`). A journal written
   before this rule keeps any earlier inhibition as a lock until it is released.
+- **Checked first.** The attempt is saved (journal, Fire intent, checklists) before anything is
+  sent, and SDK admission checks the board states again afterwards. Everything that admission
+  would refuse is therefore checked before the save (`gse.rs:launch_preflight`,
+  `gse.rs:admit_launch_intent`): the Actuator and Valve Board proof and routes, the fresh states of
+  the mode's boards, the SDK router, network time and cold flow. The proofs must stay fresh 2 s
+  past the check (`ignition_pair.rs:LAUNCH_COMMIT_ALLOWANCE`) so they outlast the save. A refusal
+  here sends nothing and leaves Launch unlocked; one after the save (the save stalled for longer, a
+  board aborted meanwhile) sends nothing either but keeps the lock.
 - **What releases it.** Either Reset all boards, or the verified healthy-board release
   (`board_recovery.rs:try_release_launch_lock`): every board on the network has a fresh verified
   readback, taken at least 10 s after the attempt, that is not aborted, is in Startup or Idle with

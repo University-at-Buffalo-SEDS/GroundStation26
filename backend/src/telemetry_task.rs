@@ -6,6 +6,8 @@ mod held_launch_tests;
 #[cfg(test)]
 mod launch_mode_gate_tests;
 #[cfg(test)]
+mod launch_commit_proof_tests;
+#[cfg(test)]
 mod side_starvation_tests;
 #[cfg(test)]
 mod abort_fence_refusal_tests;
@@ -680,7 +682,7 @@ async fn send_local_ground_station_launch(
     }
     // Refuse known missing ignition evidence before recording a sticky Fire
     // intent. Final nonce/epoch/Stop/route checks still run at SDK admission.
-    if let Err(reason) = crate::ignition_pair::readiness(&state) {
+    if let Err(reason) = crate::gse::launch_preflight(&state, &router) {
         state.clear_launch_sequence_command_pending();
         emit_notification_warning(&state, reason);
         return;
@@ -796,7 +798,7 @@ async fn send_flight_computer_launch(
     }
     // Refuse known missing ignition evidence before recording a sticky Fire
     // intent. Final nonce/epoch/Stop/route checks still run at SDK admission.
-    if let Err(reason) = crate::ignition_pair::readiness(&state) {
+    if let Err(reason) = crate::gse::launch_preflight(&state, &router) {
         state.clear_launch_sequence_command_pending();
         emit_notification_warning(&state, reason);
         return;
@@ -1291,6 +1293,7 @@ pub async fn telemetry_task(
                     }
                     if crate::runtime_mode::is_testing() && matches!(crate::sequences::command_name(&cmd), "Launch" | "GroundStationLaunch") && flight_sim::sim_mode_enabled() {
                         let original_utc=match crate::system_clock::required_control_network_utc_ms(&router){Ok(value)=>value,Err(error)=>{emit_notification_warning(&state,error.to_string());continue;}};
+                        if let Err(error) = crate::gse::simulated_launch_preflight(&state) { emit_notification_warning(&state, error); continue; }
                         let ticket = match crate::gse::inhibit_automatic_actions_for_launch_revision(&state,launch_revision) {
                             Ok(ticket) => ticket,
                             Err(error) => { emit_notification_warning(&state, error); continue; }

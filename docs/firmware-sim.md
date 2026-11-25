@@ -635,9 +635,11 @@ Failures these runs found, and their fixes:
    DAQ_LAUNCH_... refused: board busy"). The station now sends CANCEL only before its first HASH and waits through
    BUSY; the DAQ releases the slot when a hash is abandoned (host tests on both sides).
 6. **Test fire: Launch locked after a stale-proof Launch** (e2e, GroundStation26 596c56d): Launch sent 3 s after the
-   fill passed was admitted, published FLIGHT_STATE Launch, then refused at ignition ("Ignition requires fresh
+   fill passed was admitted, saved as an attempt, then refused at SDK admission ("Ignition requires fresh
    non-Abort Actuator and Valve Board readbacks") and locked Launch until a board reset. The e2e now waits for fresh
-   board-state proofs, as Normal already did; the station behaviour is a follow-up.
+   board-state proofs, as Normal already did. Nothing was published: the station logged the FLIGHT_STATE it prepared,
+   and SDK admission refused the whole batch. The station now makes that check before it saves the attempt
+   (docs/system/mission-phases.md, Launch lock) and logs FLIGHT_STATE Launch once the SDK owns it.
 7. **IGT: the FC stayed in Validating after the card swap** (e2e, 596c56d): since 02a519d the control merges faults
    per key, so the e2e's `{"faults": {}}` left the card out. It now sends `fc_sd_missing: false`. The FC itself did not
    report the pulled card (follow-up).
@@ -715,9 +717,6 @@ frame engine waveforms up to about 250 Hz come through faithfully (500 Hz Nyquis
   gate. Closed.
 * Testing: an Abort reaches only the boards that latch the ABORT packet (AB, VB, FC); the PB, RF, GB and DAQ follow
   FLIGHT_STATE, which Testing never sets to Aborted (r7).
-* Launch admitted with stale AB/VB proofs: the station publishes FLIGHT_STATE Launch, refuses ignition ("Ignition
-  requires fresh non-Abort Actuator and Valve Board readbacks") and locks Launch until a board reset, while the Launch
-  control showed enabled (r7 tf2).
 * The FC does not report a pulled card (BOARD_HEALTH SD ready stays set for at least 20 s), and an Enter ground test
   with the card out stays in Validating with no fault or time-out (r7).
 * With the safety task's checks live (r7): the sim's VB pack (15.23 V) is above the Normal/Testing layout range

@@ -5,10 +5,17 @@ use crate::{
     state::AppState,
     types::TelemetryCommand,
 };
+use std::time::Duration;
 
 pub(crate) mod observer;
 pub(crate) const REQUIRED_MASK: u8 = 0x18; // Existing application board order: AB, VB.
 const ROUTE_MAX_AGE_MS: u64 = 12_000; // Same bound as dedicated recovery endpoint verification.
+pub(crate) const PAIR_PROOF_REFUSAL: &str = "Ignition requires fresh non-Abort Actuator and Valve Board readbacks";
+/// A Launch saves its intent durably (journal, qualification, checklists)
+/// between its last up-front check and the SDK admission that checks the same
+/// proofs again. The up-front check asks for proofs that outlast that write:
+/// one that expired during it would lock Launch with nothing sent.
+pub(crate) const LAUNCH_COMMIT_ALLOWANCE: Duration = Duration::from_secs(2);
 
 pub(crate) fn command_requires_pair(command: &TelemetryCommand) -> bool {
     matches!(
@@ -106,14 +113,38 @@ pub(crate) fn required_pair(state: &AppState) -> u8 {
         REQUIRED_MASK
     }
 }
-/// The fresh non-Abort pair proof, and (with both boards present) their routes.
-fn pair_proof_current(state: &AppState, check_routes: bool) -> bool {
+/// The pair proof still fresh `ahead` from now and (with both boards present)
+/// their routes.
+fn pair_proof(state: &AppState, check_routes: bool, ahead: Duration) -> Result<(), &'static str> {
     let required = required_pair(state);
-    state.board_abort.ignition_pair_current_for(required)
-        && (!check_routes || required != REQUIRED_MASK || require_routes(state).is_ok())
+    if !state.board_abort.ignition_pair_current_ahead(required, ahead) {
+        return Err(PAIR_PROOF_REFUSAL);
+    }
+    if !check_routes || required != REQUIRED_MASK {
+        return Ok(());
+    }
+    require_routes(state)
 }
 
 pub(crate) fn readiness(state: &AppState) -> Result<(), &'static str> {
+    readiness_ahead(state, Duration::ZERO)
+}
+/// `readiness` for a Launch, with a proof that outlasts saving its intent.
+pub(crate) fn launch_readiness(state: &AppState) -> Result<(), &'static str> {
+    readiness_ahead(state, LAUNCH_COMMIT_ALLOWANCE)
+}
+/// The readiness a command that requires the pair must have.
+pub(crate) fn command_readiness(state: &AppState, command: &TelemetryCommand) -> Result<(), &'static str> {
+    if launch_control(crate::sequences::command_name(command)) {
+        launch_readiness(state)
+    } else {
+        readiness(state)
+    }
+}
+fn launch_control(name: &str) -> bool {
+    matches!(name, "Launch" | "GroundStationLaunch")
+}
+fn readiness_ahead(state: &AppState, ahead: Duration) -> Result<(), &'static str> {
     if state.shutdown_requested.load(std::sync::atomic::Ordering::Acquire) {
         return Err("Ground station is shutting down");
     }
@@ -126,50 +157,50 @@ pub(crate) fn readiness(state: &AppState) -> Result<(), &'static str> {
     if !proof_enforced(state) {
         return Ok(());
     }
-    if !state.board_abort.ignition_pair_current_for(required_pair(state)) {
-        state
-            .board_abort
-            .request_queries(required_pair(state) | crate::board_abort::required_mask(state));
-        return Err("Ignition requires fresh non-Abort Actuator and Valve Board readbacks");
-    }
-    if required_pair(state) != REQUIRED_MASK {
-        return Ok(());
-    }
-    require_routes(state)
+    pair_proof(state, true, ahead).inspect_err(|reason| {
+        if *reason == PAIR_PROOF_REFUSAL {
+            state
+                .board_abort
+                .request_queries(required_pair(state) | crate::board_abort::required_mask(state));
+        }
+    })
 }
 
-fn disable(policy: &mut ActionPolicyMsg) {
+/// The ignition controls show what `command_readiness` admits, and why not.
+fn project(state: &AppState, policy: &mut ActionPolicyMsg, check_routes: bool) {
+    if crate::rrls::is_rrls() {
+        return;
+    }
+    let blocked = state.shutdown_requested.load(std::sync::atomic::Ordering::Acquire)
+        || state.board_abort.launch_abort_mask(state) != 0;
+    let proof = |ahead| proof_enforced(state).then(|| pair_proof(state, check_routes, ahead).err()).flatten();
+    let (sequence, launch) = (proof(Duration::ZERO), proof(LAUNCH_COMMIT_ALLOWANCE));
     for control in &mut policy.controls {
-        if matches!(
-            control.cmd.as_str(),
-            "IgniterSequence" | "Launch" | "GroundStationLaunch"
-        ) {
-            control.enabled = false;
-            control.blink = BlinkMode::None;
+        let reason = match control.cmd.as_str() {
+            "IgniterSequence" => sequence,
+            name if launch_control(name) => launch,
+            _ => continue,
+        };
+        if !blocked && reason.is_none() {
+            continue;
         }
+        if control.enabled && control.disabled_reason.is_none() {
+            control.disabled_reason = reason.map(str::to_string);
+        }
+        control.enabled = false;
+        control.blink = BlinkMode::None;
     }
 }
 
 /// Existing policy refresh calls this outside Dispatch. Never require RRLS-local
 /// fill routes: RRLS projects the primary's policy and commands return to primary.
 pub(crate) fn project_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
-    if !crate::rrls::is_rrls()
-        && (state.shutdown_requested.load(std::sync::atomic::Ordering::Acquire)
-            || state.board_abort.launch_abort_mask(state) != 0
-            || proof_enforced(state) && !pair_proof_current(state, true))
-    {
-        disable(policy);
-    }
+    project(state, policy, true);
 }
 
 /// Snapshot callers can already hold application owners: inspect RAM only here.
 pub(crate) fn project_fresh_proof(state: &AppState, policy: &mut ActionPolicyMsg) {
-    if !crate::rrls::is_rrls()
-        && (state.shutdown_requested.load(std::sync::atomic::Ordering::Acquire)
-            || state.board_abort.launch_abort_mask(state) != 0
-            || proof_enforced(state) && !pair_proof_current(state, false)) {
-        disable(policy);
-    }
+    project(state, policy, false);
 }
 
 #[cfg(test)]
@@ -196,6 +227,43 @@ mod tests {
         drop(_mode);
         let _normal = crate::runtime_mode::test_support::thread_mode(crate::station_mode::Mode::Normal);
         assert_eq!(required_pair(&state), REQUIRED_MASK);
+    }
+
+    /// The Launch controls follow the Launch admission, which needs a proof
+    /// that outlasts saving the intent; the igniter sequence saves nothing.
+    /// A control the proof disables says so.
+    #[tokio::test]
+    async fn launch_controls_follow_the_launch_proof_window() {
+        use crate::types::Board;
+        // HITL's controls include the igniter sequence; its proof is opt-in.
+        let _mode = crate::runtime_mode::test_support::thread_mode(crate::station_mode::Mode::Hitl);
+        let state = crate::state::tests::test_app_state().await;
+        state.toggle_hitl_safety_interlock(3);
+        for board in ["AB", "VB"] {
+            state.mark_board_seen(board, crate::telemetry_task::get_current_timestamp_ms());
+        }
+        let control = |age: Duration, name: &str| {
+            for board in [Board::ActuatorBoard, Board::ValveBoard] {
+                let now = std::time::Instant::now();
+                state.board_abort.observe_status(board, 42, 8, 1, Some(1), false, true,
+                    now - age, state.board_abort.query_revision(board), now, 1);
+            }
+            let mut policy = crate::sequences::default_action_policy();
+            for control in &mut policy.controls {
+                control.enabled = true;
+                control.disabled_reason = None;
+            }
+            project_fresh_proof(&state, &mut policy);
+            policy.controls.iter().find(|c| c.cmd == name).map(|c| (c.enabled, c.disabled_reason.clone()))
+        };
+        let refused = Some((false, Some(PAIR_PROOF_REFUSAL.to_string())));
+        let enabled = Some((true, None));
+        let ttl = crate::board_abort::PROOF_TTL;
+        assert_eq!(control(Duration::ZERO, "Launch"), enabled);
+        assert_eq!(control(ttl - Duration::from_secs(1), "Launch"), refused, "would lapse before SDK admission");
+        assert_eq!(control(ttl - Duration::from_secs(1), "IgniterSequence"), enabled);
+        assert_eq!(control(ttl + Duration::from_secs(1), "Launch"), refused);
+        assert_eq!(control(ttl + Duration::from_secs(1), "IgniterSequence"), refused);
     }
 
     #[tokio::test]

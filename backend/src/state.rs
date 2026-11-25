@@ -2502,7 +2502,7 @@ impl AppState {
             other => other,
         };
         if !crate::rrls::is_rrls() && crate::ignition_pair::command_requires_pair(cmd)
-            && crate::ignition_pair::readiness(self).is_err() {
+            && crate::ignition_pair::command_readiness(self, cmd).is_err() {
             return false;
         }
         if crate::board_abort::launch_command(command_name(cmd))

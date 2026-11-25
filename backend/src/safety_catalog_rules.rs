@@ -489,9 +489,9 @@ const INTERLOCKS: &[Spec] = &[
         id: "ignition-pair",
         title: "Ignition pair proof",
         summary: "Ignition commands are refused on any board Abort and, while board-state proof is enforced ({station.ignition_pair_proof_enforced}; always on outside HITL), without fresh non-Abort Actuator and Valve Board readbacks and current routes.",
-        details: &[],
+        details: &["A Launch is refused, with nothing sent and Launch not locked, unless those readbacks and the required boards' states stay fresh for 2 s more: its attempt is saved before they are checked again."],
         modes: ALL,
-        enforced_in: &["backend/src/ignition_pair.rs:proof_enforced", "backend/src/gse.rs:queue_controller_with_launch_revision"],
+        enforced_in: &["backend/src/ignition_pair.rs:proof_enforced", "backend/src/gse.rs:launch_preflight", "backend/src/gse.rs:admit_launch_intent", "backend/src/gse.rs:queue_controller_with_launch_revision"],
         config_keys: &["station.ignition_pair_proof_enforced"],
     },
     Spec {

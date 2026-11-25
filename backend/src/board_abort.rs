@@ -659,13 +659,23 @@ impl Runtime {
     /// after its core guard is dropped; held-core/reentrant tests protect that.
     /// Strict proof view; optional HITL admission is selected separately.
     pub(crate) fn ignition_pair_current(&self) -> bool {
-        self.ignition_pair_current_for(crate::ignition_pair::REQUIRED_MASK)
+        self.ignition_pair_current_ahead(crate::ignition_pair::REQUIRED_MASK, Duration::ZERO)
     }
     /// The strict proof for only the `required` members of the pair (HITL
-    /// leaves an absent board out). No board may report Abort either way.
-    pub(crate) fn ignition_pair_current_for(&self, required: u8) -> bool {
+    /// leaves an absent board out), still fresh `ahead` from now. No board may
+    /// report Abort either way. Contention reads as no proof.
+    pub(crate) fn ignition_pair_current_ahead(&self, required: u8, ahead: Duration) -> bool {
         let Ok(register) = self.register.try_lock() else { return false; };
-        let (aborted, proven) = Self::masks_at(&register, Instant::now());
+        Self::ignition_pair_at(&register, required, Instant::now() + ahead)
+    }
+    /// The same proof for the Launch admission sites: they wait for the
+    /// register (as `admit_launch` does), so another reader holding it for an
+    /// instant is not taken for a missing proof once the intent is saved.
+    pub(crate) fn launch_pair_current_ahead(&self, required: u8, ahead: Duration) -> bool {
+        Self::ignition_pair_at(&self.register.lock().unwrap(), required, Instant::now() + ahead)
+    }
+    fn ignition_pair_at(register: &Register, required: u8, at: Instant) -> bool {
+        let (aborted, proven) = Self::masks_at(register, at);
         !register.history_frozen && register.abort_revision != u64::MAX
             && aborted == 0 && proven & required == required
     }
@@ -681,7 +691,7 @@ impl Runtime {
         }
         let (aborted, proven) = Self::masks_at(&register, Instant::now());
         if aborted != 0 || require_fresh && proven & crate::ignition_pair::REQUIRED_MASK != crate::ignition_pair::REQUIRED_MASK {
-            return Err("Ignition requires fresh non-Abort Actuator and Valve Board readbacks");
+            return Err(crate::ignition_pair::PAIR_PROOF_REFUSAL);
         }
         let result = admit();
         drop(register);
@@ -694,13 +704,24 @@ impl Runtime {
         revision: u64,
         admit: impl FnOnce() -> T,
     ) -> Result<T, String> {
+        self.admit_launch_ahead(state, required, revision, Duration::ZERO, admit)
+    }
+    /// `admit_launch` with board-state proofs that stay fresh `ahead` from now.
+    pub(crate) fn admit_launch_ahead<T>(
+        &self,
+        state: &AppState,
+        required: u8,
+        revision: u64,
+        ahead: Duration,
+        admit: impl FnOnce() -> T,
+    ) -> Result<T, String> {
         let seen = present_mask(state);
         let register = self.register.lock().unwrap();
         if state.shutdown_requested.load(Ordering::Acquire) || register.history_frozen { return Err("Ground station is shutting down".into()); }
         if !crate::runtime_mode::is_hitl() && let Some(error) = self.history_failure() { return Err(format!("Abort history unavailable: {error}")); }
         let unknown = required_unknown_mask(state, register.history_unknown);
         if unknown != 0 { self.request_queries(unknown); return Err(format!("Fresh actual state required because saved history is missing or was not clean for {}.", board_names(unknown))); }
-        let (_, proven) = Self::masks_at(&register, Instant::now());
+        let (_, proven) = Self::masks_at(&register, Instant::now() + ahead);
         let aborted = Self::launch_abort_mask_at(&register, seen, Instant::now());
         if aborted != 0 {
             drop(register);
