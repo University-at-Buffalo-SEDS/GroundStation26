@@ -1482,7 +1482,7 @@ async fn main() -> anyhow::Result<()> {
     sedsnet::wire_bundle::set_node_table(&crate::types::SEDS_NODE_TABLE);
     sedsnet::config::set_runtime_tuning_config(network_delivery_tuning())?;
 
-    logger::init()?;
+    let _log_flush = logger::init()?;
     let _host_temperature = host_temperature::start();
     // The flag names are kept from the per-mode builds: simulator tooling
     // parses this line.

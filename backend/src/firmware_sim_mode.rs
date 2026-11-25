@@ -79,6 +79,7 @@ pub(crate) fn refuse_foreign_clock() {
     ) {
         log::error!("{reason}");
         eprintln!("{reason}");
+        log::logger().flush();
         std::process::exit(2);
     }
 }
