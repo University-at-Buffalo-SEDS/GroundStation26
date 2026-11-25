@@ -330,6 +330,11 @@ fn feed_reports(rig: &Rig, outputs: bool) -> Arc<std::sync::atomic::AtomicBool> 
     stop
 }
 
+/// Presses refused because the board readbacks were stale.
+fn rig_refusals(state: &AppState) -> usize {
+    state.notifications_snapshot().iter().filter(|n| n.message.contains("Ignition requires fresh")).count()
+}
+
 async fn measure(site: Site, press: Press, load: Load) -> Latency {
     if site == Site::Log {
         let files = crate::logger::Queued::start(crate::logger::queue_tests::Files::default()).unwrap();
@@ -350,8 +355,18 @@ async fn measure(site: Site, press: Press, load: Load) -> Latency {
             } else {
                 // Nothing pumps the peers now: no query sent since the warm-up
                 // is answered.
-                prove(&state, &PAIR, Duration::ZERO);
-                immediate_on(&state, &router).await;
+                // A reply from the warm-up handled late may replace the proof with
+                // its own, older one: a press refused for that is made again.
+                // Never after an Abort: that Launch must not go out.
+                let refusals = || rig_refusals(&state);
+                for _ in 0..20 {
+                    let (refused, epoch) = (refusals(), state.manual_abort_intent.epoch());
+                    prove(&state, &PAIR, Duration::ZERO);
+                    immediate_on(&state, &router).await;
+                    if refusals() == refused || epoch != 0 || state.manual_abort_intent.epoch() != epoch {
+                        break;
+                    }
+                }
             }
         })
     };
