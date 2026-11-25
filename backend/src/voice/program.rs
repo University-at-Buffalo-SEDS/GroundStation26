@@ -132,6 +132,7 @@ mod tests {
             next: AtomicU32::new(1),
             claims: AtomicU64::new(1),
             program_slots: Arc::new(tokio::sync::Semaphore::new(4)),
+            limits: super::floor::Limits::default(),
         });
         let routes = axum::Router::new()
             .route("/commentary", get(upgrade))
@@ -181,7 +182,7 @@ mod tests {
                 .lock()
                 .await
                 .values()
-                .any(|p| p.name == "producer" && p.transmitting),
+                .any(|p| p.name == "producer" && p.wants_since.is_some()),
             "stream-only listener cannot acquire VC transmit"
         );
         assert_eq!(hub.history.lock().await.frames.len(), 1);
