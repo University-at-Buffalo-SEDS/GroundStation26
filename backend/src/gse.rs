@@ -2300,8 +2300,8 @@ fn fill_configuration_changed(before: &Config, after: &Config) -> bool {
         || before.fill_overfill_kg != after.fill_overfill_kg
         || before.fill_tolerance_kg != after.fill_tolerance_kg
         || before.fill_settle_ms != after.fill_settle_ms
-        || before.launch_mass_min_kg != after.launch_mass_min_kg
-        || before.launch_mass_max_kg != after.launch_mass_max_kg
+    // The Launch mass window is not here: it changes no fill, and the Launch
+    // gate reads it when it is checked, so a completed fill stays qualified.
 }
 fn invalidate_changed_configuration(rt: &mut Runtime, config: &Config) -> Result<(), String> {
     rt.turbo_evidence = None;

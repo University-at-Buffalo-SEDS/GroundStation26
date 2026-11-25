@@ -1034,6 +1034,20 @@ mod tests {
         let mut config = rt.engine.config.clone();
         config.nitrogen_steps = config.nitrogen_plan().unwrap();
         assert!(!nitrogen_configuration_changed(&rt.engine.config, &config));
+        // A Launch mass window change keeps the completed fill.
+        assert!(rt.operational.saved.qualification.completed(Milestone::FillTarget));
+        for change in [
+            (|c| c.launch_mass_min_kg = 3.5) as fn(&mut Config),
+            |c| c.launch_mass_max_kg = 9.5,
+        ] {
+            let mut window = config.clone();
+            change(&mut window);
+            assert!(!fill_configuration_changed(&config, &window));
+            assert!(!nitrogen_configuration_changed(&config, &window));
+            invalidate_changed_configuration(&mut rt, &window).unwrap();
+            let saved = operational::Saved::load(&path).unwrap();
+            assert!(saved.qualification.completed(Milestone::FillTarget));
+        }
         config.fill_settle_ms += 1000;
         invalidate_changed_configuration(&mut rt, &config).unwrap();
         let saved = operational::Saved::load(&path).unwrap();
@@ -1041,15 +1055,6 @@ mod tests {
         assert!(saved.qualification.nitrogen_satisfied());
         assert!(!saved.qualification.completed(Milestone::FillTarget));
         rt.engine.config = config.clone();
-        for change in [
-            (|c| c.launch_mass_min_kg = 3.5) as fn(&mut Config),
-            |c| c.launch_mass_max_kg = 9.5,
-        ] {
-            let mut window = config.clone();
-            change(&mut window);
-            assert!(fill_configuration_changed(&config, &window));
-            assert!(!nitrogen_configuration_changed(&config, &window));
-        }
         config.nitrogen_steps[0].hold_ms += 1000;
         invalidate_changed_configuration(&mut rt, &config).unwrap();
         let saved = operational::Saved::load(&path).unwrap();
