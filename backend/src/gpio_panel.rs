@@ -1050,7 +1050,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, not(feature = "raspberry_pi")))]
+#[cfg(test)]
 mod fill_recording_tests {
     use super::*;
     #[tokio::test]
@@ -1146,7 +1146,7 @@ mod fill_recording_tests {
     }
 }
 
-#[cfg(all(test, not(feature = "raspberry_pi")))]
+#[cfg(test)]
 mod panel_control_tests {
     use super::*;
     use crate::panel_control::{PanelMode, set};

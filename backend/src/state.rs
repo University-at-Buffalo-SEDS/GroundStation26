@@ -3306,7 +3306,6 @@ pub(crate) mod tests {
     use super::*;
     use crate::auth::AuthManager;
     use crate::fill_targets;
-    use crate::gpio::GpioPins;
     use crate::loadcell;
     use crate::ring_buffer::RingBuffer;
     use crate::telemetry_db::{DbQueueItem, RecordingModeWire, RecordingStatusMsg};
@@ -4544,7 +4543,7 @@ pub(crate) mod tests {
             auth_db,
             state: Arc::new(Mutex::new(FlightState::Startup)),
             state_tx,
-            gpio: GpioPins::new(),
+            gpio: crate::gpio::test_state_gpio(),
             board_status: Arc::new(Mutex::new(board_status)),
             board_status_tx,
             last_board_status_broadcast_ms: Arc::new(AtomicU64::new(0)),

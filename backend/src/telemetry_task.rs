@@ -3755,7 +3755,6 @@ mod tests {
     }
     use crate::auth::AuthManager;
     use crate::fill_targets;
-    use crate::gpio::GpioPins;
     use crate::loadcell;
     use crate::ring_buffer::RingBuffer;
     use crate::sequences::default_action_policy;
@@ -6505,7 +6504,7 @@ mod tests {
             auth_db,
             state: Arc::new(Mutex::new(FlightState::Startup)),
             state_tx,
-            gpio: GpioPins::new(),
+            gpio: crate::gpio::test_state_gpio(),
             board_status: Arc::new(Mutex::new(board_status)),
             board_status_tx,
             last_board_status_broadcast_ms: Arc::new(AtomicU64::new(0)),

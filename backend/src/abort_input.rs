@@ -647,7 +647,6 @@ pub(crate) mod tests {
         assert!(!info.contains("pad reports"), "{info}");
     }
 
-    #[cfg(not(feature = "raspberry_pi"))]
     #[test]
     fn abort_input_gpio_line_writes_the_bias_on_request_reassert_and_reopen() {
         let gpio = GpioPins::new_isolated();

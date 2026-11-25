@@ -35,16 +35,20 @@ pub enum BiasReadback {
         source: &'static str,
     },
     /// This platform cannot read the pad bias back.
-    #[cfg_attr(not(feature = "raspberry_pi"), allow(dead_code))]
+    #[cfg_attr(any(not(feature = "raspberry_pi"), test), allow(dead_code))]
     Unverifiable(&'static str),
 }
 
+// Unit tests use the simulated pins on every build (see the `GpioPins` alias at
+// the end), so in a `raspberry_pi` test build the rppal code below is compiled
+// and type-checked but not called.
 #[cfg(feature = "raspberry_pi")]
 const PI_5_UART_GPIO_PINS: &[u8] = &[14, 15];
 
 /// Read-only view of the Raspberry Pi 5 RP1 PADS_BANK0 registers, used only to
 /// report the bias the pad really has. All writes still go through rppal.
 #[cfg(feature = "raspberry_pi")]
+#[cfg_attr(test, allow(dead_code))]
 mod rp1_pads {
     use super::InputBias;
     use std::fs::OpenOptions;
@@ -136,6 +140,7 @@ fn ensure_regular_gpio_pin_allowed(pin_number: u8) -> Result<(), Box<dyn std::er
 }
 
 #[cfg(feature = "raspberry_pi")]
+#[cfg_attr(test, allow(dead_code, unused_imports))]
 mod real {
     use super::rp1_pads::Rp1Pads;
     use super::{BiasReadback, InputBias, Trigger, ensure_regular_gpio_pin_allowed};
@@ -471,7 +476,9 @@ mod real {
     // Re-export so external code can just use `GpioPins` regardless of cfg.
     pub use GpioPins as GpioPinsReal;
 }
-#[cfg(not(feature = "raspberry_pi"))]
+/// Simulated pins: the host backend, and unit tests in every feature set, so a
+/// `raspberry_pi` test build runs on a host without touching /dev/gpiomem.
+#[cfg(any(not(feature = "raspberry_pi"), test))]
 mod dummy {
     use super::{BiasReadback, InputBias, Trigger};
     use std::collections::HashMap;
@@ -721,7 +728,42 @@ mod dummy {
     }
 }
 
-#[cfg(feature = "raspberry_pi")]
+#[cfg(all(feature = "raspberry_pi", not(test)))]
 pub use real::GpioPinsReal as GpioPins;
-#[cfg(not(feature = "raspberry_pi"))]
+#[cfg(any(not(feature = "raspberry_pi"), test))]
 pub type GpioPins = dummy::GpioPins;
+
+/// Simulated pins private to one test `AppState`.
+///
+/// The host build gates the software buttons on its software-disable input,
+/// which reads as enabled when nothing drives it; the Pi build reads the
+/// physical panel's all-buttons-enable switch instead. A Pi test state starts
+/// with that switch on, the operating position, so the same tests run against
+/// the Pi gates. Tests that need it off drive the pin low.
+#[cfg(test)]
+pub(crate) fn test_state_gpio() -> std::sync::Arc<GpioPins> {
+    let gpio = GpioPins::new_isolated();
+    #[cfg(feature = "raspberry_pi")]
+    {
+        let pin = crate::gpio_panel::ALL_BUTTONS_ENABLE_PIN;
+        gpio.setup_input_pin(pin).expect("simulated pin");
+        gpio.set_input_for_test(pin, true);
+    }
+    gpio
+}
+
+#[cfg(all(test, feature = "raspberry_pi"))]
+mod pi_tests {
+    use super::*;
+
+    #[test]
+    fn pi_5_uart_pins_are_refused_as_regular_gpio() {
+        for pin in [14, 15] {
+            let error = ensure_regular_gpio_pin_allowed(pin).unwrap_err();
+            assert!(error.to_string().contains("reserved"), "{error}");
+        }
+        for pin in [4, 17, 27] {
+            ensure_regular_gpio_pin_allowed(pin).unwrap();
+        }
+    }
+}

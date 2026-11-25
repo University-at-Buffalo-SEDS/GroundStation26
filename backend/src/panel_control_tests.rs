@@ -201,6 +201,13 @@ async fn admin_routes_require_an_administrator() {
     .await
     .unwrap();
     let test: PressTest = serde_json::from_slice(&body).unwrap();
-    assert!(!test.gpio_available, "this build has no GPIO");
-    assert_eq!(test.message.as_deref(), Some("No GPIO on this host."));
+    if cfg!(feature = "raspberry_pi") {
+        // The Pi build reports the panel inputs (simulated pins under test).
+        assert!(test.gpio_available);
+        assert_eq!(test.message, None);
+        assert!(!test.inputs.is_empty());
+    } else {
+        assert!(!test.gpio_available, "this build has no GPIO");
+        assert_eq!(test.message.as_deref(), Some("No GPIO on this host."));
+    }
 }

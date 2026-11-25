@@ -10,6 +10,7 @@ on:
       - "Cargo.toml"
       - "build.py"
       - "scripts/prepare_frontend_source.py"
+      - "scripts/check_warnings.py"
       - ".github/workflows/macos-backend-check.yml"
   pull_request:
     branches: [dev, main]
@@ -19,6 +20,7 @@ on:
       - "Cargo.toml"
       - "build.py"
       - "scripts/prepare_frontend_source.py"
+      - "scripts/check_warnings.py"
       - ".github/workflows/macos-backend-check.yml"
 
 permissions:
@@ -52,3 +54,30 @@ jobs:
       - name: Check firmware-simulator backend and test targets on macOS
         working-directory: station
         run: cargo +stable check -p groundstation_backend --all-targets --features firmware_sim
+
+  # The flight build: the raspberry_pi feature (rppal, Linux only), checked on a
+  # Linux host. Unit tests use simulated GPIO in this build too.
+  raspberry-pi-backend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GS_FRONTEND_SOURCE_DIR: ${{ github.workspace }}/frontend-source
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: station
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: Rylan-Meilutis/Seds-Ground-Station-Frontend
+          ref: main
+          path: frontend-source
+          persist-credentials: false
+      - name: Install build dependencies
+        run: |
+          rustup toolchain install stable --profile minimal
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake libopus-dev libudev-dev pkg-config
+      - name: Check Raspberry Pi backend and test targets without warnings
+        working-directory: station
+        run: python3 scripts/check_warnings.py pi

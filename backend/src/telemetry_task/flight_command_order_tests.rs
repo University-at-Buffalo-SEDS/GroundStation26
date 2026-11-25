@@ -268,7 +268,10 @@ async fn operator_bay_timed(flight: crate::types::FlightState, between: Between,
                 }
                 Between::NewerCommand => crate::operator_command_resend::note_operator_dispatch(&state),
                 // The HITL button interlock engages with its panel enable off.
-                Between::ButtonsDisabled => state.hitl_button_interlock_enabled.store(true, std::sync::atomic::Ordering::SeqCst),
+                Between::ButtonsDisabled => {
+                    state.gpio.set_input_for_test(crate::gpio_panel::ALL_BUTTONS_ENABLE_PIN, false);
+                    state.hitl_button_interlock_enabled.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
                 Between::MainSeen => {
                     crate::recovery_events::observe_fc_state(&state, crate::types::FlightState::Ascent, crate::types::FlightState::Descent, 1);
                     crate::recovery_events::observe_fc_state(&state, crate::types::FlightState::Descent, crate::types::FlightState::Reefing, 2);
