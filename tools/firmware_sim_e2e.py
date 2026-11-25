@@ -207,6 +207,9 @@ def main() -> int:
     if a.mode == "integrated_ground_test" and "FIRMWARE_SIM_CONTROL" not in os.environ:
         # the IGT card goes in with a dataset before power-on; the scenario then swaps it for another (Retry SD)
         os.environ["FIRMWARE_SIM_CONTROL"] = json.dumps({"igt": {"dataset": IGT_POWER_ON_DATASET}})
+    # SIGTERM stops the station too (the finally below), as Ctrl-C does: a check killed with SIGTERM used to leave
+    # its station running, holding the bay's radio PTY, and later stations could not open theirs (r7)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     proc, key = start_station(out, a.mode, a.port)
     st = Station(f"http://127.0.0.1:{a.port}", key, out)
     st.mode = a.mode
