@@ -32,6 +32,10 @@ struct Limits {
     fill_tolerance_kg: f32,
     #[serde(default = "default_fill_settle")]
     fill_settle_ms: u64,
+    #[serde(default = "default_launch_mass_min")]
+    launch_mass_min_kg: f32,
+    #[serde(default = "default_launch_mass_max")]
+    launch_mass_max_kg: f32,
     pressure_step_psi: f32,
     pressure_ceiling_psi: Option<f32>,
     maximum_zero_offset_psi: Option<f32>,
@@ -46,6 +50,12 @@ fn default_fill_tolerance() -> f32 {
 fn default_fill_settle() -> u64 {
     gse_sequence::Config::default().fill_settle_ms
 }
+fn default_launch_mass_min() -> f32 {
+    gse_sequence::Config::default().launch_mass_min_kg
+}
+fn default_launch_mass_max() -> f32 {
+    gse_sequence::Config::default().launch_mass_max_kg
+}
 impl Limits {
     fn from_config(c: &gse_sequence::Config) -> Self {
         Self {
@@ -55,6 +65,8 @@ impl Limits {
             fill_overfill_kg: c.fill_overfill_kg,
             fill_tolerance_kg: c.fill_tolerance_kg,
             fill_settle_ms: c.fill_settle_ms,
+            launch_mass_min_kg: c.launch_mass_min_kg,
+            launch_mass_max_kg: c.launch_mass_max_kg,
             pressure_step_psi: c.pressure_step_psi,
             pressure_ceiling_psi: c.pressure_ceiling_psi,
             maximum_zero_offset_psi: c.maximum_zero_offset_psi,
@@ -68,6 +80,8 @@ impl Limits {
         c.fill_overfill_kg = self.fill_overfill_kg;
         c.fill_tolerance_kg = self.fill_tolerance_kg;
         c.fill_settle_ms = self.fill_settle_ms;
+        c.launch_mass_min_kg = self.launch_mass_min_kg;
+        c.launch_mass_max_kg = self.launch_mass_max_kg;
         c.pressure_step_psi = self.pressure_step_psi;
         c.pressure_ceiling_psi = self.pressure_ceiling_psi;
         c.maximum_zero_offset_psi = self.maximum_zero_offset_psi;
@@ -140,6 +154,8 @@ impl Settings {
                 "fill_overfill_kg",
                 "fill_tolerance_kg",
                 "fill_settle_ms",
+                "launch_mass_min_kg",
+                "launch_mass_max_kg",
             ] {
                 if !expected
                     .as_object()
@@ -282,6 +298,8 @@ mod tests {
         source.limits.fill_overfill_kg = 0.09;
         source.limits.fill_tolerance_kg = 0.06;
         source.limits.fill_settle_ms = 4500;
+        source.limits.launch_mass_min_kg = 3.5;
+        source.limits.launch_mass_max_kg = 9.5;
         let document = source.snapshot().unwrap()[LIMITS].clone();
         let mut destination = model();
         destination.limits.dry_self_test_confirmed = true;
@@ -291,6 +309,8 @@ mod tests {
         assert_eq!(imported.limits.fill_overfill_kg, 0.09);
         assert_eq!(imported.limits.fill_tolerance_kg, 0.06);
         assert_eq!(imported.limits.fill_settle_ms, 4500);
+        assert_eq!(imported.limits.launch_mass_min_kg, 3.5);
+        assert_eq!(imported.limits.launch_mass_max_kg, 9.5);
         assert!(
             imported.limits.dry_self_test_confirmed,
             "local evidence is not imported"
@@ -299,6 +319,9 @@ mod tests {
             ("fill_overfill_kg", json!(0.11)),
             ("fill_tolerance_kg", json!(0.08)),
             ("fill_settle_ms", json!(999)),
+            ("launch_mass_min_kg", json!(0)),
+            ("launch_mass_min_kg", json!(9.5)),
+            ("launch_mass_max_kg", json!(3.5)),
         ] {
             let mut invalid = document.clone();
             invalid[field] = bad;
@@ -317,12 +340,16 @@ mod tests {
             "fill_overfill_kg",
             "fill_tolerance_kg",
             "fill_settle_ms",
+            "launch_mass_min_kg",
+            "launch_mass_max_kg",
         ] {
             legacy.as_object_mut().unwrap().remove(field);
         }
         let imported = destination.decode(LIMITS, &legacy).unwrap();
         assert!(imported.limits.nitrogen_steps.is_empty());
         assert_eq!(imported.limits.fill_settle_ms, 3000);
+        assert_eq!(imported.limits.launch_mass_min_kg, 4.0);
+        assert_eq!(imported.limits.launch_mass_max_kg, 9.0);
         legacy.as_object_mut().unwrap().remove("pressure_step_psi");
         assert!(destination.decode(LIMITS, &legacy).is_err());
     }

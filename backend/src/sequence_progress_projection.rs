@@ -1330,6 +1330,7 @@ mod tests {
             pressure_ceiling_psi: Some(900.),
             turbocharge_max_added_mass_kg: Some(0.3),
             fill_settle_ms: 1000,
+            launch_mass_min_kg: 0.5, // This fixture fills to 1 kg.
             ..Config::default()
         };
         let context = Context {

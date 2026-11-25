@@ -54,6 +54,11 @@ pub struct Config {
     pub fill_overfill_kg: f32,
     pub fill_tolerance_kg: f32,
     pub fill_settle_ms: u64,
+    /// Lowest and highest nitrous mass (kg, inclusive, in the target's sign)
+    /// that permits plumbing retraction, Launch and a Turbocharge start. Not
+    /// relative to the target. Configured nitrous targets must lie inside it.
+    pub launch_mass_min_kg: f32,
+    pub launch_mass_max_kg: f32,
     /// Explicit additional nitrogen mass allowance, in calibrated kg.
     /// None disables Turbocharge; this is not liquid overfill tolerance.
     pub turbocharge_max_added_mass_kg: Option<f32>,
@@ -85,6 +90,8 @@ impl Default for Config {
             fill_overfill_kg: 0.05,
             fill_tolerance_kg: 0.07,
             fill_settle_ms: 3000,
+            launch_mass_min_kg: 4.0,
+            launch_mass_max_kg: 9.0,
             turbocharge_max_added_mass_kg: None,
             turbocharge_pressure_deadband_psi: 12.0,
             pressure_step_psi: 50.0,
@@ -193,6 +200,24 @@ impl Config {
         }
         Ok(())
     }
+    pub fn validate_launch_mass_window(&self) -> Result<(), String> {
+        let (min, max) = (self.launch_mass_min_kg, self.launch_mass_max_kg);
+        if !min.is_finite() || !max.is_finite() || min <= 0.0 || min >= max {
+            return Err("Launch mass window must be finite, with a minimum above 0 kg and below the maximum".into());
+        }
+        Ok(())
+    }
+    /// Nitrous mass that permits Launch. A negative target means the load cell
+    /// reads reversed, so the mass is compared in the target's sign.
+    // Safety catalog (About safety): launch-mass-window. Keep backend/src/safety_catalog_rules.rs in step.
+    pub fn launch_mass_ready(&self, mass_kg: f32, target_kg: f32) -> bool {
+        self.validate_launch_mass_window().is_ok()
+            && mass_kg.is_finite()
+            && target_kg.is_finite()
+            && target_kg != 0.0
+            && (self.launch_mass_min_kg..=self.launch_mass_max_kg)
+                .contains(&(mass_kg * target_kg.signum()))
+    }
 
     pub fn pressure_limit(&self, target: f32, margin: f32) -> Result<f32, String> {
         let limit = target + margin;
@@ -215,6 +240,7 @@ impl Config {
         }
         self.nitrogen_plan()?;
         self.validate_fill_trim()?;
+        self.validate_launch_mass_window()?;
         self.validate_turbocharge_deadband()?;
         self.validate_overpressure()?;
         if self
@@ -247,6 +273,7 @@ impl Config {
     pub fn validate(&self) -> Result<(), String> {
         self.nitrogen_plan()?;
         self.validate_fill_trim()?;
+        self.validate_launch_mass_window()?;
         let target = self.nitrogen_target_psi();
         let ceiling = self.pressure_limit(target, 100.0)?;
         let zero = self

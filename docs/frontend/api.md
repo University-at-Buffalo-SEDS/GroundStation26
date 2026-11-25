@@ -903,6 +903,11 @@ ordered pilot, vent, dump, nitrogen, nitrous. Poll every 500 ms while visible.
 `GET /api/gse/config` and authenticated `POST`/`PUT` expose `nitrogen_target_psi`,
 nullable `pressure_ceiling_psi`, nullable `maximum_zero_offset_psi`, `grouped_panel`,
 and runtime-only `dry_self_test_confirmed`. Edits are rejected during sequencing.
+`launch_mass_min_kg` / `launch_mass_max_kg` (default 4.0 / 9.0) are the inclusive nitrous
+mass window for Launch, retraction and the first Turbocharge, in the target's sign; a save
+that omits them keeps the station's values. When the mass blocks them, the `Launch`,
+`GroundStationLaunch` and `RetractPlumbing` controls carry a `disabled_reason` naming the
+window and the mass.
 New command names are `StartFill`, `PauseFill`, `CancelFill`, `ValveSelfTest`, and
 `NitrogenTest`; use existing action policy and command permissions, never direct
 browser valve sequencing. Action layout entries accept an optional `group` string.

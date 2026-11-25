@@ -202,13 +202,13 @@ impl Controller {
         }
         let mass = fresh(mass, input.now_ms).ok_or("Fresh calibrated fill mass is required")?;
         if prior.is_none()
-            && !crate::fill_resume::inventory_ready(
-                mass.value,
-                target_mass,
-                config.fill_tolerance_kg,
-            )
+            && !config.launch_mass_ready(mass.value, target_mass)
         {
-            return Err("Nitrous inventory must first be within its qualified mass band".into());
+            config.validate_launch_mass_window()?;
+            return Err(format!(
+                "Nitrous mass must be {} to {} kg before Turbocharge",
+                config.launch_mass_min_kg, config.launch_mass_max_kg
+            ));
         }
         if prior.is_some_and(|e| {
             e.nitrous_target_mass_kg != target_mass
@@ -539,6 +539,9 @@ mod tests {
             pressure_ceiling_psi: Some(900.0),
             turbocharge_max_added_mass_kg: Some(0.3),
             fill_settle_ms: 1000,
+            // These fixtures use 1 and 10 kg targets.
+            launch_mass_min_kg: 0.5,
+            launch_mass_max_kg: 20.0,
             ..Config::default()
         }
     }
@@ -871,12 +874,37 @@ mod tests {
                 745.0,
                 i,
                 Some(Sample {
-                    value: 9.0,
+                    value: 0.4,
                     at_ms: r.now
                 }),
                 context()
             )
             .is_err()
+        );
+    }
+    #[test]
+    fn initial_inventory_uses_the_absolute_launch_mass_window() {
+        let i = Rig::new(8.0).input();
+        let start = |target: f32, mass: f32| {
+            let config = Config {
+                launch_mass_min_kg: 4.0,
+                launch_mass_max_kg: 9.0,
+                ..config()
+            };
+            let mass = Some(Sample { value: mass, at_ms: i.now_ms });
+            Controller::start(&config, target, 745.0, i, mass, context()).map(|_| ())
+        };
+        for sign in [1.0, -1.0] {
+            for mass in [4.0, 5.08, 7.0, 9.0] {
+                start(8.0 * sign, mass * sign).unwrap();
+            }
+            for mass in [3.99, 9.01, -8.0, f32::NAN] {
+                assert!(start(8.0 * sign, mass * sign).is_err(), "{mass}");
+            }
+        }
+        assert_eq!(
+            start(8.0, 3.99).unwrap_err(),
+            "Nitrous mass must be 4 to 9 kg before Turbocharge"
         );
     }
     #[test]
@@ -1272,6 +1300,7 @@ mod cumulative_tests {
         let config = Config {
             turbocharge_max_added_mass_kg: Some(0.3),
             pressure_ceiling_psi: Some(900.0),
+            launch_mass_max_kg: 20.0,
             ..Config::default()
         };
         let ctx = Context {

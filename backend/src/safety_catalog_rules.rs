@@ -202,11 +202,12 @@ const SEQUENCES: &[Spec] = &[
         title: "Turbocharge limits",
         summary: "Turbocharge adds at most {gse.turbocharge_max_added_mass_kg} kg of nitrogen, holds pressure within a {gse.turbocharge_pressure_deadband_psi} psi deadband, and stays below the {gse.pressure_ceiling_psi} psi ceiling. It never admits nitrous.",
         details: &[
+            "The first Turbocharge needs a nitrous mass of {gse.launch_mass_min_kg} to {gse.launch_mass_max_kg} kg; after that its own mass evidence applies.",
             "A Nitrogen-open command waits up to the acknowledgement deadline for the board to apply it; a supply still open after a close cancels immediately (pausing).",
         ],
         modes: ALL,
         enforced_in: &["shared/gse_sequence/src/turbocharge.rs:Controller::tick", "backend/src/gse/turbocharge.rs:tick"],
-        config_keys: &["gse.turbocharge_max_added_mass_kg", "gse.turbocharge_pressure_deadband_psi", "gse.pressure_ceiling_psi"],
+        config_keys: &["gse.turbocharge_max_added_mass_kg", "gse.turbocharge_pressure_deadband_psi", "gse.pressure_ceiling_psi", "gse.launch_mass_min_kg", "gse.launch_mass_max_kg"],
     },
     Spec {
         id: "fill-limits",
@@ -291,6 +292,21 @@ const LAUNCH: &[Spec] = &[
         modes: NOT_HITL,
         enforced_in: &["backend/src/gse/operational_policy.rs:operational_launch_allowed", "backend/src/gse/overpressure.rs:command_allowed"],
         config_keys: &[],
+    },
+    Spec {
+        id: "launch-mass-window",
+        title: "Nitrous mass for Launch",
+        summary: "Plumbing retraction and Launch need a fresh nitrous mass of {gse.launch_mass_min_kg} to {gse.launch_mass_max_kg} kg, whatever the fill target is, and a completed fill to the current target.",
+        details: &[
+            "A mass older than 2 s or not a number refuses. With a negative target the load cell reads reversed, so the mass is compared in the target's sign.",
+            "Mass lost after the fill does not block until it is below the minimum.",
+            "After Turbocharge its own mass evidence (the recorded nitrous and added nitrogen) applies instead.",
+            "The fill target is not limited by this window; it stays the automatic cutoff and hold level.",
+            "HITL has no operational Launch gate, so the window does not apply there.",
+        ],
+        modes: NOT_HITL,
+        enforced_in: &["shared/gse_sequence/src/lib.rs:Config::launch_mass_ready", "backend/src/gse/operational_policy.rs:operational_launch_allowed", "backend/src/gse/operational_policy.rs:launch_mass_refusal"],
+        config_keys: &["gse.launch_mass_min_kg", "gse.launch_mass_max_kg"],
     },
     Spec {
         id: "launch-signoff",

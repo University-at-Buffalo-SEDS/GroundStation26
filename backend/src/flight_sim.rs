@@ -227,7 +227,6 @@ fn sim_nitrogen_pressure_setpoint_psi_from(fill_cfg: &fill_targets::FillTargetsC
 
 pub fn effective_fill_targets(
     mut cfg: fill_targets::FillTargetsConfig,
-    loadcell_cfg: &loadcell::LoadcellCalibrationFile,
     flight_state: FlightState,
 ) -> fill_targets::FillTargetsConfig {
     if !crate::runtime_mode::is_testing() || !sim_mode_enabled() {
@@ -236,7 +235,9 @@ pub fn effective_fill_targets(
 
     cfg.nitrogen.target_mass_kg = sim_nitrogen_target_mass_kg_from(&cfg);
     cfg.nitrogen.target_pressure_psi = sim_nitrogen_pressure_setpoint_psi_from(&cfg);
-    cfg.nitrous.target_mass_kg = sim_full_mass_kg_from(&cfg, loadcell_cfg);
+    // The calibration's full mass bounds the modeled tank; it is not the fill
+    // target (its default, 10 kg, is outside the Launch mass window).
+    cfg.nitrous.target_mass_kg = cfg.nitrous.target_mass_kg.max(0.1);
     cfg.nitrous.target_pressure_psi = cfg
         .nitrous
         .target_pressure_psi

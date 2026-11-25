@@ -421,7 +421,7 @@ async fn actual_cold_flow_routes_physical_edge_auth_cancel_and_no_launch_clock()
     );
     assert!(f.state.gse.lock().unwrap().turbo_evidence.is_some());
     type ConfigMutation = (&'static str, fn(&mut Config));
-    let mutations: [ConfigMutation; 11] = [
+    let mutations: [ConfigMutation; 13] = [
         ("nitrogen_target", |c| c.nitrogen_target_psi += 1.),
         ("nitrogen_steps", |c| {
             c.nitrogen_steps = vec![gse_sequence::NitrogenStep {
@@ -433,6 +433,8 @@ async fn actual_cold_flow_routes_physical_edge_auth_cancel_and_no_launch_clock()
         ("fill_overfill", |c| c.fill_overfill_kg = 0.06),
         ("fill_tolerance", |c| c.fill_tolerance_kg = 0.06),
         ("fill_settle", |c| c.fill_settle_ms = 4000),
+        ("launch_mass_min", |c| c.launch_mass_min_kg = 3.5),
+        ("launch_mass_max", |c| c.launch_mass_max_kg = 9.5),
         ("turbo_mass", |c| {
             c.turbocharge_max_added_mass_kg = Some(0.3)
         }),

@@ -28,6 +28,10 @@ review; the controller never reopens supply. Completion requires every valve
 closed. Overfill allowance is capped at 0.1 kg; physical stopping overshoot depends
 on sensor/transport/valve response and cannot be guaranteed by a command threshold.
 
+`Config::launch_mass_ready` is the separate, absolute mass window
+(`launch_mass_min_kg` to `launch_mass_max_kg`, default 4 to 9 kg) for Launch,
+retraction and the first Turbocharge. It does not limit the fill target.
+
 Manual override emits no outputs and cancels pending automation; it preserves
 nitrogen qualification, self-test lock and the nitrous-session hazard latch.
 Settings edits use targeted qualification invalidation and increment the generation

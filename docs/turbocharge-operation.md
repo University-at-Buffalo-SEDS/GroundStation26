@@ -1,6 +1,6 @@
 # Fill and Turbocharge
 
-After a qualified fill, less than 0.2 kg of liquid mass loss is considered full. Fill stays paused in that band; at a deficit of 0.2 kg or more, an existing paused fill may resume with fresh pressure below its configured limit. A new fill still requires its original zero-pressure checks. The upper overfill tolerance and automatic fill cutoff remain unchanged.
+After a qualified fill, less than 0.2 kg of liquid mass loss is considered full. Fill stays paused in that band; at a deficit of 0.2 kg or more, an existing paused fill may resume with fresh pressure below its configured limit. A new fill still requires its original zero-pressure checks. The upper overfill tolerance and automatic fill cutoff remain unchanged. Launch, retraction and the first Turbocharge accept any fresh nitrous mass in the absolute Launch mass window (default 4 to 9 kg), so a completed fill that lost mass is not refused until it is below the window.
 
 Turbocharge pressure deadband defaults to 12 psi and can be configured from 8 to 16 psi in GroundStation settings. Existing saved configurations load the default without changing their mass or pressure targets. The pressure target must exceed the deadband and remain below the hardware ceiling.
 

@@ -33,7 +33,7 @@ fn flight_routes(state: &AppState) -> bool {
             })
         })
 }
-// Safety catalog (About safety): launch-failure-pause, launch-signoff. Keep backend/src/safety_catalog_rules.rs in step.
+// Safety catalog (About safety): launch-failure-pause, launch-signoff, launch-mass-window. Keep backend/src/safety_catalog_rules.rs in step.
 pub(super) fn operational_launch_allowed(state: &AppState, rt: &Runtime) -> bool {
     let now = rt.now();
     let target = state.fill_targets_snapshot().nitrous.target_mass_kg;
@@ -51,9 +51,7 @@ pub(super) fn operational_launch_allowed(state: &AppState, rt: &Runtime) -> bool
         && rt.fresh_mass(now).is_some_and(|mass| {
             (!rt.turbo_inventory_pending
                 && rt.turbo_evidence.is_none()
-                && gse_sequence::fill_resume::inventory_ready(
-                    mass.value, target, rt.engine.config.fill_tolerance_kg,
-                ))
+                && rt.engine.config.launch_mass_ready(mass.value, target))
                 || turbocharge::accepts_mass(state, rt, mass)
         })
         && matches!(
@@ -82,6 +80,25 @@ pub(super) fn operational_launch_allowed(state: &AppState, rt: &Runtime) -> bool
             .iter()
             .all(|v| v.is_some_and(|v| !v.open && v.at_ms <= now && now - v.at_ms <= 2_000))
         && launch_route_ready(state)
+}
+/// Why Launch and retraction are refused, when the fresh nitrous mass outside
+/// the Launch mass window is (one of) the reasons. HITL has no operational gate.
+// Safety catalog (About safety): launch-mass-window. Keep backend/src/safety_catalog_rules.rs in step.
+pub(super) fn launch_mass_refusal(state: &AppState, rt: &Runtime) -> Option<String> {
+    if crate::runtime_mode::is_hitl() || rt.turbo_inventory_pending || rt.turbo_evidence.is_some() {
+        return None;
+    }
+    let target = state.fill_targets_snapshot().nitrous.target_mass_kg;
+    let mass = rt.fresh_mass(rt.now())?.value;
+    let config = &rt.engine.config;
+    if config.launch_mass_ready(mass, target) {
+        return None;
+    }
+    let shown = if target.is_finite() && target != 0.0 { mass * target.signum() } else { mass };
+    Some(format!(
+        "Nitrous mass {shown:.2} kg is outside the {} to {} kg Launch window",
+        config.launch_mass_min_kg, config.launch_mass_max_kg
+    ))
 }
 /// The flight-computer part of the Launch gate. Test fire has no AV bay. The
 /// integrated ground test (and HITL with the ground-test replay) needs the FC
@@ -1024,6 +1041,15 @@ mod tests {
         assert!(saved.qualification.nitrogen_satisfied());
         assert!(!saved.qualification.completed(Milestone::FillTarget));
         rt.engine.config = config.clone();
+        for change in [
+            (|c| c.launch_mass_min_kg = 3.5) as fn(&mut Config),
+            |c| c.launch_mass_max_kg = 9.5,
+        ] {
+            let mut window = config.clone();
+            change(&mut window);
+            assert!(fill_configuration_changed(&config, &window));
+            assert!(!nitrogen_configuration_changed(&config, &window));
+        }
         config.nitrogen_steps[0].hold_ms += 1000;
         invalidate_changed_configuration(&mut rt, &config).unwrap();
         let saved = operational::Saved::load(&path).unwrap();

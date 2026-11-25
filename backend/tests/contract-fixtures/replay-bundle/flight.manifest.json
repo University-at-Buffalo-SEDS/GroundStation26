@@ -205,11 +205,11 @@
       "sha256": "8ef1555c279c8b5a921d958163bd09578494781166469212646ac984df3d9844"
     },
     {
-      "bytes": 478,
+      "bytes": 528,
       "media_type": "application/json",
       "path": "config/station/gse_config.json",
       "route": "/api/gse/config",
-      "sha256": "f789ff9f0ab7bd50b1a317f9bdb41c3fd69ea1da6a059165e013d0dacbe5f1e1"
+      "sha256": "404b26856a873a6ed7af1eaf4944241bae6eb7d7fd0b845ba7494e9967c06349"
     },
     {
       "bytes": 149,
@@ -219,11 +219,11 @@
       "sha256": "b9e73929b676999e847b3b3b9ea2a8b246bc8d4a9f6d723e438d85012aa8455b"
     },
     {
-      "bytes": 79798,
+      "bytes": 81160,
       "media_type": "application/json",
       "path": "config/station/safety_about.json",
       "route": "/api/safety/about",
-      "sha256": "d9d010ae44197331bba233d9ee294b6c35548bf5546f797f9a9ce1171fd5871d"
+      "sha256": "fc57149b4cf6df6d8f59f9eb26a22b2e595bafc98c47a0f3d9a3385268e93a57"
     },
     {
       "bytes": 2268,

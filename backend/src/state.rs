@@ -2233,9 +2233,8 @@ impl AppState {
     /// Returns the latest fill-target snapshot used by the dashboard.
     pub fn fill_targets_snapshot(&self) -> FillTargetsConfig {
         let targets = self.fill_targets.lock().unwrap().clone();
-        let loadcell_cfg = self.loadcell_calibration.lock().unwrap().clone();
         let flight_state = *self.state.lock().unwrap();
-        crate::flight_sim::effective_fill_targets(targets, &loadcell_cfg, flight_state)
+        crate::flight_sim::effective_fill_targets(targets, flight_state)
     }
 
     /// Broadcasts the current fill-target snapshot if runtime-derived values changed.

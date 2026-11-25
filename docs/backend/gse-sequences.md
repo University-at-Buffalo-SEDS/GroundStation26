@@ -256,6 +256,17 @@ result remains unqualified. Completion requires closed valve reports, never
 merely transport delivery or an open vent. The old 99.5%/plateau heuristic does not
 qualify this precision-fill path; the separate legacy procedure is unchanged.
 
+Launch, plumbing retraction and the first Turbocharge need a fresh nitrous mass from
+`launch_mass_min_kg` to `launch_mass_max_kg` inclusive (defaults 4.0 and 9.0 kg,
+compared in the target's sign). The window is absolute, not relative to the target,
+and changes nothing about filling. It must be finite with 0 < minimum < maximum.
+Changing it clears the fill qualification like the other fill settings. Files and
+paired settings without the fields load the defaults; a config save that omits them
+keeps the station's values. The fill target is not limited by the window: it stays the
+automatic cutoff and hold level. A Launch or retraction refused for the mass names the
+window and the mass. HITL has no operational Launch gate, so the window does not apply
+there; the first Turbocharge checks it in every mode.
+
 Fresh calibrated mass and PT data are required (at most 2 seconds old). Network-UTC
 capture age is retained rather than reset at receipt; repeated captures cannot
 renew freshness or form a settled sample. A clock lead of at most 100 ms is clamped

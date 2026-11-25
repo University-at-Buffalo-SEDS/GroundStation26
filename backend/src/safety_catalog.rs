@@ -337,7 +337,7 @@ mod tests {
             "overpressure-relief", "overpressure-abort", "overpressure-after-t0", "overpressure-debounce", "overpressure-plausibility",
             "overpressure-latch", "nitrous-overfill", "failure-pause", "failure-dump", "stuck-supply",
             "nitrogen-hold", "nitrogen-hold-choice", "pause-resume-cancel", "launch-board-abort",
-            "launch-lock-reset", "launch-turbocharge", "launch-failure-pause", "launch-signoff",
+            "launch-lock-reset", "launch-turbocharge", "launch-failure-pause", "launch-mass-window", "launch-signoff",
             "turbocharge-limits", "auto-zero-before-launch", "valve-board-autonomy",
             "automatic-abort", "no-automatic-abort-after-launch", "manual-stop", "reset-all-boards", "recover-station", "radio-reject-test", "board-resync",
             "ignition-pair", "hitl-interlocks", "key-interlock", "plumbing-retraction", "checklists",

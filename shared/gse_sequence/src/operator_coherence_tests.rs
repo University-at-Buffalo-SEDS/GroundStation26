@@ -86,16 +86,30 @@ fn captured_resume_is_not_authority_after_cancel_reset_or_manual_override() {
     }
 }
 #[test]
-fn full_inventory_band_is_asymmetric_signed_and_exact_resume_boundary_is_not_full() {
+fn launch_mass_window_is_absolute_signed_and_inclusive_and_leaves_the_refill_deadband() {
+    let c=config();
+    assert_eq!((c.launch_mass_min_kg,c.launch_mass_max_kg),(4.,9.));
     for sign in [1.,-1.] {
-        assert!(fill_resume::inventory_ready(7.9*sign,8.*sign,0.07));
-        assert!(!fill_resume::inventory_ready(7.8*sign,8.*sign,0.07));
+        for target in [5.,8.] {
+            for ready in [4.,5.08,7.8,8.5,9.] {assert!(c.launch_mass_ready(ready*sign,target*sign),"{ready} for {target}");}
+            for refused in [3.99,9.01,0.,-5.08,f32::NAN,f32::INFINITY] {assert!(!c.launch_mass_ready(refused*sign,target*sign),"{refused} for {target}");}
+        }
+        for bad in [0.,f32::NAN,f32::INFINITY] {assert!(!c.launch_mass_ready(8.*sign,bad));}
         assert!(fill_resume::resume_required(100,Some(Sample{value:7.8*sign,at_ms:100}),8.*sign).unwrap());
-        assert!(!fill_resume::inventory_ready(8.1*sign,8.*sign,0.07));
-        for bad in [f32::NAN,f32::INFINITY] {assert!(!fill_resume::inventory_ready(bad,8.*sign,0.07));}
+        assert!(!fill_resume::resume_required(100,Some(Sample{value:7.9*sign,at_ms:100}),8.*sign).unwrap());
     }
-    assert!(!fill_resume::inventory_ready(7.9,8.,0.2));
-    assert_eq!(config().fill_tolerance_kg,0.07);assert_eq!(config().fill_overfill_kg,0.05);
+    assert_eq!((c.fill_tolerance_kg,c.fill_overfill_kg),(0.07,0.05));
+}
+#[test]
+fn launch_mass_window_is_validated_fails_closed_and_old_files_get_the_defaults() {
+    for (min,max) in [(0.,9.),(-1.,9.),(9.,9.),(9.,4.),(f32::NAN,9.),(4.,f32::INFINITY)] {
+        let c=Config{launch_mass_min_kg:min,launch_mass_max_kg:max,..config()};
+        assert!(c.validate_settings().is_err()&&c.validate().is_err(),"{min}..{max}");
+        assert!(!c.launch_mass_ready(8.,8.));
+    }
+    let mut old=serde_json::to_value(config()).unwrap();
+    for key in ["launch_mass_min_kg","launch_mass_max_kg"] {old.as_object_mut().unwrap().remove(key).unwrap();}
+    assert_eq!(serde_json::from_value::<Config>(old).unwrap(),config());
 }
 struct TurboRig { c:Controller, now:u64, mass:f32, pressure:f32, valves:[Option<ValveState>;5], events:Vec<(usize,bool)>, evidence:Option<Evidence> }
 impl TurboRig {

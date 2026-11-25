@@ -1005,6 +1005,13 @@ pub fn command_refusal_reason(state: &AppState, cmd: &TelemetryCommand) -> Optio
     if !crate::runtime_mode::is_hitl() && rt.operational.saved.qualification.fault().is_some() && valve_command(cmd) {
         return Some("A GSE qualification fault is latched; only closing commands are available.".into());
     }
+    if matches!(
+        crate::sequences::command_name(cmd),
+        "Launch" | "GroundStationLaunch" | "RetractPlumbing"
+    ) && let Some(reason) = launch_mass_refusal(state, &rt)
+    {
+        return Some(reason);
+    }
     if let Some(action) = action(cmd) {
         let input = rt.input(is_prelaunch, interlock(state, &policy));
         return rt.engine.refusal_reason(action, input);
@@ -1120,6 +1127,7 @@ pub fn decorate_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
     }
     if !crate::runtime_mode::is_hitl() {
         let ready = input.prelaunch && input.interlock && operational_launch_allowed(state, &rt);
+        let mass_reason = launch_mass_refusal(state, &rt);
         for control in &mut policy.controls {
             if matches!(
                 control.cmd.as_str(),
@@ -1132,6 +1140,7 @@ pub fn decorate_policy(state: &AppState, policy: &mut ActionPolicyMsg) {
                             rt.operational.qd.status(rt.now()),
                             QdStatus::NotStarted | QdStatus::AckTimedOut
                         ));
+                control.disabled_reason = if control.enabled { None } else { mass_reason.clone() };
                 control.blink = if rt.operational.qd.queued() {
                     BlinkMode::Fast
                 } else {
@@ -2291,6 +2300,8 @@ fn fill_configuration_changed(before: &Config, after: &Config) -> bool {
         || before.fill_overfill_kg != after.fill_overfill_kg
         || before.fill_tolerance_kg != after.fill_tolerance_kg
         || before.fill_settle_ms != after.fill_settle_ms
+        || before.launch_mass_min_kg != after.launch_mass_min_kg
+        || before.launch_mass_max_kg != after.launch_mass_max_kg
 }
 fn invalidate_changed_configuration(rt: &mut Runtime, config: &Config) -> Result<(), String> {
     rt.turbo_evidence = None;
@@ -2358,17 +2369,19 @@ fn invalidate_changed_configuration(rt: &mut Runtime, config: &Config) -> Result
     }
     Ok(())
 }
-/// Overpressure settings an older client does not know are kept, never reset.
-pub(super) const OVERPRESSURE_CONFIG_KEYS: [&str; 4] = [
+/// Settings an older client does not know are kept, never reset.
+pub(super) const KEPT_CONFIG_KEYS: [&str; 6] = [
     "overpressure_relief_psi",
     "overpressure_abort_psi",
     "overpressure_pilot_ms",
     "tank_rating_psi",
+    "launch_mass_min_kg",
+    "launch_mass_max_kg",
 ];
 pub(super) fn config_from_request(current: &Config, mut body: serde_json::Value) -> Result<Config, String> {
     let object = body.as_object_mut().ok_or("GSE configuration must be an object")?;
     let saved = serde_json::to_value(current).map_err(|e| e.to_string())?;
-    for key in OVERPRESSURE_CONFIG_KEYS {
+    for key in KEPT_CONFIG_KEYS {
         if !object.contains_key(key) {
             object.insert(key.into(), saved[key].clone());
         }
@@ -7481,6 +7494,9 @@ pub(crate) fn apply_model_effects_for_test(state: &Arc<AppState>, valves: Vec<(u
 #[cfg(test)]
 #[path = "gse/fill_resume_tests.rs"]
 mod fill_resume_tests;
+#[cfg(test)]
+#[path = "gse/launch_mass_window_tests.rs"]
+mod launch_mass_window_tests;
 
 #[cfg(test)]
 #[path = "gse/pause_resume_tests.rs"]

@@ -114,6 +114,8 @@ pub(super) fn only_cold_target_changed(a: &Config, b: &Config) -> bool {
         && a.fill_overfill_kg == b.fill_overfill_kg
         && a.fill_tolerance_kg == b.fill_tolerance_kg
         && a.fill_settle_ms == b.fill_settle_ms
+        && a.launch_mass_min_kg == b.launch_mass_min_kg
+        && a.launch_mass_max_kg == b.launch_mass_max_kg
         && a.turbocharge_max_added_mass_kg == b.turbocharge_max_added_mass_kg
         && a.turbocharge_pressure_deadband_psi == b.turbocharge_pressure_deadband_psi
         && a.pressure_step_psi == b.pressure_step_psi
@@ -142,7 +144,6 @@ fn capture_binding(
     let calibration = state.loadcell_calibration.lock().unwrap().clone();
     let targets = crate::flight_sim::effective_fill_targets(
         configured,
-        &calibration,
         *state.state.lock().unwrap(),
     );
     let signature = mass_calibration_signature(&calibration);
@@ -809,11 +810,11 @@ mod tests {
         };
         let (mut controller, _) = Controller::start(
             &config,
-            10.0,
+            8.5,
             745.0,
             input(10_000),
             Some(Sample {
-                value: 10.0,
+                value: 8.5,
                 at_ms: 10_000,
             }),
             context,
@@ -824,7 +825,7 @@ mod tests {
                 .tick(
                     input(delayed),
                     Some(Sample {
-                        value: 10.0,
+                        value: 8.5,
                         at_ms: delayed
                     }),
                     context
@@ -835,7 +836,7 @@ mod tests {
         let rollback = controller.tick(
             input(nominal),
             Some(Sample {
-                value: 10.0,
+                value: 8.5,
                 at_ms: nominal,
             }),
             context,
@@ -963,7 +964,7 @@ mod tests {
         actual_router_sequence_case(false, true).await;
     }
     async fn actual_router_sequence_case(stop_before_completion: bool, missing_pressure: bool) {
-        actual_router_inventory_case(stop_before_completion, missing_pressure, 10.0, 745.0, 0.0).await;
+        actual_router_inventory_case(stop_before_completion, missing_pressure, 8.5, 745.0, 0.0).await;
     }
     #[tokio::test]
     async fn near_full_paused_fill_noop_then_actual_turbo_settles_and_qualifies_launch() {
@@ -1393,7 +1394,7 @@ mod tests {
         let (state, sent, peer) = super::super::tests::button_test_state().await;
         state.loadcell_calibration.lock().unwrap().full_mass_kg = None;
         let mut targets = state.fill_targets_snapshot();
-        targets.nitrous.target_mass_kg = 10.0;
+        targets.nitrous.target_mass_kg = 8.5;
         targets.nitrous.target_pressure_psi = 745.0;
         state.set_fill_targets(targets);
         let mut policy = state.action_policy_snapshot();
@@ -1438,7 +1439,7 @@ mod tests {
             rt.engine.request(Action::StartFill, seed).unwrap();
             rt.engine.manual_override();
             rt.engine.status.phase = Phase::Paused;
-            rt.observe_mass(Some(10.0));
+            rt.observe_mass(Some(8.5));
             rt.mass_calibration = Some(calibration);
             rt.valve_pressure = Some(Sample { value: 100.0, at_ms: rt.now() });
             if !crate::runtime_mode::is_hitl() {
@@ -1449,7 +1450,7 @@ mod tests {
                 for milestone in [Milestone::SelfTest, Milestone::NitrogenTest, Milestone::FillTarget] {
                     rt.operational.saved.qualification.complete(milestone, 0).unwrap();
                 }
-                rt.operational.saved.fill_target_kg = Some(10.0);
+                rt.operational.saved.fill_target_kg = Some(8.5);
             }
         }
         assert!(handle_command(&state, &TelemetryCommand::Turbocharge));
@@ -1500,7 +1501,7 @@ mod tests {
                 for (key, open) in KEYS.into_iter().zip(actual) {
                     rt.observe_valve(key, open);
                 }
-                rt.observe_mass(Some(10.0));
+                rt.observe_mass(Some(8.5));
                 rt.mass_calibration = Some(calibration);
                 // A non-safety cancel cause: raw valve-board pressure goes
                 // missing right after the Nitrogen-open command.
@@ -1685,11 +1686,11 @@ mod tests {
         rt.turbocharge = Some(
             Controller::start(
                 &config,
-                10.0,
+                8.5,
                 745.0,
                 input,
                 Some(Sample {
-                    value: 10.0,
+                    value: 8.5,
                     at_ms: now,
                 }),
                 context,
@@ -1801,7 +1802,7 @@ mod tests {
         let binding = capture_binding(&state, &rt).0;
         let c = &rt.engine.config;
         // Current Turbo binding projection: the pressure deadband is intentionally bound.
-        let current_projection = serde_json::json!({"nitrogen_target_psi":c.nitrogen_target_psi,"nitrogen_steps":c.nitrogen_steps,"fill_overfill_kg":c.fill_overfill_kg,"fill_tolerance_kg":c.fill_tolerance_kg,"fill_settle_ms":c.fill_settle_ms,"turbocharge_max_added_mass_kg":c.turbocharge_max_added_mass_kg,"turbocharge_pressure_deadband_psi":c.turbocharge_pressure_deadband_psi,"pressure_step_psi":c.pressure_step_psi,"pressure_ceiling_psi":c.pressure_ceiling_psi,"maximum_zero_offset_psi":c.maximum_zero_offset_psi,"dry_self_test_confirmed":c.dry_self_test_confirmed,"grouped_panel":c.grouped_panel});
+        let current_projection = serde_json::json!({"nitrogen_target_psi":c.nitrogen_target_psi,"nitrogen_steps":c.nitrogen_steps,"fill_overfill_kg":c.fill_overfill_kg,"fill_tolerance_kg":c.fill_tolerance_kg,"fill_settle_ms":c.fill_settle_ms,"launch_mass_min_kg":c.launch_mass_min_kg,"launch_mass_max_kg":c.launch_mass_max_kg,"turbocharge_max_added_mass_kg":c.turbocharge_max_added_mass_kg,"turbocharge_pressure_deadband_psi":c.turbocharge_pressure_deadband_psi,"pressure_step_psi":c.pressure_step_psi,"pressure_ceiling_psi":c.pressure_ceiling_psi,"maximum_zero_offset_psi":c.maximum_zero_offset_psi,"dry_self_test_confirmed":c.dry_self_test_confirmed,"grouped_panel":c.grouped_panel});
         let mut expected = binding.clone();
         expected["config"] = current_projection;
         let expected = serde_json::to_vec(&expected).unwrap();
@@ -1818,7 +1819,7 @@ mod tests {
             "COLD_FLOW_CONTROL current_turbo_binding_projection=IDENTICAL cold_target_only=INERT deadband=BOUND"
         );
         let original = rt.engine.config.clone();
-        let mutations: [fn(&mut Config); 12] = [
+        let mutations: [fn(&mut Config); 14] = [
             |c| c.nitrogen_target_psi += 1.,
             |c| c.turbocharge_pressure_deadband_psi = 16.,
             |c| {
@@ -1831,6 +1832,8 @@ mod tests {
             |c| c.fill_overfill_kg = 0.06,
             |c| c.fill_tolerance_kg = 0.06,
             |c| c.fill_settle_ms = 4000,
+            |c| c.launch_mass_min_kg = 3.5,
+            |c| c.launch_mass_max_kg = 9.5,
             |c| c.turbocharge_max_added_mass_kg = Some(0.3),
             |c| c.pressure_step_psi += 1.,
             |c| c.pressure_ceiling_psi = Some(500.),

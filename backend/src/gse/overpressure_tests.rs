@@ -308,16 +308,18 @@ async fn configured_thresholds_and_window_are_used() {
 }
 
 #[test]
-fn older_clients_saving_settings_keep_the_overpressure_thresholds() {
+fn older_clients_saving_settings_keep_the_overpressure_thresholds_and_launch_mass_window() {
     let current = Config {
         overpressure_relief_psi: 800.0,
         overpressure_abort_psi: 900.0,
         overpressure_pilot_ms: 2_000,
         tank_rating_psi: Some(1_000.0),
+        launch_mass_min_kg: 3.5,
+        launch_mass_max_kg: 9.5,
         ..Config::default()
     };
     let mut legacy = serde_json::to_value(Config::default()).unwrap();
-    for key in OVERPRESSURE_CONFIG_KEYS {
+    for key in KEPT_CONFIG_KEYS {
         legacy.as_object_mut().unwrap().remove(key);
     }
     let saved = config_from_request(&current, legacy).unwrap();
@@ -325,6 +327,7 @@ fn older_clients_saving_settings_keep_the_overpressure_thresholds() {
     assert_eq!(saved.overpressure_abort_psi, 900.0);
     assert_eq!(saved.overpressure_pilot_ms, 2_000);
     assert_eq!(saved.tank_rating_psi, Some(1_000.0));
+    assert_eq!((saved.launch_mass_min_kg, saved.launch_mass_max_kg), (3.5, 9.5));
     let explicit = serde_json::to_value(Config::default()).unwrap();
     assert_eq!(config_from_request(&current, explicit).unwrap().overpressure_relief_psi, 850.0);
     assert!(config_from_request(&current, serde_json::json!({"unknown": 1})).is_err());
