@@ -164,6 +164,8 @@ pub struct AppState {
     pub(crate) control_ingress: Arc<crate::control_ingress::Registry>,
     /// Optional ring buffer for full telemetry packets (not JSON)
     pub ring_buffer: Arc<Mutex<RingBuffer<crate::ring_buffer::ReceivedPacket>>>,
+    /// Packets the ingest took from the ring, for the safety task's checks.
+    pub(crate) safety_tap: Arc<Mutex<crate::ring_buffer::SafetyTap>>,
 
     /// Commands from frontend → server (Arm, Disarm, Abort, etc.)
     pub cmd_tx: mpsc::Sender<TelemetryCommand>,
@@ -4526,6 +4528,7 @@ pub(crate) mod tests {
             fill_recording: Default::default(),
             control_ingress: Arc::new(Default::default()),
             ring_buffer: Arc::new(Mutex::new(RingBuffer::new(128))),
+            safety_tap: Default::default(),
             cmd_tx,
             ws_tx,
             warnings_tx: broadcast::channel(4).0,

@@ -90,6 +90,47 @@ impl<T> RingBuffer<T> {
     }
 }
 
+/// Every packet the ingest takes out of the ring, kept for the safety task's
+/// value-range checks. The ingest drains the ring continuously, so a snapshot
+/// of the ring every safety cycle saw only the few packets still queued at that
+/// instant and missed almost all telemetry (a PB pack at 5.6 V never warned).
+/// Bounded: when no safety task drains it (HITL, test fire) the oldest go.
+pub struct SafetyTap {
+    max: usize,
+    buf: VecDeque<sedsnet::packet::Packet>,
+}
+
+impl Default for SafetyTap {
+    fn default() -> Self {
+        Self::new(SAFETY_TAP_CAPACITY)
+    }
+}
+
+/// Packets kept between two safety cycles (500 ms) at most.
+pub const SAFETY_TAP_CAPACITY: usize = 16_384;
+
+impl SafetyTap {
+    pub fn new(max: usize) -> Self {
+        Self { max: max.max(1), buf: VecDeque::new() }
+    }
+
+    /// Records the packet of an entry the ingest took from the ring.
+    pub fn record(&mut self, received: &ReceivedPacket) {
+        if self.buf.len() >= self.max {
+            self.buf.pop_front();
+        }
+        let packet = match received {
+            ReceivedPacket::Telemetry { packet, .. } | ReceivedPacket::AppliedStatus { packet, .. } => packet,
+        };
+        self.buf.push_back(packet.clone());
+    }
+
+    /// Everything recorded since the last call, oldest first.
+    pub fn take(&mut self) -> Vec<sedsnet::packet::Packet> {
+        self.buf.drain(..).collect()
+    }
+}
+
 /// Minimum spacing of the operator warning for ingress ring overflow.
 pub const INGRESS_DROP_WARN_INTERVAL_MS: u64 = 30_000;
 
@@ -126,6 +167,27 @@ impl DropWarning {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_safety_tap_keeps_the_newest_packets_up_to_its_bound() {
+        crate::telemetry_schema::initialize().unwrap();
+        let mut tap = SafetyTap::new(2);
+        for at in 1..=3u64 {
+            tap.record(&ReceivedPacket::Telemetry {
+                packet: sedsnet::packet::Packet::new(
+                    crate::telemetry_schema::data_type("BATTERY_VOLTAGE"),
+                    &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                    "PB",
+                    at,
+                    std::sync::Arc::<[u8]>::from(7.4f32.to_le_bytes().to_vec()),
+                )
+                .unwrap(),
+                ingress_generation: 0,
+            });
+        }
+        assert_eq!(tap.take().iter().map(|p| p.timestamp()).collect::<Vec<_>>(), [2, 3]);
+        assert!(tap.take().is_empty());
+    }
 
     #[test]
     fn full_ring_counts_each_dropped_packet() {

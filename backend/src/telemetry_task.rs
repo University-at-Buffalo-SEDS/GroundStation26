@@ -1855,6 +1855,7 @@ pub async fn telemetry_task(
                                 let Some(pkt) = pkt else {
                                     break;
                                 };
+                                state.safety_tap.lock().unwrap().record(&pkt);
                                 permit.send(pkt);
                             }
                             Err(TrySendError::Full(_)) => {
@@ -6488,6 +6489,7 @@ mod tests {
             fill_recording: Default::default(),
             control_ingress: Arc::new(Default::default()),
             ring_buffer: Arc::new(Mutex::new(RingBuffer::new(128))),
+            safety_tap: Default::default(),
             cmd_tx,
             ws_tx,
             warnings_tx: broadcast::channel(4).0,

@@ -224,6 +224,17 @@ fn battery_voltage_out_of_range(sender_id: &str, voltage: f32) -> bool {
     outside_configured_range || battery_low_voltage_always_warns(sender_id, voltage)
 }
 
+/// The out-of-range warning names the pack's board: one pack out of range
+/// (a charged VB pack) must not stand for another (a drained PB pack).
+fn battery_voltage_warning(sender_id: &str) -> &'static str {
+    match canonical_sender_id(sender_id) {
+        "PB" => "Critical: PB battery voltage out of range!",
+        "VB" => "Critical: VB battery voltage out of range!",
+        "GB" => "Critical: GB battery voltage out of range!",
+        _ => "Critical: Battery voltage out of range!",
+    }
+}
+
 const BATTERY_CURRENT_WARNING: &str = "Critical: Battery current out of range!";
 
 /// BATTERY_CURRENT carries a single float32 (schema count 1): the current is
@@ -641,20 +652,11 @@ async fn safety_loop(
             last_no_packet_warning_ms = 0;
         }
 
-        // Snapshot current packets from the ring buffer for value-range checks.
-        let packets = {
-            let rb = state.ring_buffer.lock().unwrap();
-            let len = rb.len();
-            rb.recent(len)
-                .into_iter()
-                .map(|received| match received {
-                    crate::ring_buffer::ReceivedPacket::Telemetry { packet, .. }
-                    | crate::ring_buffer::ReceivedPacket::AppliedStatus { packet, .. } => {
-                        packet.clone()
-                    }
-                })
-                .collect::<Vec<_>>()
-        };
+        // Value-range checks see every packet since the last cycle: those the
+        // ingest already took from the ring (the safety tap) and those still
+        // queued in it. A packet still queued now is seen again next cycle,
+        // once taken; the checks only collect warnings, so that is harmless.
+        let packets = cycle_packets(state);
 
         // An empty snapshot only means no packet was ingested this cycle. The
         // liveness abort selected above must still be dispatched below: a
@@ -720,10 +722,12 @@ async fn safety_loop(
                     let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 2]);
                     // Voltage
                     if let Some(voltage) = values.first() {
-                        if is_fill_system_battery_sender(pkt.sender()) {
+                        // SEDSnet 7 boards send a compact @addr: source: resolve it to the board
+                        let sender = state.canonical_network_sender_id(pkt.sender());
+                        if is_fill_system_battery_sender(&sender) {
                             continue;
-                        } else if battery_voltage_out_of_range(pkt.sender(), *voltage) {
-                            cycle_warnings.insert("Critical: Battery voltage out of range!");
+                        } else if battery_voltage_out_of_range(&sender, *voltage) {
+                            cycle_warnings.insert(battery_voltage_warning(&sender));
                         }
                     }
                 }
@@ -751,7 +755,7 @@ async fn safety_loop(
                 ty if ty == crate::telemetry_schema::data_type("GENERIC_ERROR") => {
                     if !matches!(pending_abort, Some(SafetyAbortReason::GenericError { .. })) {
                         let reason = SafetyAbortReason::GenericError {
-                            sender: pkt.sender().to_owned(),
+                            sender: state.canonical_network_sender_id(pkt.sender()),
                             packet_id: pkt.packet_id(),
                             selected_state: current_state,
                             selected_wall_ms: now_ms,
@@ -809,6 +813,19 @@ async fn safety_loop(
             }
         }
     }
+}
+
+/// The packets one safety cycle checks: everything the ingest took from the
+/// ring since the last cycle (the safety tap), then whatever is still queued.
+fn cycle_packets(state: &AppState) -> Vec<sedsnet::packet::Packet> {
+    let mut packets = state.safety_tap.lock().unwrap().take();
+    let rb = state.ring_buffer.lock().unwrap();
+    let len = rb.len();
+    packets.extend(rb.recent(len).into_iter().rev().map(|received| match received {
+        crate::ring_buffer::ReceivedPacket::Telemetry { packet, .. }
+        | crate::ring_buffer::ReceivedPacket::AppliedStatus { packet, .. } => packet.clone(),
+    }));
+    packets
 }
 
 /// Claims launch exclusion before dispatch, without holding the GSE mutex over
@@ -902,6 +919,42 @@ fn dispatch_claimed_safety_abort(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ingest drains the ring continuously: a packet it already took (a PB
+    /// pack reading below range) must still reach the next safety cycle, once.
+    #[tokio::test]
+    async fn a_cycle_checks_the_packets_the_ingest_already_took() {
+        let state = crate::state::tests::test_app_state().await;
+        let now = get_current_timestamp_ms();
+        let packet = |sender: &str, volts: f32| crate::ring_buffer::ReceivedPacket::Telemetry {
+            packet: sedsnet::packet::Packet::new(
+                crate::telemetry_schema::data_type("BATTERY_VOLTAGE"),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                sender,
+                now,
+                Arc::<[u8]>::from(volts.to_le_bytes().to_vec()),
+            )
+            .unwrap(),
+            ingress_generation: 0,
+        };
+        state.ring_buffer.lock().unwrap().push(packet("PB", 5.6));
+        state.ring_buffer.lock().unwrap().push(packet("GB", 12.4));
+        // the ingest takes the first one before the safety cycle runs
+        let taken = state.ring_buffer.lock().unwrap().pop_oldest().unwrap();
+        state.safety_tap.lock().unwrap().record(&taken);
+        let senders = |packets: Vec<sedsnet::packet::Packet>| packets.iter().map(|p| p.sender().to_string()).collect::<Vec<_>>();
+        assert_eq!(senders(cycle_packets(&state)), ["PB", "GB"]);
+        let volts = state.safety_tap.lock().unwrap().take();
+        assert!(volts.is_empty(), "the tap is drained by the cycle");
+        assert!(battery_voltage_out_of_range("PB", 5.6));
+        assert_eq!(battery_voltage_warning("PB"), "Critical: PB battery voltage out of range!");
+        assert_eq!(battery_voltage_warning("VB"), "Critical: VB battery voltage out of range!");
+        // the still-queued packet is seen again once the ingest takes it; nothing else repeats
+        let taken = state.ring_buffer.lock().unwrap().pop_oldest().unwrap();
+        state.safety_tap.lock().unwrap().record(&taken);
+        assert_eq!(senders(cycle_packets(&state)), ["GB"]);
+        assert!(cycle_packets(&state).is_empty());
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn actual_safety_task_cancels_unclassified_faults_and_startup_liveness() {

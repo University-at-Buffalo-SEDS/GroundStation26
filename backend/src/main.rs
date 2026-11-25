@@ -1673,6 +1673,7 @@ async fn main() -> anyhow::Result<()> {
         fill_recording: Default::default(),
         control_ingress: Arc::new(Default::default()),
         ring_buffer: Arc::new(Mutex::new(RingBuffer::new(ring_buffer_capacity))),
+        safety_tap: Default::default(),
         cmd_tx,
         ws_tx,
         warnings_tx: broadcast::channel(alerts_capacity).0,
