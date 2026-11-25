@@ -1,8 +1,10 @@
 //! Live diagram topologies (docs/live-diagrams.md). The declarative files in
-//! `backend/layout/diagrams/*.json` (or `GS_DIAGRAMS_DIR`) describe the fill
-//! plumbing, the AV bay, the network and the stand; the dashboard draws them
-//! and derives valve/flow state itself. Editing a file changes the drawing on
-//! the next page load, without rebuilding the client.
+//! `backend/layout/diagrams/*.json` (or `GS_DIAGRAMS_DIR`) give one combined
+//! view per station mode (`flight`, `test_fire`, `ground_test`) plus the
+//! network overview; the layout's `live_diagrams` picks the view for each
+//! mode. The dashboard draws them and derives valve/flow state itself.
+//! Editing a file changes the drawing on the next page load, without
+//! rebuilding the client.
 //!
 //! `GET /api/diagrams` (ViewData): `{"diagrams":[topology…],"errors":[{file,error}]}`.
 //! A file that fails the structural check here is reported, not served; the
@@ -170,10 +172,41 @@ fn referenced_types() -> BTreeSet<String> {
     types
 }
 
-/// "diagram-fill" -> the `fill` topology.
+/// The built-in view for a station mode, used when the layout's
+/// `live_diagrams` does not name one: flight (fill system and the vehicle on
+/// the pad) in normal, HITL and testing; the test stand in test fire; the
+/// stand and the rocket on the ground in an integrated ground test.
+pub fn default_view(mode: crate::station_mode::Mode) -> &'static str {
+    use crate::station_mode::Mode;
+    match mode {
+        Mode::Normal | Mode::Hitl | Mode::Testing => "flight",
+        Mode::TestFire => "test_fire",
+        Mode::IntegratedGroundTest => "ground_test",
+    }
+}
+
+/// The per-system views the mode views replaced; a saved programme scene
+/// naming one still shows its successor.
+pub fn legacy_view(id: &str) -> Option<&'static str> {
+    match id {
+        "fill" | "av_bay" => Some("flight"),
+        "stand" => Some("ground_test"),
+        _ => None,
+    }
+}
+
+/// "diagram-flight" -> the `flight` topology; "diagram-mode" -> the view of
+/// the mode the station presents now (its layout's `live_diagram`).
 pub fn scene_topology(scene: &str) -> Option<Value> {
     let id = scene.strip_prefix("diagram-")?;
-    load(&diagrams_dir()).diagrams.into_iter().find(|d| d["id"].as_str() == Some(id))
+    let id = if id == "mode" {
+        crate::layout::load_layout().ok().and_then(|l| l.live_diagram)?
+    } else {
+        id.to_string()
+    };
+    let diagrams = load(&diagrams_dir()).diagrams;
+    let find = |id: &str| diagrams.iter().find(|d| d["id"].as_str() == Some(id)).cloned();
+    find(&id).or_else(|| legacy_view(&id).and_then(find))
 }
 
 pub fn is_scene(scene: &str) -> bool {
@@ -303,7 +336,14 @@ mod tests {
     fn scene_names_and_pyro_text() {
         assert!(is_scene("diagram-fill") && is_scene("diagram-av_bay"));
         assert!(!is_scene("diagram-") && !is_scene("diagram-../x") && !is_scene("fill"));
-        assert_eq!(scene_topology("diagram-stand").unwrap()["id"], "stand");
+        assert_eq!(scene_topology("diagram-test_fire").unwrap()["id"], "test_fire");
+        // Saved scenes of the old per-system set show their successors.
+        assert_eq!(scene_topology("diagram-stand").unwrap()["id"], "ground_test");
+        assert_eq!(scene_topology("diagram-fill").unwrap()["id"], "flight");
+        assert_eq!(scene_topology("diagram-av_bay").unwrap()["id"], "flight");
+        // "mode" follows the station's mode.
+        let mode = crate::layout::load_layout().unwrap().live_diagram.unwrap();
+        assert_eq!(scene_topology("diagram-mode").unwrap()["id"], mode.as_str());
         assert!(scene_topology("diagram-missing").is_none());
         assert_eq!(pyro_text(false, "Fill", None, None), "Safe (FC arms after Launch)");
         assert_eq!(pyro_text(true, "InFlight", Some("Reefing (SIMULATED)"), Some(true)), "Fired (FC phase Reefing) · DRY-RUN");
@@ -350,17 +390,50 @@ mod tests {
         let reply = load(&diagrams_dir());
         assert!(reply.errors.is_empty(), "{:?}", reply.errors);
         let ids: Vec<&str> = reply.diagrams.iter().filter_map(|d| d["id"].as_str()).collect();
-        assert_eq!(ids, ["av_bay", "fill", "network", "stand"]);
+        assert_eq!(ids, ["flight", "ground_test", "network", "test_fire"]);
+    }
+
+    /// One view per mode. Test fire: the fill system and the motor on the
+    /// stand (KG50, KG1000, chamber PT), no AV bay. Flight: the fill system
+    /// with the KG50 under the motor and the vehicle's AV bay, no KG1000 or
+    /// chamber PT. The ground test: the stand plus the rocket, only in IGT.
+    #[test]
+    fn mode_views_carry_their_systems() {
+        let reply = load(&diagrams_dir());
+        let view = |id: &str| reply.diagrams.iter().find(|d| d["id"] == id).unwrap().clone();
+        let all_ids = |v: &Value| -> BTreeSet<String> {
+            ["nodes", "valves", "edges", "readings"].iter().flat_map(|l| ids(v, l)).map(str::to_owned).collect()
+        };
+        let types = |v: &Value| -> BTreeSet<String> {
+            v["readings"].as_array().unwrap().iter().filter_map(|r| r["value"]["telemetry"].as_str().map(str::to_owned)).collect()
+        };
+        let (flight, test_fire, ground) = (view("flight"), view("test_fire"), view("ground_test"));
+        for v in [&flight, &test_fire, &ground] {
+            for id in ["tank", "qd", "nitrogen", "nitrous", "vent", "dump", "main", "fill_line", "tank_pt", "fill_mass", "kg50"] {
+                assert!(all_ids(v).contains(id), "{}: {id}", v["id"]);
+            }
+            assert_eq!(v["valves"], flight["valves"], "{}: the same valves", v["id"]);
+        }
+        let tf = all_ids(&test_fire);
+        assert!(["kg1000", "chamber_pt", "thrust"].iter().all(|id| tf.contains(*id)));
+        assert!(["fc", "pb", "rf", "av_can"].iter().all(|id| !tf.contains(*id)), "no AV bay on the stand");
+        assert!(types(&test_fire).is_superset(&BTreeSet::from(["LOADCELL_WEIGHT_KG".into(), "LOADCELL_50_WEIGHT_KG".into(), "COMBUSTION_CHAMBER_PRESSURE".into()])));
+        let fl = all_ids(&flight);
+        assert!(["fc", "pb", "rf", "av_can", "rf_gs", "pyro_drogue", "motor_kg50"].iter().all(|id| fl.contains(*id)));
+        assert!(!types(&flight).contains("LOADCELL_WEIGHT_KG") && !types(&flight).contains("COMBUSTION_CHAMBER_PRESSURE"));
+        assert!(tf.iter().all(|id| all_ids(&ground).contains(id)), "the ground test keeps the stand");
+        let rocket = ground["frames"].as_array().unwrap().iter().find(|f| f["vehicle"].is_object()).unwrap();
+        assert_eq!(rocket["when"], "igt");
     }
 
     #[test]
     fn broken_references_and_mismatched_ids_are_reported_not_served() {
         let dir = std::env::temp_dir().join(format!("gs26-diagrams-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let fill: Value = serde_json::from_slice(&std::fs::read(diagrams_dir().join("fill.json")).unwrap()).unwrap();
+        let fill: Value = serde_json::from_slice(&std::fs::read(diagrams_dir().join("flight.json")).unwrap()).unwrap();
         let mut broken = fill.clone();
         broken["edges"][0]["through"] = serde_json::json!(["nope"]);
-        std::fs::write(dir.join("fill.json"), serde_json::to_vec(&broken).unwrap()).unwrap();
+        std::fs::write(dir.join("flight.json"), serde_json::to_vec(&broken).unwrap()).unwrap();
         std::fs::write(dir.join("renamed.json"), serde_json::to_vec(&fill).unwrap()).unwrap();
         std::fs::write(dir.join("garbage.json"), b"{").unwrap();
         let reply = load(&dir);

@@ -3804,6 +3804,11 @@
       }
     ]
   },
+  "live_diagrams": {
+    "normal": "flight",
+    "testing": "flight",
+    "integrated_ground_test": "ground_test"
+  },
   "flight_phase_version": 1,
   "gps": {
     "data_types": [

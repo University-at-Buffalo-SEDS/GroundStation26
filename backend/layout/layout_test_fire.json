@@ -2807,6 +2807,9 @@
       }
     ]
   },
+  "live_diagrams": {
+    "test_fire": "test_fire"
+  },
   "flight_phase_version": 1,
   "gps": {
     "data_types": [

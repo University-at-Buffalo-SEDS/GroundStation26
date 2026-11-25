@@ -15,6 +15,16 @@ pub struct LayoutConfig {
     /// Integrated ground test (served layout only; omitted when false).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub igt_mode: bool,
+    /// Live-diagram view per station mode (`normal`, `hitl`, `test_fire`,
+    /// `testing`, `integrated_ground_test`): a topology id from
+    /// `backend/layout/diagrams/`. A mode not listed gets
+    /// [`crate::diagrams::default_view`]. docs/live-diagrams.md.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub live_diagrams: std::collections::BTreeMap<String, String>,
+    /// The view for the mode this layout is served in (resolved from
+    /// `live_diagrams`); the dashboard's Live diagrams tab opens it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_diagram: Option<String>,
     pub version: u32,
     #[serde(default)]
     pub branding: BrandingConfig,
@@ -936,6 +946,7 @@ fn normalize_flight_phases(layout: &mut LayoutConfig) -> Result<(), String> {
 fn apply_runtime_layout_overrides(layout: &mut LayoutConfig, mode: crate::station_mode::Mode) {
     layout.test_fire_mode = mode == crate::station_mode::Mode::TestFire;
     layout.igt_mode = mode == crate::station_mode::Mode::IntegratedGroundTest;
+    layout.live_diagram = Some(live_diagram_for(layout, mode));
     if crate::rrls::is_rrls() {
         layout.branding.app_name = Some("RRLS".into());
         layout.branding.dashboard_title = Some("RRLS".into());
@@ -1022,6 +1033,17 @@ fn apply_runtime_layout_overrides(layout: &mut LayoutConfig, mode: crate::statio
             section: None,
         },
     );
+}
+
+/// The live-diagram view a layout names for `mode`, else the built-in one.
+pub(crate) fn live_diagram_for(layout: &LayoutConfig, mode: crate::station_mode::Mode) -> String {
+    let key = serde_json::to_value(mode).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default();
+    layout
+        .live_diagrams
+        .get(&key)
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map_or_else(|| crate::diagrams::default_view(mode).to_string(), str::to_owned)
 }
 
 /// The integrated ground test uses the flight layout (AV bay, FC, recovery
@@ -1284,6 +1306,33 @@ mod tests {
             }
             assert!(checked > 0);
         }
+    }
+
+    #[test]
+    fn each_mode_serves_its_live_diagram_view() {
+        use crate::station_mode::Mode;
+        let shipped = crate::diagrams::load(&crate::diagrams::diagrams_dir());
+        let ids: Vec<&str> = shipped.diagrams.iter().filter_map(|d| d["id"].as_str()).collect();
+        for (mode, view) in [
+            (Mode::Normal, "flight"),
+            (Mode::Hitl, "flight"),
+            (Mode::Testing, "flight"),
+            (Mode::TestFire, "test_fire"),
+            (Mode::IntegratedGroundTest, "ground_test"),
+        ] {
+            let layout = load_layout_file(&default_layout_path(mode), mode).unwrap();
+            assert_eq!(layout.live_diagram.as_deref(), Some(view), "{mode:?}");
+            assert_eq!(crate::diagrams::default_view(mode), view, "{mode:?}: the files agree with the built-in default");
+            assert!(ids.contains(&view), "{view} is served");
+            let served = serde_json::to_value(&layout).unwrap();
+            assert_eq!(served["live_diagram"], view);
+        }
+        // A layout without the map (a custom or older file) still gets one.
+        let mut layout: LayoutConfig = serde_json::from_str(include_str!("../layout/layout_test_fire.json")).unwrap();
+        layout.live_diagrams.clear();
+        assert_eq!(live_diagram_for(&layout, Mode::TestFire), "test_fire");
+        layout.live_diagrams.insert("test_fire".into(), "network".into());
+        assert_eq!(live_diagram_for(&layout, Mode::TestFire), "network", "the layout chooses");
     }
 
     #[test]
