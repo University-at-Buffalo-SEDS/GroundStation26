@@ -316,9 +316,16 @@ pub(crate) fn network_output_packet(router: &Router, output: NetworkOutput, valu
 /// epoch it was taken in, so boards order it by (epoch, timestamp) also when
 /// it is re-sent after a network clock step.
 fn flight_state_wire_packet(state: NetworkFlightState, stamp: Stamp) -> Result<Packet> {
+    note_flight_state_wire(state);
+    build_flight_state_packet(state, stamp)
+}
+/// A FLIGHT_STATE write goes on the wire.
+fn note_flight_state_wire(state: NetworkFlightState) {
     // The simulator's set-(a) wire assertion reads this line.
     log::info!("FLIGHT_STATE wire value={} ({})", state as u8, state.label());
     SETTLE.lock().unwrap().last_write = Some(std::time::Instant::now());
+}
+fn build_flight_state_packet(state: NetworkFlightState, stamp: Stamp) -> Result<Packet> {
     Ok(packet_bytes_at(
         FLIGHT_STATE_TYPE,
         "FLIGHT_STATE",
@@ -1240,7 +1247,9 @@ pub(crate) struct PreparedLaunchState {
     expected: (u8, u64),
 }
 pub(crate) fn prepare_launch_state(router: &Router) -> Result<PreparedLaunchState> {
-    let packet = flight_state_wire_packet(NetworkFlightState::Launch, control_stamp(router)?)?;
+    // Noted on the wire only once the SDK admits it (`note_admitted_launch`):
+    // a refused Launch publishes nothing.
+    let packet = build_flight_state_packet(NetworkFlightState::Launch, control_stamp(router)?)?;
     let guard = store()
         .lock()
         .expect("network-variable store lock poisoned");
@@ -1248,6 +1257,15 @@ pub(crate) fn prepare_launch_state(router: &Router) -> Result<PreparedLaunchStat
         packet,
         expected: (guard.values.flight_state, guard.values.flight_state_stamp),
     })
+}
+/// The SDK owns the prepared FLIGHT_STATE Launch.
+pub(crate) fn note_admitted_launch() {
+    note_flight_state_wire(NetworkFlightState::Launch);
+}
+/// When this process last put a FLIGHT_STATE write on the wire.
+#[cfg(test)]
+pub(crate) fn last_flight_state_wire_for_test() -> Option<std::time::Instant> {
+    SETTLE.lock().unwrap().last_write
 }
 /// Post-admission CAS. Never overwrite a later reset/Abort desired revision.
 /// No packet is submitted here: its EXACT original packet already owns SDK work.
@@ -1799,6 +1817,20 @@ fn verify_qualification_boot_cache(path: &Path, completed: usize, actual: u8) ->
 
 #[cfg(test)]
 mod tests {
+    /// Preparing a Launch is not a write: only the admitted packet is.
+    #[test]
+    fn a_prepared_launch_is_noted_on_the_wire_only_once_admitted() {
+        if crate::operator_queue::isolated_native_case(module_path!(), "a_prepared_launch_is_noted_on_the_wire_only_once_admitted") { return; }
+        crate::telemetry_schema::initialize().unwrap();
+        let router = sedsnet::router::Router::new(sedsnet::router::RouterConfig::new([]).with_sender("GS"));
+        router.try_set_local_network_time(sedsnet::timesync::PartialNetworkTime::from_unix_ms(1_793_563_200_000)).unwrap();
+        let before = super::last_flight_state_wire_for_test();
+        super::prepare_launch_state(&router).unwrap();
+        assert_eq!(super::last_flight_state_wire_for_test(), before);
+        super::note_admitted_launch();
+        assert!(super::last_flight_state_wire_for_test() > before);
+    }
+
     #[test]
     fn the_latest_flight_state_is_resent_once_after_writes_settle() {
         use super::{FLIGHT_STATE_SETTLE, settle_resend_due};

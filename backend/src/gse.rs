@@ -5131,6 +5131,7 @@ pub(crate) fn queue_prepared_launch_packets(
     // Even a partial batch has real SDK owners. Persist/describe that admitted
     // Launch truthfully; no implicit retry and no automatic Abort are allowed.
     if let Some(prepared) = prepared.filter(|_| accepted > 0) {
+        crate::network_variables::note_admitted_launch();
         let _dispatch = dispatch_gate();
         with_stop_admission(state,ticket,||()) .map_err(|e|format!("SDK admitted {accepted}/{total} Launch packets, but {e}; explicit recovery required"))?;
         let claim=claim_operator_dispatch_under_gate(state,ticket.generation).ok_or_else(||format!("SDK admitted {accepted}/{total} Launch packets, recovery closed before publication"))?;
