@@ -28,6 +28,15 @@ ticket and an `after` cursor and releases audio only after the server's broadcas
 delay. It cannot be used to transmit. `/api/voice/status` reports current transmit
 permission and whether the crew audio is included in the broadcast.
 
+## Stream manager
+
+`/api/studio` and `/api/studio/{layouts,scenes,take}` hold the stream
+manager's layouts, scenes and Program scene, and list the sources (cameras,
+live diagrams, telemetry views, overlays, graphics). The programme page draws
+a studio scene in the browser; `scene=` and `source=` on its state route draw
+an unaired scene or one source for stream managers. See
+[stream manager](../media/stream-manager.md).
+
 ## Live dashboard cadence
 
 Each `/api/dashboard_status` stat now includes backend-owned `binding` metadata

@@ -34,7 +34,12 @@ it with no station connected (offline replay). Also `flight-plans/*`: a computed
 inputs, since the live log is process-wide); `terrain/heightmap-unavailable`
 and `terrain/status-empty` are the terrain routes on a station with no DEM, and
 `terrain/heightmap` is a grid built from a synthetic Terrarium tile through
-the real serializer (docs/backend/terrain.md).
+the real serializer (docs/backend/terrain.md). `studio/view`, `studio/take`
+(with `studio/take.request`) and `studio/program-scene` are the stream
+manager's `GET /api/studio`, a fade take and the programme page's resolved
+scene on a station without cameras; the station's diagrams are pinned to one
+placeholder source, since the diagram files change on their own
+(docs/media/stream-manager.md).
 
 Values that change from run to run (tickets, boot epochs, random ids, clock
 readings, process-wide counters) are replaced by fixed values of the same type

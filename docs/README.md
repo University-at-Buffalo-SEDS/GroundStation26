@@ -25,6 +25,8 @@ independently.
 - [Live diagrams](live-diagrams.md): one declarative view per station mode (flight,
   test fire, ground test) plus the network overview, the mode mapping, full screen,
   the valve/flow rules and the programme scenes.
+- [Stream manager](media/stream-manager.md): studio layouts, scenes and sources (cameras,
+  live diagrams, telemetry views, overlays), cut/fade takes and the programme page.
 - [Raw stream feed](backend/raw-stream-feed.md): read-only WebSocket/NDJSON feed of every
   telemetry stream for overlays and external scripts; stream viewer tokens.
 - [Replay bundles](backend/replay-bundle.md): `.gsreplay` export of one recording for replay with no station.
