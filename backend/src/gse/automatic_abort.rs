@@ -498,6 +498,9 @@ pub(super) fn reserve_abort_clear(state: &AppState) -> Option<AutomaticAbortClai
 }
 
 #[cfg(test)]
+mod disk_stall_tests;
+
+#[cfg(test)]
 pub(super) mod tests {
     use super::*;
     use std::sync::{

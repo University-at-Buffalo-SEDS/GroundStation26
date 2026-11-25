@@ -64,6 +64,9 @@ struct Pending {
 pub(crate) struct Inbox {
     state: Mutex<Pending>,
     wake: Notify,
+    /// Observations the worker took up so far.
+    #[cfg(test)]
+    pub(crate) claimed: std::sync::atomic::AtomicUsize,
 }
 impl Inbox {
     /// No GSE, journal, DB, packet parsing or network operations under this lock.
@@ -134,6 +137,8 @@ impl Inbox {
     fn claim(self: &Arc<Self>) -> Option<Claim> {
         let mut state = self.state.lock().unwrap();
         let observation = state.manual.take().or_else(|| state.automatic.take())?;
+        #[cfg(test)]
+        self.claimed.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         if !observation.automatic {
             state.active_manual = true;
         }
