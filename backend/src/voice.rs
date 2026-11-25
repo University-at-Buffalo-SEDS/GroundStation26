@@ -1707,7 +1707,13 @@ mod tests {
         );
     }
 
+    /// Sustained 32-client audio load. Opt-in (like `voice_load_report`): run in
+    /// the normal suite it saturated the machine and starved the timing-bounded
+    /// board-recovery tests running beside it. The caps themselves are covered
+    /// by the 32-client socket floor test, which stays in the suite. Run with
+    /// `cargo test -p groundstation_backend thirty_two_bots -- --ignored`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
     async fn thirty_two_bots_join_talk_and_leave_within_the_caps() {
         let limits = floor::Limits { max_participants: 32, max_talkers: 4 };
         let r = voice_load(32, limits, 4.0).await;
