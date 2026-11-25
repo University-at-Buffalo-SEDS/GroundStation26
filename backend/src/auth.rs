@@ -8,7 +8,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const USERS_FILE_VERSION: u32 = 1;
@@ -658,11 +659,12 @@ struct PendingLoginChallenge {
 #[derive(Debug, Clone)]
 pub struct AuthManager {
     path: PathBuf,
+    last_cleanup_ms: Arc<AtomicI64>,
 }
 
 impl AuthManager {
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self { path, last_cleanup_ms: Arc::default() }
     }
 
     #[allow(dead_code)]
@@ -945,7 +947,9 @@ impl AuthManager {
         token: Option<&str>,
         required: Permission,
     ) -> Result<AuthPrincipal, AuthFailure> {
-        self.cleanup_expired_sessions(db).await?;
+        // Every token's own expiry is checked below. The cleanup writes to the
+        // session database: no request, an Abort least of all, waits for it.
+        self.cleanup_expired_sessions_in_background(db);
 
         if let Some(token) = token.filter(|token| !token.trim().is_empty()) {
             let token = token.trim();
@@ -1312,14 +1316,38 @@ impl AuthManager {
         Ok(principal)
     }
 
-    pub async fn cleanup_expired_sessions(&self, db: &SqlitePool) -> Result<(), AuthFailure> {
-        sqlx::query("DELETE FROM auth_sessions WHERE expires_at_ms <= ?")
-            .bind(now_ms())
-            .execute(db)
-            .await
-            .map_err(|e| AuthFailure::Internal(format!("failed to cleanup sessions: {e}")))?;
-        Ok(())
+    /// `cleanup_expired_sessions`, one at a time and at most once a minute.
+    fn cleanup_expired_sessions_in_background(&self, db: &SqlitePool) {
+        const INTERVAL_MS: i64 = 60_000;
+        let (now, last) = (now_ms(), self.last_cleanup_ms.load(Ordering::Acquire));
+        // `i64::MAX`: one is running.
+        if last == i64::MAX || (now - last).abs() < INTERVAL_MS
+            || self.last_cleanup_ms.compare_exchange(last, i64::MAX, Ordering::AcqRel, Ordering::Acquire).is_err()
+        {
+            return;
+        }
+        let (db, finished) = (db.clone(), self.last_cleanup_ms.clone());
+        tokio::spawn(async move {
+            if let Err(error) = delete_expired_sessions(&db).await {
+                log::warn!("failed to clean up expired sessions: {error}");
+            }
+            finished.store(now_ms(), Ordering::Release);
+        });
     }
+
+    pub async fn cleanup_expired_sessions(&self, db: &SqlitePool) -> Result<(), AuthFailure> {
+        delete_expired_sessions(db)
+            .await
+            .map_err(|e| AuthFailure::Internal(format!("failed to cleanup sessions: {e}")))
+    }
+}
+
+async fn delete_expired_sessions(db: &SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM auth_sessions WHERE expires_at_ms <= ?")
+        .bind(now_ms())
+        .execute(db)
+        .await
+        .map(drop)
 }
 
 /// Resolve a verified paired (portable) session against the CURRENT local
