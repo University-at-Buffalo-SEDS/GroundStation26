@@ -55,6 +55,8 @@ mod comms_config;
 mod control_ingress;
 mod core_busy;
 mod deferred_abort;
+#[cfg(test)]
+mod disk_stall;
 mod dummy_packets;
 mod ethernet_autoconfig;
 mod fill_delivery_probe;

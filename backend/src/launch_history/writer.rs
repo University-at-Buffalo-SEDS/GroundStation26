@@ -70,6 +70,8 @@ impl Writer {
                         }
                         #[cfg(test)]
                         crate::web::clock_worker_tests::pause_journal_before_save(&path);
+                        #[cfg(test)]
+                        crate::disk_stall::wait(crate::disk_stall::Site::Journal);
                         atomic_save(&path, &data)
                     })();
                     let report = {

@@ -131,6 +131,8 @@ impl Saved {
             file.write_all(&bytes)?;
             #[cfg(test)]
             persist_diagnostic::before_sync(path)?;
+            #[cfg(test)]
+            crate::disk_stall::wait(crate::disk_stall::Site::Qualification);
             file.sync_all()?;
             std::fs::rename(&temporary, path)?;
             std::fs::File::open(parent)?.sync_all()

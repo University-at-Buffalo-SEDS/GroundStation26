@@ -274,6 +274,8 @@ fn store() -> &'static Mutex<VariableStore> {
 }
 
 fn persist(path: &Path, values: PersistentVariables) -> Result<()> {
+    #[cfg(test)]
+    crate::disk_stall::wait(crate::disk_stall::Site::Variables);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| {
             format!(

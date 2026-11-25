@@ -513,6 +513,8 @@ impl Store {
                 .write(true)
                 .open(&tmp)?;
             file.write_all(&data)?;
+            #[cfg(test)]
+            crate::disk_stall::wait(crate::disk_stall::Site::Checklists);
             file.sync_all()?;
             std::fs::rename(&tmp, &self.path)?;
             std::fs::File::open(parent)?.sync_all()?;
