@@ -124,7 +124,8 @@ class Helpers(unittest.TestCase):
 
     def test_the_stepper_retract_is_the_firmwares_600_s(self):
         self.assertAlmostEqual(e2e.STEPPER_RETRACT_S, 600.0)
-        self.assertEqual(e2e.AUX_RETRACT_S, 45.0)
+        self.assertEqual(e2e.AUX_RETRACT_S, 25.0)
+        self.assertEqual(e2e.QD_TRAVEL_S, (20.0, 25.0))
 
     def test_low_battery_drains_both_packs_and_sees_the_condition_and_the_alert(self):
         class BatteryStation(FakeStation):

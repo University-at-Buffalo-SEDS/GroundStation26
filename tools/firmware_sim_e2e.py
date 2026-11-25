@@ -392,14 +392,15 @@ def launch_started(st: Station):
 
 
 # The QD fill drive the Normal e2e selects (FIRMWARE_SIM_E2E_QD_DRIVE): "auxiliary", the drive the QD retracts with on
-# the hardware: the AB powers the QD actuator from Backup_Valve_EN PD2 for 45 s (ActuatorBoard26 fill_motion.h
-# FILL_DURATION_MS, deliberately longer than the travel) and the actuator's own limit switch stops it after 20-30 s
-# (the plant's qd_travel_s, 25 s). "stepper" keeps the factory-default legacy stepper drive: 20 000 000 pulses at 30 us
+# the hardware: the AB powers the QD actuator from Backup_Valve_EN PD2 for 25 s (ActuatorBoard26 fill_motion.h
+# FILL_DURATION_MS) and the actuator's own limit switch stops it (the plant's qd_travel_s, 23 s). The
+# operator checks the QD by eye; the station has no QD-disconnect gate. "stepper" keeps the factory-default legacy
+# stepper drive: 20 000 000 pulses at 30 us
 # (main_task.c), 600 s through its 100:1 gearbox, which the plant does not model mechanically.
 QD_DRIVE = os.environ.get("FIRMWARE_SIM_E2E_QD_DRIVE", "auxiliary")
-AUX_RETRACT_S = 45.0
+AUX_RETRACT_S = 25.0
 STEPPER_RETRACT_S = 20_000_000 * 30e-6
-QD_TRAVEL_S = (20.0, 30.0)
+QD_TRAVEL_S = (20.0, AUX_RETRACT_S)
 
 
 def select_qd_drive(st: Station, check, result, mode=QD_DRIVE):
@@ -437,8 +438,8 @@ def normal_launch(st: Station, check):
     retract the QD (RetractPlumbing, refreshing the actuator readback until the station reports QD motion), then
     Launch once every required board's state proof and the retraction proof are fresh (/api/board_abort).
 
-    Auxiliary drive: the plant's QD actuator reaches its limit switch 20-30 s after the AB powers it, then Launch
-    follows the AB's own 45 s retraction (the GS also holds Launch 45 s after the AB accepted it).
+    Auxiliary drive: the plant's QD actuator reaches its limit switch 20-25 s after the AB powers it, then Launch
+    follows the AB's own 25 s retraction (the GS also holds Launch 25 s after the AB accepted it).
     FIRMWARE_SIM_E2E_QD_FAULT=never_trips jams the actuator short of its switch: the QD stays connected and the e2e
     records what the AB and the station report (the AB has no input from the switch)."""
     code, doc = st.api("/api/checklists")
@@ -461,7 +462,7 @@ def normal_launch(st: Station, check):
     qd = st.wait(retracting, 90, "QD retract dispatched", poll=3)
     check("the QD retracts (RetractPlumbing through the AB)", qd, qd=qd, umbilical=st.plant().get("umbilical_attached"))
     if QD_DRIVE == "auxiliary":
-        # the limit switch, not the AB's 45 s output, ends the motion
+        # the limit switch, not the AB's 25 s output, ends the motion
         def switch():
             q = st.plant().get("qd") or {}
             return q if q.get("limit_switch") else None
@@ -473,7 +474,7 @@ def normal_launch(st: Station, check):
             check("QD fault: the limit switch never trips and the QD stays connected", not tripped
                   and (st.plant().get("supply") or {}).get("qd_connected"), qd=q)
         else:
-            check("the QD actuator stops at its limit switch 20-30 s after the AB powers it",
+            check("the QD actuator stops at its limit switch 20-25 s after the AB powers it",
                   after is not None and QD_TRAVEL_S[0] <= after <= QD_TRAVEL_S[1], qd=q)
             check("the QD disconnects at the limit switch", not (st.plant().get("supply") or {}).get("qd_connected"),
                   supply=st.plant().get("supply"))
@@ -481,7 +482,7 @@ def normal_launch(st: Station, check):
             q = st.plant().get("qd") or {}
             return q if q.get("last_output_on_s") is not None and not q.get("output_on") else None
         q = st.wait(output_off, AUX_RETRACT_S + 30, "AB QD output off", poll=1) or st.plant().get("qd") or {}
-        check("the AB powers the QD actuator for its 45 s (FILL_DURATION_MS)",
+        check("the AB powers the QD actuator for its 25 s (FILL_DURATION_MS)",
               abs((q.get("last_output_on_s") or 0) - AUX_RETRACT_S) <= 2, qd=q)
         if fault:
             # the AB cannot see the switch: record what it and the station report once its timer ends
@@ -513,7 +514,7 @@ def normal_launch(st: Station, check):
         code, body = st.command("Launch")
         launched[0] = {"http": code, "body": body}
         return code == 200 and st.wait(lambda: launch_started(st), 15, "station in Launch")
-    # Launch follows the AB's own retraction end: the auxiliary drive's 45 s output (the switch ends the motion
+    # Launch follows the AB's own retraction end: the auxiliary drive's 25 s output (the switch ends the motion
     # earlier, but the AB cannot see it), or the legacy stepper's full 600 s move
     move_s = AUX_RETRACT_S if QD_DRIVE == "auxiliary" else STEPPER_RETRACT_S
     ok = st.wait(launch, max(0.0, move_s - (st.now() - t_cmd)) + 120, "Launch admitted", poll=2)

@@ -326,7 +326,7 @@ const LAUNCH: &[Spec] = &[
         id: "plumbing-retraction",
         title: "Plumbing retraction",
         summary: "Plumbing retraction is admitted only when launch is otherwise allowed; its completion timeout is {station.plumbing_completion_timeout_ms} ms (depends on the configured drive mode).",
-        details: &[],
+        details: &["The auxiliary drive powers the QD actuator for 25 s and then reports complete. Neither the Actuator Board nor the station can sense the actuator's limit switch or the QD: the operator checks by eye that it has disconnected. The station has no QD-disconnect confirmation or gate."],
         modes: NOT_HITL,
         enforced_in: &["backend/src/gse/operational_policy.rs:handle_operational_command", "backend/src/actuator_plumbing/mod.rs:completion_timeout_ms"],
         config_keys: &["station.plumbing_completion_timeout_ms"],

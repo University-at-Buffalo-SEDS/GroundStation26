@@ -70,25 +70,25 @@ async fn nothing_shows_before_any_retraction() {
 async fn actuator_reported_aux_retraction_runs_with_its_remaining_time() {
     let state = crate::state::tests::test_app_state().await;
     sent(&state, Mode::Auxiliary, 3_000);
-    observe(&state, status(1, 30_000), 2_100, 2_000);
+    observe(&state, status(1, 20_000), 2_100, 2_000);
     let p = progress(&state).unwrap();
     assert_eq!(p.state, S::Running);
     assert!(p.confirmed);
     let remaining = p.remaining_ms.unwrap();
-    assert!((27_000..=28_000).contains(&remaining), "{remaining}");
+    assert!((17_000..=18_000).contains(&remaining), "{remaining}");
 }
 
 #[tokio::test]
 async fn sent_retraction_without_motion_status_shows_running_unconfirmed_with_countdown() {
     // The fire's build had no MotionV2 reply: the station still shows the
-    // 45 s AUX move it sent as running, as an estimate.
+    // 25 s AUX move it sent as running, as an estimate.
     let state = crate::state::tests::test_app_state().await;
     sent(&state, Mode::Auxiliary, 10_000);
     let p = progress(&state).unwrap();
     assert_eq!(p.state, S::Running);
     assert!(!p.confirmed);
     let remaining = p.remaining_ms.unwrap();
-    assert!((34_000..=35_000).contains(&remaining), "{remaining}");
+    assert!((14_000..=15_000).contains(&remaining), "{remaining}");
     assert!(p.message.unwrap().contains("not confirmed"));
     // The estimate never feeds the actuator-reported hold or completion.
     assert!(!retract_motion_active(&state));

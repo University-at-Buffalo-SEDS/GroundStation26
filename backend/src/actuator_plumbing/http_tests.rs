@@ -1330,7 +1330,7 @@ async fn public_motion_queue_cannot_cross_mode_commit_and_fresh_motion_keeps_ori
             QdStatus::AwaitingAck,
             "SDK admission is not completion"
         );
-        let (status, floor) = crate::gse::plumbing_qd_probe_for_test(&f.state, 45_000);
+        let (status, floor) = crate::gse::plumbing_qd_probe_for_test(&f.state, u64::from(wire::TIMED_MOVE_MS));
         assert_eq!(
             status,
             QdStatus::AwaitingAck,
@@ -1346,7 +1346,7 @@ async fn public_motion_queue_cannot_cross_mode_commit_and_fresh_motion_keeps_ori
                         crate::telemetry_schema::data_type("UMBILICAL_STATUS"),
                         &[crate::telemetry_schema::endpoint("GROUND_STATION")],
                         "AB",
-                        floor + 45_001 + nonce,
+                        floor + u64::from(wire::TIMED_MOVE_MS) + 1 + nonce,
                         nonce as u16,
                         Arc::from([8, on]),
                     )
@@ -1499,7 +1499,7 @@ impl Fixture {
         proof[3] = 5;
         proof[12..20].copy_from_slice(&self.board_boot.to_le_bytes());
         proof[20..24].copy_from_slice(&1u32.to_le_bytes());
-        proof[48..52].copy_from_slice(&45_000u32.to_le_bytes());
+        proof[48..52].copy_from_slice(&wire::TIMED_MOVE_MS.to_le_bytes());
         self.motion = Some(proof);
         // Explicit readiness may already have issued an old-mode query. A
         // new mode proof honors the real one-second query cooldown; no test
@@ -1532,7 +1532,7 @@ impl Fixture {
         proof[3] = 5;
         proof[12..20].copy_from_slice(&42u64.to_le_bytes());
         proof[20..24].copy_from_slice(&1u32.to_le_bytes());
-        proof[48..52].copy_from_slice(&45_000u32.to_le_bytes());
+        proof[48..52].copy_from_slice(&wire::TIMED_MOVE_MS.to_le_bytes());
         self.motion = Some(proof);
         let mut refresh = crate::board_abort::ActuatorReadbackRefresh::default();
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
@@ -1751,12 +1751,12 @@ async fn motion_final_gate_uses_actual_minimum_proof_and_original_operation_not_
     proof[35] = 1;
     proof[40..48].copy_from_slice(&record.original_utc_ms.to_le_bytes());
     proof[52..56].copy_from_slice(&record.epoch.to_le_bytes());
-    proof[48..52].copy_from_slice(&44_999u32.to_le_bytes());
+    proof[48..52].copy_from_slice(&(wire::TIMED_MOVE_MS - 1).to_le_bytes());
     f.motion = Some(proof.clone());
-    // UTC age is deliberately >45s. Only actual accepted-start remaining may
+    // UTC age is deliberately past the 25 s window. Only actual accepted-start remaining may
     // release the minimum; this modeled peer response represents early legacy
     // completion. Real ThreadX timing is independently qualified in AB C tests.
-    f.clock.fetch_add(45_100, Ordering::Relaxed);
+    f.clock.fetch_add(u64::from(wire::TIMED_MOVE_MS) + 100, Ordering::Relaxed);
     // A continuously connected peer refreshes its discovery lease too; do not
     // accidentally turn this timer identity control into a route-expiry test.
     f.host
@@ -1795,7 +1795,7 @@ async fn motion_final_gate_uses_actual_minimum_proof_and_original_operation_not_
     } else {
         assert!(
             gate.allowed,
-            "known board-owned operation may bypass min45 in HITL"
+            "known board-owned operation may bypass the minimum window in HITL"
         );
         f.state.toggle_hitl_safety_interlock(0);
         assert!(!retraction_gate(&f.state).allowed);
@@ -2458,11 +2458,11 @@ async fn modeled_retraction_actual_acceptance_uses_monotonic45_and_original_stop
     assert!(!gate.allowed);
     assert_eq!(gate.phase, "countdown");
     assert_eq!(
-        modeled_remaining(start, start + std::time::Duration::from_millis(44_999)),
+        modeled_remaining(start, start + std::time::Duration::from_millis(u64::from(wire::TIMED_MOVE_MS) - 1)),
         1
     );
     assert_eq!(
-        modeled_remaining(start, start + std::time::Duration::from_millis(45_000)),
+        modeled_remaining(start, start + std::time::Duration::from_millis(u64::from(wire::TIMED_MOVE_MS))),
         0
     );
     crate::gse::admit_simulated_retraction_stamped(&f.state, Some(origin), |source,now| {
@@ -2495,7 +2495,7 @@ async fn modeled_retraction_actual_acceptance_uses_monotonic45_and_original_stop
         .modeled_retraction
         .as_mut()
         .unwrap()
-        .started = Instant::now() - std::time::Duration::from_secs(45);
+        .started = Instant::now() - std::time::Duration::from_secs(25);
     let gate = retraction_gate(&f.state);
     assert!(gate.allowed);
     assert!(gate.message.contains("Testing model"));

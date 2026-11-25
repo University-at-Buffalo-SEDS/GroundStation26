@@ -151,7 +151,7 @@ fn running_retract(remaining_ms: u32, issuer: u64) -> motion_wire::MotionStatus 
     }
 }
 
-/// The auxiliary drive reports "retracted" only after its 45 s timed move.
+/// The auxiliary drive reports "retracted" only after its 25 s timed move.
 /// An accepted, running retraction keeps the operator's intent and shows as
 /// active instead of expiring to Unconfirmed and then "not triggered".
 #[tokio::test]

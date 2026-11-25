@@ -190,19 +190,21 @@ their internal state:
 QD retract (the mechanism timing):
 
 * **Auxiliary drive** (how the QD retracts on the hardware): `RetractPlumbing` makes the AB hold `Backup_Valve_EN`
-  (PD2, the P4 solenoid-driver output) on for 45 s (ActuatorBoard26 `fill_motion.h` `FILL_DURATION_MS`). That is a
-  deliberate overdrive: the QD actuator's own limit switch stops it at the end of its travel, 20-30 s on the
-  hardware. The plant integrates the powered time and trips the switch at `qd_travel_s` (default 25 s): the QD
+  (PD2, the P4 solenoid-driver output) on for 25 s (ActuatorBoard26 `fill_motion.h` `FILL_DURATION_MS`; 45 s
+  before 25 Nov 2026). The QD actuator's own limit switch stops it at the end of its travel. Travel was earlier quoted as
+  20-30 s and has not been re-measured: an actuator that needs more than 25 s is cut off short of its switch. The plant
+  integrates the powered time and trips the switch at `qd_travel_s` (default 23 s, an assumption inside the 25 s): the QD
   disconnects there (no more nitrogen/nitrous into the tank) and `/api/firmware-sim` `bay.plant.qd` shows
   `limit_switch`, `limit_switch_after_s`, `travel_s` and the AB output's `last_output_on_s`. Re-mating the QD
   (`plant.qd_connected` false, then true) puts the actuator back at the start of its travel. Only a change of
   `qd_connected` acts, so a control rewritten for another section does not undo a retraction.
 * The AB has **no input from the limit switch** (the actuator's two power leads are all that reach P4): it ends the
-  retraction on its 45 s timer and reports it complete whether or not the switch tripped. The station's Launch gate
-  follows the AB (45 s minimum after the AB accepted the retraction, then its completion), so Launch is admitted about
-  45 s after the retract, not at the switch. Fault `qd_switch_never_trips`: the actuator jams short of its switch and
-  the QD stays connected; the AB still reports the retraction complete at 45 s (whether that should be a fault is an
-  open question for the AB, not a sim gap).
+  retraction on its 25 s timer and reports it complete whether or not the switch tripped. The station's Launch gate
+  follows the AB (25 s minimum after the AB accepted the retraction, then its completion), so Launch is admitted about
+  25 s after the retract. **The operator checks by eye that the QD has disconnected**; by decision (25 Nov 2026) the
+  station has no QD-disconnect confirmation or gate. Fault `qd_switch_never_trips`: the actuator jams short of its
+  switch and the QD stays connected; the AB still reports the retraction complete at 25 s and only the operator's
+  visual check catches it.
 * **Legacy stepper drive** (the AB's factory default with no saved selection): 20 000 000 STEP pulses at 30 us
   (`main_task.c` `PLUMBING_RETRACT_MOTOR_STEPS` 200000 x `PLUMBING_RETRACT_GEARBOX_RATIO` 100) = 600 s, through the
   stepper's 100:1 gearbox, which turns very slowly. TIM1 counts at 1 MHz (170 MHz / (PSC 169 + 1)), ARR 29 gives one
@@ -437,8 +439,8 @@ Per mode (the e2e: `python3 tools/firmware_sim_e2e.py --out DIR --mode <mode>`):
 * **Normal**: the RF NEO-M9N fix reaches the station, so the GPS gate passes; while the station is Idle the e2e runs
   the DAC patch (below), selects the auxiliary fill drive (`/api/actuator/plumbing/settings`, releasing the
   default stepper's holding torque), then runs the full procedure (self-test, nitrogen test, fill, QD retract,
-  Launch). The QD retract checks that the plant's actuator stops at its limit switch 20-30 s after the AB powers it,
-  that the QD disconnects there and that the AB holds its output the full 45 s; Launch follows the AB's 45 s
+  Launch). The QD retract checks that the plant's actuator stops at its limit switch 20-25 s after the AB powers it,
+  that the QD disconnects there and that the AB holds its output the full 25 s; Launch follows the AB's 25 s
   retraction and the station's retraction proof (`/api/board_abort` `retraction.allowed`).
   `FIRMWARE_SIM_E2E_QD_DRIVE=stepper` keeps the legacy stepper (600 s before Launch);
   `FIRMWARE_SIM_E2E_QD_FAULT=never_trips` jams the actuator and records what the AB and the station report
@@ -573,8 +575,8 @@ Issues these runs found, and their fixes (r6b):
 
 The 600 s QD retract of those runs was the legacy stepper drive, the AB's factory default when no drive is saved:
 20 000 000 pulses at 30 us (`main_task.c`, "better driver for stepper" cd329ab; before it 200000 steps at 40 us, 8 s),
-the stepper's 100:1 gearbox included. The hardware retracts the QD with the auxiliary drive instead (45 s output, the
-actuator's limit switch at 20-30 s); the e2e now selects it and the plant models the switch (QD retract above).
+the stepper's 100:1 gearbox included. The hardware retracts the QD with the auxiliary drive instead (45 s output at r7, 25 s
+since; the actuator's limit switch); the e2e now selects it and the plant models the switch (QD retract above).
 
 ### Verified on jupiter (r7, 2026-11-25)
 
@@ -703,9 +705,10 @@ frame engine waveforms up to about 250 Hz come through faithfully (500 Hz Nyquis
 * Testing establishes no network time (`network UTC is not available` for station controls).
 * Test fire: no automatic return to a download-permitting state after the burn; the final burn report waits for the
   operator's rewind to Idle.
-* The AB cannot see the QD actuator's limit switch: it reports the retraction complete after its 45 s whether or not
-  the switch tripped (`qd_switch_never_trips`), and the station then admits Launch with the QD still connected (r7).
-  Whether that should be a fault is open for the AB and the station.
+* The AB cannot see the QD actuator's limit switch: it reports the retraction complete after its drive time whether
+  or not the switch tripped (`qd_switch_never_trips`), and the station then admits Launch with the QD still connected
+  (r7). Decided 25 Nov 2026: the drive is 25 s and the operator verifies the QD by eye; no station confirmation or
+  gate. Closed.
 * Testing: an Abort reaches only the boards that latch the ABORT packet (AB, VB, FC); the PB, RF, GB and DAQ follow
   FLIGHT_STATE, which Testing never sets to Aborted (r7).
 * Launch admitted with stale AB/VB proofs: the station publishes FLIGHT_STATE Launch, refuses ignition ("Ignition

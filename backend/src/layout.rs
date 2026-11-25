@@ -1411,7 +1411,7 @@ mod vehicle_binding_tests {
                 assert_eq!(
                     labels,
                     [
-                        ("TogglePlumbingDelayInterlock", "Retraction minimum 45 seconds"),
+                        ("TogglePlumbingDelayInterlock", "Retraction minimum 25 seconds"),
                         ("ToggleChecklistInterlock", "Checklist enforcement"),
                         ("ToggleSupplyInterlock", "Nitrogen/nitrous one at a time"),
                         ("ToggleBoardStateProofInterlock", "Board state checks"),

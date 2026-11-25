@@ -822,7 +822,7 @@ const RETRACT_ACTIVE_MARGIN_MS: u64 = 3_000;
 
 /// The actuator reports an accepted retraction still running: its motion
 /// status said busy with the retract action, and the remaining time it then
-/// reported (the auxiliary drive's timed 45 s move) has not yet run out.
+/// reported (the auxiliary drive's timed 25 s move) has not yet run out.
 /// The plumbing report says "retracted" only once that move completes, so
 /// without this the station would show an accepted, running retraction as
 /// unconfirmed and then not triggered. This is display and pending-intent
@@ -850,7 +850,7 @@ const RETRACT_FAILURE_SHOWN_MS: u128 = 60_000;
 /// The auxiliary drive's timed retraction move (the actuator's
 /// FILL_DURATION_MS). A retraction the station sent with no actuator motion
 /// report is shown running for this long, then unconfirmed.
-const RETRACT_MOVE_MS: u32 = 45_000;
+const RETRACT_MOVE_MS: u32 = wire::TIMED_MOVE_MS;
 /// The stepper (main) drive's retraction move: PLUMBING_RETRACT_STEPS
 /// (200000 x 100) at PLUMBING_RETRACT_STEP_PERIOD_US (30 us). The actuator
 /// reports the plumbing retracted when this move starts, so that report
@@ -1116,7 +1116,7 @@ pub(crate) fn invalidate_modeled_retraction(state: &AppState) {
     });
 }
 fn modeled_remaining(started: Instant, now: Instant) -> u32 {
-    45_000u32.saturating_sub(
+    RETRACT_MOVE_MS.saturating_sub(
         now.saturating_duration_since(started)
             .as_millis()
             .min(u32::MAX as u128) as u32,
@@ -1262,14 +1262,14 @@ pub(crate) fn retraction_gate(state: &AppState) -> RetractionGate {
                 true,
                 "ready",
                 Some(0),
-                "Testing model: 45 monotonic seconds elapsed after accepted modeled retraction; no hardware or physical-disconnection proof is claimed.",
+                "Testing model: 25 monotonic seconds elapsed after accepted modeled retraction; no hardware or physical-disconnection proof is claimed.",
             )
         } else {
             make(
                 false,
                 "countdown",
                 Some(remaining),
-                "Testing model: Launch waits 45 monotonic seconds from the explicitly accepted modeled retraction.",
+                "Testing model: Launch waits 25 monotonic seconds from the explicitly accepted modeled retraction.",
             )
         };
     }
@@ -1348,7 +1348,7 @@ pub(crate) fn retraction_gate(state: &AppState) -> RetractionGate {
             false,
             "countdown",
             Some(remaining),
-            "Launch is locked until at least 45 seconds after the actuator actually accepted retraction. Check fresh completion when the countdown ends.",
+            "Launch is locked until at least 25 seconds after the actuator actually accepted retraction. Check fresh completion when the countdown ends.",
         );
     }
     if !record.matches_motion(proof) {
@@ -1386,7 +1386,7 @@ pub(crate) fn retraction_gate(state: &AppState) -> RetractionGate {
         true,
         "ready",
         Some(0),
-        "The actual retraction minimum interval and completion checks passed; other Launch interlocks still apply. This is not physical-disconnection proof.",
+        "The actual retraction minimum interval and completion checks passed; other Launch interlocks still apply. This is not physical-disconnection proof: check by eye that the QD has disconnected.",
     )
 }
 fn motion_view(state: &AppState, inner: &Inner) -> Value {
@@ -2194,10 +2194,11 @@ pub(crate) fn set_desired_for_test(state: &AppState, mode: u8, revision: u64, so
 pub(crate) fn completion_timeout_ms(state: &AppState) -> u64 {
     let inner = state.plumbing_drive.inner.lock().unwrap();
     if inner.observed.is_some() {
+        // The drive's move plus 5 s for its completion report.
         if inner.desired.mode == 0 {
-            605_000
+            u64::from(STEPPER_RETRACT_MOVE_MS) + 5_000
         } else {
-            50_000
+            u64::from(RETRACT_MOVE_MS) + 5_000
         }
     } else {
         5_000
@@ -2321,7 +2322,7 @@ mod tests {
         deliver(&state, "AB", &frame(&state, 10, 2, 0));
         assert_eq!(view(&state, true)["pending"], false);
         assert!(motion_ready(&state).is_ok());
-        assert_eq!(completion_timeout_ms(&state), 50_000);
+        assert_eq!(completion_timeout_ms(&state), 30_000);
     }
     #[tokio::test]
     async fn io_metadata_allows_explicit_retry_context_but_never_motion_or_automatic_repair() {

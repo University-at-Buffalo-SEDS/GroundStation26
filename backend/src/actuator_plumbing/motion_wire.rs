@@ -1,6 +1,6 @@
 //! Actual accepted-start provenance. Separate from the legacy Static40 setting
 //! status and from the host T-clock. No packet ACK proves physical position.
-use super::wire::{Mode, Request, Status};
+use super::wire::{Mode, Request, Status, TIMED_MOVE_MS};
 
 pub(super) const TYPE: &str = "AB_FILL_MOTION_STATUS_V2";
 pub(super) const BYTES: usize = 56;
@@ -33,7 +33,7 @@ impl MotionStatus {
             minimum_delay_remaining_ms: u32::from_le_bytes(bytes[48..52].try_into().ok()?),
             origin_epoch: u32::from_le_bytes(bytes[52..56].try_into().ok()?),
         };
-        if value.minimum_delay_remaining_ms > 45_000
+        if value.minimum_delay_remaining_ms > TIMED_MOVE_MS
             || (value.lifecycle == 1
                 && (!setting.busy || setting.active_action != value.accepted_action))
             || (value.lifecycle == 2 && (setting.busy || setting.active_action != 0))

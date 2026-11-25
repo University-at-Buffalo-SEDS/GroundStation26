@@ -1717,7 +1717,7 @@ mod tests {
         crate::gse::qualified_launch_proofs_for_test(&state);
         // Isolate the inherited ACK+five-second settle policy with a modeled
         // already-accepted legacy dispatch. Actual public/GSE retraction now
-        // owns durable MotionV2 provenance and the independent45s gate; its
+        // owns durable MotionV2 provenance and the independent 25 s gate; its
         // real SDK path is exercised by actuator_plumbing::http_tests.
         {
             let mut rt=state.gse.lock().unwrap();

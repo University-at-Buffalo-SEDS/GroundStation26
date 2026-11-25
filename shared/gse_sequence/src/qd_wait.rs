@@ -109,21 +109,21 @@ impl QdWait {
 mod tests {
     use super::*;
     #[test]
-    fn timed_auxiliary_completion_waits_45_seconds_then_settles_without_replaying_launch() {
+    fn timed_auxiliary_completion_waits_25_seconds_then_settles_without_replaying_launch() {
         let mut q = QdWait::default();
-        q.dispatched_with_timeout(100, 50_000);
+        q.dispatched_with_timeout(100, 30_000);
         q.queue_launch(101).unwrap();
-        assert_eq!(q.status(45_099), QdStatus::AwaitingAck);
-        assert!(!q.take_ready_launch(45_099));
-        assert!(q.confirm(45_100));
-        assert!(!q.confirm(46_100));
-        assert_eq!(q.status(50_099), QdStatus::Settling { remaining_ms: 1 });
-        assert!(q.take_ready_launch(50_100));
-        assert!(!q.take_ready_launch(50_101));
-        q.dispatched_with_timeout(100, 50_000);
+        assert_eq!(q.status(25_099), QdStatus::AwaitingAck);
+        assert!(!q.take_ready_launch(25_099));
+        assert!(q.confirm(25_100));
+        assert!(!q.confirm(26_100));
+        assert_eq!(q.status(30_099), QdStatus::Settling { remaining_ms: 1 });
+        assert!(q.take_ready_launch(30_100));
+        assert!(!q.take_ready_launch(30_101));
+        q.dispatched_with_timeout(100, 30_000);
         q.queue_launch(101).unwrap();
-        assert_eq!(q.status(50_100), QdStatus::AckTimedOut);
-        assert!(!q.take_ready_launch(50_100));
+        assert_eq!(q.status(30_100), QdStatus::AckTimedOut);
+        assert!(!q.take_ready_launch(30_100));
         assert!(!q.queued());
     }
     #[test]

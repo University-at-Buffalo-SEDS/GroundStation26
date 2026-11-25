@@ -1,7 +1,12 @@
 //! Application-owned actuator settings. These IDs and layouts are not SDK protocol.
 pub const REQUEST_BYTES: usize = 32;
 pub const STATUS_BYTES: usize = 40;
-pub const TIMED_MOVE_MS: u32 = 45_000;
+/// The auxiliary drive's timed QD retraction (ActuatorBoard26
+/// `FILL_DURATION_MS`): the actuator holds its output this long and reports
+/// no remaining time or minimum delay above it. Nothing senses the QD
+/// actuator's limit switch, so completion means only that the drive time ran
+/// out; the operator checks by eye that the QD has disconnected.
+pub const TIMED_MOVE_MS: u32 = 25_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -246,10 +251,10 @@ mod tests {
         let mut bytes = response();
         bytes[32] = 1;
         bytes[33] = 1;
-        bytes[36..40].copy_from_slice(&45_000u32.to_le_bytes());
+        bytes[36..40].copy_from_slice(&TIMED_MOVE_MS.to_le_bytes());
         let status = Status::decode(&bytes).unwrap();
         assert!(status.busy);
-        assert_eq!(status.remaining_ms, 45_000);
+        assert_eq!(status.remaining_ms, TIMED_MOVE_MS);
         bytes[33] = 0;
         assert!(Status::decode(&bytes).is_none());
         bytes[32] = 0;

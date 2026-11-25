@@ -448,7 +448,7 @@
     "controls": [
       {
         "cmd": "TogglePlumbingDelayInterlock",
-        "label": "Retraction minimum 45 seconds"
+        "label": "Retraction minimum 25 seconds"
       },
       {
         "cmd": "ToggleChecklistInterlock",
