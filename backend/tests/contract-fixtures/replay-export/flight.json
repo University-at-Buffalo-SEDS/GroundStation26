@@ -3172,6 +3172,12 @@
       "lat_index": 0,
       "lon_index": 1
     },
+    "live_diagram": "flight",
+    "live_diagrams": {
+      "integrated_ground_test": "ground_test",
+      "normal": "flight",
+      "testing": "flight"
+    },
     "main_tabs": [
       "state",
       "connection-status",
