@@ -3787,7 +3787,7 @@
         "drop_rate_data_type": "VALVE_BOARD_BATTERY_DROP_RATE_V_PER_MIN",
         "remaining_minutes_data_type": "VALVE_BOARD_BATTERY_REMAINING_MINUTES",
         "empty_voltage": 13.6,
-        "full_voltage": 15.2,
+        "full_voltage": 16.85,
         "curve_exponent": 1.0
       },
       {
@@ -3799,7 +3799,7 @@
         "drop_rate_data_type": "FILL_BOX_POWER_DROP_RATE_V_PER_MIN",
         "remaining_minutes_data_type": "FILL_BOX_POWER_REMAINING_MINUTES",
         "empty_voltage": 13.6,
-        "full_voltage": 15.2,
+        "full_voltage": 16.85,
         "curve_exponent": 1.0
       }
     ]

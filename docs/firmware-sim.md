@@ -275,6 +275,10 @@ follow:
 | `gateway` (GB, fill box) | 0x4D V1 x 10.1 - 0.07 V; 0x4C V1, 20 mOhm | 4S, 6 Ah, R0 80 mOhm, SoC 0.6 (about 15.2 V) | 15 W (measured 0.41-1.54 A) | AB N2/N2O solenoids 8 Ohm, igniter 2.5 Ohm |
 | `valve` (VB) | 0x4D V2 x 5.7 (V1 12 V rail /4, V3/V4 7 V rails /2.5, dropping out with the pack); 0x4C V1, 20 mOhm, x 0.580 - 1.427 A | 4S, 3 Ah, R0 100 mOhm, SoC 0.6 | 4 W | VB pilot solenoid 8 Ohm |
 
+Full charge is 4.2 V per cell: the assumed 4S GB and VB packs are 16.8 V full, inside the station's 16.85 V maximum
+(the layouts' `full_voltage` for VB and GB since 25 Nov 2026; 15.2 V before, below this model's 4S pack at SoC 0.6), and
+the assumed 2S PB pack 8.4 V, its layout maximum. `full_voltage` is also the station's 100 % point. The station checks the PB and VB packs only on the pad (from
+Launch on in-flight checks are the FC's) and the GB pack through its own 13.0 V low-voltage alert.
 Pack capacities, resistances and the gateway's share of the AB loads are assumptions (no pack data in the repos);
 brown-out resets are not modelled. Before this the monitors read static codes (PB 3.5 V and 130 A, GB 12.6 V), so
 simulated runs carried a permanent battery-current alarm and a fill-system low-voltage condition. Draining the
