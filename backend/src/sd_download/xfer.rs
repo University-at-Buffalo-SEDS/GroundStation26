@@ -503,6 +503,8 @@ pub(crate) trait Catalog: Send + Sync + 'static {
     fn on_served(&self, _raw: usize) {}
     /// Test hook: an ACK for an open transfer arrived.
     fn on_ack(&self, _ack: &Ack) {}
+    /// Test hook: a CANCEL arrived (a board abandons a SHA-256 it was computing).
+    fn on_cancel(&self) {}
     /// Test hook: an incoming request is dropped (a lossy uplink in tests
     /// that cannot drop router frames).
     fn drop_request(&self, _payload: &[u8]) -> bool {
@@ -818,6 +820,7 @@ pub(crate) fn serve(router: &Arc<Router>, port: u16, catalog: Arc<dyn Catalog>, 
                 }
                 OP_CANCEL => {
                     sessions.remove(&event.stream_id);
+                    catalog.on_cancel();
                     Some(vec![OP_CANCEL | RESPONSE, STATUS_OK])
                 }
                 _ => catalog.other(p).or_else(|| Some(vec![p[0] | RESPONSE, STATUS_BAD_MESSAGE])),

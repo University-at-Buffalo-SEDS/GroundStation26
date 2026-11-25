@@ -975,6 +975,11 @@ mod timing {
     /// An OPEN or HASH whose answer did not come is sent again after this.
     pub const OPEN_RETRY: Duration = Duration::from_secs(3);
     pub const HASH_RETRY: Duration = Duration::from_secs(10);
+    /// A board answering BUSY to a HASH is asked again this often (no CANCEL:
+    /// it is usually still hashing the file, and a CANCEL would restart that).
+    pub const HASH_BUSY_POLL: Duration = Duration::from_secs(1);
+    /// BUSY for this long: CANCEL whatever the board still holds, then ask again.
+    pub const HASH_BUSY_CANCEL: Duration = Duration::from_secs(60);
     /// No new DATA for this long while not paused: OPEN again from the
     /// committed offset (the board may have dropped the transfer).
     pub const STALL: Duration = Duration::from_secs(8);
@@ -987,6 +992,8 @@ mod timing {
     use std::time::Duration;
     pub const OPEN_RETRY: Duration = Duration::from_millis(1500);
     pub const HASH_RETRY: Duration = Duration::from_secs(2);
+    pub const HASH_BUSY_POLL: Duration = Duration::from_millis(200);
+    pub const HASH_BUSY_CANCEL: Duration = Duration::from_secs(30);
     pub const STALL: Duration = Duration::from_secs(4);
     pub const PAUSE_HOLD: Duration = Duration::from_secs(3);
 }
@@ -1296,12 +1303,23 @@ pub(crate) async fn read_range(
 }
 
 /// The board's size and SHA-256 of the file as it is now.
+///
+/// A board hashes a large file over many service turns (the DAQ: 4 KB a turn,
+/// tens of seconds for an 18 MB launch file in the r7 simulation) and answers
+/// BUSY to requests meanwhile. Only the first request is preceded by a CANCEL
+/// (a transfer the board still holds would make it BUSY); a retry or a BUSY
+/// answer asks again without one, since a CANCEL abandons the hash in progress
+/// and the board starts over: with a CANCEL on every retry a file that takes
+/// longer than HASH_RETRY to hash never verified, and DAQ-Board's abandoned
+/// hash also left its request slot BUSY ("SHA-256 refused: board busy").
 async fn board_hash(stream: &mut BoardStream, req: &TransferRequest, gate: &Gate, cancel: &AtomicBool) -> Result<xfer::HashAnswer, StreamError> {
     let deadline = Instant::now() + HASH_TIMEOUT;
-    let mut busy = 0u32;
+    let mut cancel_first = true;
+    let mut busy_since: Option<Instant> = None;
     loop {
-        // CANCEL first: a transfer the board still holds would make it BUSY.
-        stream.send(&[OP_CANCEL])?;
+        if std::mem::take(&mut cancel_first) {
+            stream.send(&[OP_CANCEL])?;
+        }
         stream.send(&xfer::encode_hash(req.dir, &req.name))?;
         let retry = (Instant::now() + timing::HASH_RETRY).min(deadline);
         let answer = loop {
@@ -1314,9 +1332,13 @@ async fn board_hash(stream: &mut BoardStream, req: &TransferRequest, gate: &Gate
         };
         match answer {
             Some(a) if a.status == STATUS_OK => return Ok(a),
-            Some(a) if a.status == STATUS_BUSY && busy < 100 => {
-                busy += 1;
-                tokio::time::sleep(Duration::from_millis(200)).await;
+            Some(a) if a.status == STATUS_BUSY && Instant::now() < deadline => {
+                let since = *busy_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= timing::HASH_BUSY_CANCEL {
+                    cancel_first = true;
+                    busy_since = None;
+                }
+                tokio::time::sleep(timing::HASH_BUSY_POLL).await;
             }
             Some(a) if a.status == STATUS_BAD_STATE => return Err(StreamError::Gate(status_text(a.status).into())),
             Some(a) => return Err(StreamError::Other(format!("SHA-256 of {} refused: {}", req.name, status_text(a.status)))),

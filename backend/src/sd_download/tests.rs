@@ -90,6 +90,11 @@ pub(super) struct MockCard {
     /// When ACKs with rate 0 (pauses) arrived, and the last ACK's rate.
     pub pause_acks: Mutex<Vec<Instant>>,
     last_rate: AtomicU64,
+    /// A board that needs this long to hash a file: BUSY until then; a CANCEL
+    /// abandons the hash and the next HASH starts it over (DAQ-Board).
+    pub hash_takes: Mutex<Option<Duration>>,
+    hash_started: Mutex<Option<Instant>>,
+    pub hash_restarts: AtomicUsize,
 }
 
 impl MockCard {
@@ -103,6 +108,9 @@ impl MockCard {
             on_trigger: Mutex::new(Box::new(|| {})),
             pause_acks: Mutex::new(Vec::new()),
             last_rate: AtomicU64::new(1),
+            hash_takes: Mutex::new(None),
+            hash_started: Mutex::new(None),
+            hash_restarts: AtomicUsize::new(0),
         }
     }
     pub(super) fn trigger(&self, at: u64, f: impl FnMut() + Send + 'static) {
@@ -120,6 +128,22 @@ impl xfer::Catalog for MockCard {
         let files = self.files.lock().unwrap();
         let f = files.iter().find(|f| f.0 == dir && f.1 == name).ok_or(xfer::STATUS_NOT_FOUND)?;
         Ok(xfer::Snapshot { bytes: Arc::new(f.2.clone()), growing: f.3 })
+    }
+    fn hash(&self, dir: u8, name: &str) -> Result<(u64, [u8; 32], bool), u8> {
+        if let Some(takes) = *self.hash_takes.lock().unwrap() {
+            let started = *self.hash_started.lock().unwrap().get_or_insert_with(Instant::now);
+            if started.elapsed() < takes {
+                return Err(xfer::STATUS_BUSY);
+            }
+            *self.hash_started.lock().unwrap() = None;
+        }
+        let snap = self.file(dir, name)?;
+        Ok((snap.bytes.len() as u64, xfer::sha256(&snap.bytes), snap.growing))
+    }
+    fn on_cancel(&self) {
+        if self.hash_started.lock().unwrap().take().is_some() {
+            self.hash_restarts.fetch_add(1, Ordering::SeqCst);
+        }
     }
     fn on_open(&self, _open: &xfer::Open) {
         self.opens.fetch_add(1, Ordering::SeqCst);
@@ -305,6 +329,31 @@ async fn lists_downloads_resumes_and_verifies_partial_tail() {
     assert_eq!(manager.get(id).unwrap().resumed_from, 0);
     assert_eq!(std::fs::read(&final_path).unwrap(), launch);
 
+    running.store(false, Ordering::Relaxed);
+    task.await.unwrap();
+}
+
+/// A board that takes longer than HASH_RETRY to hash the file (the DAQ with an
+/// 18 MB launch file, r7) answers BUSY meanwhile; the station waits for it
+/// instead of cancelling, which restarted the hash on every retry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_hash_is_waited_for_not_cancelled() {
+    let (gs, daq) = link();
+    let launch = pattern(5 * 512 + 3, 4);
+    let board = Arc::new(MockCard::new(vec![(0, "DAQ_LAUNCH_2_000.CSV", launch.clone())]));
+    *board.hash_takes.lock().unwrap() = Some(Duration::from_secs(5));
+    serve(&daq, board.clone());
+    let (running, task) = pump(gs.clone(), daq.clone());
+    let manager: &'static Manager = Box::leak(Box::new(Manager::default()));
+    let root = TestDirectory::new();
+    let (final_path, _) = local_paths(&root.0, Board::DaqBoard, "LAUNCH", "DAQ_LAUNCH_2_000.CSV");
+    let (id, cancel) = manager.create_job(Board::DaqBoard, "LAUNCH", "DAQ_LAUNCH_2_000.CSV").unwrap();
+    transfer(manager, gs.clone(), &request(id, &root.0, "DAQ_LAUNCH_2_000.CSV"), &open_gate(), &cancel)
+        .await
+        .unwrap();
+    assert_eq!(manager.get(id).unwrap().phase, Phase::Complete);
+    assert_eq!(std::fs::read(&final_path).unwrap(), launch);
+    assert_eq!(board.hash_restarts.load(Ordering::SeqCst), 0, "no CANCEL while the board hashes");
     running.store(false, Ordering::Relaxed);
     task.await.unwrap();
 }
