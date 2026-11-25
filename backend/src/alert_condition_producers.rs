@@ -50,17 +50,21 @@ pub fn heartbeat_enqueue(accepted: bool) -> Evidence {
         .into(),
     }
 }
-/// Gate recovery using the original decoded sender/type/value/source clock.
+/// Gate recovery using the original decoded type/value/source clock and the
+/// packet's resolved sender (`AppState::canonical_network_sender_id`: SEDSnet 7
+/// boards send a compact `@addr:` source, not their name, so the raw sender
+/// never read "GB" and the condition never evaluated).
 /// Unknown clocks may raise a low-voltage condition, but cannot prove recovery.
 pub fn gateway_voltage(
     packet: &Packet,
+    sender: &str,
     received_network_ms: i64,
     previous: Option<ConditionState>,
     low: f32,
     recover: f32,
 ) -> Option<Evidence> {
     if packet.data_type() != DataType::named("BATTERY_VOLTAGE")
-        || !matches!(packet.sender(), "GB" | "GW")
+        || !matches!(sender, "GB" | "GW")
     {
         return None;
     }
@@ -125,7 +129,7 @@ mod tests {
         let at = 1_793_000_000_000;
         let low = packet("GB", "BATTERY_VOLTAGE", at, 12.9);
         assert_eq!(
-            gateway_voltage(&low, at as i64, None, 13., 15.)
+            gateway_voltage(&low, low.sender(), at as i64, None, 13., 15.)
                 .unwrap()
                 .state,
             ConditionState::Active
@@ -136,20 +140,20 @@ mod tests {
             packet("GB", "BATTERY_VOLTAGE", at - 2001, 16.),
         ] {
             assert!(
-                gateway_voltage(&wrong, at as i64, Some(ConditionState::Active), 13., 15.)
+                gateway_voltage(&wrong, wrong.sender(), at as i64, Some(ConditionState::Active), 13., 15.)
                     .is_none()
             );
         }
         let fresh = packet("GW", "BATTERY_VOLTAGE", at, 15.1);
         assert_eq!(
-            gateway_voltage(&fresh, at as i64, Some(ConditionState::Active), 13., 15.)
+            gateway_voltage(&fresh, fresh.sender(), at as i64, Some(ConditionState::Active), 13., 15.)
                 .unwrap()
                 .state,
             ConditionState::Resolved
         );
         let midpoint = packet("GB", "BATTERY_VOLTAGE", at, 14.);
         assert_eq!(
-            gateway_voltage(&midpoint, at as i64, Some(ConditionState::Active), 13., 15.)
+            gateway_voltage(&midpoint, midpoint.sender(), at as i64, Some(ConditionState::Active), 13., 15.)
                 .unwrap()
                 .state,
             ConditionState::Active
@@ -157,6 +161,7 @@ mod tests {
         assert_eq!(
             gateway_voltage(
                 &midpoint,
+                midpoint.sender(),
                 at as i64,
                 Some(ConditionState::Unknown),
                 13.,
@@ -166,9 +171,16 @@ mod tests {
             .state,
             ConditionState::Unknown
         );
+        // the resolved sender decides, not the raw source (a compact @addr: on the wire)
+        let addressed = packet("FC", "BATTERY_VOLTAGE", at, 12.9);
+        assert_eq!(
+            gateway_voltage(&addressed, "GB", at as i64, None, 13., 15.).unwrap().state,
+            ConditionState::Active
+        );
+        assert!(gateway_voltage(&low, "FC", at as i64, None, 13., 15.).is_none());
         let unknown = packet("GB", "BATTERY_VOLTAGE", 1000, 16.);
         assert_eq!(
-            gateway_voltage(&unknown, at as i64, Some(ConditionState::Active), 13., 15.)
+            gateway_voltage(&unknown, unknown.sender(), at as i64, Some(ConditionState::Active), 13., 15.)
                 .unwrap()
                 .state,
             ConditionState::Unknown

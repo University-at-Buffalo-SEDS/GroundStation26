@@ -3354,6 +3354,7 @@ async fn handle_packet_inner(
         {
             crate::alert_condition_producers::gateway_voltage(
                 &pkt,
+                &sender_id,
                 live_receipt.network_ms,
                 state
                     .alert_conditions
