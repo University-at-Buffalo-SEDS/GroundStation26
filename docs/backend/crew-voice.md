@@ -75,12 +75,132 @@ existing long-distance data link, or a VPN. This feature does not itself provide
 a radio link or extend network range. Backend relaying avoids direct browser-to-
 browser NAT connectivity requirements. TCP congestion can still delay voice.
 
-One shared channel supports up to 12 authorized crew participants. Audio is mono 16 kHz
-PCM16, 20 ms per packet: approximately 256 kbit/s per transmitting participant,
-plus protocol overhead. The station sends each speaker to every other listener.
-This favors broad browser support over bandwidth efficiency; capacity-plan your
-link for the number of simultaneous speakers. Browser buffering and server queues
-are bounded. Old/excess audio is dropped rather than accumulating without limit.
+## Capacity and talk floor
+
+One shared channel holds up to **32** authorized participants by default,
+and at most **4** of them are *on air* (forwarded) at once. Both are set on
+the Ground Station service:
+
+| Variable | Default | Range | Meaning |
+| --- | --- | --- | --- |
+| `GS_VOICE_MAX_PARTICIPANTS` | 32 | 2–128 | Joined participants (browsers, phones, watches, the broadcast studio's crew link). The next one is refused with `Voice channel is full (N participants)`; watches retry a full channel. |
+| `GS_VOICE_MAX_TALKERS` | 4 | 1–8 | Talkers forwarded at once. Never more than the participant cap. |
+
+Unset or unparsable values use the defaults; out-of-range values are
+clamped. The backend logs the limits at start-up, and `joined` and
+`GET /api/voice/status` report them (`max_participants`, `max_talkers`).
+Audience listeners do not count.
+
+### Why the old limit was 12
+
+Before this change the cap was a hard-coded `MAX_PEERS = 12`. The relay
+already forwarded through the station (no browser-to-browser mesh, no
+per-listener re-encoding: Opus is decoded once per watch speaker and PCM is
+encoded once per frame for Opus listeners), but **every participant could
+transmit at once** (open mic) and every frame went to every other
+participant. Browsers send PCM16, about 260 kbit/s per talker with framing,
+so egress grew as talkers × listeners: 12 open mics already meant
+12 × 11 × 260 kbit/s ≈ 34 Mbit/s, and 32 would have been ≈ 260 Mbit/s.
+On top of that every participant's one-second status tick sent the full
+roster to *every* participant, an N² message storm (32 peers: about 1,000
+roster messages and 20 Mbit/s per second with nobody talking).
+
+### The talk floor
+
+The station now forwards only on-air talkers, so egress is bounded by
+`max_talkers × listeners` regardless of how many people join. The rules
+(`backend/src/voice/floor.rs`):
+
+1. `{"type":"transmitting","enabled":true}` (push to talk pressed, or open
+   mic) is a request for the floor. With a free slot it goes on air at once.
+2. A talker on air keeps the floor while it asks for it; a newer request
+   never interrupts it. Releasing push-to-talk frees the slot.
+3. When the floor is full, requests wait in line: administrators first,
+   then oldest first. The first waiter goes on air as soon as a slot frees.
+4. **Quiet yield.** A talker on air whose audio has stayed below about
+   −40 dBFS for 1.5 s gives its slot to a waiter (an open mic left on does
+   not block the channel). It keeps its request and goes back on air when
+   a slot frees.
+5. **Administrator override.** An application administrator (for example
+   the range safety officer's account) who asks when no slot is quiet takes
+   the slot of the ordinary talker that has been on air longest. That
+   talker returns to the line with `reason: "priority"`. Administrators are
+   never overridden, except by the quiet yield. Losing the admin role takes
+   effect at the next one-second recheck.
+
+Audio from a participant that is not on air is dropped at the station. The
+watch handoff (below) still applies first: a held phone cannot ask for the
+floor. The radio bridge (RRLS) is a separate source and does not take a slot;
+a talker's `radio` relay only carries audio while it is on air.
+
+The station tells each participant its own state with
+`{"type":"floor","state":"on_air"|"waiting"|"idle","reason":null|"priority"|"quiet","talkers":N,"max_talkers":K}`
+whenever it changes, and the roster marks `transmitting` (on air) and
+`waiting` for everyone. The roster is sent to everyone when anything
+changes and to each participant once a second, so a dropped `floor` message
+is repaired within a second. The crew voice page shows **Transmitting**
+while on air and **Waiting for a free channel · 4 of 4 talking** while in
+line, sends no audio while waiting, and lists people as *On air*, *Waiting
+to talk* or *Listening*. Watches show **Waiting** on the push-to-talk
+button.
+
+### Bandwidth and CPU
+
+Each listener receives one stream per on-air talker in its own codec:
+PCM16 for browsers (≈ 260 kbit/s per talker with framing), Opus for
+watches (≈ 27 kbit/s). Worst case with the defaults, four talkers and 31
+PCM listeners, is 4 × 31 × 260 kbit/s ≈ 32 Mbit/s, the same as the old
+12-person worst case; the usual case, one talker, is about 8 Mbit/s.
+Plan Wi-Fi for about 1 Mbit/s per browser listener. The watch relay through
+a phone carries at most four Opus streams (about 18 kB/s with base64).
+
+#### Measurements behind the defaults
+
+`voice::tests::voice_load_report` runs the station's voice routes on their
+own four-thread runtime (a Raspberry Pi 5 has four cores) and drives bots
+over loopback WebSockets: every fourth bot is an Opus (watch) client, all
+ask for the floor, on-air bots send a 20 ms frame every 20 ms, halfway the
+first talkers leave and waiters take over, then everyone leaves. CPU is the
+station runtime's and SQLite workers' thread time (`/proc/self/task/*/schedstat`,
+which includes their system calls); latency is talker send to listener
+receive for PCM frames. Measured 2026-11-24 on the development workstation
+(AMD Ryzen 9 7900X), release build, 20 s runs:
+
+```sh
+VOICE_LOAD_BOTS=32 VOICE_LOAD_TALKERS=4 VOICE_LOAD_SECONDS=20 \
+cargo test -p groundstation_backend --release voice_load_report -- --ignored --nocapture
+```
+
+| Participants / talkers | Station CPU (host, one core) | Pi 5 estimate (×3.5) | Latency p50 / p99 | Station egress |
+| --- | --- | --- | --- | --- |
+| 12 / 12, everyone talking (old worst case)¹ | 6.9 % | ≈ 24 % of one core | 0.5 / 1.2 ms | 26 Mbit/s |
+| 32 / 1 | 3.1 % | ≈ 11 % | 0.1 / 0.5 ms | 6 Mbit/s |
+| **32 / 4 (defaults)** | **5.1 %** | **≈ 18 %** | **0.2 / 0.9 ms** | **23 Mbit/s** |
+| 32 / 32, everyone talking (no floor)¹ | 33.7 % | ≈ 1.2 cores | 1.4 / 3.4 ms | 188 Mbit/s |
+| 64 / 4 | 10.1 % | ≈ 35 % | 0.4 / 0.8 ms | 48 Mbit/s |
+| 128 / 4 | 28.0 % | ≈ one core | 0.7 / 4.1 ms (max 60) | 99 Mbit/s |
+
+¹ Everyone is on air from the start and leaves halfway, so these windows
+are 10 s.
+
+The Pi 5 column scales host CPU by 3.5, the ratio of single-core
+benchmark scores between a 2.4 GHz Cortex-A76 and the 7900X; it was not
+measured on a Pi. TLS adds AES-GCM over the egress (the Pi 5 has ARMv8
+crypto instructions; 23 Mbit/s is about 3 MB/s, well under 1 % of a core),
+and a real network interface adds driver work the loopback runs do not
+include. Loopback latency shows the station adds well under a frame of
+delay; the network and the clients' 40 ms playout buffer dominate.
+
+**Why 32 and 4.** With the defaults the voice relay needs about a fifth of
+one Pi 5 core (a twentieth of the four) and at most about 32 Mbit/s, the
+same worst case as the old 12-person channel, leaving the telemetry, radio
+and recording tasks their headroom and staying within what a field Wi-Fi
+access point delivers. Without a talker cap, 32 open microphones would need
+188 Mbit/s and more than a Pi core. Doubling participants doubles egress
+(64: about 48 Mbit/s), so raise `GS_VOICE_MAX_PARTICIPANTS` only on a wired
+or fast network; 128 needs about one Pi 5 core and 100 Mbit/s. Four talkers
+cover crossing calls without letting the channel become a wall of sound;
+each extra talker adds about 8 Mbit/s with 31 PCM listeners.
 
 Voice is not recorded unless the deployment opts in (below). Watch audio
 (below) is decoded into the same PCM16 pipeline as browser audio, so the
@@ -120,9 +240,10 @@ with the same shared account, are unaffected. Code: `backend/src/voice/pairing.r
    `{"type":"auth","token":"SESSION_TOKEN"}` (optionally `"codec":"opus"`;
    the default is `"pcm16"`). Tokens are sent inside the connection,
    not in URL query parameters. Invalid, expired, and anonymous sessions are rejected.
-2. Receive `{"type":"joined","id":N,"sample_rate":16000,"codec":"pcm16","frame_samples":320,"device":"web"}`
-   and `roster` updates (`peers[]`: `id`, `name`, `transmitting`, `device` = `web|watch`).
-3. Send `{"type":"transmitting","enabled":true}` before audio, or `false` to mute.
+2. Receive `{"type":"joined","id":N,"sample_rate":16000,"codec":"pcm16","frame_samples":320,"device":"web","max_participants":32,"max_talkers":4}`
+   and `roster` updates (`peers[]`: `id`, `name`, `transmitting` = on air, `waiting`, `device` = `web|watch`).
+3. Send `{"type":"transmitting","enabled":true}` to ask for the floor, or `false` to release it.
+   Send audio once `floor` says `on_air`; frames sent while waiting are dropped (see "The talk floor").
 4. PCM16 client binary frames contain exactly 640 bytes: 320 little-endian signed PCM16
    samples; Opus clients send one packet (1–400 bytes) that decodes to exactly
    320 samples. Anything else closes the connection. Server binary frames prepend the authenticated sender's four-byte
@@ -151,9 +272,19 @@ Run backend tests and the audio processor tests:
 ```sh
 cargo test -p groundstation_backend --no-default-features
 (cd ui && node tests/station-voice_audio.cjs)
+(cd ui && node tests/station-voice-floor_browser.mjs)   # Playwright; fake station socket
 ```
 
-`voice::tests` include a fake watch client: it joins over a real socket with
+`voice::floor` unit tests cover the limits parsing and clamping, oldest-first
+grants, hand-over on release, the quiet yield, the administrator override
+and the cap for any mix of requests. `voice::tests::the_channel_cap_and_talk_floor_hold_for_thirty_two_participants`
+joins 32 clients over real sockets, checks the 33rd is refused, and walks
+the floor through waiting, release, override and quiet yield.
+`voice::tests::thirty_two_bots_join_talk_and_leave_within_the_caps` is the
+load test in the normal suite (32 bots, every fourth Opus, 4 s);
+`voice_load_report` is the longer measurement run (see "Bandwidth and CPU").
+
+`voice::tests` also include a fake watch client: it joins over a real socket with
 a watch token and Opus next to a PCM browser client, and checks both hear each
 other, that watch audio reaches the program buffer, the phone/watch handoff,
 and that a token without the voice grant (or an account without voice

@@ -18,8 +18,9 @@ navigation. No radio hardware commands are involved.
 with scoped download/playback URLs; it requires live-preview access. See
 [recordings](../backend/video-recordings.md). `/api/voice/ws` authenticates a signed-in
 session with explicit `permissions.voice_transmit` and view access in its first
-message, relays bounded PCM frames, and provides
-a participant roster. See [voice protocol and controls](../backend/crew-voice.md).
+message, relays bounded PCM/Opus frames from the talkers on air (at most
+`GS_VOICE_MAX_TALKERS`, default 4, of up to `GS_VOICE_MAX_PARTICIPANTS`, default 32),
+and provides a participant roster and `floor` state. See [voice protocol and controls](../backend/crew-voice.md).
 
 Broadcast settings now include `comms_audio_enabled` (default false). Stream
 managers can include delayed crew audio in the audience program; viewers get only
