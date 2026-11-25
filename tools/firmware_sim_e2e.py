@@ -425,7 +425,7 @@ def select_qd_drive(st: Station, check, result, mode=QD_DRIVE):
                 "expected_reset_epoch": plumbing.get("reset_epoch"),
                 "release_stepper": board.get("mode") == "stepper" and mode == "auxiliary"}
         code, reply = st.api("/api/actuator/plumbing/settings", body)
-        attempts.append({"http": code, "reply": reply if code >= 300 else (reply or {}).get("message")})
+        attempts.append({"http": code, "reply": reply.get("message") if isinstance(reply, dict) else reply})
         return None
     board = st.wait(selected, 120, f"QD drive {mode}", poll=3)
     result.setdefault("normal", {})["qd_drive"] = {"mode": mode, "board": board, "attempts": attempts[-5:]}
