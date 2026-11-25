@@ -2553,16 +2553,55 @@ pub(crate) fn apply_umbilical_status_at_ingress(
     }
 }
 
-pub(crate) fn apply_captured_umbilical_status(
-    state: &Arc<AppState>,
-    capture: ValidatedUmbilicalStatus,
-) -> Option<TelemetryRow> {
+/// Applies board output reports in arrival order on a thread of its own.
+/// Applying one waits for the GSE owner, which a Launch holds while it is
+/// saved; the router worker that receives it must not, or no other board
+/// packet (an Abort readback among them) is received and nothing the router
+/// retries (an ABORT among them) is sent until the disk answers.
+pub(crate) struct UmbilicalReports(std::sync::mpsc::Sender<(Packet, ValidatedUmbilicalStatus)>);
+impl UmbilicalReports {
+    pub(crate) fn start(state: &Arc<AppState>) -> std::io::Result<Self> {
+        let (reports, received) = std::sync::mpsc::channel::<(Packet, ValidatedUmbilicalStatus)>();
+        let state = Arc::downgrade(state);
+        std::thread::Builder::new().name("board_reports".to_string()).spawn(move || {
+            for (packet, capture) in received {
+                let Some(state) = state.upgrade() else { return };
+                // Judged by the clocks captured at ingress, not by this wait.
+                if let Some(row) = apply_captured_status_inner(&state, capture) {
+                    state.cache_recent_telemetry(row.clone());
+                    let _ = state.ws_tx.send(row.clone());
+                    state
+                        .ring_buffer
+                        .lock()
+                        .unwrap()
+                        .push(crate::ring_buffer::ReceivedPacket::AppliedStatus { packet, row });
+                }
+            }
+        })?;
+        Ok(Self(reports))
+    }
+    /// One valid board output report received by this station.
+    pub(crate) fn receive(&self, state: &AppState, packet: &Packet, capture: ValidatedUmbilicalStatus) {
+        state.mark_packet_received(capture.received_ms());
+        note_umbilical_status_heard(state, &capture);
+        let _ = self.0.send((packet.clone(), capture));
+    }
+}
+
+fn note_umbilical_status_heard(state: &AppState, capture: &ValidatedUmbilicalStatus) {
     state.mark_board_seen_at(
         capture.owner.sender_id(),
         capture.received_ms,
         capture.receipt.monotonic_at,
         capture.receipt.simulation_ms,
     );
+}
+#[cfg(test)]
+pub(crate) fn apply_captured_umbilical_status(
+    state: &Arc<AppState>,
+    capture: ValidatedUmbilicalStatus,
+) -> Option<TelemetryRow> {
+    note_umbilical_status_heard(state, &capture);
     apply_captured_status_inner(state, capture)
 }
 fn apply_captured_status_inner(

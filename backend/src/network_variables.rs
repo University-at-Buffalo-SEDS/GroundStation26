@@ -7,7 +7,7 @@ use sedsnet::router::{NetworkVariablePermissions, Router};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 // One durable desired revision, not a periodic route/clock refresh. An older
@@ -77,14 +77,18 @@ struct VariableStore {
     durable: bool,
     revision: u64,
     automatic_idle: Option<AutomaticLiveIdentity>,
+    /// `values.flight_state`, for readers that must not wait for a save.
+    saved_flight_state: Arc<AtomicU8>,
 }
 
 impl VariableStore {
     fn new(path: PathBuf) -> Self {
         let persisted = read_persisted(&path);
+        let values = persisted.unwrap_or_else(default_values);
         Self {
             path,
-            values: persisted.unwrap_or_else(default_values),
+            saved_flight_state: Arc::new(AtomicU8::new(values.flight_state)),
+            values,
             durable: persisted.is_some(),
             revision: 1,
             automatic_idle: None,
@@ -100,6 +104,7 @@ impl VariableStore {
         }
         persist(&self.path, values)?;
         self.values = values;
+        self.saved_flight_state.store(values.flight_state, Ordering::Release);
         self.durable = true;
         Ok(())
     }
@@ -203,7 +208,8 @@ pub(crate) fn automatic_idle_batch_limits() -> sedsnet::router::ManagedBatchPrep
     }
 }
 
-static STORE: OnceLock<Mutex<VariableStore>> = OnceLock::new();
+static STORE: OnceLock<crate::unpin::Mutex<VariableStore>> = OnceLock::new();
+static SAVED_FLIGHT_STATE: OnceLock<Arc<AtomicU8>> = OnceLock::new();
 static NETWORK_VARIABLE_NONCE: AtomicU16 = AtomicU16::new(1);
 
 fn cache_path() -> PathBuf {
@@ -269,8 +275,12 @@ fn default_values() -> PersistentVariables {
     }
 }
 
-fn store() -> &'static Mutex<VariableStore> {
-    STORE.get_or_init(|| Mutex::new(VariableStore::new(cache_path())))
+fn store() -> &'static crate::unpin::Mutex<VariableStore> {
+    STORE.get_or_init(|| {
+        let store = VariableStore::new(cache_path());
+        let _ = SAVED_FLIGHT_STATE.set(store.saved_flight_state.clone());
+        crate::unpin::Mutex::new(store)
+    })
 }
 
 fn persist(path: &Path, values: PersistentVariables) -> Result<()> {
@@ -491,6 +501,56 @@ pub(crate) fn takeover_changed(router: &Router, takeover: bool) -> Result<()> {
     }
     Ok(())
 }
+/// Received FLIGHT_STATE values to save, in order of receipt, on a thread of
+/// their own.
+static INBOUND_FLIGHT_STATES: std::sync::LazyLock<InboundFlightStates> = std::sync::LazyLock::new(InboundFlightStates::start);
+struct InboundFlightStates(std::sync::mpsc::Sender<(Packet, NetworkFlightState)>);
+impl InboundFlightStates {
+    fn start() -> Self {
+        let (received, saves) = std::sync::mpsc::channel::<(Packet, NetworkFlightState)>();
+        let saver = std::thread::Builder::new().name("flight_state_save".into()).spawn(move || {
+            for (packet, state) in saves {
+                if let Err(err) = save_inbound_flight_state(&packet, state) {
+                    log::warn!("failed to persist inbound flight-state network variable: {err}");
+                }
+            }
+        });
+        if let Err(err) = saver {
+            log::error!("inbound flight states are not saved: {err}");
+        }
+        Self(received)
+    }
+    fn send(&self, received: (Packet, NetworkFlightState)) {
+        let _ = self.0.send(received);
+    }
+}
+fn save_inbound_flight_state(packet: &Packet, received: NetworkFlightState) -> Result<()> {
+    let state = received as u8;
+    let mut guard = store()
+        .lock()
+        .expect("network-variable store lock poisoned");
+    if crate::types::canonical_sender_id(packet.sender()) == "FC"
+        && (state == 15
+            || guard.values.flight_state == 15
+            || (matches!(guard.values.flight_state, 7..=14 | 16) && state <= 6))
+    {
+        return Ok(());
+    }
+    // The store keeps the GS-internal phase: Fill received while the
+    // store already holds a fill sub-phase is the same network value.
+    let state = if network_phase(guard.values.flight_state).ok() == Some(received) {
+        guard.values.flight_state
+    } else {
+        received.local() as u8
+    };
+    let mut next = guard.values;
+    if next.flight_state != state || next.flight_state_stamp == 0 {
+        next.flight_state_stamp = packet.timestamp();
+        next.flight_state_epoch = packet.time_epoch();
+    }
+    next.flight_state = state;
+    guard.commit_flight_state(next)
+}
 fn initialize_for_role_seed(router: &Router, observer: bool, seed: bool) -> Result<()> {
     for data_type in STATION_VARIABLES {
         router.enable_network_variable(
@@ -549,30 +609,15 @@ fn initialize_for_role_seed(router: &Router, observer: bool, seed: bool) -> Resu
             if crate::types::canonical_sender_id(packet.sender()) == "FC" && state == 15 {
                 return Ok(());
             }
-            let mut guard = store()
-                .lock()
-                .expect("network-variable store lock poisoned");
-            if crate::types::canonical_sender_id(packet.sender()) == "FC"
-                && (state == 15
-                    || guard.values.flight_state == 15
-                    || (matches!(guard.values.flight_state, 7..=14 | 16) && state <= 6))
-            {
+            // Saving waits for a disk, and this callback runs on the router
+            // worker: nothing is received or retried until it returns. The
+            // primary, whose Launch saves hold this store, saves the flight
+            // computer's reports on a thread of their own.
+            if !observer {
+                INBOUND_FLIGHT_STATES.send((packet.clone(), received));
                 return Ok(());
             }
-            // The store keeps the GS-internal phase: Fill received while the
-            // store already holds a fill sub-phase is the same network value.
-            let state = if network_phase(guard.values.flight_state).ok() == Some(received) {
-                guard.values.flight_state
-            } else {
-                received.local() as u8
-            };
-            let mut next = guard.values;
-            if next.flight_state != state || next.flight_state_stamp == 0 {
-                next.flight_state_stamp = packet.timestamp();
-                next.flight_state_epoch = packet.time_epoch();
-            }
-            next.flight_state = state;
-            guard.commit_flight_state(next).map_err(|err| {
+            save_inbound_flight_state(packet, received).map_err(|err| {
                 log::warn!("failed to persist inbound flight-state network variable: {err}");
                 sedsnet::TelemetryError::HandlerError(
                     "persist inbound flight-state network variable",
@@ -1799,12 +1844,14 @@ pub fn flight_buzzer_enabled() -> bool {
         .flight_buzzer
 }
 
+/// The last saved flight state. Never waits for a save in progress: the router
+/// worker reads it.
 pub fn flight_state() -> u8 {
-    store()
-        .lock()
-        .expect("network-variable store lock poisoned")
-        .values
-        .flight_state
+    store();
+    SAVED_FLIGHT_STATE
+        .get()
+        .expect("set with the store")
+        .load(Ordering::Acquire)
 }
 
 /// Qualification uses the engine's completed-sample marker to distinguish a

@@ -1906,6 +1906,7 @@ async fn main() -> anyhow::Result<()> {
     let daq_loadcell_rate_reported_handler = daq_loadcell_rate_reported.clone();
     let fill_telemetry_seen = Arc::new(Mutex::new(HashSet::<Board>::new()));
     let fill_telemetry_seen_handler = fill_telemetry_seen.clone();
+    let umbilical_reports = telemetry_task::UmbilicalReports::start(&state)?;
     let abort_handler_state_clone = state.clone();
     let flight_state_handler_state_clone = state.clone();
     let heartbeat_handler_state_clone = state.clone();
@@ -2160,22 +2161,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             if let Some(capture) = umbilical_capture {
-                ground_station_handler_state_clone.mark_packet_received(capture.received_ms());
-                if let Some(row) = telemetry_task::apply_captured_umbilical_status(
-                    &ground_station_handler_state_clone,
-                    capture,
-                ) {
-                    ground_station_handler_state_clone.cache_recent_telemetry(row.clone());
-                    let _ = ground_station_handler_state_clone.ws_tx.send(row.clone());
-                    ground_station_handler_state_clone
-                        .ring_buffer
-                        .lock()
-                        .unwrap()
-                        .push(crate::ring_buffer::ReceivedPacket::AppliedStatus {
-                            packet: pkt.clone(),
-                            row,
-                        });
-                }
+                umbilical_reports.receive(&ground_station_handler_state_clone, pkt, capture);
                 return Ok(());
             }
             ground_station_handler_state_clone.mark_packet_received(get_current_timestamp_ms());
