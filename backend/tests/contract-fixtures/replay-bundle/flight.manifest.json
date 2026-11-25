@@ -219,11 +219,11 @@
       "sha256": "b9e73929b676999e847b3b3b9ea2a8b246bc8d4a9f6d723e438d85012aa8455b"
     },
     {
-      "bytes": 79524,
+      "bytes": 79798,
       "media_type": "application/json",
       "path": "config/station/safety_about.json",
       "route": "/api/safety/about",
-      "sha256": "c8ed5a8c7bd9e3a4fac47af57272a76ce2ff57e5faa553f988e60288bde2c4dd"
+      "sha256": "d9d010ae44197331bba233d9ee294b6c35548bf5546f797f9a9ce1171fd5871d"
     },
     {
       "bytes": 2268,
