@@ -420,7 +420,10 @@ Per mode (the e2e: `python3 tools/firmware_sim_e2e.py --out DIR --mode <mode>`):
 
 * **HITL**: fill by hand (Nitrogen/Nitrous/NormallyOpen/Dump), AdvanceFlightState to Armed, Launch: the VB opens the
   pilot at T+10 s, the plant lights the motor (no igniter in HITL) and flies; the FC runs its estimator and fires its
-  pyro outputs.
+  pyro outputs. After Landed the e2e presses Abort and times each board's Abort: shown (in `/api/board_abort`, a
+  pushed latch) and read back (its own query reply since the press, `/api/board-recovery/status`); the AV bay must read
+  back within 3 s. The VB is not expected then: it rides the vehicle and the umbilical is gone (`result.json` `abort`;
+  `FIRMWARE_SIM_E2E_ABORT=0` skips it).
 * **Test fire**: the fill-side boards on the umbilical. Armed comes from the station's own GSE procedure (valve
   self-test, nitrogen test, fill to target), not from manual valve commands; the e2e drives that procedure: a dry
   valve self-test (the e2e closes both supply bottles first, as the self-test confirmation asks), the nitrogen test
@@ -453,8 +456,10 @@ Per mode (the e2e: `python3 tools/firmware_sim_e2e.py --out DIR --mode <mode>`):
 * **Testing**: the mode's own logic against the simulated boards (the e2e checks the links, the DAC patch, the fill
   rules and the batteries: GB and PB voltages in range, then both packs drained from the control until the GB reads
   13.0 V or less with the fill-system low-voltage condition active and the PB below its range with the battery alert,
-  then recharged). The station stays in Startup in Testing and declares it to the boards once all are seen, so the DAQ knows
-  its flight state and allows DAC output.
+  then recharged; the alert must name the PB). The station stays in Startup in Testing and declares it to the boards once all are seen, so the DAQ knows
+  its flight state and allows DAC output. Then Abort: only the AB, VB and FC are expected to read it back, since
+  Testing (no flight-state authority) sends the ABORT packet but no FLIGHT_STATE Aborted, which is what the PB, RF, GB
+  and DAQ follow (r7 below).
 * **DAC patch** (in the Normal and Testing runs): a 2 Hz sine on DAC1 patched onto the KG1000 amplifier through a 1/1000
   attenuator (the simulated loopback cable), measured by the DAQ's frame engine and judged by the station's DAC
   validation, then the station's linearity sweep (11 DC steps) through the same patch: both pass (gain error -0.26 %,
@@ -571,6 +576,77 @@ The 600 s QD retract of those runs was the legacy stepper drive, the AB's factor
 the stepper's 100:1 gearbox included. The hardware retracts the QD with the auxiliary drive instead (45 s output, the
 actuator's limit switch at 20-30 s); the e2e now selects it and the plant models the switch (QD retract above).
 
+### Verified on jupiter (r7, 2026-11-25)
+
+The whole stack at dev after the 24 Nov changes: FC d0cbf8e (sensor plausibility, backup drogue timer, break-up
+abort, thread restructure; the ground-test variant from the same commit), RF 42b2cb4, PB 8f57546, GB 4682e2c, AB
+ce76dd8, VB 6e96497, DAQ 89b2846, SEDSnet main e599795 (7.0.2), FirmwareSimulator dev 1d69071 plus the fixes below
+(618c425 for the final runs), the release station from GroundStation26 dev 56342b7 plus the fixes below. A private
+cache rebuilt from scratch: 169 MB (seven boards, the FC ground-test variant, the coordinator, simclock), 232 s clean
+and 176 s for a rebuild. zstd-lean builds and links on every board: SEDSnet 7.0.2's compile-time check that zstd is
+1.5.7 passes (zstd-sys held below 2.2) and the long-distance-matcher entry points resolve to SEDSnet's stubs.
+
+Every run started with the 1-minute load under 8 and is repeated if the load passed 15 (only the first HITL run, load
+up to 34, was). One bay at a time.
+
+| Mode | Checks | Key results | Load (max) |
+|------|--------|-------------|------------|
+| HITL | 19/19 | apogee 2171 m (5.1 kg, hand fill); drogue T+23.1 s at 2163 m, main T+92.2 s at 452 m; rail exit 39.1 m/s; Abort read back: AB, GB, DAQ 0.2 s, FC 0.4 s, PB 1.8 s, RF 2.6 s (shown 0.2-0.4 s) | 3.6 |
+| Testing | 16/16 | DAC sine (gain -0.5 to -0.6 %) and sweep (nonlinearity 0.003 % FS); fill rules; batteries GB 15.0 V / PB 7.6 V, drained to 12.4 V / 5.8 V (GatewayLowVoltage active, "PB battery voltage out of range"), recharged; Abort read back: AB, VB 0.2 s, FC 2.4 s | 0.9 |
+| Test fire | 19/19 | valve self-test, nitrogen test, fill, Launch (control enabled at once, fresh proofs), igniter on PB7, chamber 370 psi, KG50 +5.0 to -37.3 kg, KG1000 0.21 to 0.94 V, burn report 7.91 kN s / 3.95 kN peak / 5.2 s, final once the DAQ launch file (18.2 MB, 76 kB/s, SHA-256 verified) merged | 1.8 |
+| IGT | 21/21 | power-on card (measured_motor) mounted; card swapped to nominal_10k, Retry SD, Enter: Ready 6 s later (the FC did not report the card out); GSE procedure, Launch; the replayed flight (Ascent, Coast, Apogee, Descent, Reefing, Landed) with dry-run pyros, replayed GPS then real GPS; FC SD launch file 3.0 MB collected over the radio (7 kB/s, after the DAQ's fetch) and attached; IgtExit | 4.1 |
+| Normal | 28/28 | GPS gate, DAC patch and sweep, aux drive, GSE procedure; QD limit switch 25.0 s after the AB powered it, QD disconnected there, AB output 45.0 s, Launch about 4.5 s after it; apogee 1375 m (3.25 kg, GSE fill); drogue T+18.9 s at 1368 m, main T+56.0 s at 455 m; Landed; map track 122 points, 651 m drift; FC SD launch file 1.67 MB downloaded and attached | 5.3 |
+| Normal, `QD_FAULT=never_trips` | 27/27 | finding below; the flight as above (apogee 1374 m) | 2.6 |
+
+The HITL apogee is higher than Normal's because the hand fill puts 5.1 kg of nitrous in the tank against the GSE
+fill's 3.25 kg; FirmwareSimulator's own test of the hybrid motor's flight grain gives about 2.2 km for 5.6 kg.
+
+**QD fault finding** (`never_trips`): the actuator never reaches its switch and the QD stays connected. The AB keeps
+its output 45 s and then reports the motion complete (lifecycle 2, minimum-delay proof true); the station shows the QD
+`Ready`, its retraction gate `allowed` ("This is not physical-disconnection proof"), and admits Launch: the vehicle
+lifts off with the QD still connected. Nothing on the AB or the station can tell; follow-up below.
+
+Failures these runs found, and their fixes:
+
+1. **Testing: board stamps 13 s ahead of the station** (FirmwareSimulator 876dab2). The simulated GPS dated its NMEA
+   from the host clock while the station follows the bay's virtual clock; whenever the bay slipped (here the 1 ms plant
+   steps of the DAC patch) the GPS ran ahead by the slip, and in Testing, with no station network time, the boards
+   follow the RF GPS. The GPS now dates its sentences from the bay's epoch plus virtual time (`SIM_UTC_EPOCH_MS`, the
+   epoch the station's simclock already uses); host test `tests/test_native_gps_utc.py`.
+2. **"Actuator Board safety ADC failed to start; continuity sensing unavailable" every 10 s in every run**
+   (FirmwareSimulator 618c425). The AB's safety ADC (since ActuatorBoard26 17a9375) accepts a sample only from a
+   completed DMA transfer with CNDTR 0 into its own CMAR; the shim never set the G4 DMA channel registers. It now
+   does (CMAR, CNDTR, EN as HAL_DMA_Start_IT, CNDTR 0 at a normal-mode completion).
+3. **The safety task's value checks saw almost nothing** (GroundStation26 341314c). They read a snapshot of the
+   ingress ring every 500 ms, which the ingest drains continuously: a PB pack at 5.6 V never warned. The ingest now
+   records every packet it takes in a bounded safety tap that each cycle checks; the battery check resolves SEDSnet 7
+   compact senders and names the board. These checks now fire, which exposes two settings (follow-ups below).
+4. **GatewayLowVoltage never evaluated** (GroundStation26 e02edf0): the producer required the raw sender "GB", but
+   SEDSnet 7 boards send a compact `@addr:` source. It now takes the station's resolved sender.
+5. **Test fire: the burn report never went final** (GroundStation26 04991be, DAQ-Board 502c636). The DAQ's launch file
+   is now 18.2 MB and takes longer to hash than the station's 10 s HASH retry; the retry's CANCEL abandoned the hash,
+   and the DAQ's abandoned hash kept its request slot BUSY, so every later request was refused ("SHA-256 of
+   DAQ_LAUNCH_... refused: board busy"). The station now sends CANCEL only before its first HASH and waits through
+   BUSY; the DAQ releases the slot when a hash is abandoned (host tests on both sides).
+6. **Test fire: Launch locked after a stale-proof Launch** (e2e, GroundStation26 596c56d): Launch sent 3 s after the
+   fill passed was admitted, published FLIGHT_STATE Launch, then refused at ignition ("Ignition requires fresh
+   non-Abort Actuator and Valve Board readbacks") and locked Launch until a board reset. The e2e now waits for fresh
+   board-state proofs, as Normal already did; the station behaviour is a follow-up.
+7. **IGT: the FC stayed in Validating after the card swap** (e2e, 596c56d): since 02a519d the control merges faults
+   per key, so the e2e's `{"faults": {}}` left the card out. It now sends `fc_sd_missing: false`. The FC itself did not
+   report the pulled card (follow-up).
+
+Three runs (Testing ts3 and ts5, IGT igt2) were void: the station could not open the bay's radio PTY at start ("AV
+bay link unavailable: failed to configure serial port"; Testing then ran on the dummy link, IGT panicked). A station
+left over from an interactive debugging session of this pass (its check had been stopped with SIGTERM, which skipped
+the check's cleanup) still held `/dev/pts/4`; with it stopped the repeated runs started normally. The e2e now stops its
+station on SIGTERM too (GroundStation26 4365482) and the station logs the cause chain of that error (477dc53).
+
+FirmwareSimulator `build.py test --offline` printed "Full-system qualification FAIL" and "FAIL: policy per-ID500ms
+ALL-owner audit" while exiting 0. Both come from unit tests that drive the runners' failure paths on purpose (a mocked
+failing soak stage, a mocked failed audit), not from a swallowed failure; the tests now capture and assert that output,
+so a passing run prints no FAIL line (FirmwareSimulator 8b1bc00).
+
 ### Valve-report time stamps and the bay's pace (2026-11-23)
 
 Test-fire runs showed the VB/AB valve-state reports refused as clock-skewed (+100 ms to -5 s window around station
@@ -628,7 +704,18 @@ frame engine waveforms up to about 250 Hz come through faithfully (500 Hz Nyquis
 * Test fire: no automatic return to a download-permitting state after the burn; the final burn report waits for the
   operator's rewind to Idle.
 * The AB cannot see the QD actuator's limit switch: it reports the retraction complete after its 45 s whether or not
-  the switch tripped (`qd_switch_never_trips`). Whether that should be a fault is open for the AB.
+  the switch tripped (`qd_switch_never_trips`), and the station then admits Launch with the QD still connected (r7).
+  Whether that should be a fault is open for the AB and the station.
+* Testing: an Abort reaches only the boards that latch the ABORT packet (AB, VB, FC); the PB, RF, GB and DAQ follow
+  FLIGHT_STATE, which Testing never sets to Aborted (r7).
+* Launch admitted with stale AB/VB proofs: the station publishes FLIGHT_STATE Launch, refuses ignition ("Ignition
+  requires fresh non-Abort Actuator and Valve Board readbacks") and locks Launch until a board reset, while the Launch
+  control showed enabled (r7 tf2).
+* The FC does not report a pulled card (BOARD_HEALTH SD ready stays set for at least 20 s), and an Enter ground test
+  with the card out stays in Validating with no fault or time-out (r7).
+* With the safety task's checks live (r7): the sim's VB pack (15.23 V) is above the Normal/Testing layout range
+  (13.6-15.2 V), and the FC's ACCEL_DATA X axis carries gravity against a +/-2 m/s2 X threshold. Pack data or layout
+  range, and the axis thresholds, need deciding.
 * SAR inputs in the DAC patch; roll/6-DOF attitude; brown-outs on a flat pack; the Settings sim panel has no
   battery inputs yet (the control route takes `batteries`).
 * An actual remote bundle run, the armhf cross build and a run on the Pi station.
