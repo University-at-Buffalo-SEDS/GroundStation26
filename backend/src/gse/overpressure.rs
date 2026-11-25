@@ -28,6 +28,7 @@
 //! The latch never re-closes anything automatically; the operator
 //! acknowledges it after a fresh reading is back below the relief pressure.
 use super::*;
+pub(crate) mod watch;
 
 /// A threshold trips only when every counted valve-board reading has stayed
 /// at or above it for this long, measured on capture timestamps (about 13
@@ -163,6 +164,7 @@ pub(crate) enum Level {
     Abort(f32),
 }
 
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct Thresholds {
     pub(crate) relief_psi: f32,
     pub(crate) abort_psi: f32,
@@ -171,16 +173,99 @@ pub(crate) struct Thresholds {
 impl Thresholds {
     /// Invalid settings can never disable protection: fall back to defaults.
     pub(crate) fn from_config(config: &Config) -> Self {
-        let config = if config.validate_overpressure().is_ok() {
-            config.clone()
-        } else {
-            Config::default()
-        };
-        Self {
+        let of = |config: &Config| Self {
             relief_psi: config.overpressure_relief_psi,
             abort_psi: config.overpressure_abort_psi,
             pilot_ms: config.overpressure_pilot_ms,
+        };
+        if config.validate_overpressure().is_ok() { of(config) } else { of(&Config::default()) }
+    }
+}
+
+/// The monitor and everything it decides from, beside the GSE lock: other work
+/// holds that lock across disk writes, and protection waits for none. The
+/// monitor lock is a leaf; `turn` keeps decisions and their packets in one
+/// order and is held over nothing but those.
+#[derive(Clone, Default)]
+pub struct Protection(Arc<Shared>);
+#[derive(Default)]
+struct Shared {
+    monitor: Mutex<Monitor>,
+    published: Mutex<Option<Published>>,
+    owed: Mutex<Vec<Owed>>,
+    turn: Mutex<()>,
+    watch: watch::Watch,
+}
+/// What a decision does to the runtime. Whoever takes the GSE lock next finds
+/// it done, so no automatic owner acts after the monitor owns the valves.
+struct Owed {
+    retire: Option<String>,
+    status: Option<String>,
+}
+/// What the runtime says, as of the last release of the GSE lock.
+#[derive(Clone, Copy)]
+struct Published {
+    clock: Instant,
+    #[cfg(test)]
+    test_now_ms: Option<u64>,
+    sample: Option<Sample>,
+    thresholds: Thresholds,
+}
+impl Published {
+    fn now(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(now) = self.test_now_ms {
+            return now;
         }
+        sequence_clock_ms(self.clock.elapsed().as_millis() as u64, crate::simulation_clock_ms())
+    }
+}
+fn leaf<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+impl Protection {
+    pub(super) fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+    pub(super) fn publish(&self, rt: &Runtime) {
+        *leaf(&self.0.published) = Some(Published {
+            clock: rt.clock,
+            #[cfg(test)]
+            test_now_ms: rt.test_now_ms,
+            sample: rt.valve_pressure,
+            thresholds: Thresholds::from_config(&rt.engine.config),
+        });
+    }
+    pub(super) fn adopt(&self, rt: &mut Runtime) {
+        let owed = std::mem::take(&mut *leaf(&self.0.owed));
+        for owed in owed {
+            let now = rt.now();
+            if let Some(message) = owed.retire {
+                retire_automation(rt, now, &message);
+            }
+            if let Some(status) = owed.status {
+                rt.engine.status.message = status;
+            }
+        }
+    }
+    fn published(&self) -> Published {
+        leaf(&self.0.published).expect("published when the owner was made")
+    }
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, Monitor> {
+        leaf(&self.0.monitor)
+    }
+    pub(crate) fn latched(&self) -> bool {
+        self.lock().latched()
+    }
+    pub(crate) fn owns_valves(&self) -> bool {
+        self.lock().owns_valves()
+    }
+    pub(crate) fn board_owns(&self, now: u64) -> bool {
+        self.lock().board_owns(now)
+    }
+    #[cfg(test)]
+    pub(crate) fn settling(&self) -> bool {
+        self.lock().settling()
     }
 }
 
@@ -304,16 +389,11 @@ pub(crate) fn sensor_fault_message(fault: &SensorFault) -> String {
     )
 }
 
-/// Launch admitted (T-clock sticky inhibit) or in flight. Read without the
-/// GSE lock held, so this never orders other locks behind it.
-fn launched(state: &AppState) -> bool {
-    state
-        .launch_history
-        .lock()
-        .unwrap()
-        .automatic_actions_inhibited()
+/// Launch admitted (T-clock sticky inhibit) or in flight.
+fn launched(state: &AppState, inhibited: bool) -> bool {
+    inhibited
         || matches!(
-            *state.state.lock().unwrap(),
+            state.local_flight_state_snapshot(),
             FlightState::Launch
                 | FlightState::Ascent
                 | FlightState::Coast
@@ -325,12 +405,13 @@ fn launched(state: &AppState) -> bool {
                 | FlightState::Recovery
         )
 }
-
-/// Test-fire Fire commitment is T0 for the overpressure policy.
-fn fire_committed(rt: &Runtime) -> bool {
-    !crate::runtime_mode::is_hitl()
-        && rt.operational.saved.qualification.stage()
-            == gse_sequence::qualification::MissionStage::Fire
+/// T0 and after: alarms only. Test-fire Fire commitment is T0 too. With the
+/// Launches admitted so far, to be compared when it is acted on. None while a
+/// Launch is being saved: whether it is one is not decided yet.
+fn burning(state: &AppState) -> Option<(bool, u64)> {
+    let launches = state.gse.abort.launches()?;
+    let inhibited = automatic_abort::launch_inhibited(state)?;
+    Some((launched(state, inhibited) || state.gse.abort.fire_committed(), launches))
 }
 
 const RELIEF: [(usize, bool); 4] = [(4, false), (3, false), (2, true), (1, true)];
@@ -367,35 +448,49 @@ fn retire_automation(rt: &mut Runtime, now: u64, message: &str) {
     );
 }
 
-enum Action {
-    /// Relief valve effects, plus the Actuator Board overpressure abort when
-    /// `ab_abort` is set.
-    Commands {
-        effects: Effects,
-        ab_abort: bool,
-    },
-    Alarm(String),
+/// One decision of the monitor: what to send now, and what the runtime and the
+/// operator are told afterwards.
+#[derive(Default)]
+struct Step {
+    /// Retire every automatic owner, for this reason.
+    retire: Option<String>,
+    /// Engine status text.
+    status: Option<String>,
+    /// The relief outputs are commanded for the first time.
+    relief: bool,
+    valves: Vec<(usize, bool)>,
+    /// The Actuator Board overpressure abort goes with the valves.
+    ab_abort: bool,
+    /// The automatic Abort follows the valves.
+    abort: bool,
+    /// Shown for the valve effects (persistent while the engine is faulted).
+    notification: Option<String>,
+    /// Shown until acknowledged.
+    alarms: Vec<String>,
 }
-
-/// Evaluate the freshest valve-board pressure. Called on every valve-board
-/// pressure receipt and every GSE tick. Never under the dispatch gate.
-// Safety catalog (About safety): overpressure-relief, overpressure-abort, overpressure-after-t0. Keep backend/src/safety_catalog_rules.rs in step.
-pub(crate) fn evaluate(state: &Arc<AppState>) {
-    let launched = launched(state);
-    let (action, abort, notice) = {
-        let mut rt = state.gse.lock().unwrap();
-        let now = rt.now();
-        let thresholds = Thresholds::from_config(&rt.engine.config);
-        let sample = rt.valve_pressure;
-        let level = rt.overpressure.observe(sample, now, &thresholds);
-        let notice = rt.overpressure.take_sensor_notice(now);
-        if let Some(notice) = &notice {
+impl Step {
+    fn is_empty(&self) -> bool {
+        !self.relief
+            && self.retire.is_none()
+            && self.status.is_none()
+            && self.valves.is_empty()
+            && !self.ab_abort
+            && !self.abort
+            && self.notification.is_none()
+            && self.alarms.is_empty()
+    }
+}
+impl Monitor {
+    /// Decide on one sample (or on time alone, without one).
+    // Safety catalog (About safety): overpressure-relief, overpressure-abort, overpressure-after-t0. Keep backend/src/safety_catalog_rules.rs in step.
+    fn decide(&mut self, sample: Option<Sample>, now: u64, thresholds: &Thresholds, burn: bool) -> Step {
+        let mut step = Step::default();
+        let level = self.observe(sample, now, thresholds);
+        if let Some(notice) = self.take_sensor_notice(now) {
             log::warn!("{notice}");
+            step.alarms.push(notice);
         }
-        let burn = launched || fire_committed(&rt);
-        let mut action = None;
-        let mut abort = false;
-        match (rt.overpressure.latch.clone(), level) {
+        match (self.latch.clone(), level) {
             (None, Level::Relief(psi) | Level::Abort(psi)) => {
                 let abort_level = matches!(level, Level::Abort(_));
                 let threshold = if abort_level {
@@ -408,7 +503,7 @@ pub(crate) fn evaluate(state: &Arc<AppState>) {
                         "Tank overpressure during launch: {psi:.0} psi > {threshold:.0}. No automatic valve action: the main valve is already open for firing."
                     );
                     log::error!("{message}");
-                    rt.overpressure.latch = Some(Latch {
+                    self.latch = Some(Latch {
                         peak_psi: psi,
                         threshold_psi: threshold,
                         at_ms: now,
@@ -417,17 +512,17 @@ pub(crate) fn evaluate(state: &Arc<AppState>) {
                         abort: AbortStage::NotRequired,
                         ab_abort_sent: false,
                     });
-                    action = Some(Action::Alarm(message));
+                    step.alarms.insert(0, message);
                 } else {
                     let message = format!(
                         "Tank overpressure: {psi:.0} psi > {:.0}",
                         thresholds.relief_psi
                     );
                     log::error!("{message}; closing supplies and opening dump and vent");
-                    retire_automation(&mut rt, now, &message);
-                    let mut valves = RELIEF.to_vec();
+                    step.retire = Some(message.clone());
+                    step.valves = RELIEF.to_vec();
                     let stage = if abort_level {
-                        valves.push((0, true));
+                        step.valves.push((0, true));
                         AbortStage::PilotOpen {
                             until_ms: now + thresholds.pilot_ms,
                         }
@@ -443,8 +538,8 @@ pub(crate) fn evaluate(state: &Arc<AppState>) {
                     } else {
                         format!("{message}. Supplies closed, dump and vent open. Acknowledge after pressure drops.")
                     };
-                    rt.engine.status.message = notice.clone();
-                    rt.overpressure.latch = Some(Latch {
+                    step.status = Some(notice.clone());
+                    self.latch = Some(Latch {
                         peak_psi: psi,
                         threshold_psi: thresholds.relief_psi,
                         at_ms: now,
@@ -453,13 +548,8 @@ pub(crate) fn evaluate(state: &Arc<AppState>) {
                         abort: stage,
                         ab_abort_sent: false,
                     });
-                    action = Some(Action::Commands {
-                        effects: Effects {
-                            valves,
-                            notification: Some(notice),
-                        },
-                        ab_abort: true,
-                    });
+                    step.notification = Some(notice);
+                    step.ab_abort = true;
                 }
             }
             (Some(latch), Level::Abort(psi)) if latch.abort == AbortStage::NotRequired => {
@@ -471,74 +561,287 @@ pub(crate) fn evaluate(state: &Arc<AppState>) {
                     );
                     log::error!("{message}");
                     // Re-assert the relief path with the main valve.
-                    let mut valves = RELIEF.to_vec();
-                    valves.push((0, true));
-                    if let Some(l) = &mut rt.overpressure.latch {
+                    step.valves = RELIEF.to_vec();
+                    step.valves.push((0, true));
+                    if let Some(l) = &mut self.latch {
                         l.abort = AbortStage::PilotOpen {
                             until_ms: now + thresholds.pilot_ms,
                         };
                     }
-                    rt.engine.status.message = message.clone();
+                    step.status = Some(message.clone());
                     // Normally already sent at the relief stage; never wait
                     // for the main-valve window.
-                    action = Some(Action::Commands {
-                        effects: Effects {
-                            valves,
-                            notification: Some(message),
-                        },
-                        ab_abort: !latch.ab_abort_sent,
-                    });
+                    step.ab_abort = !latch.ab_abort_sent;
+                    step.notification = Some(message);
                 } else if !latch.relief_commanded {
                     let message = format!(
                         "Tank overpressure during launch: {psi:.0} psi >= {:.0}. No automatic valve action or Abort after T0.",
                         thresholds.abort_psi
                     );
                     log::error!("{message}");
-                    if let Some(l) = &mut rt.overpressure.latch {
+                    if let Some(l) = &mut self.latch {
                         l.abort = AbortStage::Aborted;
                     }
-                    action = Some(Action::Alarm(message));
+                    step.alarms.insert(0, message);
                 }
             }
             (Some(latch), _) => {
                 if let AbortStage::PilotOpen { until_ms } = latch.abort
                     && now >= until_ms
                 {
-                    if let Some(l) = &mut rt.overpressure.latch {
+                    if let Some(l) = &mut self.latch {
                         l.abort = AbortStage::Aborted;
                     }
                     // Pilot closed first, then Abort, in that order.
-                    action = Some(Action::Commands {
-                        effects: Effects {
-                            valves: vec![(0, false)],
-                            notification: None,
-                        },
-                        ab_abort: false,
-                    });
-                    abort = true;
+                    step.valves = vec![(0, false)];
+                    step.abort = true;
                 }
             }
             (None, Level::Normal) => {}
         }
-        (action, abort, notice)
+        step
+    }
+}
+
+/// Evaluate the freshest valve-board pressure. Called on every valve-board
+/// pressure receipt and every GSE tick. Never under the dispatch gate.
+pub(crate) fn evaluate(state: &Arc<AppState>) {
+    for done in act(state) {
+        done.settle(state);
+    }
+}
+/// The same, for a caller that must not wait for the GSE lock: everything is
+/// decided and sent, and what is left to settle is handed to `unsettled`.
+fn evaluate_without_waiting(state: &Arc<AppState>, mut unsettled: impl FnMut(Sent)) {
+    let done = act(state);
+    if done.is_empty() {
+        return;
+    }
+    if let Some(router) = state.topology_router.get()
+        && let Err(error) = crate::telemetry_task::dispatch_abort_tx(router)
+    {
+        log::error!("failed to flush overpressure commands: {error:?}");
+    }
+    done.into_iter().for_each(&mut unsettled);
+}
+/// Decide and send. Takes neither the GSE lock nor the dispatch gate, and
+/// waits for no disk. While a Launch is being saved nothing is observed: the
+/// same samples are judged again once its outcome is known.
+fn act(state: &Arc<AppState>) -> Vec<Sent> {
+    let protection = &state.gse.overpressure;
+    let _turn = leaf(&protection.0.turn);
+    let mut done = Vec::new();
+    let mut decide = |sample: Option<Sample>, published: &Published| {
+        let step = loop {
+            let Some((burn, launches)) = burning(state) else { return false };
+            #[cfg(test)]
+            automatic_abort::between::here(automatic_abort::between::Point::OverpressureDecided);
+            let mut monitor = protection.lock();
+            // A Launch is refused by a latched monitor, checked once it is
+            // admitted: it is either admitted by now, or it sees the latch.
+            if state.gse.abort.launches() != Some(launches) {
+                continue;
+            }
+            let mut step = monitor.decide(sample, published.now(), &published.thresholds, burn);
+            owe(protection, &mut step);
+            break step;
+        };
+        if !step.is_empty() {
+            done.push(send(state, step));
+        }
+        true
     };
-    match action {
-        Some(Action::Commands { effects, ab_abort }) => {
-            apply(state, effects);
-            if ab_abort {
-                dispatch_ab_abort(state);
+    // Each reading as it was received, in order, then the runtime's newest.
+    while let Some(sample) = protection.0.watch.next(state, &protection.published()) {
+        if !decide(Some(sample), &protection.published()) {
+            protection.0.watch.put_back(sample);
+            return done;
+        }
+    }
+    let published = protection.published();
+    decide(published.sample, &published);
+    done
+}
+/// Leaves the step's runtime part to the next holder of the GSE lock. Called
+/// with the monitor held.
+fn owe(protection: &Protection, step: &mut Step) {
+    step.relief = step.retire.is_some();
+    if step.retire.is_some() || step.status.is_some() {
+        leaf(&protection.0.owed).push(Owed { retire: step.retire.take(), status: step.status.take() });
+    }
+}
+/// Decide and send, and leave the rest unsettled (tests).
+#[cfg(test)]
+pub(crate) fn act_for_test(state: &Arc<AppState>) -> usize {
+    act(state).len()
+}
+/// Transmit one step, in the order relief, main valve, Actuator Board, Abort.
+fn send(state: &Arc<AppState>, step: Step) -> Sent {
+    let mut sent = Sent::default();
+    // Work that holds the runtime may still apply what it decided before.
+    sent.contended = step.relief && (state.gse.try_lock().is_err() || try_dispatch_gate().is_none());
+    let router = state.topology_router.get();
+    if !step.valves.is_empty() {
+        match router {
+            Some(router) => sent.failed = send_valves(state, router, &step.valves),
+            None => sent.no_router = true,
+        }
+    }
+    if step.ab_abort {
+        sent.ab_abort = Some(send_ab_abort(state));
+    }
+    if step.abort {
+        sent.abort = Some(send_abort(state));
+    }
+    sent.step = step;
+    sent
+}
+/// The packets of the valve effects. An error ends them, after the best effort
+/// closes of both supplies: never continue opening a supply after an error.
+fn send_valves(
+    state: &Arc<AppState>,
+    router: &sedsnet::router::Router,
+    valves: &[(usize, bool)],
+) -> Option<String> {
+    for &(index, open) in valves {
+        let kind = crate::telemetry_schema::data_type(if index < 3 { "VALVE_COMMAND" } else { "ACTUATOR_COMMAND" });
+        let payload = if open { OPEN[index] } else { CLOSE[index] };
+        match queue_controller_with_stop_fence(state, router, kind, &[payload | 0x80]) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => {
+                log::error!("GSE command failed: {error}");
+                for index in [4, 3] {
+                    let _ = crate::telemetry_task::queue_automatic_controller_command(
+                        router,
+                        crate::telemetry_schema::data_type("ACTUATOR_COMMAND"),
+                        CLOSE[index],
+                    );
+                }
+                return Some(error.to_string());
             }
         }
-        Some(Action::Alarm(message)) => {
-            state.add_notification_with_persistence(message, true);
+        log::info!(
+            "GSE overpressure command queued valve={} requested={} payload={payload:02x}",
+            ["Pilot", "Vent", "Dump", "Nitrogen", "Nitrous"][index],
+            if open { "open" } else { "closed" },
+        );
+        state.set_pending_umbilical_valve_state(KEYS[index], open);
+    }
+    None
+}
+
+/// What was sent, and what is still to be told to the runtime and the operator.
+#[derive(Default)]
+struct Sent {
+    step: Step,
+    contended: bool,
+    failed: Option<String>,
+    no_router: bool,
+    ab_abort: Option<Result<bool, &'static str>>,
+    abort: Option<AbortOutcome>,
+}
+enum AbortOutcome {
+    Sent,
+    NotAdmitted,
+    NoRouter,
+    /// Asked again with the next evaluation.
+    LaunchSaving,
+}
+impl Sent {
+    /// May wait for the GSE lock.
+    fn settle(self, state: &Arc<AppState>) {
+        let step = self.step;
+        if self.contended {
+            drop(dispatch_gate());
         }
-        None => {}
+        {
+            let mut rt = state.gse.lock().unwrap();
+            let now = rt.now();
+            if !step.valves.is_empty() || matches!(self.ab_abort, Some(Ok(true))) {
+                rt.effects_queued = true;
+            }
+            if self.failed.is_some() || self.no_router {
+                if !crate::runtime_mode::is_hitl() {
+                    rt.operational.saved.qualification.latch(if self.no_router {
+                        Fault::TopologyLost
+                    } else {
+                        Fault::MissingTelemetry
+                    });
+                    rt.operational.running = false;
+                    if !self.no_router {
+                        rt.operational.qd = QdWait::default();
+                        rt.operational.qd_launch_admission = None;
+                    }
+                    let _ = rt.operational.persist();
+                }
+                if !self.no_router {
+                    rt.fill_trim = None;
+                }
+                rt.engine.fault(
+                    now,
+                    if self.no_router { "No hardware command router is available" } else { "Command transport failed" },
+                );
+            }
+        }
+        if self.contended {
+            reassert(state);
+        }
+        if self.no_router {
+            state.add_notification("GSE sequence failed: no hardware command router is available");
+        } else if self.failed.is_some() {
+            state.add_notification("GSE command transport failed. Verify supply valves are closed.");
+        } else if let Some(message) = step.notification {
+            let persistent = state.gse.lock().unwrap().engine.status.phase == Phase::Fault
+                || message.starts_with(gse_sequence::FAILURE_PAUSE_PREFIX);
+            state.add_notification_with_persistence(message, persistent);
+        }
+        if let Some(Err(refused)) = self.ab_abort {
+            let _ = state.add_notification_with_persistence(refused.to_string(), true);
+        }
+        for alarm in step.alarms {
+            let _ = state.add_notification_with_persistence(alarm, true);
+        }
+        match self.abort {
+            None | Some(AbortOutcome::LaunchSaving) => {}
+            Some(AbortOutcome::Sent) => {
+                crate::sequences::refresh_action_policy_now(state);
+                state.broadcast_action_policy_snapshot();
+            }
+            Some(AbortOutcome::NoRouter) => {
+                let _ = state.add_notification_with_persistence(
+                    "Tank overpressure Abort could not be sent: no hardware command router".to_string(),
+                    true,
+                );
+            }
+            Some(AbortOutcome::NotAdmitted) => {
+                let _ = state.add_notification_with_persistence(
+                    "Tank overpressure Abort was not admitted (already aborted, Stop pending or launch admitted); dump and vent remain open".to_string(),
+                    true,
+                );
+            }
+        }
     }
-    if let Some(notice) = notice {
-        state.add_notification_with_persistence(notice, true);
+}
+/// The relief commands went out while other work held the runtime or the
+/// dispatch gate, and that work may have queued what it had already decided
+/// (a supply opening, a vent closing) after them. Automation is retired now:
+/// command the relief once more.
+fn reassert(state: &Arc<AppState>) {
+    let protection = &state.gse.overpressure;
+    let _turn = leaf(&protection.0.turn);
+    let mut valves = RELIEF.to_vec();
+    match protection.lock().latch.as_ref().filter(|latch| latch.relief_commanded).map(|latch| latch.abort) {
+        Some(AbortStage::PilotOpen { .. }) => valves.push((0, true)),
+        Some(_) => {}
+        None => return,
     }
-    if abort {
-        dispatch_abort(state);
+    if burning(state).is_none_or(|(burn, _)| burn) {
+        return;
+    }
+    if let Some(router) = state.topology_router.get() {
+        let _ = send_valves(state, router, &valves);
+        let _ = crate::telemetry_task::dispatch_abort_tx(router);
     }
 }
 
@@ -555,7 +858,6 @@ pub(crate) fn board_warning(state: &Arc<AppState>, text: &str) -> Option<String>
         return Some(text.to_string());
     };
     let display = text[..text.rfind(" [").unwrap_or(text.len())].to_string();
-    let burn = launched(state);
     let quiet_period_over = state
         .network_health
         .lock()
@@ -567,22 +869,35 @@ pub(crate) fn board_warning(state: &Arc<AppState>, text: &str) -> Option<String>
         && !state
             .board_recovery
             .apply_requested_within(crate::types::Board::ValveBoard, SENSOR_STALE_RECOVERY_GRACE);
-    let action = {
-        let mut rt = state.gse.lock().unwrap();
-        let now = rt.now();
-        let changed = rt
-            .overpressure
+    let protection = &state.gse.overpressure;
+    let sent = {
+        // The board acts by itself: adopting its report waits for a Launch
+        // that is being saved.
+        let (burn, _turn, mut monitor) = loop {
+            let decided = burning(state).and_then(|(burn, launches)| {
+                let turn = leaf(&protection.0.turn);
+                let monitor = protection.lock();
+                (state.gse.abort.launches() == Some(launches)).then_some((burn, turn, monitor))
+            });
+            match decided {
+                Some(decided) => break decided,
+                None => crate::unpin::blocking(|| std::thread::sleep(std::time::Duration::from_millis(1))),
+            }
+        };
+        let published = protection.published();
+        let now = published.now();
+        let changed = monitor
             .board
             .as_ref()
             .is_none_or(|b| b.code != code || b.trip != trip);
         match code {
-            'C' => rt.overpressure.board = None,
+            'C' => monitor.board = None,
             'F' | 'S' | 'I' => {
                 // A sensor fault is reported, never adopted as a trip.
-                let repeat = rt.overpressure.board_sensor.as_ref().is_some_and(|b| {
+                let repeat = monitor.board_sensor.as_ref().is_some_and(|b| {
                     b.code == code && now.saturating_sub(b.at_ms) < SENSOR_FAULT_SHOW_MS
                 });
-                rt.overpressure.board_sensor = Some(BoardReport { code, psi, trip, at_ms: now });
+                monitor.board_sensor = Some(BoardReport { code, psi, trip, at_ms: now });
                 if code == 'S' && !quiet_period_over {
                     return None;
                 }
@@ -593,68 +908,52 @@ pub(crate) fn board_warning(state: &Arc<AppState>, text: &str) -> Option<String>
                     _ => display,
                 });
             }
-            _ => rt.overpressure.board = Some(BoardReport { code, psi, trip, at_ms: now }),
+            _ => monitor.board = Some(BoardReport { code, psi, trip, at_ms: now }),
         }
-        let settling = rt
-            .overpressure
+        let settling = monitor
             .board_ack_at
             .is_some_and(|at| now.saturating_sub(at) < BOARD_ACK_SETTLE_MS);
-        let adopt = code != 'C' && rt.overpressure.latch.is_none() && (changed || !settling);
+        let adopt = code != 'C' && monitor.latch.is_none() && (changed || !settling);
         if !adopt {
             return changed.then_some(display);
         }
-        let relief_psi = Thresholds::from_config(&rt.engine.config).relief_psi;
-        if code == 'L' || burn || fire_committed(&rt) {
-            rt.overpressure.latch = Some(Latch {
-                peak_psi: psi as f32,
-                threshold_psi: relief_psi,
-                at_ms: now,
-                message: display.clone(),
-                relief_commanded: false,
-                abort: AbortStage::NotRequired,
-                ab_abort_sent: false,
-            });
-            Action::Alarm(display)
+        let relief_psi = published.thresholds.relief_psi;
+        let alarm = code == 'L' || burn;
+        monitor.latch = Some(Latch {
+            peak_psi: psi as f32,
+            threshold_psi: relief_psi,
+            at_ms: now,
+            message: display.clone(),
+            relief_commanded: !alarm,
+            abort: if alarm || code == 'R' {
+                AbortStage::NotRequired
+            } else {
+                AbortStage::Aborted
+            },
+            ab_abort_sent: false,
+        });
+        if alarm {
+            drop(monitor);
+            Sent { step: Step { alarms: vec![display], ..Default::default() }, ..Default::default() }
         } else {
             log::error!("{display}; adopting the Valve Board overpressure latch");
-            retire_automation(&mut rt, now, &display);
             let notice = format!(
                 "{display}. Supplies closed, dump and vent open by the Valve Board. Acknowledge after pressure drops."
             );
-            rt.engine.status.message = notice.clone();
-            rt.overpressure.latch = Some(Latch {
-                peak_psi: psi as f32,
-                threshold_psi: relief_psi,
-                at_ms: now,
-                message: display,
-                relief_commanded: true,
-                abort: if code == 'R' {
-                    AbortStage::NotRequired
-                } else {
-                    AbortStage::Aborted
-                },
-                ab_abort_sent: false,
-            });
-            Action::Commands {
-                effects: Effects {
-                    valves: RELIEF.to_vec(),
-                    notification: Some(notice),
-                },
+            let mut step = Step {
+                retire: Some(display),
+                status: Some(notice.clone()),
+                valves: RELIEF.to_vec(),
                 ab_abort: true,
-            }
+                notification: Some(notice),
+                ..Default::default()
+            };
+            owe(protection, &mut step);
+            drop(monitor);
+            send(state, step)
         }
     };
-    match action {
-        Action::Commands { effects, ab_abort } => {
-            apply(state, effects);
-            if ab_abort {
-                dispatch_ab_abort(state);
-            }
-        }
-        Action::Alarm(message) => {
-            state.add_notification_with_persistence(message, true);
-        }
-    }
+    sent.settle(state);
     None
 }
 
@@ -663,13 +962,9 @@ pub(crate) fn board_warning(state: &Arc<AppState>, text: &str) -> Option<String>
 /// AB outputs off), so a pending Stop never holds it back. Recorded on the
 /// latch only once queued, so a later abort stage retries a failed send.
 // Safety catalog (About safety): overpressure-relief, overpressure-abort. Keep backend/src/safety_catalog_rules.rs in step.
-fn dispatch_ab_abort(state: &Arc<AppState>) {
+fn send_ab_abort(state: &Arc<AppState>) -> Result<bool, &'static str> {
     let Some(router) = state.topology_router.get() else {
-        let _ = state.add_notification_with_persistence(
-            "Tank overpressure: Actuator Board abort could not be sent: no hardware command router".to_string(),
-            true,
-        );
-        return;
+        return Err("Tank overpressure: Actuator Board abort could not be sent: no hardware command router");
     };
     let queued = queue_controller_with_stop_fence(
         state,
@@ -680,57 +975,51 @@ fn dispatch_ab_abort(state: &Arc<AppState>) {
     match queued {
         Ok(true) => {
             log::warn!("tank overpressure: Actuator Board abort queued payload={AB_ABORT_PAYLOAD:02x}");
-            let mut rt = state.gse.lock().unwrap();
-            rt.effects_queued = true;
-            if let Some(latch) = &mut rt.overpressure.latch {
+            if let Some(latch) = &mut state.gse.overpressure.lock().latch {
                 latch.ab_abort_sent = true;
             }
+            Ok(true)
         }
-        Ok(false) => log::error!("tank overpressure: Actuator Board abort not admitted"),
+        Ok(false) => {
+            log::error!("tank overpressure: Actuator Board abort not admitted");
+            Ok(false)
+        }
         Err(error) => {
             log::error!("tank overpressure: Actuator Board abort failed: {error:?}");
-            let _ = state.add_notification_with_persistence(
-                "Tank overpressure: Actuator Board abort could not be sent".to_string(),
-                true,
-            );
+            Err("Tank overpressure: Actuator Board abort could not be sent")
         }
     }
 }
 
-fn dispatch_abort(state: &Arc<AppState>) {
-    let generation = automatic_generation(state);
+/// Same dispatch as the safety task's automatic abort, in every mode.
+fn send_abort(state: &Arc<AppState>) -> AbortOutcome {
     let Some(router) = state.topology_router.get() else {
-        let _ = state.add_notification_with_persistence(
-            "Tank overpressure Abort could not be sent: no hardware command router".to_string(),
-            true,
-        );
-        return;
+        return AbortOutcome::NoRouter;
     };
-    match claim_automatic_abort_for_generation(state, generation) {
-        Some(_claim) => {
-            // Same dispatch as the safety task's automatic abort, in every build.
-            state.set_abort_indicator_latched(true);
-            crate::sequences::refresh_action_policy_now(state);
-            state.broadcast_action_policy_snapshot();
-            match crate::telemetry_task::queue_automatic_abort_packet(
+    match decide_automatic_abort(state, automatic_generation(state)) {
+        automatic_abort::Decision::Claimed(claim) => {
+            if let Err(error) = send_automatic_abort(
+                state,
                 router,
+                &claim,
                 "Tank overpressure abort",
                 crate::abort_retirement::AbortCause::Overpressure,
             ) {
-                Ok(()) => {
-                    if let Err(error) = router.process_all_queues_with_timeout(3) {
-                        log::error!("failed to flush overpressure abort: {error:?}");
-                    }
-                }
-                Err(error) => log::error!("failed to queue overpressure abort: {error:?}"),
+                log::error!("failed to queue overpressure abort: {error:?}");
             }
+            AbortOutcome::Sent
         }
-        None => {
+        automatic_abort::Decision::LaunchSaving => {
+            // Due again at the next evaluation, once the Launch is decided.
+            let now = state.gse.overpressure.published().now();
+            if let Some(latch) = &mut state.gse.overpressure.lock().latch {
+                latch.abort = AbortStage::PilotOpen { until_ms: now };
+            }
+            AbortOutcome::LaunchSaving
+        }
+        automatic_abort::Decision::Startup(_) | automatic_abort::Decision::Unavailable => {
             log::error!("tank overpressure abort not admitted (already aborted, Stop pending or launch admitted)");
-            let _ = state.add_notification_with_persistence(
-                "Tank overpressure Abort was not admitted (already aborted, Stop pending or launch admitted); dump and vent remain open".to_string(),
-                true,
-            );
+            AbortOutcome::NotAdmitted
         }
     }
 }
@@ -767,8 +1056,10 @@ pub(crate) fn command_allowed(rt: &Runtime, cmd: &TelemetryCommand) -> Option<bo
 pub(crate) fn acknowledge(state: &AppState) -> Result<(), String> {
     let mut rt = state.gse.lock().unwrap();
     let now = rt.now();
-    let board = rt.overpressure.board.clone();
-    let latch = match (rt.overpressure.latch.clone(), &board) {
+    let protection = rt.overpressure.clone();
+    let mut monitor = protection.lock();
+    let board = monitor.board.clone();
+    let latch = match (monitor.latch.clone(), &board) {
         (Some(latch), _) => latch,
         (None, Some(b)) => Latch {
             peak_psi: b.psi as f32,
@@ -789,7 +1080,7 @@ pub(crate) fn acknowledge(state: &AppState) -> Result<(), String> {
         return Err("Main-valve overpressure relief is still running".into());
     }
     let thresholds = Thresholds::from_config(&rt.engine.config);
-    if rt.overpressure.settling() {
+    if monitor.settling() {
         return Err(
             "Tank pressure sensor implausible or not connected: wait for a settled reading to acknowledge".into(),
         );
@@ -804,9 +1095,9 @@ pub(crate) fn acknowledge(state: &AppState) -> Result<(), String> {
         }
         None => return Err("A fresh valve-board tank pressure is required to acknowledge".into()),
     }
-    rt.overpressure.latch = None;
-    rt.overpressure.relief_since = None;
-    rt.overpressure.abort_since = None;
+    monitor.latch = None;
+    monitor.relief_since = None;
+    monitor.abort_since = None;
     rt.engine.status.message = format!(
         "Tank overpressure acknowledged (peak {:.0} psi); valves unchanged, manual control",
         latch.peak_psi
@@ -816,7 +1107,8 @@ pub(crate) fn acknowledge(state: &AppState) -> Result<(), String> {
     }
     // The board validates its own fresh pressure; while it stays latched it
     // keeps re-announcing and the station adopts it again.
-    rt.overpressure.board_ack_at = Some(now);
+    monitor.board_ack_at = Some(now);
+    drop(monitor);
     drop(rt);
     let Some(router) = state.topology_router.get() else {
         return Err("Valve Board overpressure acknowledgement not sent: no hardware command router".into());
@@ -832,8 +1124,9 @@ pub(crate) fn acknowledge(state: &AppState) -> Result<(), String> {
 /// `vb_connected`: the Valve Board is on the network now. Its stale-sensor
 /// report is hidden while it is offline; the board-offline alert covers that.
 pub(super) fn decorate_status(rt: &Runtime, vb_connected: bool, response: &mut serde_json::Value) {
-    response["overpressure_latched"] = serde_json::json!(rt.overpressure.latched());
-    response["overpressure"] = rt.overpressure.latch.as_ref().map_or(
+    let monitor = rt.overpressure.lock().clone();
+    response["overpressure_latched"] = serde_json::json!(monitor.latched());
+    response["overpressure"] = monitor.latch.as_ref().map_or(
         serde_json::json!({"latched": false}),
         |l| {
             serde_json::json!({
@@ -847,27 +1140,25 @@ pub(super) fn decorate_status(rt: &Runtime, vb_connected: bool, response: &mut s
             })
         },
     );
-    response["overpressure"]["valve_board"] = rt.overpressure.board.as_ref().map_or(
+    response["overpressure"]["valve_board"] = monitor.board.as_ref().map_or(
         serde_json::Value::Null,
         |b| {
             serde_json::json!({
                 "stage": b.code.to_string(),
                 "psi": b.psi,
                 "trip": b.trip,
-                "holds_relief": rt.overpressure.board_owns(rt.now()),
+                "holds_relief": monitor.board_owns(rt.now()),
             })
         },
     );
-    response["overpressure"]["sensor"] = sensor_status(rt, vb_connected);
+    response["overpressure"]["sensor"] = sensor_status(&monitor, rt.now(), vb_connected);
 }
 
 /// Tank pressure sensor health for the operator: an implausible step on the
 /// station's own check, or a Valve Board sensor fault report. Never a trip.
-fn sensor_status(rt: &Runtime, vb_connected: bool) -> serde_json::Value {
-    let now = rt.now();
-    let station = rt.overpressure.sensor_fault_recent(now);
-    let board = rt
-        .overpressure
+fn sensor_status(monitor: &Monitor, now: u64, vb_connected: bool) -> serde_json::Value {
+    let station = monitor.sensor_fault_recent(now);
+    let board = monitor
         .board_sensor
         .as_ref()
         .filter(|b| now.saturating_sub(b.at_ms) <= SENSOR_FAULT_SHOW_MS)
@@ -887,7 +1178,7 @@ fn sensor_status(rt: &Runtime, vb_connected: bool) -> serde_json::Value {
     serde_json::json!({
         "fault": message.is_some(),
         "implausible": station.is_some() || board.is_some_and(|b| b.code == 'I'),
-        "settling": rt.overpressure.settling(),
+        "settling": monitor.settling(),
         "message": message,
         "station": station.map(|f| serde_json::json!({
             "from_psi": f.from_psi,

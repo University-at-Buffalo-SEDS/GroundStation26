@@ -171,29 +171,35 @@ impl Drop for Claim {
         }
     }
 }
-fn apply(state: &Arc<AppState>, observation: &Observation) {
+/// False: a Launch is being saved, which decides whether an automatic Abort
+/// still counts; ask again.
+fn apply(state: &Arc<AppState>, observation: &Observation) -> bool {
     // Completion may have occurred while this observation waited for its
     // blocking worker. Never relatch a retired Abort in the new host state.
     if retired(state, &observation.packet) {
-        return;
+        return true;
     }
     // The lease belongs to actual blocking observation work, never its awaiter.
     // Independent manual observations must still cancel recovery whileclosed.
     let _automatic_claim = if observation.automatic {
-        let Some(claim) = crate::gse::claim_operator_dispatch(state, observation.generation) else {
-            return;
+        let Some(claim) = crate::gse::claim_abort_dispatch(state, observation.generation) else {
+            return true;
         };
         Some(claim)
     } else {
         None
     };
 
-    if !crate::gse::accept_observed_abort(state, observation.automatic, observation.generation) {
-        log::info!(
-            "ignored stale automatic abort observation packet={}",
-            observation.packet.packet_id()
-        );
-        return;
+    match crate::gse::accept_observed_abort(state, observation.automatic, observation.generation) {
+        None => return false,
+        Some(false) => {
+            log::info!(
+                "ignored stale automatic abort observation packet={}",
+                observation.packet.packet_id()
+            );
+            return true;
+        }
+        Some(true) => {}
     }
     log::info!(
         "abort observation processed manual_epoch={} pending={}",
@@ -224,6 +230,7 @@ fn apply(state: &Arc<AppState>, observation: &Observation) {
         observation.packet.packet_id()
     );
     crate::web::emit_error(state, reason);
+    true
 }
 pub(crate) struct ShutdownOutcome { pub(crate) quiesced: bool }
 /// Main signals this owner only after actual SDK receiver/packet drain. Global
@@ -232,7 +239,7 @@ pub(crate) fn spawn(state: Arc<AppState>) -> (tokio::task::JoinHandle<ShutdownOu
     spawn_with_apply(state,apply)
 }
 fn spawn_with_apply(
-    state:Arc<AppState>, apply:impl Fn(&Arc<AppState>,&Observation)+Send+Sync+'static,
+    state:Arc<AppState>, apply:impl Fn(&Arc<AppState>,&Observation)->bool+Send+Sync+'static,
 ) -> (tokio::task::JoinHandle<ShutdownOutcome>, tokio::sync::oneshot::Sender<()>) {
     let apply=Arc::new(apply);
     let (stop,mut stopping)=tokio::sync::oneshot::channel();
@@ -243,10 +250,17 @@ fn spawn_with_apply(
                 let current=state.clone();
                 let apply=apply.clone();
                 let applied=tokio::task::spawn_blocking(move || {
-                    apply(&current,claim.observation.as_ref().expect("claimed observation"));
-                    claim.accepted=true;
-                    drop(claim);
+                    claim.accepted=apply(&current,claim.observation.as_ref().expect("claimed observation"));
+                    claim.accepted
                 }).await;
+                if matches!(applied,Ok(false)) {
+                    // Retained, behind any manual observation. A Launch save
+                    // that never ends must not hold the shutdown.
+                    tokio::select! {
+                        _=&mut stopping=>break,
+                        _=tokio::time::sleep(std::time::Duration::from_millis(5))=>{},
+                    }
+                }
                 if applied.is_err() {
                     healthy=false;
                     // Keep the original unaccepted observation/epoch. A failed
@@ -637,6 +651,7 @@ mod shutdown_receipt_tests {
             signaled.store(true,Ordering::Release);
             let (lock,wake)=&*work; let mut ready=lock.lock().unwrap();
             while !*ready { ready=wake.wait(ready).unwrap(); }
+            true
         });
         tokio::task::yield_now().await;
         state.request_shutdown(); // SDK receivers have NOT yet joined.

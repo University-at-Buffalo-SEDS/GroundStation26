@@ -70,7 +70,12 @@ pub(crate) fn close_operator_admission(
         std::sync::atomic::Ordering::AcqRel,
         std::sync::atomic::Ordering::Acquire,
     ) {
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            // Before anyone reads the inflight count: an automatic abort is
+            // counted without this gate (`claim_abort_dispatch`).
+            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
         Err(current) if current == owner => Ok(()),
         Err(_) => Err("Recovery admission belongs to another owner"),
     }

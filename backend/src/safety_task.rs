@@ -1,5 +1,5 @@
 use crate::state::AppState;
-use crate::telemetry_task::{get_current_timestamp_ms, queue_automatic_abort_packet};
+use crate::telemetry_task::get_current_timestamp_ms;
 use crate::types::{Board, FlightState, canonical_sender_id};
 use crate::web::{emit_warning, emit_warning_db_only};
 use sedsnet::router::Router;
@@ -405,25 +405,96 @@ pub async fn safety_task(
     let _ = safety_loop(&state, &router, &mut shutdown_rx, token).await;
 }
 
+/// The abort watch's findings, for the safety loop to report. Reporting may wait
+/// for a disk; the watch never waits for the reporting.
+enum Finding {
+    /// One cycle's board status, before its packets are read.
+    Boards {
+        now_ms: u64,
+        evidence: Vec<crate::alert_condition_producers::Evidence>,
+        warnings: Vec<(String, crate::alert_conditions::Key)>,
+        log_only: Vec<String>,
+    },
+    /// The same cycle's packets.
+    Packets {
+        now_ms: u64,
+        packets: Vec<sedsnet::packet::Packet>,
+        vehicle_on_pad: bool,
+        generic_error: bool,
+    },
+    /// A board reported an error: pause the fill.
+    PauseFill,
+    LivenessCancelled(FlightState),
+    /// An automatic abort was claimed and sent.
+    Aborted(SafetyAbortReason, AbortSent),
+    Ended(SafetyExit),
+}
+enum AbortSent {
+    Accepted,
+    Failed(sedsnet::TelemetryError),
+}
+/// Cycles the reporting may fall behind before the watch drops packets (their
+/// value-range warnings); everything else it keeps.
+const MAX_CYCLES_BEHIND: usize = 120;
+
+/// The boards an abort can be raised for, read from the layout file by the
+/// reporting loop. Empty until it was read once in this mode.
+type RequiredBoards = Arc<std::sync::Mutex<Option<Vec<Board>>>>;
+
+fn required_boards(state: &AppState) -> Vec<Board> {
+    Board::ALL.iter().copied().filter(|board| state.board_required_for_progression(*board)).collect()
+}
+
+/// Ends the abort watch when the safety loop does.
+struct WatchStop(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+impl WatchStop {
+    fn new() -> Self {
+        Self(Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())))
+    }
+}
+impl Drop for WatchStop {
+    fn drop(&mut self) {
+        *self.0.0.lock().unwrap() = true;
+        self.0.1.notify_all();
+    }
+}
+
+/// One run: the abort watch decides and sends on its own thread, this loop
+/// reports, and publishes the automatic flight state.
 async fn safety_loop(
     state: &Arc<AppState>,
     router: &Arc<Router>,
     shutdown_rx: &mut broadcast::Receiver<()>,
     token: crate::runtime_mode::ModeToken,
 ) -> SafetyExit {
-    let mut pending_abort = None;
-    let mut first_abort_reason = None;
     let mut last_no_packet_warning_ms: u64 = 0;
-    // Off the pad until the record has been read once (a restart in flight).
-    let mut launch_attempted = true;
     let warning_cooldown_ms = env_u64(
         "GS_SAFETY_WARNING_COOLDOWN_MS",
         SAFETY_WARNING_COOLDOWN_MS_DEFAULT,
     );
     let mut last_warning_emit_ms: HashMap<&'static str, u64> = HashMap::new();
+    let required: RequiredBoards = Arc::default();
+    let (findings, mut found) = tokio::sync::mpsc::unbounded_channel();
+    let behind = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stop = WatchStop::new();
+    let watch = {
+        let (state, router, required, stop, behind) =
+            (state.clone(), router.clone(), required.clone(), stop.0.clone(), behind.clone());
+        crate::runtime_mode::spawn_thread("safety_abort", move || {
+            abort_watch(&state, &router, token, &required, &stop, &behind, &findings)
+        })
+    };
+    if let Err(error) = watch {
+        // The channel is closed: this run ends, and a new one is started.
+        log::error!("The automatic abort watch could not be started: {error}");
+        sleep(Duration::from_secs(1)).await;
+        return SafetyExit::ModeChanged;
+    }
+    // Reads the layout file, which may wait for a disk.
+    *required.lock().unwrap() = Some(required_boards(state));
     loop {
-        tokio::select! {
-            _ = sleep(Duration::from_millis(500)) => {}
+        let finding = tokio::select! {
+            finding = found.recv() => finding,
             recv = shutdown_rx.recv() => {
                 match recv {
                     Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) | Err(broadcast::error::RecvError::Closed) => {
@@ -431,20 +502,183 @@ async fn safety_loop(
                     }
                 }
             }
-        }
-        // Local state (pending abort, warning cooldowns) belongs to the mode
-        // it was built under; a switch starts a fresh run.
-        if !token.is_current() {
+        };
+        let Some(finding) = finding else {
+            // The watch ended without saying why (a panic): start over.
+            log::error!("The automatic abort watch ended unexpectedly; it is started again");
+            sleep(Duration::from_secs(1)).await;
+            return SafetyExit::ModeChanged;
+        };
+        // Local state (warning cooldowns) belongs to the mode it was built
+        // under; a switch starts a fresh run.
+        if !token.is_current() && !matches!(finding, Finding::Aborted(..) | Finding::Ended(SafetyExit::Claimed)) {
             return SafetyExit::ModeChanged;
         }
+        match finding {
+            Finding::Ended(exit) => return exit,
+            Finding::Aborted(reason, sent) => report_abort(state, &reason, &sent),
+            Finding::LivenessCancelled(stage) => {
+                log::warn!("automatic_abort_intent_cancelled source=board_offline state={stage:?}");
+            }
+            Finding::PauseFill => {
+                // Hold the mode admission across "still this mode" and the
+                // pause so a switch cannot slip between them.
+                let _admission = crate::runtime_mode::admission();
+                if !token.is_current() {
+                    return SafetyExit::ModeChanged;
+                }
+                crate::gse::pause_fill_for_recoverable_fault(state, "board reported an unclassified error");
+            }
+            Finding::Packets { now_ms, packets, vehicle_on_pad, generic_error } => {
+                behind.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                let mut cycle_warnings: HashSet<&'static str> = HashSet::new();
+                if generic_error {
+                    cycle_warnings.insert("Generic Error received from vehicle!");
+                    gs_debug_println!("Safety: Generic Error packet received");
+                }
+                for pkt in packets {
+                    if pkt.data_type() != crate::telemetry_schema::data_type("GENERIC_ERROR") {
+                        value_range_warnings(state, &pkt, vehicle_on_pad, &mut cycle_warnings);
+                    }
+                }
+                let mut emitted = cycle_warnings.into_iter().collect::<Vec<_>>();
+                emitted.sort_unstable();
+                for msg in emitted {
+                    let last_ms = last_warning_emit_ms.get(msg).copied().unwrap_or(0);
+                    if now_ms.saturating_sub(last_ms) >= warning_cooldown_ms {
+                        emit_warning(state, msg);
+                        last_warning_emit_ms.insert(msg, now_ms);
+                    }
+                }
+            }
+            Finding::Boards { now_ms, evidence, warnings, log_only } => {
+                // This original finite owner precedes every status/layout/provider wait.
+                // Losing eligibility affects only automatic publication, never health
+                // observation or independent manual/automatic emergency supervision.
+                let automatic_observation = crate::automatic_flight_state::Observation::begin(state);
+                #[cfg(all(test, not(feature = "firmware_sim")))]
+                crate::normal_publication_probe::n6_record(state, match automatic_observation.as_ref() { None => 0, Some(o) if o.captured().is_none() => 1, Some(_) => 2 });
+                let current_state = { *state.state.lock().unwrap() };
+                // Decide the required set before taking the status table: in HITL the
+                // requirement itself reads board presence from that table.
+                let boards = required_boards(state);
+                *required.lock().unwrap() = Some(boards.clone());
+                let all_boards_seen = {
+                    let board_status = state.board_status.lock().unwrap();
+                    boards.iter().all(|board| board_status.get(board).and_then(|s| s.last_seen_ms).is_some())
+                };
 
-        // This original finite owner precedes every status/layout/provider wait.
-        // Losing eligibility affects only automatic publication, never health
-        // observation or independent manual/automatic emergency supervision.
-        let automatic_observation = crate::automatic_flight_state::Observation::begin(&state);
-        #[cfg(all(test, not(feature = "firmware_sim")))]
-        crate::normal_publication_probe::n6_record(&state, match automatic_observation.as_ref() { None => 0, Some(o) if o.captured().is_none() => 1, Some(_) => 2 });
-        let current_state = { *state.state.lock().unwrap() };
+                for evidence in evidence {
+                    crate::alert_condition_runtime::observe(state,evidence.key,evidence.state,evidence.message,now_ms as i64);
+                }
+                for (warning,key) in warnings {
+                    crate::web::emit_warning_linked(state,warning,state.alert_conditions.current_link(key));
+                }
+                for warning in log_only {
+                    emit_warning_db_only(state, warning);
+                }
+
+                let _ = state
+                    .board_status_tx
+                    .send(state.board_status_snapshot(now_ms));
+
+                if current_state == FlightState::Startup
+                    && all_boards_seen
+                    && !crate::runtime_mode::is_hitl()
+                    && !crate::runtime_mode::is_test_fire()
+                    && *state.state.lock().unwrap() == FlightState::Startup {
+                        #[cfg(all(test, not(feature = "firmware_sim")))]
+                        crate::normal_publication_probe::point(state, crate::normal_publication_probe::Site::SafetyReady, current_state as u8).await;
+                        if let Some(original) = automatic_observation.as_ref().and_then(|o| o.captured())
+                            && original.expected == current_state
+                            && let Some(proposal) = original.proposal(FlightState::Idle, crate::automatic_flight_state::Cause::Readiness) {
+                            let _admission = crate::runtime_mode::admission();
+                            if !token.is_current() {
+                                return SafetyExit::ModeChanged;
+                            }
+                            crate::automatic_flight_state::publish(state, proposal);
+                        }
+                    }
+
+                // Testing has no automatic flight-state authority (no Readiness Idle),
+                // and a fresh station has no retained FLIGHT_STATE to publish, so the
+                // boards never learned any state: the DAQ refuses DAC output with no
+                // known state. Declare the station's actual Startup once.
+                if let Some(router) = state.topology_router.get()
+                    && testing_startup_due(
+                        crate::runtime_mode::is_testing(),
+                        current_state,
+                        all_boards_seen,
+                        router.own_network_variable(crate::telemetry_schema::data_type("FLIGHT_STATE")).is_some(),
+                    )
+                {
+                    match crate::network_variables::set_flight_state_control_stamped(router, FlightState::Startup as u8) {
+                        Ok(()) => log::info!("Testing: published the station's Startup FLIGHT_STATE for the boards"),
+                        // retried every pass until the network clock is set (once at boot): log it once
+                        Err(err) => {
+                            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                log::info!("Testing: the Startup FLIGHT_STATE waits for network time: {err}");
+                            }
+                        }
+                    }
+                }
+
+                let last_packet_ms = state.last_packet_received_ms();
+                if current_state == FlightState::Startup {
+                    last_no_packet_warning_ms = 0;
+                } else if last_packet_ms == 0 || now_ms.saturating_sub(last_packet_ms) > 10_000 {
+                    if last_no_packet_warning_ms == 0
+                        || now_ms.saturating_sub(last_no_packet_warning_ms) >= 10_000
+                    {
+                        emit_warning(
+                            state,
+                            "Warning: No telemetry packets received for 10 seconds!",
+                        );
+                        gs_debug_println!("Safety: No telemetry packets received for >=10 seconds!");
+                        last_no_packet_warning_ms = now_ms;
+                    }
+                } else {
+                    last_no_packet_warning_ms = 0;
+                }
+            }
+        }
+    }
+}
+
+/// Decides and sends the automatic aborts of one run. Nothing here waits for a
+/// disk, a log, or a lock that is held across either; every report is handed to
+/// `findings`.
+fn abort_watch(
+    state: &Arc<AppState>,
+    router: &Arc<Router>,
+    token: crate::runtime_mode::ModeToken,
+    required: &RequiredBoards,
+    stop: &(std::sync::Mutex<bool>, std::sync::Condvar),
+    behind: &std::sync::atomic::AtomicUsize,
+    findings: &tokio::sync::mpsc::UnboundedSender<Finding>,
+) {
+    let report = |finding| {
+        let _ = findings.send(finding);
+    };
+    let mut pending_abort = None;
+    let mut first_abort_reason = None;
+    // Off the pad until the record has been read once (a restart in flight).
+    let mut launch_attempted = true;
+    loop {
+        {
+            let stopped = stop.0.lock().unwrap();
+            let (stopped, _) = stop.1.wait_timeout_while(stopped, Duration::from_millis(500), |stopped| !*stopped).unwrap();
+            if *stopped {
+                return;
+            }
+        }
+        // Local state (the pending abort) belongs to the mode it was built
+        // under; a switch starts a fresh run.
+        if !token.is_current() {
+            return report(Finding::Ended(SafetyExit::ModeChanged));
+        }
+        let current_state = state.local_flight_state_snapshot();
         let on_ground = matches!(
             current_state,
             FlightState::Startup
@@ -474,10 +708,8 @@ async fn safety_loop(
         let mut board_warnings = Vec::new();
         let mut condition_evidence=Vec::new();
         let mut board_log_only = Vec::new();
-        // Decide the required set before taking the status table: in HITL the
-        // requirement itself reads board presence from that table.
-        let required = Board::ALL.iter().copied().filter(|board| state.board_required_for_progression(*board)).collect::<Vec<_>>();
-        let all_boards_seen = {
+        let required = required.lock().unwrap().clone();
+        if let Some(required) = required {
             let mut board_status = state.board_status.lock().unwrap();
             for (board, status) in board_status.iter_mut() {
                 if !required.contains(board) {
@@ -576,87 +808,13 @@ async fn safety_loop(
                     status.warned = false;
                 }
             }
-            required.iter().all(|board| {
-                board_status
-                    .get(board)
-                    .and_then(|s| s.last_seen_ms)
-                    .is_some()
-            })
-        };
-
-        for evidence in condition_evidence {
-            crate::alert_condition_runtime::observe(&state,evidence.key,evidence.state,evidence.message,now_ms as i64);
         }
-        for (warning,key) in board_warnings {
-            crate::web::emit_warning_linked(&state,warning,state.alert_conditions.current_link(key));
-        }
-        for warning in board_log_only {
-            emit_warning_db_only(&state, warning);
-        }
-
-        let _ = state
-            .board_status_tx
-            .send(state.board_status_snapshot(now_ms));
-
-        if current_state == FlightState::Startup
-            && all_boards_seen
-            && !crate::runtime_mode::is_hitl()
-            && !crate::runtime_mode::is_test_fire()
-            && *state.state.lock().unwrap() == FlightState::Startup {
-                #[cfg(all(test, not(feature = "firmware_sim")))]
-                crate::normal_publication_probe::point(&state, crate::normal_publication_probe::Site::SafetyReady, current_state as u8).await;
-                if let Some(original) = automatic_observation.as_ref().and_then(|o| o.captured())
-                    && original.expected == current_state
-                    && let Some(proposal) = original.proposal(FlightState::Idle, crate::automatic_flight_state::Cause::Readiness) {
-                    let _admission = crate::runtime_mode::admission();
-                    if !token.is_current() {
-                        return SafetyExit::ModeChanged;
-                    }
-                    crate::automatic_flight_state::publish(state, proposal);
-                }
-            }
-
-        // Testing has no automatic flight-state authority (no Readiness Idle),
-        // and a fresh station has no retained FLIGHT_STATE to publish, so the
-        // boards never learned any state: the DAQ refuses DAC output with no
-        // known state. Declare the station's actual Startup once.
-        if let Some(router) = state.topology_router.get()
-            && testing_startup_due(
-                crate::runtime_mode::is_testing(),
-                current_state,
-                all_boards_seen,
-                router.own_network_variable(crate::telemetry_schema::data_type("FLIGHT_STATE")).is_some(),
-            )
-        {
-            match crate::network_variables::set_flight_state_control_stamped(router, FlightState::Startup as u8) {
-                Ok(()) => log::info!("Testing: published the station's Startup FLIGHT_STATE for the boards"),
-                // retried every pass until the network clock is set (once at boot): log it once
-                Err(err) => {
-                    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        log::info!("Testing: the Startup FLIGHT_STATE waits for network time: {err}");
-                    }
-                }
-            }
-        }
-
-        let last_packet_ms = state.last_packet_received_ms();
-        if current_state == FlightState::Startup {
-            last_no_packet_warning_ms = 0;
-        } else if last_packet_ms == 0 || now_ms.saturating_sub(last_packet_ms) > 10_000 {
-            if last_no_packet_warning_ms == 0
-                || now_ms.saturating_sub(last_no_packet_warning_ms) >= 10_000
-            {
-                emit_warning(
-                    &state,
-                    "Warning: No telemetry packets received for 10 seconds!",
-                );
-                gs_debug_println!("Safety: No telemetry packets received for >=10 seconds!");
-                last_no_packet_warning_ms = now_ms;
-            }
-        } else {
-            last_no_packet_warning_ms = 0;
-        }
+        report(Finding::Boards {
+            now_ms,
+            evidence: condition_evidence,
+            warnings: board_warnings,
+            log_only: board_log_only,
+        });
 
         // Value-range checks see every packet since the last cycle: those the
         // ingest already took from the ring (the safety tap) and those still
@@ -668,75 +826,57 @@ async fn safety_loop(
         // liveness abort selected above must still be dispatched below: a
         // board that drops off can take every other packet with it (the
         // Gateway Board carries the whole umbilical).
-        let mut cycle_warnings: HashSet<&'static str> = HashSet::new();
         launch_attempted = launch_attempted_now(state, launch_attempted);
         let vehicle_on_pad = vehicle_checks_on_pad(current_state, launch_attempted);
-        for pkt in packets {
-            match pkt.data_type() {
-                ty if ty == crate::telemetry_schema::data_type("GENERIC_ERROR") => {
-                    // The board's own error report is shown in every phase; only
-                    // on the pad may it pause the fill (never an action in flight).
-                    if vehicle_on_pad
-                        && !matches!(pending_abort, Some(SafetyAbortReason::GenericError { .. }))
-                    {
-                        let reason = SafetyAbortReason::GenericError {
-                            sender: state.canonical_network_sender_id(pkt.sender()),
-                            packet_id: pkt.packet_id(),
-                            selected_state: current_state,
-                            selected_wall_ms: now_ms,
-                        };
-                        record_first_abort_reason(&mut first_abort_reason, reason.clone());
-                        // A real fault supersedes a cancellable liveness intent.
-                        pending_abort = Some(reason);
-                    }
-                    cycle_warnings.insert("Generic Error received from vehicle!");
-                    gs_debug_println!("Safety: Generic Error packet received");
-                }
-
-                _ => value_range_warnings(state, &pkt, vehicle_on_pad, &mut cycle_warnings),
+        let mut generic_error = false;
+        for pkt in &packets {
+            if pkt.data_type() != crate::telemetry_schema::data_type("GENERIC_ERROR") {
+                continue;
+            }
+            generic_error = true;
+            // The board's own error report is shown in every phase; only
+            // on the pad may it pause the fill (never an action in flight).
+            if vehicle_on_pad && !matches!(pending_abort, Some(SafetyAbortReason::GenericError { .. })) {
+                let reason = SafetyAbortReason::GenericError {
+                    sender: state.canonical_network_sender_id(pkt.sender()),
+                    packet_id: pkt.packet_id(),
+                    selected_state: current_state,
+                    selected_wall_ms: now_ms,
+                };
+                record_first_abort_reason(&mut first_abort_reason, reason.clone());
+                // A real fault supersedes a cancellable liveness intent.
+                pending_abort = Some(reason);
             }
         }
-
-        if !cycle_warnings.is_empty() {
-            let mut emitted = cycle_warnings.into_iter().collect::<Vec<_>>();
-            emitted.sort_unstable();
-            for msg in emitted {
-                let last_ms = last_warning_emit_ms.get(msg).copied().unwrap_or(0);
-                if now_ms.saturating_sub(last_ms) >= warning_cooldown_ms {
-                    emit_warning(&state, msg);
-                    last_warning_emit_ms.insert(msg, now_ms);
-                }
-            }
-        }
+        let reporting = behind.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < MAX_CYCLES_BEHIND;
+        report(Finding::Packets {
+            now_ms,
+            packets: if reporting { packets } else { Vec::new() },
+            vehicle_on_pad,
+            generic_error,
+        });
 
         if let Some(reason) = pending_abort.as_ref() {
-            // Hold the mode admission across "still this mode" and the claim so
-            // a switch cannot slip between them.
-            let dispatched = {
-                let _admission = crate::runtime_mode::admission();
-                token
-                    .is_current()
-                    .then(|| dispatch_safety_abort_reason(state, router, reason))
-            };
-            let Some(dispatched) = dispatched else {
-                return SafetyExit::ModeChanged;
-            };
-            match dispatched {
-                SafetyDispatch::Claimed => return SafetyExit::Claimed,
+            match dispatch_safety_abort_reason(state, router, reason, token) {
+                SafetyDispatch::Claimed(sent) => {
+                    report(Finding::Aborted(reason.clone(), sent));
+                    return report(Finding::Ended(SafetyExit::Claimed));
+                }
                 SafetyDispatch::StartupLivenessCancelled(stage) => {
-                    log::warn!(
-                        "automatic_abort_intent_cancelled source=board_offline state={stage:?}"
-                    );
+                    report(Finding::LivenessCancelled(stage));
                     pending_abort = None;
                     first_abort_reason = None;
                 }
-                SafetyDispatch::RecoverableFaultPaused => {
+                SafetyDispatch::RecoverableFault => {
+                    report(Finding::PauseFill);
                     pending_abort = None;
                     first_abort_reason = None;
                 }
                 SafetyDispatch::Unavailable => {}
             }
         }
+        #[cfg(test)]
+        state.gse.abort.cycles.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
@@ -857,22 +997,24 @@ fn cycle_packets(state: &AppState) -> Vec<sedsnet::packet::Packet> {
     packets
 }
 
-/// Claims launch exclusion before dispatch, without holding the GSE mutex over
-/// router callbacks. Admission failure keeps the persisted recovery latch.
+/// Claims launch exclusion and sends, without the GSE lock.
 #[cfg(test)]
 pub(crate) fn dispatch_safety_abort(state: &Arc<AppState>, router: &Arc<Router>) -> bool {
     let Some(claim) = crate::gse::claim_automatic_abort(state) else {
         return false;
     };
     let cause = crate::abort_retirement::AbortCause::Unknown("Safety Task Abort Command Issued".into());
-    dispatch_claimed_safety_abort(state, router, claim, cause);
+    let _ = send_safety_abort(state, router, &claim, cause);
+    drop(claim);
+    crate::sequences::refresh_action_policy_now(state);
     true
 }
 
 enum SafetyDispatch {
-    Claimed,
+    Claimed(AbortSent),
     StartupLivenessCancelled(FlightState),
-    RecoverableFaultPaused,
+    RecoverableFault,
+    /// Not now: refused, or a Launch is being saved. Tried again next cycle.
     Unavailable,
 }
 
@@ -880,27 +1022,47 @@ fn dispatch_safety_abort_reason(
     state: &Arc<AppState>,
     router: &Arc<Router>,
     reason: &SafetyAbortReason,
+    token: crate::runtime_mode::ModeToken,
 ) -> SafetyDispatch {
-    // GENERIC_ERROR has no severity contract. It is not evidence of a massive,
-    // unrecoverable hazard; preserve diagnostics and cancel fill, never global Abort.
-    if matches!(reason, SafetyAbortReason::GenericError { .. }) {
-        crate::gse::pause_fill_for_recoverable_fault(state, "board reported an unclassified error");
-        return SafetyDispatch::RecoverableFaultPaused;
-    }
-    let claim = if matches!(reason, SafetyAbortReason::BoardOffline { .. }) {
-        match crate::gse::claim_liveness_abort(state) {
-            crate::gse::LivenessAbortDecision::Claimed(claim) => claim,
-            crate::gse::LivenessAbortDecision::Startup(stage) => {
-                return SafetyDispatch::StartupLivenessCancelled(stage);
-            }
-            crate::gse::LivenessAbortDecision::Unavailable => return SafetyDispatch::Unavailable,
-        }
-    } else {
-        let Some(claim) = crate::gse::claim_automatic_abort(state) else {
-            return SafetyDispatch::Unavailable;
-        };
-        claim
+    let SafetyAbortReason::BoardOffline { board, .. } = reason else {
+        // GENERIC_ERROR has no severity contract. It is not evidence of a massive,
+        // unrecoverable hazard; preserve diagnostics and cancel fill, never global Abort.
+        return SafetyDispatch::RecoverableFault;
     };
+    let claim = match crate::gse::decide_liveness_abort(state, token) {
+        crate::gse::AbortDecision::Claimed(claim) => claim,
+        crate::gse::AbortDecision::Startup(stage) => {
+            return SafetyDispatch::StartupLivenessCancelled(stage);
+        }
+        crate::gse::AbortDecision::LaunchSaving | crate::gse::AbortDecision::Unavailable => {
+            return SafetyDispatch::Unavailable;
+        }
+    };
+    // Recorded so a stale abort is retired by age only once its cause cleared.
+    let cause = crate::types::Board::from_sender_id(board).map_or_else(
+        || crate::abort_retirement::AbortCause::Unknown(format!("{board} offline")),
+        crate::abort_retirement::AbortCause::BoardOffline,
+    );
+    // The claim's record starts once the ABORT is on its way.
+    SafetyDispatch::Claimed(send_safety_abort(state, router, &claim, cause))
+}
+
+/// Latch, queue, transmit: nothing else before the ABORT. A queue failure keeps
+/// the claim latched.
+fn send_safety_abort(
+    state: &Arc<AppState>,
+    router: &Arc<Router>,
+    claim: &crate::gse::AutomaticAbortClaim,
+    cause: crate::abort_retirement::AbortCause,
+) -> AbortSent {
+    match crate::gse::send_automatic_abort(state, router, claim, "Safety Task Abort Command Issued", cause) {
+        Ok(()) => AbortSent::Accepted,
+        Err(error) => AbortSent::Failed(error),
+    }
+}
+
+/// What the station logs and shows of a claimed abort.
+fn report_abort(state: &Arc<AppState>, reason: &SafetyAbortReason, sent: &AbortSent) {
     // This is a claimed cause, distinct from an earlier selected/cancelled one.
     match serde_json::to_string(reason) {
         Ok(value) => log::error!("automatic_abort_claimed_cause={value}"),
@@ -908,41 +1070,14 @@ fn dispatch_safety_abort_reason(
             log::error!("automatic_abort_claimed_cause={reason:?} serialization_error={error}")
         }
     }
-    // Recorded so a stale abort is retired by age only once its cause cleared.
-    let cause = match reason {
-        SafetyAbortReason::BoardOffline { board, .. } => crate::types::Board::from_sender_id(board)
-            .map_or_else(
-                || crate::abort_retirement::AbortCause::Unknown(format!("{board} offline")),
-                crate::abort_retirement::AbortCause::BoardOffline,
-            ),
-        SafetyAbortReason::GenericError { sender, .. } => {
-            crate::abort_retirement::AbortCause::Unknown(format!("error reported by {sender}"))
-        }
-    };
-    dispatch_claimed_safety_abort(state, router, claim, cause);
-    SafetyDispatch::Claimed
-}
-
-fn dispatch_claimed_safety_abort(
-    state: &Arc<AppState>,
-    router: &Arc<Router>,
-    _claim: crate::gse::AutomaticAbortClaim,
-    cause: crate::abort_retirement::AbortCause,
-) {
-    state.set_abort_indicator_latched(true);
-    crate::sequences::refresh_action_policy_now(state);
-    state.broadcast_action_policy_snapshot();
-    match queue_automatic_abort_packet(router, "Safety Task Abort Command Issued", cause) {
-        Ok(()) => {
-            if let Err(error) = router.process_all_queues_with_timeout(3) {
-                log::error!("failed to flush automatic abort: {error:?}");
-            }
-            gs_debug_println!("Safety task: Abort command accepted for delivery");
-        }
-        Err(error) => {
+    match sent {
+        AbortSent::Accepted => gs_debug_println!("Safety task: Abort command accepted for delivery"),
+        AbortSent::Failed(error) => {
             log::error!("failed to queue automatic abort; GSE abort remains latched: {error:?}")
         }
     }
+    crate::sequences::refresh_action_policy_now(state);
+    state.broadcast_action_policy_snapshot();
 }
 
 #[cfg(test)]
@@ -1161,7 +1296,7 @@ mod tests {
                 crate::telemetry_schema::endpoint("ABORT"),
                 move |packet| {
                     assert!(
-                        weak.upgrade().unwrap().gse.try_lock().is_ok(),
+                        crate::gse::lock_free_for_callback(&weak.upgrade().unwrap()),
                         "I/O callback holds no GSE mutex"
                     );
                     if packet.data_type() == crate::telemetry_schema::data_type("ABORT") {
@@ -1259,6 +1394,7 @@ mod tests {
                 seen.load(Ordering::SeqCst) > 0,
                 "actual Router receives ABORT"
             );
+            state.gse.abort.settle();
             assert!(state.abort_indicator_latched());
             assert!(
                 crate::gse::claim_automatic_abort(&state).is_none(),
@@ -1278,6 +1414,8 @@ mod tests {
             assert_eq!(seen.load(Ordering::SeqCst), 0);
             assert!(!state.abort_indicator_latched());
         }
+        // The record follows the ABORT on its own thread.
+        state.gse.abort.settle();
         let saved: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(

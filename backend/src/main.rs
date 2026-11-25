@@ -1707,7 +1707,7 @@ async fn main() -> anyhow::Result<()> {
         umbilical_valve_states: Arc::new(crate::unpin::Mutex::new(HashMap::new())),
         pending_umbilical_valve_states: Arc::new(crate::unpin::Mutex::new(HashMap::new())),
         latest_ox_tank_pressure: Arc::new(crate::unpin::Mutex::new(None)),
-        gse: Arc::new(crate::unpin::Mutex::new(crate::gse::Runtime::default())),
+        gse: Arc::new(crate::gse::Owner::default()),
         phase_control_selected: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         phase_control_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         phase_control_public: Arc::new(crate::unpin::Mutex::new(None)),
@@ -1916,6 +1916,7 @@ async fn main() -> anyhow::Result<()> {
         move |pkt: &Packet| {
             let ingress_generation = gse::automatic_generation(&ground_station_handler_state_clone);
             crate::board_abort::observe_raw(&ground_station_handler_state_clone, pkt);
+            crate::gse::overpressure::watch::receive(&ground_station_handler_state_clone, pkt);
             let umbilical_capture =
                 if pkt.data_type() == telemetry_schema::data_type("UMBILICAL_STATUS") {
                     match telemetry_task::capture_umbilical_status_at_ingress(
@@ -2596,6 +2597,11 @@ async fn main() -> anyhow::Result<()> {
         router.clone(),
         state.shutdown_subscribe(),
     ));
+    // An RRLS raises no automatic abort of its own.
+    if !rrls::is_rrls() {
+        state.gse.abort.start();
+        crate::gse::overpressure::watch::spawn(state.clone())?;
+    }
     // Without them no operator Abort would leave this station.
     let _manual_stop_publisher = crate::manual_abort_publisher::spawn(state.clone(), router.clone())?;
     let full_bay_discovery_ready = Arc::new(AtomicBool::new(false));
@@ -3544,6 +3550,15 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // The record of an automatic abort follows its ABORT.
+    let recorded = state.clone();
+    if !tokio::task::spawn_blocking(move || recorded.gse.abort.finished_within(task_shutdown_timeout))
+        .await
+        .unwrap_or(false)
+    {
+        shutdown_producers_quiesced = false;
+        log::error!("The record of an automatic abort is still being written");
+    }
     // Late HTTP claims must be gone, not merely hidden by server completion.
     shutdown_producers_quiesced &= state.operator_dispatch_inflight.load(Ordering::Acquire) == 0;
     // Active/Unknown protects a later Launch; it is not a promise of physical

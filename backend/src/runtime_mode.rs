@@ -260,6 +260,16 @@ pub fn unavailable(what: &str) -> String {
     format!("{what} is unavailable in {} mode.", label(current()))
 }
 
+/// A named thread in the mode this one runs in (a test's own mode included).
+pub(crate) fn spawn_thread<T: Send + 'static>(
+    name: &str,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> std::io::Result<std::thread::JoinHandle<T>> {
+    #[cfg(test)]
+    let work = test_support::inherit(work);
+    std::thread::Builder::new().name(name.to_string()).spawn(work)
+}
+
 /// Held (shared) while code checks the mode and registers mode-dependent
 /// activity, so that a switch cannot run between the two.
 pub fn admission() -> RwLockReadGuard<'static, ()> {
@@ -340,6 +350,15 @@ pub(crate) mod test_support {
         fn drop(&mut self) {
             OVERRIDE.with(|cell| cell.set(self.0));
             BOOT.with(|cell| cell.set(self.1));
+        }
+    }
+    /// `work`, for another thread, in this thread's own mode.
+    pub(super) fn inherit<T>(work: impl FnOnce() -> T) -> impl FnOnce() -> T {
+        let (mode, boot) = (override_state(), boot_override());
+        move || {
+            OVERRIDE.with(|cell| cell.set(mode));
+            BOOT.with(|cell| cell.set(boot));
+            work()
         }
     }
     /// Run this thread in `mode` until the guard drops.

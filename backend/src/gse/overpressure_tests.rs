@@ -70,7 +70,7 @@ impl Fixture {
         self.commands().iter().position(|(k, c)| k == command.0 && *c == command.1)
     }
     fn latch(&self) -> Option<overpressure::Latch> {
-        self.state.gse.lock().unwrap().overpressure.latch.clone()
+        self.state.gse.lock().unwrap().overpressure.lock().latch.clone()
     }
 }
 
@@ -477,7 +477,7 @@ async fn board_refusing_acknowledgement_is_adopted_again() {
 async fn board_latch_alone_can_be_acknowledged_and_expires_when_silent() {
     let mut f = Fixture::new().await;
     f.board("Valve Board overpressure relief: 900 psi [R1]");
-    f.state.gse.lock().unwrap().overpressure.latch = None; // station restarted
+    f.state.gse.lock().unwrap().overpressure.lock().latch = None; // station restarted
     {
         let mut rt = f.state.gse.lock().unwrap();
         rt.observe_valve(KEYS[1], true);
@@ -590,7 +590,7 @@ async fn abort_stage_retries_an_actuator_board_abort_the_relief_stage_did_not_se
     f.lead(860.0);
     f.sample(860.0);
     // As if the relief-stage send had failed.
-    f.state.gse.lock().unwrap().overpressure.latch.as_mut().unwrap().ab_abort_sent = false;
+    f.state.gse.lock().unwrap().overpressure.lock().latch.as_mut().unwrap().ab_abort_sent = false;
     let before = f.ab_aborts();
     f.lead(955.0);
     f.sample(955.0);
@@ -704,7 +704,7 @@ async fn floating_input_trace_never_trips_and_reports_an_implausible_sensor() {
         assert!(spikes > 100);
         assert!(f.latch().is_none() && f.commands().is_empty(), "{:?}", f.commands());
         assert!(!f.state.abort_indicator_latched());
-        let fault = f.state.gse.lock().unwrap().overpressure.sensor_fault.clone().expect("fault");
+        let fault = f.state.gse.lock().unwrap().overpressure.lock().sensor_fault.clone().expect("fault");
         assert!(fault.count as usize >= spikes, "every spike is an implausible step");
         // Visible in /api/gse/status for a minute after the last glitch.
         let status = f.status();
@@ -813,7 +813,7 @@ async fn genuine_ramp_trips_relief_at_850_then_main_valve_and_abort_at_950() {
         assert!(relief >= at850 + SUSTAIN && relief < at850 + SUSTAIN + dt, "{ramp_ms}: {relief} vs {at850}");
         assert!(pilot >= at950 + SUSTAIN && pilot < at950 + SUSTAIN + dt, "{ramp_ms}: {pilot} vs {at950}");
         assert_relief_order(&f);
-        assert!(f.state.gse.lock().unwrap().overpressure.sensor_fault.is_none());
+        assert!(f.state.gse.lock().unwrap().overpressure.lock().sensor_fault.is_none());
         f.advance(2_999);
         assert!(!f.has(PILOT_CLOSE) && !f.state.abort_indicator_latched());
         f.advance(1);

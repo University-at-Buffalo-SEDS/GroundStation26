@@ -14,7 +14,7 @@ const TANK: &[Spec] = &[
             "Tank rating (optional): {gse.tank_rating_psi} psi. Both thresholds must stay below it.",
         ],
         modes: ALL,
-        enforced_in: &["backend/src/gse/overpressure.rs:evaluate", "backend/src/gse/overpressure.rs:command_allowed"],
+        enforced_in: &["backend/src/gse/overpressure.rs:decide", "backend/src/gse/overpressure.rs:act", "backend/src/gse/overpressure.rs:command_allowed"],
         config_keys: &["gse.overpressure_relief_psi", "gse.tank_rating_psi"],
     },
     Spec {
@@ -24,9 +24,10 @@ const TANK: &[Spec] = &[
         details: &[
             "Order: relief (as above), PILOT open, and the Actuator Board overpressure abort immediately if the relief stage has not already sent it; after the window: PILOT close, then the broadcast automatic Abort. The Actuator Board command never touches PILOT, so it does not wait. The broadcast Abort is sent only after the window, so neither the station's abort fence nor the Valve Board's abort safe state (which closes PILOT) can cut it short.",
             "If Abort is not admitted (already aborted, Stop pending, Launch admitted) the station alarms; Dump and Vent stay open.",
+            "Detection, relief and Abort wait for no disk: they run on a thread of their own, from the readings as the radio or umbilical delivers them. Only while a Launch is being saved is nothing judged; the readings are judged when the save ends.",
         ],
         modes: ALL,
-        enforced_in: &["backend/src/gse/overpressure.rs:evaluate", "backend/src/gse/overpressure.rs:dispatch_abort"],
+        enforced_in: &["backend/src/gse/overpressure.rs:decide", "backend/src/gse/overpressure.rs:send_abort"],
         config_keys: &["gse.overpressure_abort_psi", "gse.overpressure_pilot_ms"],
     },
     Spec {
@@ -35,7 +36,7 @@ const TANK: &[Spec] = &[
         summary: "From Launch admission (or test-fire Fire commitment) onward the station only logs and alarms: PILOT is already open for firing, so no valve action, no Actuator Board overpressure abort and no Abort.",
         details: &[],
         modes: ALL,
-        enforced_in: &["backend/src/gse/overpressure.rs:launched", "backend/src/gse/overpressure.rs:fire_committed"],
+        enforced_in: &["backend/src/gse/overpressure.rs:launched", "backend/src/gse/overpressure.rs:burning"],
         config_keys: &[],
     },
     Spec {
@@ -354,9 +355,13 @@ const STOP: &[Spec] = &[
         id: "automatic-abort",
         title: "Automatic abort",
         summary: "Before Launch the safety task aborts when a board other than the Valve Board has been silent for {station.board_offline_abort_ms} ms (shown offline after {station.board_offline_display_ms} ms). Disconnect aborts arm in the Idle mission phase, once every required board has been seen, and never apply in Startup. Unclassified board errors pause the sequence instead of aborting.",
-        details: &["Normal, testing and integrated ground test modes only: the safety task does not run in HITL or test-fire mode. The thresholds are fixed in code."],
+        details: &[
+            "Normal, testing and integrated ground test modes only: the safety task does not run in HITL or test-fire mode. The thresholds are fixed in code.",
+            "An automatic abort is sent before it is saved and waits for no disk. Launch and Fire are refused from the moment it is decided. Clear GSE abort is refused until its record is saved (or the save failed), so the clear is always saved after it.",
+            "If power is lost after the Abort was sent and before its record was saved, the station restarts as it was last saved, without this abort latched. The boards that received the Abort stay aborted.",
+        ],
         modes: FLIGHT,
-        enforced_in: &["backend/src/safety_task.rs:dispatch_safety_abort_reason", "backend/src/gse/automatic_abort.rs:claim_automatic_abort_for_generation"],
+        enforced_in: &["backend/src/safety_task.rs:abort_watch", "backend/src/gse/automatic_abort.rs:claim_from_source", "backend/src/gse/automatic_abort.rs:send_claimed"],
         config_keys: &["station.board_offline_abort_ms", "station.board_offline_display_ms"],
     },
     Spec {
@@ -365,10 +370,11 @@ const STOP: &[Spec] = &[
         summary: "From Launch admission onward (the Launch, In flight and Landed mission phases) the station issues no automatic abort of any kind, valve correction or sequence action. Disconnect aborts apply only in Idle and Fill. Operator Abort and Stop stay available.",
         details: &[
             "Covered paths: board-offline (disconnect) aborts, unclassified-fault and ADC/tare-failure aborts, tank overpressure abort and the Actuator Board overpressure abort, queued automatic aborts and automatic supply closes, and acceptance of observed automatic aborts.",
+            "A Launch is admitted just before it is saved. An automatic abort that comes up while the save runs waits for it: not sent if the Launch was saved, sent if the save failed.",
             "The one automatic valve action after Launch is the Valve Board's own auto-vent once its link or continuity has been lost for 150 s (never before Launch + 60 s); it is not an Abort. See \"Valve Board auto-vent after Launch\".",
         ],
         modes: ALL,
-        enforced_in: &["backend/src/gse/automatic_abort.rs:stage_allows_automatic_abort", "backend/src/gse.rs:automatic_abort_allowed", "backend/src/mission_phase.rs:MissionPhase::automatic_aborts_allowed"],
+        enforced_in: &["backend/src/gse/automatic_abort.rs:stage_allows_automatic_abort", "backend/src/gse/automatic_abort.rs:admit_launch", "backend/src/gse.rs:automatic_abort_allowed", "backend/src/mission_phase.rs:MissionPhase::automatic_aborts_allowed"],
         config_keys: &[],
     },
     Spec {

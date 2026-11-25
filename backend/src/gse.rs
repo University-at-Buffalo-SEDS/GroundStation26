@@ -12,14 +12,18 @@ pub(crate) use turbocharge::mass_ingress_snapshot;
 pub(crate) use turbocharge::{mass_calibration_signature, observe_valve_pressure_ingress};
 use crate::network_stamp::Stamp;
 mod automatic_abort;
+mod owner;
+pub use owner::Owner;
 #[cfg(test)]
 mod rrls_http_tests;
 // Verified recovery coordinator uses the same bounded owner primitives.
 pub(crate) mod reset_generation;
-pub(crate) use automatic_abort::claim_automatic_abort;
-pub(crate) use automatic_abort::claim_automatic_abort_for_generation;
+#[cfg(test)]
+pub(crate) use automatic_abort::{claim_automatic_abort, claim_automatic_abort_for_generation, tests::lock_free_for_callback};
 pub(crate) use automatic_abort::{
-    AutomaticAbortClaim, LivenessAbortDecision, claim_liveness_abort,
+    AutomaticAbortClaim, Decision as AbortDecision, ModeSwitchHold, decide_automatic_abort, decide_liveness_abort,
+    hold_for_mode_switch,
+    send_claimed as send_automatic_abort,
 };
 mod operational_policy;
 use operational_policy::*;
@@ -214,8 +218,7 @@ pub struct Runtime {
     phase_control_revision: u64,
     pub(crate) manual_control: bool,
     effects_queued: bool,
-    automatic_abort_in_flight: bool,
-    overpressure: overpressure::Monitor,
+    overpressure: overpressure::Protection,
     auto_vent: auto_vent::Monitor,
 }
 impl Default for Runtime {
@@ -259,7 +262,6 @@ impl Default for Runtime {
             phase_control_revision: 0,
             manual_control: false,
             effects_queued: false,
-            automatic_abort_in_flight: false,
             overpressure: Default::default(),
             auto_vent: Default::default(),
         }
@@ -734,7 +736,10 @@ fn restore_operational(state: &AppState) {
                     rt.engine.status.message = "Fire was already committed; manual reset is required before a new operation".into();
                 }
                 rt.operational.run_generation = saved.qualification.generation();
+                // A claim made while a mode change reads the file stays latched.
+                let claimed = rt.operational.saved.automatic_abort_claimed;
                 rt.operational.saved = saved;
+                rt.operational.saved.automatic_abort_claimed |= claimed;
                 if let Err(error) = rt
                     .operational
                     .persist()
@@ -1156,6 +1161,11 @@ fn apply(state: &Arc<AppState>, effects: Effects) {
         state.gse.lock().unwrap().effects_queued = true;
         if let Some(router) = state.topology_router.get() {
             for (index, open) in effects.valves {
+                // Decided before a tank overpressure took the valves: nothing
+                // re-opens a supply or the main valve, or re-closes the relief.
+                if open != matches!(index, 1 | 2) && state.gse.overpressure.owns_valves() {
+                    continue;
+                }
                 let kind = crate::telemetry_schema::data_type(if index < 3 {
                     "VALVE_COMMAND"
                 } else {
@@ -3492,7 +3502,7 @@ pub(crate) fn verified_recovery_host_idle(state: &AppState) -> bool {
     if rt.engine.active() {
         return false;
     }
-    if !crate::runtime_mode::is_hitl() && (rt.operational.running || rt.automatic_abort_in_flight) {
+    if !crate::runtime_mode::is_hitl() && (rt.operational.running || state.gse.abort.in_flight()) {
         return false;
     }
     true
@@ -3513,7 +3523,7 @@ pub(crate) fn operator_work_block_reason(state: &AppState) -> Option<String> {
         if cold_flow::runtime_active(&rt) {
             return Some("Cold flow is running; stop it first.".into());
         }
-        if !crate::runtime_mode::is_hitl() && (rt.operational.running || rt.automatic_abort_in_flight) {
+        if !crate::runtime_mode::is_hitl() && (rt.operational.running || state.gse.abort.in_flight()) {
             return Some("An operation or automatic abort is still running.".into());
         }
     }
@@ -3544,7 +3554,7 @@ pub(crate) fn operator_reset_block_reason(state: &AppState) -> Option<String> {
 // Safety catalog (About safety): board-resync. Keep backend/src/safety_catalog_rules.rs in step.
 #[cfg(test)]
 pub(crate) fn set_overpressure_latch_for_test(state: &AppState, latch: Option<overpressure::Latch>) {
-    state.gse.lock().unwrap().overpressure.latch = latch;
+    state.gse.overpressure.lock().latch = latch;
 }
 pub(crate) fn overpressure_holds_abort(state: &AppState) -> bool {
     let rt = state.gse.lock().unwrap();
@@ -3575,7 +3585,7 @@ pub(crate) fn operator_reset_host_idle_ram(state: &AppState) -> bool {
         if engine_blocks_operator_reset(&rt) || cold_flow::runtime_active(&rt) {
             return false;
         }
-        if !crate::runtime_mode::is_hitl() && (rt.operational.running || rt.automatic_abort_in_flight) {
+        if !crate::runtime_mode::is_hitl() && (rt.operational.running || state.gse.abort.in_flight()) {
             return false;
         }
     }
@@ -3589,7 +3599,7 @@ pub(crate) fn prepare_verified_startup(state: &Arc<AppState>) -> Result<(), &'st
         return Err("Sequence still active");
     }
     if !crate::runtime_mode::is_hitl() {
-        if rt.operational.running || rt.automatic_abort_in_flight {
+        if rt.operational.running || state.gse.abort.in_flight() {
             return Err("GSE owner still active");
         }
         rt.operational
@@ -3740,7 +3750,9 @@ pub(crate) fn mode_switch_block_reason(state: &AppState) -> Option<&'static str>
     if cold_flow::runtime_active(&rt) {
         return Some("cold flow is running");
     }
-    None
+    drop(rt);
+    // The switch replaces the qualification the abort is latched in.
+    state.gse.abort.in_flight().then_some("an automatic abort, or its clear, is being recorded")
 }
 /// Operator recovery only: never dispatch a valve, ignition or launch command.
 fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)> {
@@ -3748,7 +3760,7 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
     let hitl = crate::runtime_mode::is_hitl();
     // Declared before the runtime guard so it is released after it.
     let mut _clear_reservation: Option<automatic_abort::AutomaticAbortClaim> = None;
-    let mut rt = state.gse.lock().unwrap();
+    let rt = state.gse.lock().unwrap();
     let aborted = *state.state.lock().unwrap() == FlightState::Aborted;
     let aborted = aborted
         || (!hitl
@@ -3761,13 +3773,12 @@ fn clear_ground_abort(state: &Arc<AppState>) -> Result<(), (StatusCode, String)>
         return Err((StatusCode::CONFLICT, "GroundStation is not aborted".into()));
     }
     if !hitl {
-        if rt.automatic_abort_in_flight {
-            return Err((
-                StatusCode::CONFLICT,
-                "Automatic abort dispatch is still in progress".into(),
-            ));
-        }
-        _clear_reservation = Some(automatic_abort::reserve_abort_clear(state, &mut rt));
+        // Also until the claim's record is on disk (or its save failed): the
+        // clear is always written after it.
+        _clear_reservation = Some(automatic_abort::reserve_abort_clear(state).ok_or((
+            StatusCode::CONFLICT,
+            "Automatic abort dispatch is still in progress".into(),
+        ))?);
     }
     // Preserve the existing validation priority even before a router exists.
     if rt.engine.active() {
@@ -4043,44 +4054,10 @@ pub(crate) fn set_operational_prerequisites_for_test(state: &AppState) {
 }
 
 /// All GroundStation automatic abort producers share this stage boundary.
-/// Manual Abort remains a separate operator command.
+/// Manual Abort remains a separate operator command. Waits for no disk and no
+/// lock held across one; while a Launch is being saved the answer is no.
 pub fn automatic_abort_allowed(state: &AppState) -> bool {
-    // A retained manual Stop supersedes new automatic intent. Do not use the
-    // shared indicator here: the already-claimed automatic path sets it before
-    // its own final SDK admission. Unsafe output admission has its own fence.
-    if state.manual_abort_intent.pending_epoch().is_some() || state.deferred_abort.manual_pending()
-    {
-        return false;
-    }
-    if crate::runtime_mode::is_hitl() {
-        let _runtime = state.gse.lock().unwrap();
-        !state
-            .launch_history
-            .lock()
-            .unwrap()
-            .automatic_actions_inhibited()
-            && matches!(
-                state.local_flight_state_snapshot(),
-                FlightState::Startup
-                    | FlightState::Idle
-                    | FlightState::PreFill
-                    | FlightState::FillTest
-                    | FlightState::NitrogenFill
-                    | FlightState::NitrousFill
-                    | FlightState::Armed
-            )
-    } else {
-        let rt = state.gse.lock().unwrap();
-        !state
-            .launch_history
-            .lock()
-            .unwrap()
-            .automatic_actions_inhibited()
-            && automatic_abort::stage_allows_automatic_abort(
-                &rt,
-                state.local_flight_state_snapshot(),
-            )
-    }
+    !automatic_abort_superseded(state) && automatic_abort::abort_boundary(state) == Some(true)
 }
 
 #[derive(serde::Deserialize)]
@@ -5264,6 +5241,17 @@ pub(crate) fn admit_simulated_launch(
     }
 }
 
+const OVERPRESSURE_LATCHED: &str = "Tank overpressure is latched; launch was not dispatched";
+/// An observed automatic abort latches without the dispatch gate. Checked once
+/// the Launch is admitted: from then on none is accepted until its outcome, and
+/// nothing is saved yet. HITL does not hold a press on an earlier abort.
+fn launch_abort_latched(state: &AppState) -> Result<(), String> {
+    if !crate::runtime_mode::is_hitl() && state.abort_indicator_latched() {
+        return Err("An abort is latched; launch was not dispatched".into());
+    }
+    Ok(())
+}
+
 /// Serialize launch admission against automatic valve-effect preparation in every mode.
 /// T-clock reset and delayed flight-state packets cannot re-enable automation.
 pub(crate) fn inhibit_automatic_actions_for_launch_revision(
@@ -5288,15 +5276,23 @@ pub(crate) fn inhibit_automatic_actions_for_pressed_launch(
         .map(crate::telemetry_schema::data_type);
     let _dispatch=launch_preparation_gate(state,ticket,&controller_types)?;
     admit_launch_intent(state, ticket)?;
+    const ABORT_PENDING: &str = "Automatic abort is pending; launch was not dispatched";
+    // Declared before the runtime guard: released after it.
+    let _launch;
     let runtime = state.gse.lock().unwrap();
     if let Some(reason) = launch_journal_block(&state.launch_history.lock().unwrap()) {
         return Err(reason.into());
     }
-    if runtime.automatic_abort_in_flight {
-        return Err("Automatic abort is pending; launch was not dispatched".into());
+    if state.gse.abort.launch_refused(false) {
+        return Err(ABORT_PENDING.into());
     }
     if turbocharge_active(&runtime) {
         return Err(TURBOCHARGE_UNFINISHED_MESSAGE.into());
+    }
+    _launch = state.gse.abort.admit_launch(false).ok_or(ABORT_PENDING)?;
+    launch_abort_latched(state)?;
+    if state.gse.overpressure.owns_valves() {
+        return Err(OVERPRESSURE_LATCHED.into());
     }
     state
         .launch_history
@@ -5345,12 +5341,16 @@ pub(crate) fn commit_fire_intent_for_pressed_launch(
     admit_launch_intent(state, ticket)?;
     let _clock_claim = claim_operator_dispatch_under_gate(state, ticket.generation)
         .ok_or_else(|| "Recovery admission is closed; Fire was not admitted".to_string())?;
+    const ABORT_PENDING: &str = "Automatic abort is pending; clear GSE abort before Fire";
+    // Declared before the runtime guard, which publishes the Fire stage as it
+    // is released: no automatic abort is decided in between.
+    let _launch;
     let mut rt = state.gse.lock().unwrap();
     if let Some(reason) = launch_journal_block(&state.launch_history.lock().unwrap()) {
         return Err(reason.into());
     }
-    if rt.operational.saved.automatic_abort_claimed || rt.automatic_abort_in_flight {
-        return Err("Automatic abort is pending; clear GSE abort before Fire".into());
+    if state.gse.abort.launch_refused(true) {
+        return Err(ABORT_PENDING.into());
     }
     if turbocharge_active(&rt) {
         return Err(TURBOCHARGE_UNFINISHED_MESSAGE.into());
@@ -5365,6 +5365,15 @@ pub(crate) fn commit_fire_intent_for_pressed_launch(
         && !matches!(rt.operational.qd.status(rt.now()), QdStatus::Ready)
     {
         return Err("Quick disconnect is not acknowledged and settled".into());
+    }
+    #[cfg(test)]
+    automatic_abort::between::here(automatic_abort::between::Point::FireAdmitted);
+    // Admitted from here, before the first write: an automatic abort claimed
+    // until now refuses it, one that comes later waits for its outcome.
+    _launch = state.gse.abort.admit_launch(true).ok_or(ABORT_PENDING)?;
+    launch_abort_latched(state)?;
+    if state.gse.overpressure.latched() {
+        return Err(OVERPRESSURE_LATCHED.into());
     }
     rt.operational.commit_fire()?;
     state.launch_history.lock().unwrap().inhibit_automatic_actions()
@@ -5626,17 +5635,18 @@ pub(crate) fn sync_calibration_after_automatic_zero(
     Ok(())
 }
 
+/// The final check of an automatic abort that is already claimed, and its
+/// transmission. Waits for no disk and no lock held across one.
 pub(crate) fn queue_automatic_abort_for_generation(
     state: &Arc<AppState>,
     router: &Arc<sedsnet::router::Router>,
     generation: u64,
     reason: &str,
 ) -> sedsnet::TelemetryResult<bool> {
-    let _dispatch = dispatch_gate();
-    let Some(_claim) = claim_operator_dispatch_under_gate(state, generation) else {
+    let Some(_claim) = claim_abort_dispatch(state, generation) else {
         return Ok(false);
     };
-    if generation != automatic_generation(state) || !automatic_abort_allowed(state) {
+    if !automatic_abort_allowed(state) {
         return Ok(false);
     }
     crate::telemetry_task::queue_automatic_abort_packet(
@@ -5644,6 +5654,9 @@ pub(crate) fn queue_automatic_abort_for_generation(
         reason,
         crate::abort_retirement::AbortCause::Unknown(reason.to_string()),
     )?;
+    if let Err(error) = crate::telemetry_task::dispatch_abort_tx(router) {
+        log::error!("failed to flush automatic abort: {error:?}");
+    }
     Ok(true)
 }
 
@@ -6032,6 +6045,23 @@ pub(crate) fn claim_operator_dispatch(
     let _dispatch = dispatch_gate();
     claim_operator_dispatch_under_gate(state, generation)
 }
+/// The same lease without the dispatch gate, which is held across disk writes
+/// an automatic abort must not wait for. The gate orders a claim against the
+/// barrier; here the count is raised first and the barrier read after it, and
+/// `close_operator_admission` closes the barrier before anyone reads the count,
+/// so one of the two always sees the other.
+pub(crate) fn claim_abort_dispatch(state: &AppState, generation: u64) -> Option<OperatorDispatchClaim> {
+    use std::sync::atomic::Ordering;
+    let open = || {
+        generation == automatic_generation(state) && state.operator_admission_barrier.load(Ordering::SeqCst) == 0
+    };
+    if !open() {
+        return None;
+    }
+    let claim = claim_operator_inflight(state)?;
+    std::sync::atomic::fence(Ordering::SeqCst);
+    open().then_some(claim)
+}
 /// Only this RAM flag is published under the dispatch gate; file IO remains
 /// entirely in the settings worker after this helper returns.
 pub(crate) fn claim_plumbing_settings_dispatch(
@@ -6065,9 +6095,9 @@ fn claim_operator_dispatch_under_gate(
         }
         return None;
     }
-    claim_operator_inflight_under_gate(state)
+    claim_operator_inflight(state)
 }
-fn claim_operator_inflight_under_gate(state: &AppState) -> Option<OperatorDispatchClaim> {
+fn claim_operator_inflight(state: &AppState) -> Option<OperatorDispatchClaim> {
     let count = &state.operator_dispatch_inflight;
     let mut current = count.load(std::sync::atomic::Ordering::Acquire);
     loop {
@@ -6144,7 +6174,7 @@ pub(crate) fn claim_manual_dispatch(state:&AppState,generation:u64,origin:Option
     let _dispatch=dispatch_gate();
     if let Some(origin)=origin {
         if origin.generation()!=generation || !origin.dispatched(state) {return None;}
-        claim_operator_inflight_under_gate(state)
+        claim_operator_inflight(state)
     } else {claim_operator_dispatch_under_gate(state,generation)}
 }
 
@@ -6192,19 +6222,31 @@ pub(crate) fn commit_local_manual_stop(
     }
 }
 
-pub(crate) fn accept_observed_abort(state: &AppState, automatic: bool, generation: u64) -> bool {
-    // Only an automatic observation is judged against what the gate orders. A
-    // manual one stands whatever is being dispatched, and the gate is held
-    // across disk writes; Launch and recovery admission are ordered against it
-    // by the observation inbox (`admit_if_no_manual_since`).
-    let _dispatch = automatic.then(dispatch_gate);
-    if automatic && (generation != automatic_generation(state) || !automatic_abort_allowed(state)) {
-        return false;
+/// Never the dispatch gate or the GSE lock: both are held across disk writes.
+/// A manual observation stands whatever is being dispatched; Launch and
+/// recovery admission are ordered against it by the observation inbox
+/// (`admit_if_no_manual_since`). An automatic one passes the abort boundary;
+/// None while a Launch is being saved, which decides whether it counts.
+pub(crate) fn accept_observed_abort(state: &AppState, automatic: bool, generation: u64) -> Option<bool> {
+    let latch = || {
+        state.clear_launch_sequence_command_pending();
+        state.launch_mode_gate.clear_sent();
+        state.set_abort_indicator_latched(true);
+    };
+    if !automatic {
+        latch();
+        return Some(true);
     }
-    state.clear_launch_sequence_command_pending();
-    state.launch_mode_gate.clear_sent();
-    state.set_abort_indicator_latched(true);
-    true
+    if generation != automatic_generation(state) || automatic_abort_superseded(state) {
+        return Some(false);
+    }
+    automatic_abort::within_abort_boundary(state, latch).map(|within| within.is_some())
+}
+/// A retained manual Stop supersedes new automatic intent. Not the shared
+/// indicator: a claimed automatic abort sets it before its own SDK admission.
+/// Unsafe output admission has its own fence.
+fn automatic_abort_superseded(state: &AppState) -> bool {
+    state.manual_abort_intent.pending_epoch().is_some() || state.deferred_abort.manual_pending()
 }
 
 /// Host work that keeps Recover station refused, from RAM only and without
@@ -6223,7 +6265,7 @@ pub(crate) fn station_recovery_work_block_reason(state: &AppState) -> Option<Str
             return Some("Cold flow is running; stop it first.".into());
         }
         if !crate::runtime_mode::is_hitl() {
-            if rt.automatic_abort_in_flight || rt.operational.running {
+            if state.gse.abort.in_flight() || rt.operational.running {
                 return Some("An operation or automatic abort is still running.".into());
             }
             if rt.operational.saved.automatic_abort_claimed {
@@ -7219,6 +7261,7 @@ mod recovery_quiescence_tests {
             .operator_dispatch_inflight
             .load(std::sync::atomic::Ordering::Acquire);
         drop(fresh);
+        state.gse.abort.settle();
         assert!(!closed_admitted);
         assert_eq!(during, 1);
         assert_eq!(
@@ -7330,6 +7373,7 @@ mod recovery_http_quiescence_tests {
             crate::web::command_dispatch_tests::preauth_fixture().await;
         let (state, router, _seen, path) = automatic_abort::tests::fixture_with_state(state).await;
         drop(claim_automatic_abort(&state).unwrap());
+        state.gse.abort.settle();
         let before = std::fs::read(&path).unwrap();
         let held = state.auth_db.acquire().await.unwrap();
         let request = clear_abort(State(state.clone()), headers.clone());

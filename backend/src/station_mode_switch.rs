@@ -856,16 +856,22 @@ impl Switch {
         let rrls = self.config.rrls;
         let station_resets = self.config.station_resets;
         let from = crate::runtime_mode::current();
+        let hold = std::cell::RefCell::new(None);
         let result = crate::runtime_mode::switch_to(
             target.mode,
             || {
                 if let Some(busy) = station_busy(state, rrls) {
                     return Err(format!("Station became active before the switch: {busy}"));
                 }
-                self.config.target_supported(target)
+                self.config.target_supported(target)?;
+                // Last: from here to the reset no automatic abort is decided.
+                *hold.borrow_mut() = Some(crate::gse::hold_for_mode_switch(state)
+                    .map_err(|busy| format!("Station became active before the switch: {busy}"))?);
+                Ok(())
             },
             |token| {
-                apply_switch(state, from, token, station_resets);
+                let hold = hold.borrow_mut().take().expect("held by the admission above");
+                apply_switch(state, from, token, station_resets, hold);
                 let change = json!({
                     "mode": mode_id(token.mode),
                     "label": mode_label(token.mode),
@@ -960,7 +966,13 @@ fn restore_selection(path: &Path, previous: Option<Vec<u8>>) -> std::io::Result<
 /// and before any mode-dependent admission reopens; the station was found
 /// idle under the same gate. Tasks that exist for one mode (sequence, safety,
 /// paired settings, shared checklists) follow the mode epoch on their own.
-fn apply_switch(state: &Arc<AppState>, from: Mode, token: crate::runtime_mode::ModeToken, station_resets: bool) {
+fn apply_switch(
+    state: &Arc<AppState>,
+    from: Mode,
+    token: crate::runtime_mode::ModeToken,
+    station_resets: bool,
+    hold: crate::gse::ModeSwitchHold,
+) {
     // HITL operator interlocks start released, as at start.
     state.hitl_button_interlock_enabled.store(false, Ordering::SeqCst);
     state.hitl_launch_interlock_enabled.store(false, Ordering::SeqCst);
@@ -985,13 +997,14 @@ fn apply_switch(state: &Arc<AppState>, from: Mode, token: crate::runtime_mode::M
     if station_resets {
         // Qualification state (outside HITL), HITL phase control and
         // turbocharge evidence, rebuilt as at start.
-        crate::gse::mode_switch::reset_for_mode_switch(state);
+        crate::gse::mode_switch::reset_for_mode_switch(state, hold);
         if calibration_file_changes(from, token.mode) {
             // Testing, and test fire with the integrated ground test, keep
             // their own calibration files.
             *state.loadcell_calibration.lock().unwrap() = crate::loadcell::load_or_default();
         }
     } else {
+        drop(hold);
         crate::gse::mode_switch::reset_phase_control(state);
     }
     LAYOUT_REVISION.fetch_add(1, Ordering::AcqRel);

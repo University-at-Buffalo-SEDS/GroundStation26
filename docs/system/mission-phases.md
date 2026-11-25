@@ -95,7 +95,9 @@ state alone (the HITL column above).
 - **No automatic aborts after Launch.** From Launch admission onward (Launch, In flight,
   Landed) no automatic abort of any kind is sent. Operator Abort and Stop stay available.
   The enforcement stays keyed on the detailed state in
-  `gse::automatic_abort_allowed` / `stage_allows_automatic_abort`.
+  `gse::automatic_abort_allowed` / `stage_allows_automatic_abort`. A Launch is admitted
+  just before it is saved (`AbortOwner::admit_launch`): an automatic abort that comes up
+  during the save waits for it, and goes only if the save failed.
   `gse/automatic_abort.rs::no_automatic_abort_path_acts_after_launch` enumerates every
   automatic path:
   - liveness abort;

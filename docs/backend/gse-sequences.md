@@ -143,7 +143,9 @@ Missing/stale PT (2 s), invalid PT, pressure ceiling, lost interlock, command tr
 errors, missing acknowledgements (5 s), and step/dump timeouts (60 s) stop sequencing.
 Before Fire, faults request supply closure and dump/vent opening. Operational
 builds issue no automatic abort or valve correction after durable Fire intent;
-this boundary also survives a service restart. Independent board abort latches
+this boundary also survives a service restart. Before that, an automatic abort is
+sent first and recorded after: no disk delays it, and until its record is written
+Launch and Fire are refused and the abort cannot be cleared. Independent board abort latches
 and FC autonomous protections remain in force. Verify physical state after any
 fault; a network failure can prevent all requested recovery actions.
 

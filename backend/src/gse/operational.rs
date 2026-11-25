@@ -135,6 +135,8 @@ impl Saved {
             crate::disk_stall::wait(crate::disk_stall::Site::Qualification);
             file.sync_all()?;
             std::fs::rename(&temporary, path)?;
+            #[cfg(test)]
+            persist_diagnostic::saved(path, self);
             std::fs::File::open(parent)?.sync_all()
         })();
         if result.is_err() {
@@ -570,7 +572,7 @@ mod fire_persistence_tests {
 
 // Private diagnostic successor only: exact-path, one-shot, bounded test gate.
 #[cfg(test)]
-pub(super) mod persist_diagnostic {
+pub(in crate::gse) mod persist_diagnostic {
     use std::{
         io,
         path::{Path, PathBuf},
@@ -583,6 +585,19 @@ pub(super) mod persist_diagnostic {
         release: mpsc::Receiver<()>,
     }
     static GATE: Mutex<Option<Gate>> = Mutex::new(None);
+    /// What each record on disk said, in order: the automatic-abort claim and
+    /// whether Fire was committed.
+    static SAVED: Mutex<Vec<(PathBuf, bool, bool)>> = Mutex::new(Vec::new());
+    pub(super) fn saved(path: &Path, record: &super::Saved) {
+        let fire = record.qualification.stage() == gse_sequence::qualification::MissionStage::Fire;
+        SAVED.lock().unwrap().push((path.to_path_buf(), record.automatic_abort_claimed, fire));
+    }
+    pub fn take_saved(path: &Path) -> Vec<(bool, bool)> {
+        let mut all = SAVED.lock().unwrap();
+        let (mine, others) = all.drain(..).partition::<Vec<_>, _>(|entry| entry.0 == path);
+        *all = others;
+        mine.into_iter().map(|(_, claimed, fire)| (claimed, fire)).collect()
+    }
     pub fn arm(path: PathBuf) -> (mpsc::Receiver<Instant>, mpsc::Sender<()>) {
         let (entry_tx, entry_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();

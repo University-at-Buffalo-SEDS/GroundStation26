@@ -1,149 +1,500 @@
-//! Serialize automatic-abort ownership with durable Fire using the per-GSE lock.
-//! A dispatch permit owns no lock while the router invokes transport callbacks.
+//! Automatic-abort ownership. An automatic abort is claimed and sent without
+//! the GSE lock, the dispatch gate or a disk: all three can be held by a write
+//! that does not finish. The claim is latched in RAM first (Launch and Fire are
+//! refused from then on), the ABORT is sent, and the durable record follows on
+//! a thread of its own.
+//!
+//! Against a Launch: both are admitted under this owner's RAM lock, so one is
+//! always first. A claim that is first refuses the Launch. A Launch that is
+//! first holds `LaunchHold` from before its first write until its outcome can
+//! be read (the Fire stage, or the journal's inhibition): until then an abort
+//! is neither sent nor refused (`Decision::LaunchSaving`), and is decided
+//! again afterwards. Automatic aborts stop at Launch admission; a Launch whose
+//! save fails was not one.
 use super::*;
+use std::sync::{MutexGuard, PoisonError, TryLockError, mpsc};
 
-pub(crate) struct AutomaticAbortClaim {
-    runtime: Arc<crate::unpin::Mutex<Runtime>>,
+/// Test seam: work another thread does at one point of this thread's path.
+#[cfg(test)]
+pub(crate) mod between {
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(crate) enum Point {
+        /// A claim has read the journal and the flight state, not taken yet.
+        ClaimTaken,
+        /// Fire passed its checks and is about to be admitted.
+        FireAdmitted,
+        /// The overpressure monitor read whether a Launch is on, not decided yet.
+        OverpressureDecided,
+    }
+    type Work = Box<dyn FnOnce() + Send>;
+    thread_local! {
+        static AT: std::cell::RefCell<Option<(Point, Work)>> = const { std::cell::RefCell::new(None) };
+    }
+    /// Once, on this thread, at `point`: `work` runs on a thread of its own and
+    /// is waited for.
+    pub(crate) fn at(point: Point, work: impl FnOnce() + Send + 'static) {
+        AT.with(|at| *at.borrow_mut() = Some((point, Box::new(work))));
+    }
+    pub(crate) fn here(point: Point) {
+        let work = AT.with(|at| {
+            let mut at = at.borrow_mut();
+            at.as_ref().is_some_and(|(at, _)| *at == point).then(|| at.take().unwrap().1)
+        });
+        if let Some(work) = work {
+            crate::runtime_mode::spawn_thread("between", work).unwrap().join().unwrap();
+        }
+    }
+}
+
+/// Bounded RAM only; a panic inside leaves nothing half written.
+fn ram<T>(lock: &std::sync::Mutex<T>) -> MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(PoisonError::into_inner)
+}
+type Record = Box<dyn FnOnce() + Send>;
+
+#[derive(Default)]
+struct Claims {
+    /// A claim, or a Clear of one, that is not finished: until it is, its
+    /// record is not on disk. Holds Launch, Fire, Clear and Reset.
+    in_flight: bool,
+    /// Claimed, and the runtime does not say so yet.
+    unapplied: bool,
+    /// Launches being saved now, and all there ever were.
+    saving: usize,
+    launches: u64,
+    /// A station mode change is replacing the runtime's qualification.
+    switching: bool,
+}
+/// The runtime's qualification as of the last release of the GSE lock.
+#[derive(Default)]
+struct Published {
+    claimed: bool,
+    fire_committed: bool,
+}
+#[derive(Default)]
+pub(crate) struct AbortOwner {
+    claims: std::sync::Mutex<Claims>,
+    published: std::sync::Mutex<Published>,
+    finished: std::sync::Condvar,
+    records: std::sync::Mutex<Option<mpsc::Sender<Record>>>,
+    /// Cycles the abort watch finished deciding.
+    #[cfg(test)]
+    pub(crate) cycles: std::sync::atomic::AtomicUsize,
+}
+impl AbortOwner {
+    pub(super) fn adopt(&self, rt: &mut Runtime) {
+        let mut claims = ram(&self.claims);
+        if std::mem::take(&mut claims.unapplied) {
+            latch(rt);
+            ram(&self.published).claimed = true;
+        }
+    }
+    pub(super) fn publish(&self, rt: &Runtime) {
+        let mut published = ram(&self.published);
+        published.claimed = rt.operational.saved.automatic_abort_claimed;
+        published.fire_committed =
+            rt.operational.saved.qualification.stage() == gse_sequence::qualification::MissionStage::Fire;
+    }
+    /// A claim being sent or recorded, or a Clear being saved.
+    pub(crate) fn in_flight(&self) -> bool {
+        ram(&self.claims).in_flight
+    }
+    /// A Launch is being saved: whether it is one is not decided yet.
+    pub(super) fn launch_saving(&self) -> bool {
+        ram(&self.claims).saving != 0
+    }
+    /// The Launches admitted so far. None while one is being saved.
+    pub(super) fn launches(&self) -> Option<u64> {
+        let claims = ram(&self.claims);
+        (claims.saving == 0).then_some(claims.launches)
+    }
+    pub(super) fn fire_committed(&self) -> bool {
+        !crate::runtime_mode::is_hitl() && ram(&self.published).fire_committed
+    }
+    fn claimed(&self, claims: &Claims) -> bool {
+        claims.unapplied || ram(&self.published).claimed
+    }
+    fn open(&self, claims: &Claims, hitl: bool) -> Result<u64, Closed> {
+        if claims.in_flight || (!hitl && self.claimed(claims)) {
+            Err(Closed::Refused)
+        } else if claims.saving != 0 || claims.switching {
+            Err(Closed::Later)
+        } else if !hitl && ram(&self.published).fire_committed {
+            Err(Closed::Refused)
+        } else {
+            Ok(claims.launches)
+        }
+    }
+    /// What an abort may still become: the Launches admitted so far, to be
+    /// compared when it is taken.
+    fn check(&self, hitl: bool) -> Result<u64, Closed> {
+        self.open(&ram(&self.claims), hitl)
+    }
+    fn take(&self, hitl: bool, launches: u64, token: crate::runtime_mode::ModeToken) -> Result<bool, Closed> {
+        let mut claims = ram(&self.claims);
+        // Still the mode it was decided in: a switch that is not excluded by
+        // `open` either has not stored its mode yet, or is finished.
+        if self.open(&claims, hitl)? != launches || !token.is_current() {
+            return Ok(false);
+        }
+        claims.in_flight = true;
+        claims.unapplied = !hitl;
+        Ok(true)
+    }
+    /// Admit a Launch before its first write. `fire`: a claim that was never
+    /// cleared refuses it too.
+    pub(super) fn admit_launch(self: &Arc<Self>, fire: bool) -> Option<LaunchHold> {
+        let mut claims = ram(&self.claims);
+        if claims.in_flight || (fire && self.claimed(&claims)) {
+            return None;
+        }
+        claims.saving += 1;
+        claims.launches += 1;
+        Some(LaunchHold(self.clone()))
+    }
+    pub(super) fn launch_refused(&self, fire: bool) -> bool {
+        let claims = ram(&self.claims);
+        claims.in_flight || (fire && self.claimed(&claims))
+    }
+    /// For a Clear, which excludes new aborts and Fire while it runs.
+    fn reserve(&self) -> bool {
+        !std::mem::replace(&mut ram(&self.claims).in_flight, true)
+    }
+    fn release(&self) {
+        ram(&self.claims).in_flight = false;
+        self.finished.notify_all();
+    }
+    /// Run on the recorder thread, in order. It may wait on a disk.
+    pub(crate) fn record(&self, record: impl FnOnce() + Send + 'static) {
+        let mut records = ram(&self.records);
+        if records.is_none() {
+            *records = start_recorder();
+        }
+        let record: Record = Box::new(record);
+        let refused = match records.as_ref() {
+            Some(sender) => sender.send(record).err().map(|unsent| unsent.0),
+            None => Some(record),
+        };
+        drop(records);
+        // No thread could be started: the ABORT is already sent.
+        if let Some(record) = refused {
+            record();
+        }
+    }
+    /// Before it is needed, so that an abort starts no thread.
+    pub(crate) fn start(&self) {
+        let mut records = ram(&self.records);
+        if records.is_none() {
+            *records = start_recorder();
+        }
+    }
+    /// Wait until no claim or Clear is unfinished. False: not in time.
+    pub(crate) fn finished_within(&self, timeout: std::time::Duration) -> bool {
+        let (claims, timeout) = self
+            .finished
+            .wait_timeout_while(ram(&self.claims), timeout, |claims| claims.in_flight)
+            .unwrap_or_else(PoisonError::into_inner);
+        drop(claims);
+        !timeout.timed_out()
+    }
+    #[cfg(test)]
+    pub(crate) fn settle(&self) {
+        assert!(self.finished_within(std::time::Duration::from_secs(30)), "the automatic abort was not recorded");
+    }
+}
+fn start_recorder() -> Option<mpsc::Sender<Record>> {
+    let (sender, records) = mpsc::channel::<Record>();
+    std::thread::Builder::new()
+        .name("auto_abort_record".to_string())
+        .spawn(move || {
+            for record in records {
+                // A failed record must not cost the next one.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(record));
+            }
+        })
+        .inspect_err(|error| log::error!("Automatic abort recorder thread could not be started: {error}"))
+        .ok()?;
+    Some(sender)
+}
+enum Closed {
+    Refused,
+    Later,
+}
+fn latch(rt: &mut Runtime) {
+    rt.operational.saved.automatic_abort_claimed = true;
+    rt.operational.running = false;
+    rt.engine.claimed = true;
+    rt.engine.status.phase = Phase::Fault;
+    rt.engine.status.message =
+        "Automatic abort requested; clear GSE abort before another operation".into();
+}
+
+/// A Launch whose outcome is not decided yet. Declared before the runtime
+/// guard, so that the guard publishes the outcome before this is released.
+pub(super) struct LaunchHold(Arc<AbortOwner>);
+impl Drop for LaunchHold {
+    fn drop(&mut self) {
+        ram(&self.0.claims).saving -= 1;
+    }
+}
+/// Keeps automatic aborts undecided while a mode change replaces the
+/// qualification they are latched in.
+pub(crate) struct ModeSwitchHold(Arc<AbortOwner>);
+impl Drop for ModeSwitchHold {
+    fn drop(&mut self) {
+        ram(&self.0.claims).switching = false;
+    }
+}
+pub(crate) fn hold_for_mode_switch(state: &AppState) -> Result<ModeSwitchHold, String> {
+    let mut claims = ram(&state.gse.abort.claims);
+    if claims.in_flight {
+        return Err("an automatic abort is being recorded".into());
+    }
+    claims.switching = true;
+    drop(claims);
+    Ok(ModeSwitchHold(state.gse.abort.clone()))
+}
+
+struct InFlight {
+    owner: Arc<AbortOwner>,
     _operator_claim: Option<OperatorDispatchClaim>,
+}
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.owner.release();
+    }
+}
+/// An admitted automatic abort (or a Clear) and its dispatch. Dropping an
+/// abort's claim hands its record to the recorder thread; it stays in flight
+/// until the record is on disk or its save failed.
+pub(crate) struct AutomaticAbortClaim {
+    runtime: Arc<Owner>,
+    in_flight: Option<InFlight>,
+    durable: bool,
 }
 impl Drop for AutomaticAbortClaim {
     fn drop(&mut self) {
-        self.runtime.lock().unwrap().automatic_abort_in_flight = false;
+        let in_flight = self.in_flight.take();
+        if !self.durable {
+            return;
+        }
+        let runtime = self.runtime.clone();
+        self.runtime.abort.record(move || {
+            let _in_flight = in_flight;
+            // Taking the lock puts the claim into the runtime, so this save
+            // has it, and so has every later one. A save that began before
+            // ends before this one: no older record overwrites it.
+            let mut rt = runtime.lock().unwrap_or_else(PoisonError::into_inner);
+            // Storage failure cannot suppress the critical abort. The RAM latch
+            // and persist_error still block Fire; durability is not claimed on
+            // I/O error.
+            let saved = rt.operational.persist();
+            drop(rt);
+            if let Err(error) = saved {
+                log::error!("Automatic abort could not be persisted; abort sent, Fire blocked: {error}");
+            }
+        });
     }
 }
 
 // Safety catalog (About safety): no-automatic-abort-after-launch. Keep backend/src/safety_catalog_rules.rs in step.
-pub(super) fn stage_allows_automatic_abort(rt: &Runtime, stage: FlightState) -> bool {
-    rt.operational.saved.qualification.stage() != gse_sequence::qualification::MissionStage::Fire
-        && matches!(
-            stage,
-            FlightState::Startup
-                | FlightState::Idle
-                | FlightState::PreFill
-                | FlightState::FillTest
-                | FlightState::NitrogenFill
-                | FlightState::NitrousFill
-                | FlightState::Armed
-        )
+pub(super) fn stage_allows_automatic_abort(stage: FlightState) -> bool {
+    matches!(
+        stage,
+        FlightState::Startup
+            | FlightState::Idle
+            | FlightState::PreFill
+            | FlightState::FillTest
+            | FlightState::NitrogenFill
+            | FlightState::NitrousFill
+            | FlightState::Armed
+    )
 }
 
-pub(crate) enum LivenessAbortDecision {
+pub(crate) enum Decision {
     Claimed(AutomaticAbortClaim),
+    /// A disconnect abort while in Startup, where none is armed.
     Startup(FlightState),
+    /// A Launch is being saved. Whether this abort may go depends on the
+    /// outcome: decide again later.
+    LaunchSaving,
     Unavailable,
 }
+#[cfg(test)]
+impl Decision {
+    fn claimed(self) -> Option<AutomaticAbortClaim> {
+        match self {
+            Self::Claimed(claim) => Some(claim),
+            _ => None,
+        }
+    }
+}
 
+#[cfg(test)]
 pub(crate) fn claim_automatic_abort(state: &AppState) -> Option<AutomaticAbortClaim> {
     claim_automatic_abort_for_generation(state, automatic_generation(state))
 }
 
+#[cfg(test)]
 pub(crate) fn claim_automatic_abort_for_generation(
     state: &AppState,
     generation: u64,
 ) -> Option<AutomaticAbortClaim> {
-    if crate::runtime_mode::is_hitl() {
-        let operator_claim = claim_operator_dispatch(state, generation)?;
-        let mut runtime = state.gse.lock().unwrap();
-        if runtime.automatic_abort_in_flight
-            || state
-                .launch_history
-                .lock()
-                .unwrap()
-                .automatic_actions_inhibited()
-            || !matches!(
-                state.local_flight_state_snapshot(),
-                FlightState::Startup
-                    | FlightState::Idle
-                    | FlightState::PreFill
-                    | FlightState::FillTest
-                    | FlightState::NitrogenFill
-                    | FlightState::NitrousFill
-                    | FlightState::Armed
-            )
-        {
-            return None;
-        }
-        runtime.automatic_abort_in_flight = true;
-        Some(AutomaticAbortClaim {
-            runtime: state.gse.clone(),
-            _operator_claim: Some(operator_claim),
-        })
-    } else {
-        match claim_from_source(state, false, generation) {
-            LivenessAbortDecision::Claimed(claim) => Some(claim),
-            LivenessAbortDecision::Startup(stage) => {
-                debug_assert_eq!(stage, FlightState::Startup);
-                None
-            }
-            LivenessAbortDecision::Unavailable => None,
-        }
-    }
+    decide_automatic_abort(state, generation).claimed()
 }
 
-pub(crate) fn claim_liveness_abort(state: &AppState) -> LivenessAbortDecision {
-    claim_from_source(state, true, automatic_generation(state))
+pub(crate) fn decide_automatic_abort(state: &AppState, generation: u64) -> Decision {
+    claim_from_source(state, false, generation, None)
 }
 
-fn claim_from_source(state: &AppState, liveness: bool, generation: u64) -> LivenessAbortDecision {
-    {
-        let Some(operator_claim) = claim_operator_dispatch(state, generation) else {
-            return LivenessAbortDecision::Unavailable;
-        };
-        let mut rt = state.gse.lock().unwrap();
+#[cfg(test)]
+pub(crate) fn claim_liveness_abort(state: &AppState) -> Decision {
+    claim_from_source(state, true, automatic_generation(state), None)
+}
+
+/// `token`: the station mode the disconnect was seen in.
+pub(crate) fn decide_liveness_abort(state: &AppState, token: crate::runtime_mode::ModeToken) -> Decision {
+    claim_from_source(state, true, automatic_generation(state), Some(token))
+}
+
+/// Never waits for a disk, or for a lock that is held across a disk write.
+fn claim_from_source(
+    state: &AppState,
+    liveness: bool,
+    generation: u64,
+    token: Option<crate::runtime_mode::ModeToken>,
+) -> Decision {
+    let Some(operator_claim) = claim_abort_dispatch(state, generation) else {
+        return Decision::Unavailable;
+    };
+    let owner = &state.gse.abort;
+    loop {
+        let mode = crate::runtime_mode::token();
+        if token.is_some_and(|token| token != mode) {
+            return Decision::Unavailable;
+        }
+        let hitl = mode.mode == crate::station_mode::Mode::Hitl;
         // Preserve the original general-claim short circuit: a held/latched
         // claim must not acquire the flight-state mutex unnecessarily.
-        if rt.automatic_abort_in_flight
-            || rt.operational.saved.automatic_abort_claimed
-            || state
-                .launch_history
-                .lock()
-                .unwrap()
-                .automatic_actions_inhibited()
-        {
-            return LivenessAbortDecision::Unavailable;
+        let launches = match owner.check(hitl) {
+            Ok(launches) => launches,
+            Err(Closed::Later) => return Decision::LaunchSaving,
+            Err(Closed::Refused) => return Decision::Unavailable,
+        };
+        match launch_inhibited(state) {
+            Some(false) => {}
+            Some(true) => return Decision::Unavailable,
+            // A Launch admitted meanwhile: the check above says so.
+            None => continue,
         }
         let stage = state.local_flight_state_snapshot();
         // Source-specific eligibility is checked at the same serialized claim
-        // decision as the durable latch. Disconnect aborts arm from the Idle
+        // decision as the latch. Disconnect aborts arm from the Idle
         // mission phase onward; only Startup is exempt.
         if liveness
             && crate::mission_phase::safety_phase(stage) == crate::mission_phase::MissionPhase::Startup
         {
-            return LivenessAbortDecision::Startup(stage);
+            return Decision::Startup(stage);
         }
-        if !stage_allows_automatic_abort(&rt, stage) {
-            return LivenessAbortDecision::Unavailable;
+        if !stage_allows_automatic_abort(stage) {
+            return Decision::Unavailable;
         }
-        rt.automatic_abort_in_flight = true;
-        rt.operational.saved.automatic_abort_claimed = true;
-        rt.operational.running = false;
-        rt.engine.claimed = true;
-        rt.engine.status.phase = Phase::Fault;
-        rt.engine.status.message =
-            "Automatic abort requested; clear GSE abort before another operation".into();
-        // Storage failure cannot suppress the critical abort. The RAM latch and
-        // persist_error still block Fire; durability is not claimed on I/O error.
-        if let Err(error) = rt.operational.persist() {
-            log::error!(
-                "Automatic abort could not be persisted; dispatching abort and blocking Fire: {error}"
-            );
+        #[cfg(test)]
+        between::here(between::Point::ClaimTaken);
+        match owner.take(hitl, launches, mode) {
+            Ok(true) => {
+                return Decision::Claimed(AutomaticAbortClaim {
+                    runtime: state.gse.clone(),
+                    in_flight: Some(InFlight {
+                        owner: owner.clone(),
+                        _operator_claim: Some(operator_claim),
+                    }),
+                    durable: !hitl,
+                });
+            }
+            // A Launch or a mode change came and went since the check.
+            Ok(false) => continue,
+            Err(Closed::Later) => return Decision::LaunchSaving,
+            Err(Closed::Refused) => return Decision::Unavailable,
         }
-        drop(rt);
-        LivenessAbortDecision::Claimed(AutomaticAbortClaim {
-            runtime: state.gse.clone(),
-            _operator_claim: Some(operator_claim),
-        })
     }
 }
 
-pub(super) fn reserve_abort_clear(state: &AppState, rt: &mut Runtime) -> AutomaticAbortClaim {
-    debug_assert!(!rt.automatic_abort_in_flight);
-    rt.automatic_abort_in_flight = true;
-    AutomaticAbortClaim {
+/// A Launch is on record. None: a Launch is being saved, which holds this
+/// record across its disk write (and nothing else does).
+pub(super) fn launch_inhibited(state: &AppState) -> Option<bool> {
+    loop {
+        match state.launch_history.try_lock() {
+            Ok(history) => return Some(history.automatic_actions_inhibited()),
+            Err(TryLockError::Poisoned(poisoned)) => {
+                return Some(poisoned.into_inner().automatic_actions_inhibited());
+            }
+            Err(TryLockError::WouldBlock) if state.gse.abort.launch_saving() => return None,
+            Err(TryLockError::WouldBlock) => std::thread::sleep(std::time::Duration::from_micros(200)),
+        }
+    }
+}
+
+/// The boundary every automatic abort passes, and the automatic valve actions
+/// before Launch. Waits for nothing. None: a Launch is being saved.
+pub(super) fn abort_boundary(state: &AppState) -> Option<bool> {
+    within_abort_boundary(state, || ()).map(|within| within.is_some())
+}
+/// `apply` (atomics only) runs inside the boundary or not at all: no Launch is
+/// admitted between the check and it.
+pub(super) fn within_abort_boundary<T>(state: &AppState, apply: impl FnOnce() -> T) -> Option<Option<T>> {
+    let owner = &state.gse.abort;
+    let hitl = crate::runtime_mode::is_hitl();
+    loop {
+        let before = {
+            let claims = ram(&owner.claims);
+            if claims.saving != 0 || claims.switching {
+                return None;
+            }
+            claims.launches
+        };
+        let Some(inhibited) = launch_inhibited(state) else { return None };
+        if inhibited
+            || (!hitl && owner.fire_committed())
+            || !stage_allows_automatic_abort(state.local_flight_state_snapshot())
+        {
+            return Some(None);
+        }
+        let claims = ram(&owner.claims);
+        if claims.launches == before && claims.saving == 0 {
+            return Some(Some(apply()));
+        }
+    }
+}
+
+/// Claimed, before any of its slower bookkeeping: latch, queue and transmit.
+/// Only transmits: received packets are the router worker's, and their
+/// handlers wait for station state.
+pub(crate) fn send_claimed(
+    state: &AppState,
+    router: &Arc<sedsnet::router::Router>,
+    claim: &AutomaticAbortClaim,
+    reason: &str,
+    cause: crate::abort_retirement::AbortCause,
+) -> sedsnet::TelemetryResult<()> {
+    debug_assert!(claim.in_flight.is_some());
+    state.set_abort_indicator_latched(true);
+    crate::telemetry_task::queue_automatic_abort_packet(router, reason, cause)?;
+    if let Err(error) = crate::telemetry_task::dispatch_abort_tx(router) {
+        log::error!("failed to flush automatic abort: {error:?}");
+    }
+    Ok(())
+}
+
+/// For a Clear: excludes automatic aborts and Fire until it is dropped. None
+/// while an abort is being sent or recorded.
+pub(super) fn reserve_abort_clear(state: &AppState) -> Option<AutomaticAbortClaim> {
+    state.gse.abort.reserve().then(|| AutomaticAbortClaim {
         runtime: state.gse.clone(),
         // Existing explicit clear already owns its outer dispatch reservation.
-        _operator_claim: None,
-    }
+        in_flight: Some(InFlight { owner: state.gse.abort.clone(), _operator_claim: None }),
+        durable: false,
+    })
 }
 
 #[cfg(test)]
@@ -160,6 +511,19 @@ pub(super) mod tests {
         std::path::PathBuf,
     ) {
         fixture_with_state(crate::state::tests::test_app_state().await).await
+    }
+
+    /// The recorder thread may hold the lock for a moment; the thread that runs
+    /// this callback must not.
+    pub(crate) fn lock_free_for_callback(state: &AppState) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while state.gse.try_lock().is_err() {
+            if std::time::Instant::now() > deadline {
+                return false;
+            }
+            std::thread::yield_now();
+        }
+        true
     }
 
     pub(in crate::gse) async fn fixture_with_state(
@@ -179,7 +543,7 @@ pub(super) mod tests {
                     crate::telemetry_schema::endpoint("ABORT"),
                     move |packet| {
                         assert!(
-                            weak.upgrade().unwrap().gse.try_lock().is_ok(),
+                            lock_free_for_callback(&weak.upgrade().unwrap()),
                             "router callback must not run under GSE lock"
                         );
                         if packet.data_type() == crate::telemetry_schema::data_type("ABORT") {
@@ -200,7 +564,7 @@ pub(super) mod tests {
         state: &Arc<AppState>,
         router: &Arc<sedsnet::router::Router>,
     ) -> bool {
-        if !crate::runtime_mode::is_test_fire() {
+        let dispatched = if !crate::runtime_mode::is_test_fire() {
             // The HITL suite skips every caller (HITL builds had no safety task).
             crate::safety_task::dispatch_safety_abort(state, router)
         } else {
@@ -215,7 +579,9 @@ pub(super) mod tests {
             .unwrap();
             router.process_all_queues_with_timeout(3).unwrap();
             true
-        }
+        };
+        state.gse.abort.settle();
+        dispatched
     }
     fn acknowledge_abort_owners(router: &sedsnet::router::Router) {
         for row in router.export_reliable_pending_stats() {
@@ -244,7 +610,7 @@ pub(super) mod tests {
         state.set_preexisting_flight_state_for_test(FlightState::Startup);
         assert!(matches!(
             claim_liveness_abort(&state),
-            LivenessAbortDecision::Startup(FlightState::Startup)
+            Decision::Startup(FlightState::Startup)
         ));
         assert!(
             !state
@@ -267,6 +633,7 @@ pub(super) mod tests {
                 .automatic_abort_claimed
         );
         drop(claim);
+        state.gse.abort.settle();
         assert!(
             claim_automatic_abort(&state).is_none(),
             "durable claim remains latched"
@@ -281,7 +648,7 @@ pub(super) mod tests {
         state.set_local_flight_state(FlightState::Idle);
         assert!(matches!(
             claim_liveness_abort(&state),
-            LivenessAbortDecision::Claimed(_)
+            Decision::Claimed(_)
         ));
         assert!(
             state
@@ -333,7 +700,7 @@ pub(super) mod tests {
             if !crate::runtime_mode::is_test_fire() {
                 assert!(!matches!(
                     claim_liveness_abort(&state),
-                    LivenessAbortDecision::Claimed(_)
+                    Decision::Claimed(_)
                 ));
             }
             // 4. Queued automatic abort and automatic supply closes.
@@ -359,7 +726,7 @@ pub(super) mod tests {
             // packets tagged SEDS_AUTO_ABORT_V1 (About safety: Board behaviour).
             // The boards gate them before Launch themselves; the GS must not
             // adopt one after Launch either.
-            assert!(!accept_observed_abort(&state, true, generation));
+            assert_eq!(accept_observed_abort(&state, true, generation), Some(false));
         }
         router.process_all_queues_with_timeout(0).unwrap();
         assert_eq!(seen.load(Ordering::SeqCst), 0, "no ABORT left the station");
@@ -372,6 +739,7 @@ pub(super) mod tests {
         crate::mode_suite!(Normal, TestFire, Testing);
         let (state, _router, _seen, path) = fixture().await;
         drop(claim_automatic_abort(&state).unwrap());
+        state.gse.abort.settle();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let worker_state = state.clone();
@@ -379,8 +747,8 @@ pub(super) mod tests {
         let worker = std::thread::spawn(move || {
             let _ = started_tx.send(());
             let unavailable = matches!(
-                claim_from_source(&worker_state, false, automatic_generation(&worker_state)),
-                LivenessAbortDecision::Unavailable
+                claim_from_source(&worker_state, false, automatic_generation(&worker_state), None),
+                Decision::Unavailable
             );
             let _ = result_tx.send(unavailable);
         });
@@ -443,6 +811,7 @@ pub(super) mod tests {
         );
         go.wait();
         worker.join().unwrap();
+        state.gse.abort.settle();
         assert_eq!(seen.load(Ordering::SeqCst), 1);
         assert!(
             operational::Saved::load(&path)
@@ -539,6 +908,7 @@ pub(super) mod tests {
             .is_err()
         );
         drop(claim);
+        state.gse.abort.settle();
         assert!(commit_fire_intent(&state).is_err());
         {
             let mut rt = state.gse.lock().unwrap();
@@ -575,6 +945,7 @@ pub(super) mod tests {
         let (state, _router, _seen, path) = fixture().await;
         let claim = claim_automatic_abort(&state).unwrap();
         drop(claim);
+        state.gse.abort.settle();
         let restored = crate::state::tests::test_app_state().await;
         unsafe {
             std::env::set_var("GS_GSE_QUALIFICATION", &path);

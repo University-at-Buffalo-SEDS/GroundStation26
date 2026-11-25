@@ -548,6 +548,15 @@ pub(crate) fn recording_network_utc_ms() -> Option<i64> {
         .ok()
 }
 
+/// The Valve Board tank pressure of a packet, exactly as it is recorded.
+pub(crate) fn valve_pressure_psi(packet: &Packet) -> Option<f32> {
+    telemetry_f32_values(packet)?
+        .first()
+        .copied()
+        .flatten()
+        .filter(|psi| psi.is_finite() && *psi >= 0.0)
+}
+
 pub(crate) fn displayed_network_utc_ms() -> i64 {
     recording_network_utc_ms().unwrap_or_else(|| get_current_timestamp_ms() as i64)
 }
@@ -1220,9 +1229,35 @@ pub async fn telemetry_task(
                     let Some(cmd) = command_at_dispatch_with_manual_origin(&state, cmd, recovery_origin) else {
                         continue;
                     };
-                    let _automatic_abort_claim = if automatic_abort {
-                        let Some(claim) = crate::gse::claim_automatic_abort_for_generation(&state, automatic_generation.expect("automatic Abort retains original generation")) else { continue; };
-                        Some(claim)
+                    // Sent as soon as it is claimed: everything below may wait for
+                    // a lock that is held across a disk write.
+                    let mut automatic_abort_sent = false;
+                    let _automatic_abort_lease = if automatic_abort {
+                        let generation = automatic_generation.expect("automatic Abort retains original generation");
+                        let claim = loop {
+                            match crate::gse::decide_automatic_abort(&state, generation) {
+                                crate::gse::AbortDecision::Claimed(claim) => break Some(claim),
+                                // Decided by how the Launch being saved ends.
+                                crate::gse::AbortDecision::LaunchSaving => tokio::time::sleep(Duration::from_millis(5)).await,
+                                crate::gse::AbortDecision::Startup(_) | crate::gse::AbortDecision::Unavailable => break None,
+                            }
+                        };
+                        let Some(claim) = claim else { continue; };
+                        state.set_abort_indicator_latched(true);
+                        // The Testing model takes the Abort itself, below.
+                        if !flight_sim::sim_mode_enabled() {
+                            state.clear_launch_sequence_command_pending();
+                            state.launch_mode_gate.clear_sent();
+                            match crate::gse::queue_automatic_abort_for_generation(&state, &router, generation, "Automatic zero failure abort") {
+                                Ok(false) => continue,
+                                Ok(true) => automatic_abort_sent = true,
+                                Err(error) => log_telemetry_error("failed to log Abort command", error),
+                            }
+                        }
+                        // The record starts now; this worker's lease stays.
+                        let lease = crate::gse::claim_abort_dispatch(&state, generation);
+                        drop(claim);
+                        lease
                     } else { None };
                     if matches!(cmd, TelemetryCommand::ResetSim) {
                         reset_testing_simulation(&state).await;
@@ -1348,14 +1383,18 @@ pub async fn telemetry_task(
                         TelemetryCommand::Abort => {
                                 state.clear_launch_sequence_command_pending();
                                 state.launch_mode_gate.clear_sent();
-                                let queued = if automatic_abort {
-                                    crate::gse::queue_automatic_abort_for_generation(&state, &router,
+                                let queued = if automatic_abort_sent {
+                                    Ok(())
+                                } else if automatic_abort {
+                                    match crate::gse::queue_automatic_abort_for_generation(&state, &router,
                                         automatic_generation.expect("automatic abort has generation"),
-                                        "Automatic zero failure abort")
+                                        "Automatic zero failure abort") {
+                                        Ok(false) => continue,
+                                        queued => queued.map(drop),
+                                    }
                                 } else {
-                                    queue_abort_packet(&router, "Manual Abort Command Issued").map(|()| true)
+                                    queue_abort_packet(&router, "Manual Abort Command Issued")
                                 };
-                                if matches!(queued, Ok(false)) { continue; }
                                 if let Err(e) = queued {
                                     log_telemetry_error("failed to log Abort command", e);
                                 } else {
@@ -6290,7 +6329,7 @@ mod tests {
                 move |packet| {
                     if packet.data_type() == crate::telemetry_schema::data_type("ABORT") {
                         assert!(
-                            weak.upgrade().unwrap().gse.try_lock().is_ok(),
+                            crate::gse::lock_free_for_callback(&weak.upgrade().unwrap()),
                             "automatic router callback held GSE lock"
                         );
                         delivered.send(()).unwrap();
@@ -6326,6 +6365,7 @@ mod tests {
         worker.await.unwrap();
         assert_eq!(result.unwrap(), Some(()));
         assert!(state.is_command_allowed(&TelemetryCommand::Abort));
+        state.gse.abort.settle();
         if let Some(path) = path {
             let record: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -6569,7 +6609,7 @@ mod tests {
             umbilical_valve_states: Arc::new(crate::unpin::Mutex::new(HashMap::new())),
             pending_umbilical_valve_states: Arc::new(crate::unpin::Mutex::new(HashMap::new())),
             latest_ox_tank_pressure: Arc::new(crate::unpin::Mutex::new(None)),
-            gse: Arc::new(crate::unpin::Mutex::new(crate::gse::Runtime::default())),
+            gse: Arc::new(crate::gse::Owner::default()),
         phase_control_selected: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         phase_control_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         phase_control_public: Arc::new(crate::unpin::Mutex::new(None)),

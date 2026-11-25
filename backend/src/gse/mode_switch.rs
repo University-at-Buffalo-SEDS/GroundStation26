@@ -5,7 +5,9 @@
 //! turbocharge), so no operation can observe the intermediate state.
 use super::*;
 
-pub(crate) fn reset_for_mode_switch(state: &AppState) {
+/// `hold` keeps automatic aborts undecided until the old qualification is gone;
+/// the saved one is read without it, and adds its latch to any new one.
+pub(crate) fn reset_for_mode_switch(state: &AppState, hold: ModeSwitchHold) {
     {
         let mut rt = state.gse.lock().unwrap();
         // The operational (qualification) runtime exists outside HITL only;
@@ -22,6 +24,7 @@ pub(crate) fn reset_for_mode_switch(state: &AppState) {
         rt.turbo_binding = None;
         reset_phase_control_locked(state, &mut rt);
     }
+    drop(hold);
     restore_operational(state);
 }
 
