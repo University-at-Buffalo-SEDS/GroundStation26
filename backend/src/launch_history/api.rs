@@ -195,7 +195,7 @@ mod tests {
         std::fs::write(root.0.join("auth.json"),serde_json::json!({"users":[{"username":"operator","roles":[],"password":{"salt_b64":"","hash_b64":""},"permissions":{"view_data":true,"send_commands":true}}]}).to_string()).unwrap();
         sqlx::query("INSERT INTO auth_sessions(token,username,session_type,can_view_data,can_send_commands,created_at_ms,expires_at_ms) VALUES('recovery-test','operator','session',1,1,0,9999999999999)").execute(&state.auth_db).await.unwrap();
         let inner = Arc::get_mut(&mut state).unwrap();
-        inner.launch_history = Arc::new(std::sync::Mutex::new(
+        inner.launch_history = Arc::new(crate::unpin::Mutex::new(
             super::super::Store::open(root.0.join("clock.json"), false, None, 10000, 0).unwrap(),
         ));
         let mut headers = HeaderMap::new();

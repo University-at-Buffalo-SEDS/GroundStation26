@@ -3,7 +3,7 @@
 use super::*;
 
 pub(crate) struct AutomaticAbortClaim {
-    runtime: Arc<std::sync::Mutex<Runtime>>,
+    runtime: Arc<crate::unpin::Mutex<Runtime>>,
     _operator_claim: Option<OperatorDispatchClaim>,
 }
 impl Drop for AutomaticAbortClaim {

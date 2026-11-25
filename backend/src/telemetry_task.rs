@@ -687,11 +687,13 @@ async fn send_local_ground_station_launch(
         emit_notification_warning(&state, reason);
         return;
     }
-    let admitted = if crate::runtime_mode::is_hitl() {
-        crate::gse::inhibit_automatic_actions_for_pressed_launch(&state, launch_revision, pressed)
-    } else {
-        crate::gse::commit_fire_intent_for_pressed_launch(&state, launch_revision, pressed)
-    };
+    let admitted = crate::unpin::blocking(|| {
+        if crate::runtime_mode::is_hitl() {
+            crate::gse::inhibit_automatic_actions_for_pressed_launch(&state, launch_revision, pressed)
+        } else {
+            crate::gse::commit_fire_intent_for_pressed_launch(&state, launch_revision, pressed)
+        }
+    });
     let ticket = match admitted {
         Ok(ticket) => ticket,
         Err(error) => {
@@ -718,9 +720,9 @@ async fn send_local_ground_station_launch(
     };
     // Station mode changes stay refused until the countdown starts.
     state.launch_mode_gate.mark_sent();
-    if let Err(error) =
-        crate::gse::queue_admitted_launch_packets(&state, &router, ticket, vec![packet])
-    {
+    let queued =
+        crate::unpin::blocking(|| crate::gse::queue_admitted_launch_packets(&state, &router, ticket, vec![packet]));
+    if let Err(error) = queued {
         state.clear_launch_sequence_command_pending();
         state.launch_mode_gate.clear_sent();
         emit_notification_warning(&state, error);
@@ -803,11 +805,13 @@ async fn send_flight_computer_launch(
         emit_notification_warning(&state, reason);
         return;
     }
-    let admitted = if crate::runtime_mode::is_hitl() {
-        crate::gse::inhibit_automatic_actions_for_pressed_launch(&state, launch_revision, pressed)
-    } else {
-        crate::gse::commit_fire_intent_for_pressed_launch(&state, launch_revision, pressed)
-    };
+    let admitted = crate::unpin::blocking(|| {
+        if crate::runtime_mode::is_hitl() {
+            crate::gse::inhibit_automatic_actions_for_pressed_launch(&state, launch_revision, pressed)
+        } else {
+            crate::gse::commit_fire_intent_for_pressed_launch(&state, launch_revision, pressed)
+        }
+    });
     let ticket = match admitted {
         Ok(ticket) => ticket,
         Err(error) => {
@@ -845,8 +849,9 @@ async fn send_flight_computer_launch(
     // Station mode changes stay refused until the countdown starts. A partly
     // admitted Launch below keeps refusing them: a packet may be on its way.
     state.launch_mode_gate.mark_sent();
-    if let Err(error) = crate::gse::queue_admitted_launch_packets(&state, &router, ticket, packets)
-    {
+    let queued =
+        crate::unpin::blocking(|| crate::gse::queue_admitted_launch_packets(&state, &router, ticket, packets));
+    if let Err(error) = queued {
         // An accepted first packet remains an honest SDK owner. Only a
         // zero-owner CoreBusy suffix was re-offered (inside the same window);
         // never retry here or undo durable inhibition after partial admission.
@@ -6491,37 +6496,37 @@ mod tests {
         let state = Arc::new(AppState {
             fill_recording: Default::default(),
             control_ingress: Arc::new(Default::default()),
-            ring_buffer: Arc::new(Mutex::new(RingBuffer::new(128))),
+            ring_buffer: Arc::new(crate::unpin::Mutex::new(RingBuffer::new(128))),
             safety_tap: Default::default(),
             cmd_tx,
             ws_tx,
             warnings_tx: broadcast::channel(4).0,
             errors_tx: broadcast::channel(4).0,
-            alert_ack_state: Arc::new(Mutex::new(crate::web::AlertAckStateMsg::default())),
+            alert_ack_state: Arc::new(crate::unpin::Mutex::new(crate::web::AlertAckStateMsg::default())),
             alert_conditions: condition_runtime.clone(),
             alert_ack_tx: broadcast::channel(4).0,
             dashboard_reset_tx: broadcast::channel(4).0,
-            db: Arc::new(Mutex::new(db)),
-            db_path: Arc::new(Mutex::new("sqlite::memory:".to_string())),
+            db: Arc::new(crate::unpin::Mutex::new(db)),
+            db_path: Arc::new(crate::unpin::Mutex::new("sqlite::memory:".to_string())),
             placeholder_db_path: condition_runtime.test_placeholder_path(),
             recording_store: Default::default(),
             db_queue_tx: db_tx,
             db_write_runtime: tokio::runtime::Handle::current(),
             auth_db,
-            state: Arc::new(Mutex::new(FlightState::Startup)),
+            state: Arc::new(crate::unpin::Mutex::new(FlightState::Startup)),
             state_tx,
             gpio: crate::gpio::test_state_gpio(),
-            board_status: Arc::new(Mutex::new(board_status)),
+            board_status: Arc::new(crate::unpin::Mutex::new(board_status)),
             board_status_tx,
             last_board_status_broadcast_ms: Arc::new(AtomicU64::new(0)),
             last_packet_rx_ms: Arc::new(AtomicU64::new(0)),
-            umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
-            pending_umbilical_valve_states: Arc::new(Mutex::new(HashMap::new())),
-            latest_ox_tank_pressure: Arc::new(Mutex::new(None)),
-            gse: Arc::new(Mutex::new(crate::gse::Runtime::default())),
+            umbilical_valve_states: Arc::new(crate::unpin::Mutex::new(HashMap::new())),
+            pending_umbilical_valve_states: Arc::new(crate::unpin::Mutex::new(HashMap::new())),
+            latest_ox_tank_pressure: Arc::new(crate::unpin::Mutex::new(None)),
+            gse: Arc::new(crate::unpin::Mutex::new(crate::gse::Runtime::default())),
         phase_control_selected: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         phase_control_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        phase_control_public: Arc::new(Mutex::new(None)),
+        phase_control_public: Arc::new(crate::unpin::Mutex::new(None)),
             sequence_progress: Arc::new(crate::sequence_progress_service::Shared::new(
                 rand::random::<u128>(),
             )),
@@ -6533,16 +6538,16 @@ mod tests {
             abort_resend: Arc::new(crate::manual_abort_resend::AbortResend::default()),
             recovery_events: Arc::default(),
             deferred_abort: Arc::new(crate::deferred_abort::Inbox::default()),
-            igniter_sense: Arc::new(std::sync::Mutex::new(crate::igniter_sense::Tracker::default())),
+            igniter_sense: Arc::new(crate::unpin::Mutex::new(crate::igniter_sense::Tracker::default())),
             board_recovery: Arc::new(crate::board_recovery::Runtime::default()),
             board_abort: Arc::new(crate::board_abort::Runtime::default()),
             launch_dedup_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             board_abort_tx: broadcast::channel(16).0,
-            latest_fill_mass_kg: Arc::new(Mutex::new(None)),
+            latest_fill_mass_kg: Arc::new(crate::unpin::Mutex::new(None)),
             loadcell_processing: Arc::new(crate::loadcell_zero::Service::default()),
-            network_traffic: Arc::new(Mutex::new(crate::network_traffic::Sampler::default())),
-            network_health: Arc::new(Mutex::new(crate::network_health::Tracker::default())),
-            loadcell_calibration: Arc::new(Mutex::new(loadcell::load_or_default())),
+            network_traffic: Arc::new(crate::unpin::Mutex::new(crate::network_traffic::Sampler::default())),
+            network_health: Arc::new(crate::unpin::Mutex::new(crate::network_health::Tracker::default())),
+            loadcell_calibration: Arc::new(crate::unpin::Mutex::new(loadcell::load_or_default())),
             auto_zero: Default::default(),
             daq_log_session: Default::default(),
             shutdown_tx,
@@ -6552,22 +6557,22 @@ mod tests {
         transport_tx_activity: Arc::new(Default::default()),
         radio_tx_activity: Arc::new(Default::default()),
             db_write_notify: Arc::new(Notify::new()),
-            notifications: Arc::new(Mutex::new(Vec::new())),
+            notifications: Arc::new(crate::unpin::Mutex::new(Vec::new())),
             notifications_tx,
             next_notification_id: Arc::new(AtomicU64::new(0)),
-            messages: Arc::new(Mutex::new(Vec::new())),
+            messages: Arc::new(crate::unpin::Mutex::new(Vec::new())),
             messages_tx,
             next_message_id: Arc::new(AtomicU64::new(0)),
-            action_policy: Arc::new(Mutex::new(default_action_policy())),
-            sequence_policy_state: Arc::new(Mutex::new(
+            action_policy: Arc::new(crate::unpin::Mutex::new(default_action_policy())),
+            sequence_policy_state: Arc::new(crate::unpin::Mutex::new(
                 crate::sequences::SequencePolicyState::default(),
             )),
             action_policy_tx,
-            fill_targets: Arc::new(Mutex::new(fill_targets::load_or_default())),
+            fill_targets: Arc::new(crate::unpin::Mutex::new(fill_targets::load_or_default())),
             fill_targets_tx,
             plumbing_drive: Arc::new(crate::actuator_plumbing::Runtime::default()),
-            launch_history: Arc::new(Mutex::new(crate::launch_history::Store::ephemeral())),
-            launch_clock: Arc::new(Mutex::new(LaunchClockMsg::idle())),
+            launch_history: Arc::new(crate::unpin::Mutex::new(crate::launch_history::Store::ephemeral())),
+            launch_clock: Arc::new(crate::unpin::Mutex::new(LaunchClockMsg::idle())),
             launch_clock_tx,
             launch_sequence_command_pending: Arc::new(AtomicBool::new(false)),
             launch_mode_gate: Default::default(),
@@ -6582,16 +6587,16 @@ mod tests {
             hitl_launch_interlock_enabled: Arc::new(AtomicBool::new(false)),
             hitl_safety_interlocks: crate::state::default_hitl_safety_interlocks(),
             hitl_physical_launch_uses_ground_station: Arc::new(AtomicBool::new(false)),
-            recording_status: Arc::new(Mutex::new(RecordingStatusMsg::new(RecordingModeWire::Idle, None))),
+            recording_status: Arc::new(crate::unpin::Mutex::new(RecordingStatusMsg::new(RecordingModeWire::Idle, None))),
             recording_status_tx,
-            last_command_ms: Arc::new(Mutex::new(HashMap::new())),
+            last_command_ms: Arc::new(crate::unpin::Mutex::new(HashMap::new())),
             fill_sequence_continue_requests: Arc::new(AtomicU64::new(0)),
             sequence_access: Default::default(),
             panel_control: Default::default(),
-            recent_telemetry_cache: Arc::new(Mutex::new(VecDeque::new())),
-            latest_gps_fix_by_sender: Arc::new(Mutex::new(HashMap::new())),
-            latest_gps_satellites_by_sender: Arc::new(Mutex::new(HashMap::new())),
-            recent_alerts_cache: Arc::new(Mutex::new(VecDeque::new())),
+            recent_telemetry_cache: Arc::new(crate::unpin::Mutex::new(VecDeque::new())),
+            latest_gps_fix_by_sender: Arc::new(crate::unpin::Mutex::new(HashMap::new())),
+            latest_gps_satellites_by_sender: Arc::new(crate::unpin::Mutex::new(HashMap::new())),
+            recent_alerts_cache: Arc::new(crate::unpin::Mutex::new(VecDeque::new())),
             av_bay_comms_connected: Arc::new(AtomicBool::new(false)),
             fill_comms_connected: Arc::new(AtomicBool::new(false)),
             topology_router: Arc::new(OnceLock::new()),

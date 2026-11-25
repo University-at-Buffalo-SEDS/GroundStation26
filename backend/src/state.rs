@@ -22,7 +22,8 @@ use sedsnet::router::Router;
 use sqlx::SqlitePool;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use crate::unpin::Mutex;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::time::{Duration, Instant};
 

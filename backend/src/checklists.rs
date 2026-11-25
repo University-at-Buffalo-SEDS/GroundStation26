@@ -1,4 +1,5 @@
 //! Shared checklists: per-item transactions, durable completion, administrator templates.
+use crate::unpin::Mutex;
 use crate::{
     auth::{Permission, StreamRole},
     state::AppState,
@@ -14,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, OnceLock},
 };
 pub(crate) mod paired;
 // Shared wire definitions also serve the bounded paired-checklist model.

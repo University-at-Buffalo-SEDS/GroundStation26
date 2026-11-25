@@ -368,8 +368,8 @@ async fn restarted_primary_ignores_repeated_received_launch_ascent_and_landed_un
     let restored = Store::open(path.clone(), false, None, 12000, 0).unwrap();
     let mut state = crate::state::tests::test_app_state().await;
     let inner = Arc::get_mut(&mut state).unwrap();
-    inner.launch_clock = Arc::new(Mutex::new(restored.snapshot().clock));
-    inner.launch_history = Arc::new(Mutex::new(restored));
+    inner.launch_clock = Arc::new(crate::unpin::Mutex::new(restored.snapshot().clock));
+    inner.launch_history = Arc::new(crate::unpin::Mutex::new(restored));
     for phase in [
         crate::types::FlightState::Launch,
         crate::types::FlightState::Ascent,

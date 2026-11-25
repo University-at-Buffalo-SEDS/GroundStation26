@@ -7,7 +7,7 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::Instant,
 };
 
@@ -456,7 +456,7 @@ pub(crate) struct RecoveryFence {
     writer: Arc<Writer>,
     revision_staged: bool,
 }
-pub type Shared = Arc<Mutex<Store>>;
+pub type Shared = Arc<crate::unpin::Mutex<Store>>;
 
 fn t0(clock: &LaunchClockMsg) -> Option<i64> {
     match clock.kind {

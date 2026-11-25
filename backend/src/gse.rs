@@ -49,7 +49,7 @@ use std::{
 
 // Serialize effect preparation/admission with manual handoff. Transport
 // processing happens after this gate is released (callbacks may reenter GSE).
-static DISPATCH_GATE: Mutex<()> = Mutex::new(());
+static DISPATCH_GATE: crate::unpin::Mutex<()> = crate::unpin::Mutex::new(());
 /// Take the dispatch gate. It guards no data, so a panic while another path
 /// held it leaves nothing inconsistent; poisoning must never stop a later
 /// Stop, Abort or ordinary dispatch.

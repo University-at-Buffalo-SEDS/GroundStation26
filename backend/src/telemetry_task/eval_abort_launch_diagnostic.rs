@@ -124,7 +124,7 @@ async fn run_case(settle_before_launch: bool, hold_retry: bool) -> bool {
     {
         let inner = Arc::get_mut(&mut state).unwrap();
         inner.auth = Arc::new(AuthManager::new(auth_path));
-        inner.launch_history = Arc::new(Mutex::new(
+        inner.launch_history = Arc::new(crate::unpin::Mutex::new(
             crate::launch_history::Store::open(
                 journal.clone(),
                 false,

@@ -780,7 +780,7 @@ async fn suite() {
     unsafe {
         std::env::remove_var("GS_STATION_PAIRING_FILE");
     }
-    let mesh = Arc::new(Mutex::new(crate::rrls::Mesh::new(
+    let mesh = Arc::new(std::sync::Mutex::new(crate::rrls::Mesh::new(
         crate::rrls::Role::Primary,
         7,
     )));

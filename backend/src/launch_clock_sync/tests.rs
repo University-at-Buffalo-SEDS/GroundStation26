@@ -600,7 +600,7 @@ async fn revision_ack_waits_for_observer_durability_and_retries_same_snapshot() 
         .apply_primary(next.clone(), true, 11000, 1000)
         .unwrap();
     let mut state = crate::state::tests::test_app_state().await;
-    Arc::get_mut(&mut state).unwrap().launch_history = Arc::new(std::sync::Mutex::new(observer));
+    Arc::get_mut(&mut state).unwrap().launch_history = Arc::new(crate::unpin::Mutex::new(observer));
     let mut runtime = Runtime::new(None, true).unwrap();
     runtime.connect(true, Some(42));
     assert!(
