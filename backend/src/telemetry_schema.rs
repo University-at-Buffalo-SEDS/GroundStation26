@@ -120,7 +120,8 @@ pub mod baro {
     pub const ALTITUDE_M: usize = 0;
     /// Compensated static pressure, pascals.
     pub const PRESSURE_PA: usize = 1;
-    /// Sensor temperature, degrees Celsius.
+    /// Sensor temperature, degrees Celsius (read by tests; no station consumer).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub const TEMPERATURE_C: usize = 2;
 }
 

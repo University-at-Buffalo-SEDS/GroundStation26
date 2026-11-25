@@ -444,6 +444,15 @@ const PHASES: &[Spec] = &[
         enforced_in: &["backend/src/mission_phase.rs:fc_contact_lost_after_flight"],
         config_keys: &[],
     },
+    Spec {
+        id: "fc-owns-in-flight-checks",
+        title: "FC owns in-flight checks",
+        summary: "In-flight control is the FC's alone, because radio telemetry can drop out. The station checks no accelerometer, gyro, barometer, GPS-position or Kalman-state threshold; the FC owns its sensor plausibility and break-up abort, and the station only shows those values. Vehicle health (Power Board and Valve Board battery voltage, battery current, ox tank pressure) warns on the pad only: Startup through Armed, or Aborted, with no Launch attempt on record. The Gateway Board's battery current is checked in every phase.",
+        details: &["These checks only warn; none sends a command. A board's own GENERIC_ERROR is shown in every phase but pauses the fill only on the pad."],
+        modes: FLIGHT,
+        enforced_in: &["backend/src/safety_task.rs:value_range_warnings", "backend/src/safety_task.rs:vehicle_checks_on_pad"],
+        config_keys: &[],
+    },
 ];
 
 const INTERLOCKS: &[Spec] = &[

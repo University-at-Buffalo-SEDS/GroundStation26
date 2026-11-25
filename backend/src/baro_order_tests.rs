@@ -4,7 +4,6 @@
 //! temperature in every station consumer and in every shipped layout.
 use crate::telemetry_schema::baro;
 use sedsnet::packet::Packet;
-use std::collections::HashSet;
 
 const ALT_M: f32 = 123.4;
 const PRESSURE_PA: f32 = 98_765.0;
@@ -23,38 +22,12 @@ fn fc_frame(values: [f32; 3]) -> Vec<f32> {
     pkt.data_as_f32().unwrap()
 }
 
-fn warnings(values: [f32; 3]) -> HashSet<&'static str> {
-    let mut out = HashSet::new();
-    crate::safety_task::check_baro_thresholds(&fc_frame(values), &mut out);
-    out
-}
-
 #[test]
 fn fc_ordered_frame_decodes_to_altitude_pressure_temperature() {
     let values = fc_frame([ALT_M, PRESSURE_PA, TEMP_C]);
     assert_eq!(values[baro::ALTITUDE_M], ALT_M);
     assert_eq!(values[baro::PRESSURE_PA], PRESSURE_PA);
     assert_eq!(values[baro::TEMPERATURE_C], TEMP_C);
-}
-
-#[test]
-fn safety_thresholds_test_the_fields_they_name() {
-    assert!(warnings([ALT_M, PRESSURE_PA, TEMP_C]).is_empty());
-    // Real pad data (2026-11-09 recording) and a cold, drifted pad.
-    assert!(warnings([-0.64, 98_221.9, 24.15]).is_empty());
-    assert!(warnings([-12.0, 101_900.0, -15.0]).is_empty());
-    assert_eq!(
-        warnings([ALT_M, 20_000.0, TEMP_C]),
-        HashSet::from(["Critical: Barometer pressure threshold exceeded!"])
-    );
-    assert_eq!(
-        warnings([ALT_M, PRESSURE_PA, 90.0]),
-        HashSet::from(["Critical: Barometer temperature threshold exceeded!"])
-    );
-    assert_eq!(
-        warnings([-40.0, PRESSURE_PA, TEMP_C]),
-        HashSet::from(["Critical: Barometer altitude threshold exceeded!"])
-    );
 }
 
 #[test]

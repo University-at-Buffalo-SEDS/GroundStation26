@@ -342,7 +342,7 @@ mod tests {
             "automatic-abort", "no-automatic-abort-after-launch", "manual-stop", "reset-all-boards", "recover-station", "radio-reject-test", "board-resync",
             "ignition-pair", "hitl-interlocks", "key-interlock", "plumbing-retraction", "checklists",
             "valve-freshness", "supply-interlock", "fill-limits", "qd-settle", "igniter-sense",
-            "stale-data", "connectivity-loss", "mission-phases", "fc-owns-landing", "board-heartbeat-abort", "board-vb-post-launch-vent", "board-vb-overpressure", "board-abort-latch", "board-fc-vigilant",
+            "stale-data", "connectivity-loss", "mission-phases", "fc-owns-landing", "fc-owns-in-flight-checks", "board-heartbeat-abort", "board-vb-post-launch-vent", "board-vb-overpressure", "board-abort-latch", "board-fc-vigilant",
             "igt-mode-entry", "igt-enter", "igt-live-pyro", "igt-plain-path", "igt-launch-gate", "igt-replay-admission",
             "igt-reset-exits", "igt-dry-run-default", "igt-vb-auto-vent", "igt-abort",
             "igt-image-identification", "igt-image-latch", "igt-image-no-latch", "igt-image-mismatch",

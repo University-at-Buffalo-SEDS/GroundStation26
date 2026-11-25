@@ -2326,9 +2326,6 @@ mod tests {
         let maxima = crate::flight_maxima::samples(&row);
         assert_eq!(maxima.len(), 1);
         assert!((maxima[0].1 - f64::from(altitude_m)).abs() < 1e-3);
-        let mut warnings = std::collections::HashSet::new();
-        crate::safety_task::check_baro_thresholds(&values, &mut warnings);
-        assert!(warnings.is_empty(), "{warnings:?}");
     }
 }
 

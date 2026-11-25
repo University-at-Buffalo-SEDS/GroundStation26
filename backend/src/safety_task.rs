@@ -8,39 +8,13 @@ use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
 use tokio::time::{Duration, sleep};
 
-// Acceleration thresholds (m/s²)
-const ACCELERATION_X_MIN_THRESHOLD: f32 = -2.0; // m/s²
-const ACCELERATION_X_MAX_THRESHOLD: f32 = 2.0; // m/s²
-const ACCELERATION_Y_MIN_THRESHOLD: f32 = -2.0; // m/s²
-const ACCELERATION_Y_MAX_THRESHOLD: f32 = 2.0; // m/s²
-const ACCELERATION_Z_MIN_THRESHOLD: f32 = -2.0; // m/s²
-const ACCELERATION_Z_MAX_THRESHOLD: f32 = 100.0; // m/s²
-
-// Gyroscope thresholds (deg/s)
-const GYRO_X_MAX_THRESHOLD: f32 = 5.0; // deg/s
-const GYRO_Y_MAX_THRESHOLD: f32 = 5.0; // deg/s
-const GYRO_Z_MAX_THRESHOLD: f32 = 360.0; // deg/s
-const GYRO_X_MIN_THRESHOLD: f32 = -5.0;
-const GYRO_Y_MIN_THRESHOLD: f32 = -5.0;
-const GYRO_Z_MIN_THRESHOLD: f32 = -360.0;
-
-// Barometer thresholds, applied to BAROMETER_DATA (alt m, pressure Pa, temp C).
-const BARO_PRESSURE_MIN_THRESHOLD: f32 = 30000.0; // Pa
-const BARO_PRESSURE_MAX_THRESHOLD: f32 = 110000.0; // Pa
-// The BMP390's operating range; a winter pad sits below 0 °C.
-const BARO_TEMPERATURE_MIN_THRESHOLD: f32 = -40.0; // °C
-const BARO_TEMPERATURE_MAX_THRESHOLD: f32 = 85.0; // °C
-// The FC's own MIN_ALT: below it the FC rejects the sample. Pad weather moves
-// the relative altitude a few metres.
-const BARO_ALTITUDE_MIN_THRESHOLD: f32 = -30.0; // m
-const BARO_ALTITUDE_MAX_THRESHOLD: f32 = 11000.0; // m
-
-// GPS thresholds
-// Should be in texas
-const GPS_LATITUDE_MIN_THRESHOLD: f32 = 25.0; // degrees
-const GPS_LATITUDE_MAX_THRESHOLD: f32 = 36.5; // degrees
-const GPS_LONGITUDE_MIN_THRESHOLD: f32 = -106.5; // degrees
-const GPS_LONGITUDE_MAX_THRESHOLD: f32 = -93.5; // degrees
+// In-flight control is the FC's alone: radio telemetry can drop out, so the
+// station evaluates no vehicle flight-sensor thresholds (accelerometer, gyro,
+// barometer, GPS position, Kalman state). The FC owns its sensor plausibility
+// and its break-up abort; the station shows those values only. (An X-axis
+// accel window of +/-2 m/s^2 also fired on the pad: X is vertical, 1 g at rest.)
+// Vehicle health checks below (PB/VB battery, battery current, tank pressure)
+// warn only while the vehicle is on the pad (`vehicle_checks_on_pad`).
 
 // Default battery voltage thresholds (V), used as fallback sender ranges.
 const BATTERY_VOLTAGE_AV_BAY_MIN_THRESHOLD: f32 = 6.3; // V
@@ -62,10 +36,6 @@ const BATTERY_CURRENT_MAX_THRESHOLD: f32 = 50.0; // A
 // Ox Tank Pressure thresholds (psi)
 const OX_TANK_PRESSURE_MIN_THRESHOLD: f32 = 0.0; // psi
 const OX_TANK_PRESSURE_MAX_THRESHOLD: f32 = 3000.0; // psi
-
-// Kalman Filter thresholds
-const KALMAN_STATE_MIN_THRESHOLD: f32 = -5000.0; // arbitrary units
-const KALMAN_STATE_MAX_THRESHOLD: f32 = 5000.0; // arbitrary units
 
 // The testing build used the same thresholds.
 const BOARD_TIMEOUT_MS: u64 = 12000;
@@ -259,66 +229,24 @@ fn check_ox_tank_pressure(pkt: &sedsnet::packet::Packet, warnings: &mut HashSet<
     }
 }
 
-fn check_accel_thresholds(values: &[f32], warnings: &mut HashSet<&'static str>) {
-    if let Some(accel_x) = values.first()
-        && ((ACCELERATION_X_MIN_THRESHOLD > *accel_x) || (*accel_x > ACCELERATION_X_MAX_THRESHOLD))
-    {
-        warnings.insert("Critical: Acceleration X threshold exceeded!");
-    }
-
-    if let Some(accel_y) = values.get(1)
-        && ((ACCELERATION_Y_MIN_THRESHOLD > *accel_y) || (*accel_y > ACCELERATION_Y_MAX_THRESHOLD))
-    {
-        warnings.insert("Critical: Acceleration Y threshold exceeded!");
-    }
-
-    if let Some(accel_z) = values.get(2)
-        && ((ACCELERATION_Z_MIN_THRESHOLD > *accel_z) || (*accel_z > ACCELERATION_Z_MAX_THRESHOLD))
-    {
-        warnings.insert("Critical: Acceleration Z threshold exceeded!");
-    }
-}
-
-fn check_gyro_thresholds(values: &[f32], warnings: &mut HashSet<&'static str>) {
-    if let Some(gyro_x) = values.first()
-        && ((GYRO_X_MIN_THRESHOLD > *gyro_x) || (*gyro_x > GYRO_X_MAX_THRESHOLD))
-    {
-        warnings.insert("Critical: Gyro X threshold exceeded!");
-    }
-
-    if let Some(gyro_y) = values.get(1)
-        && ((GYRO_Y_MIN_THRESHOLD > *gyro_y) || (*gyro_y > GYRO_Y_MAX_THRESHOLD))
-    {
-        warnings.insert("Critical: Gyro Y threshold exceeded!");
-    }
-
-    if let Some(gyro_z) = values.get(2)
-        && ((GYRO_Z_MIN_THRESHOLD > *gyro_z) || (*gyro_z > GYRO_Z_MAX_THRESHOLD))
-    {
-        warnings.insert("Critical: Gyro Z threshold exceeded!");
-    }
-}
-
-/// One BAROMETER_DATA sample in the FC's order: altitude m, pressure Pa, temperature C.
-pub(crate) fn check_baro_thresholds(values: &[f32], warnings: &mut HashSet<&'static str>) {
-    use crate::telemetry_schema::baro;
-    if let Some(pressure) = values.get(baro::PRESSURE_PA)
-        && ((BARO_PRESSURE_MIN_THRESHOLD > *pressure) || (*pressure > BARO_PRESSURE_MAX_THRESHOLD))
-    {
-        warnings.insert("Critical: Barometer pressure threshold exceeded!");
-    }
-
-    if let Some(temp) = values.get(baro::TEMPERATURE_C)
-        && ((BARO_TEMPERATURE_MIN_THRESHOLD > *temp) || (*temp > BARO_TEMPERATURE_MAX_THRESHOLD))
-    {
-        warnings.insert("Critical: Barometer temperature threshold exceeded!");
-    }
-
-    if let Some(alt) = values.get(baro::ALTITUDE_M)
-        && ((BARO_ALTITUDE_MIN_THRESHOLD > *alt) || (*alt > BARO_ALTITUDE_MAX_THRESHOLD))
-    {
-        warnings.insert("Critical: Barometer altitude threshold exceeded!");
-    }
+/// Vehicle health checks (PB/VB battery voltage, battery current, tank
+/// pressure) warn only while the vehicle is on the pad: a pre-Launch state, or
+/// Aborted, with no launch attempt on record. The launch lock is the station's
+/// own persisted record of a Launch, so neither an Abort sent before the FC's
+/// first in-flight report nor a restart in flight turns the checks back on.
+fn vehicle_checks_on_pad(current: FlightState, launch_attempted: bool) -> bool {
+    !launch_attempted
+        && matches!(
+            current,
+            FlightState::Startup
+                | FlightState::Idle
+                | FlightState::PreFill
+                | FlightState::FillTest
+                | FlightState::NitrogenFill
+                | FlightState::NitrousFill
+                | FlightState::Armed
+                | FlightState::Aborted
+        )
 }
 
 /// Testing: publish the station's Startup FLIGHT_STATE once every board is
@@ -663,97 +591,16 @@ async fn safety_loop(
         // board that drops off can take every other packet with it (the
         // Gateway Board carries the whole umbilical).
         let mut cycle_warnings: HashSet<&'static str> = HashSet::new();
+        let vehicle_on_pad =
+            vehicle_checks_on_pad(current_state, state.launch_history.lock().unwrap().launch_locked());
         for pkt in packets {
             match pkt.data_type() {
-                ty if ty == crate::telemetry_schema::data_type("ACCEL_DATA") => {
-                    let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 3]);
-                    check_accel_thresholds(&values, &mut cycle_warnings);
-                }
-
-                ty if ty == crate::telemetry_schema::data_type("GYRO_DATA") => {
-                    let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 3]);
-                    check_gyro_thresholds(&values, &mut cycle_warnings);
-                }
-
-                ty if ty == crate::telemetry_schema::data_type("IMU_DATA") => {
-                    let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 6]);
-                    if values.len() >= 6 {
-                        check_accel_thresholds(&values[..3], &mut cycle_warnings);
-                        check_gyro_thresholds(&values[3..6], &mut cycle_warnings);
-                    }
-                }
-
-                ty if ty == crate::telemetry_schema::data_type("BAROMETER_DATA") => {
-                    let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 3]);
-                    check_baro_thresholds(&values, &mut cycle_warnings);
-                }
-
-                // GPS: [lat, lon] in "xy"
-                ty if ty == crate::telemetry_schema::data_type("GPS_DATA") => {
-                    if !crate::runtime_mode::is_hitl() {
-                        let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 3]);
-
-                        // Latitude (x)
-                        if let Some(lat) = values.first()
-                            && ((GPS_LATITUDE_MIN_THRESHOLD > *lat)
-                                || (*lat > GPS_LATITUDE_MAX_THRESHOLD))
-                        {
-                            cycle_warnings
-                                .insert("Critical: GPS latitude out of bounds (Texas check)!");
-                        }
-
-                        // Longitude (y)
-                        if let Some(lon) = values.get(1)
-                            && ((GPS_LONGITUDE_MIN_THRESHOLD > *lon)
-                                || (*lon > GPS_LONGITUDE_MAX_THRESHOLD))
-                        {
-                            cycle_warnings
-                                .insert("Critical: GPS longitude out of bounds (Texas check)!");
-                        }
-                    }
-                }
-
-                ty if ty == crate::telemetry_schema::data_type("BATTERY_CURRENT") => {
-                    let values = pkt.data_as_f32().unwrap_or_default();
-                    check_battery_current(&values, &mut cycle_warnings);
-                }
-
-                ty if ty == crate::telemetry_schema::data_type("BATTERY_VOLTAGE") => {
-                    let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 2]);
-                    // Voltage
-                    if let Some(voltage) = values.first() {
-                        // SEDSnet 7 boards send a compact @addr: source: resolve it to the board
-                        let sender = state.canonical_network_sender_id(pkt.sender());
-                        if is_fill_system_battery_sender(&sender) {
-                            continue;
-                        } else if battery_voltage_out_of_range(&sender, *voltage) {
-                            cycle_warnings.insert(battery_voltage_warning(&sender));
-                        }
-                    }
-                }
-
-                // Ox tank pressure: [pressure_psi, ...] (current or legacy wire id)
-                ty if crate::telemetry_schema::is_ox_tank_pressure(ty) => {
-                    check_ox_tank_pressure(&pkt, &mut cycle_warnings);
-                }
-
-                // Ascent/descent Kalman filter state packets.
-                ty if ty == crate::telemetry_schema::data_type("ASCENT_STATE")
-                    || ty == crate::telemetry_schema::data_type("DESCENT_STATE") =>
-                {
-                    let values = pkt.data_as_f32().unwrap_or_default();
-
-                    if values.iter().any(|value| {
-                        !value.is_finite()
-                            || *value < KALMAN_STATE_MIN_THRESHOLD
-                            || *value > KALMAN_STATE_MAX_THRESHOLD
-                    }) {
-                        cycle_warnings.insert("Critical: Kalman filter state out of range!");
-                    }
-                }
-
                 ty if ty == crate::telemetry_schema::data_type("GENERIC_ERROR") => {
-                    if !matches!(pending_abort, Some(SafetyAbortReason::GenericError { .. })) {
+                    // The board's own error report is shown in every phase; only
+                    // on the pad may it pause the fill (never an action in flight).
+                    if vehicle_on_pad
+                        && !matches!(pending_abort, Some(SafetyAbortReason::GenericError { .. }))
+                    {
                         let reason = SafetyAbortReason::GenericError {
                             sender: state.canonical_network_sender_id(pkt.sender()),
                             packet_id: pkt.packet_id(),
@@ -768,7 +615,7 @@ async fn safety_loop(
                     gs_debug_println!("Safety: Generic Error packet received");
                 }
 
-                _ => {}
+                _ => value_range_warnings(state, &pkt, vehicle_on_pad, &mut cycle_warnings),
             }
         }
 
@@ -812,6 +659,53 @@ async fn safety_loop(
                 SafetyDispatch::Unavailable => {}
             }
         }
+    }
+}
+
+/// The value-range checks of one packet. No accel, gyro, IMU, barometer, GPS
+/// or Kalman-state check: in-flight control is the FC's (note at the top).
+/// Vehicle health (PB/VB battery, battery current, tank pressure) is checked
+/// on the pad only; the GB's battery current in every phase.
+fn value_range_warnings(
+    state: &AppState,
+    pkt: &sedsnet::packet::Packet,
+    vehicle_on_pad: bool,
+    warnings: &mut HashSet<&'static str>,
+) {
+    match pkt.data_type() {
+        ty if ty == crate::telemetry_schema::data_type("BATTERY_CURRENT") => {
+            let sender = state.canonical_network_sender_id(pkt.sender());
+            if vehicle_on_pad || is_fill_system_battery_sender(&sender) {
+                let values = pkt.data_as_f32().unwrap_or_default();
+                check_battery_current(&values, warnings);
+            }
+        }
+
+        ty if ty == crate::telemetry_schema::data_type("BATTERY_VOLTAGE") => {
+            let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 2]);
+            // Voltage
+            if let Some(voltage) = values.first() {
+                // SEDSnet 7 boards send a compact @addr: source: resolve it to the board
+                let sender = state.canonical_network_sender_id(pkt.sender());
+                // GB: its own low-voltage alert (telemetry_task). PB/VB
+                // ride the vehicle: checked on the pad only.
+                if !is_fill_system_battery_sender(&sender)
+                    && vehicle_on_pad
+                    && battery_voltage_out_of_range(&sender, *voltage)
+                {
+                    warnings.insert(battery_voltage_warning(&sender));
+                }
+            }
+        }
+
+        // Ox tank pressure: [pressure_psi, ...] (current or legacy wire id).
+        // A fill check: on the pad only (the tank flies with the vehicle).
+        ty if crate::telemetry_schema::is_ox_tank_pressure(ty) => {
+            if vehicle_on_pad {
+                check_ox_tank_pressure(pkt, warnings);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -919,6 +813,102 @@ fn dispatch_claimed_safety_abort(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn f32_packet(data_type: &str, sender: &str, values: &[f32]) -> sedsnet::packet::Packet {
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        sedsnet::packet::Packet::new(
+            crate::telemetry_schema::data_type(data_type),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+            sender,
+            get_current_timestamp_ms(),
+            Arc::<[u8]>::from(bytes),
+        )
+        .unwrap()
+    }
+
+    /// In-flight control is the FC's: the station raises no warning from the
+    /// vehicle's flight sensors, on the pad or in flight. The FC's X axis is
+    /// vertical, so 1 g at rest used to trip "Acceleration X exceeded".
+    #[tokio::test]
+    async fn the_station_checks_no_vehicle_flight_sensor_threshold() {
+        let state = crate::state::tests::test_app_state().await;
+        let packets = [
+            f32_packet("ACCEL_DATA", "FC", &[9.81, 0.0, 0.0]),
+            f32_packet("ACCEL_DATA", "FC", &[300.0, -50.0, 500.0]),
+            f32_packet("GYRO_DATA", "FC", &[90.0, -90.0, 720.0]),
+            f32_packet("IMU_DATA", "FC", &[9.81, 3.0, 3.0, 90.0, 90.0, 900.0]),
+            f32_packet("BAROMETER_DATA", "FC", &[-40.0, 20_000.0, 90.0]),
+            f32_packet("GPS_DATA", "RF", &[0.0, 0.0, 0.0]),
+            f32_packet("ASCENT_STATE", "FC", &[f32::NAN, 9_000.0, -9_000.0, 0.0, 0.0, 0.0]),
+            f32_packet("DESCENT_STATE", "FC", &[f32::INFINITY, 9_000.0, 0.0, 0.0]),
+        ];
+        for on_pad in [true, false] {
+            let mut warnings = HashSet::new();
+            for pkt in &packets {
+                value_range_warnings(&state, pkt, on_pad, &mut warnings);
+            }
+            assert!(warnings.is_empty(), "on_pad={on_pad}: {warnings:?}");
+        }
+    }
+
+    /// PB/VB battery, battery current and tank pressure ride the vehicle:
+    /// checked on the pad, silent from Launch on. The GB's current stays.
+    #[tokio::test]
+    async fn vehicle_health_warns_on_the_pad_only() {
+        let state = crate::state::tests::test_app_state().await;
+        let run = |pkt: sedsnet::packet::Packet, on_pad: bool| {
+            let mut warnings = HashSet::new();
+            value_range_warnings(&state, &pkt, on_pad, &mut warnings);
+            warnings
+        };
+        let pb_low = || f32_packet("BATTERY_VOLTAGE", "PB", &[5.6]);
+        assert_eq!(run(pb_low(), true), HashSet::from(["Critical: PB battery voltage out of range!"]));
+        assert!(run(pb_low(), false).is_empty());
+        // A full 4S pack (16.8 V) is in range: the maximum is 16.85 V.
+        assert!(run(f32_packet("BATTERY_VOLTAGE", "VB", &[16.8]), true).is_empty());
+        assert!(!battery_voltage_out_of_range("VB", 16.85));
+        assert!(battery_voltage_out_of_range("VB", 16.9));
+        let vb_amps = || f32_packet("BATTERY_CURRENT", "VB", &[60.0]);
+        assert_eq!(run(vb_amps(), true), HashSet::from([BATTERY_CURRENT_WARNING]));
+        assert!(run(vb_amps(), false).is_empty());
+        assert_eq!(
+            run(f32_packet("BATTERY_CURRENT", "GB", &[60.0]), false),
+            HashSet::from([BATTERY_CURRENT_WARNING])
+        );
+        let tank = || f32_packet("OX_TANK_PRESSURE", "VB", &[3_500.0]);
+        assert_eq!(run(tank(), true), HashSet::from(["Critical: Ox tank pressure out of range!"]));
+        assert!(run(tank(), false).is_empty());
+    }
+
+    #[test]
+    fn vehicle_checks_stop_at_launch() {
+        use FlightState as S;
+        let pad = [S::Startup, S::Idle, S::PreFill, S::FillTest, S::NitrogenFill, S::NitrousFill, S::Armed, S::Aborted];
+        let flight = [
+            S::Launch, S::Ascent, S::Coast, S::Apogee, S::Descent, S::Reefing, S::InFlight, S::Landed, S::Recovery,
+        ];
+        for s in pad {
+            assert!(vehicle_checks_on_pad(s, false), "{s:?}");
+            // An Abort while the station still shows Launch, or a restart in
+            // flight, keeps the checks off until the launch lock is released.
+            assert!(!vehicle_checks_on_pad(s, true), "{s:?}");
+        }
+        for s in flight {
+            assert!(!vehicle_checks_on_pad(s, false), "{s:?}");
+            assert!(!vehicle_checks_on_pad(s, true), "{s:?}");
+        }
+    }
+
+    /// The gate's launch evidence is the recorded Launch attempt, which an
+    /// Abort does not clear.
+    #[tokio::test]
+    async fn a_recorded_launch_attempt_keeps_the_vehicle_checks_off_through_an_abort() {
+        let state = crate::state::tests::test_app_state().await;
+        let attempted = || state.launch_history.lock().unwrap().launch_locked();
+        assert!(vehicle_checks_on_pad(FlightState::Aborted, attempted()));
+        state.launch_history.lock().unwrap().inhibit_automatic_actions().unwrap();
+        assert!(!vehicle_checks_on_pad(FlightState::Aborted, attempted()));
+    }
 
     /// The ingest drains the ring continuously: a packet it already took (a PB
     /// pack reading below range) must still reach the next safety cycle, once.

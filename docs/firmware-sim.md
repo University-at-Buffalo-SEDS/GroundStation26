@@ -721,8 +721,9 @@ frame engine waveforms up to about 250 Hz come through faithfully (500 Hz Nyquis
 * The FC does not report a pulled card (BOARD_HEALTH SD ready stays set for at least 20 s), and an Enter ground test
   with the card out stays in Validating with no fault or time-out (r7).
 * With the safety task's checks live (r7): the sim's VB pack (15.23 V) is above the Normal/Testing layout range
-  (13.6-15.2 V), and the FC's ACCEL_DATA X axis carries gravity against a +/-2 m/s2 X threshold. Pack data or layout
-  range, and the axis thresholds, need deciding.
+  (13.6-15.2 V), and the FC's ACCEL_DATA X axis carries gravity against a +/-2 m/s2 X threshold. Decided 25 Nov
+  2026: the VB/GB maximum is 16.85 V (4S full), and in-flight control is the FC's alone, so the station checks no
+  accel, gyro, barometer, GPS or Kalman threshold and checks vehicle health on the pad only. Closed.
 * SAR inputs in the DAC patch; roll/6-DOF attitude; brown-outs on a flat pack; the Settings sim panel has no
   battery inputs yet (the control route takes `batteries`).
 * An actual remote bundle run, the armhf cross build and a run on the Pi station.

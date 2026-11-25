@@ -108,7 +108,9 @@ pub struct BaroRef {
 /// (alt m, pressure Pa, temperature C): the pressure its altitude is
 /// measured from. `None` for an implausible sample.
 pub fn reference_pressure(values: &[f32]) -> Option<f64> {
-    let (alt, pressure) = (f64::from(*values.first()?), f64::from(*values.get(1)?));
+    use crate::telemetry_schema::baro;
+    let (alt, pressure) =
+        (f64::from(*values.get(baro::ALTITUDE_M)?), f64::from(*values.get(baro::PRESSURE_PA)?));
     if !(30_000.0..=125_000.0).contains(&pressure) || !(-1_000.0..=10_000.0).contains(&alt) {
         return None;
     }
