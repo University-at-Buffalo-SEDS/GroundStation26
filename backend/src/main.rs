@@ -1417,8 +1417,9 @@ fn open_rocket_comms(link: &CommsLinkConfig) -> (Arc<Mutex<Box<dyn CommsDevice>>
         }
         Err(e) => {
             gs_debug_println!("Rocket comms missing, using DummyComms: {}", e);
+            // {e:#}: the whole cause chain (the OS error behind "failed to configure serial port")
             log::warn!(
-                "AV bay link unavailable: {e}. Setup hint: {}",
+                "AV bay link unavailable: {e:#}. Setup hint: {}",
                 startup_failure_hint(link)
             );
             // RUNTIME-MODE-BOOT: links open once at start. Normal refuses to
