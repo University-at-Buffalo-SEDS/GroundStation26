@@ -6279,11 +6279,28 @@ mod rfd_worker_tests {
         assert!(at <= Duration::from_millis(2_000), "mode reply took {at:?}");
         // The heartbeat's own 1 Hz overtake still holds alongside the owed turn
         // (FC GND_TIMEOUT 3 s): no gap over 1.5 s, first one within 1.5 s.
+        let gap = longest_gap(&heartbeats, Duration::from_millis(2_900));
+        assert!(gap <= Duration::from_millis(1_500), "heartbeat gap {gap:?}: {heartbeats:?}");
+    }
+
+    /// The longest silence up to `end` between increasing arrival times (from
+    /// zero). The read loop runs past `end`, so arrivals may be later than it.
+    fn longest_gap(arrivals: &[Duration], end: Duration) -> Duration {
         let mut previous = Duration::ZERO;
-        for at in heartbeats.iter().chain(std::iter::once(&Duration::from_millis(2_900))) {
-            assert!(*at - previous <= Duration::from_millis(1_500), "heartbeat gap {:?} at {at:?}: {heartbeats:?}", *at - previous);
-            previous = *at;
-        }
+        arrivals
+            .iter()
+            .chain(std::iter::once(&end))
+            .map(|at| at.saturating_sub(std::mem::replace(&mut previous, *at)))
+            .max()
+            .unwrap()
+    }
+
+    #[test]
+    fn the_longest_gap_counts_an_arrival_after_the_end() {
+        let ms = Duration::from_millis;
+        assert_eq!(longest_gap(&[], ms(2_900)), ms(2_900));
+        assert_eq!(longest_gap(&[ms(100), ms(1_200)], ms(2_900)), ms(1_700));
+        assert_eq!(longest_gap(&[ms(1_000), ms(2_000), ms(2_950)], ms(2_900)), ms(1_000));
     }
 
     #[tokio::test]
