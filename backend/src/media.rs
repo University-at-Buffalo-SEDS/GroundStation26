@@ -9,6 +9,8 @@ mod recorded_vehicle;
 mod recordings;
 #[path = "media/rundown.rs"]
 mod rundown;
+#[path = "media/studio.rs"]
+mod studio;
 #[path = "media/transcoding.rs"]
 mod transcoding;
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -108,6 +110,7 @@ pub fn router(
         .merge(publishing::routes())
         .merge(transcoding::routes())
         .merge(recorded_vehicle::routes())
+        .merge(studio::routes())
         .route("/api/video/streams", get(list_streams))
         .route(
             "/api/video/streams/{id}/name",
@@ -133,6 +136,13 @@ pub fn router(
             "/media",
             get(|| async { Html(gs_browser_assets::MEDIA_HTML) }),
         )
+}
+
+/// The studio and programme routes over a media state in `root`, with no
+/// relay and no background tasks (contract fixtures).
+#[cfg(test)]
+pub(crate) fn studio_fixture_router(app: Arc<AppState>, root: &std::path::Path) -> Router {
+    contract::routes().merge(studio::routes()).with_state(studio::test_state(app, root))
 }
 
 /// `GET /api/vehicle_visualization` on its own (the replay bundle snapshots

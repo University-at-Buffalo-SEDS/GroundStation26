@@ -57,6 +57,16 @@ pub(super) fn routes() -> Router<Arc<MediaState>> {
                 }
             }),
         )
+        .route(
+            "/assets/program-studio.js",
+            get(|| async {
+                // Optional asset: an older frontend checkout has no studio script.
+                match gs_browser_assets::asset_bytes("PROGRAM_STUDIO_JS") {
+                    Some(bytes) => ([(header::CONTENT_TYPE, "text/javascript")], bytes).into_response(),
+                    None => StatusCode::NOT_FOUND.into_response(),
+                }
+            }),
+        )
         .route("/api/media-assets/program/state", get(program_state))
         .route("/api/media-assets/program/vehicle-geometry", get(program_vehicle_geometry))
         .route("/api/media-assets/program/audio", get(program_audio))
@@ -198,7 +208,27 @@ async fn program_state(
 ) -> ApiResult<Response> {
     let headers = ticket_headers(&state, &headers, &query, "program").await?;
     authorize(&state, &headers, Permission::ViewData).await?;
-    let presentation = read_presentation(&state).await?;
+    let mut presentation = read_presentation(&state).await?;
+    // The manager's Preview monitor (`scene=`) and a single-source browser
+    // source (`source=`) draw live, whatever the programme is replaying.
+    let studio_override = match (&query.source, &query.scene) {
+        (Some(source), _) => Some(
+            super::super::studio::single_source(source)
+                .ok_or_else(|| error(StatusCode::NOT_FOUND, "Unknown source"))?,
+        ),
+        (None, Some(scene)) => {
+            let studio = &presentation.broadcast.studio;
+            let scene = studio.scene(scene).ok_or_else(|| error(StatusCode::NOT_FOUND, "Unknown scene"))?;
+            let layout = studio.layouts.iter().find(|l| l.id == scene.layout_id).ok_or_else(|| error(StatusCode::NOT_FOUND, "Unknown layout"))?;
+            Some((scene.clone(), layout.clone()))
+        }
+        (None, None) => None,
+    };
+    if studio_override.is_some() {
+        // Unaired scenes and single sources are the stream manager's.
+        authorize_preview(&state, &headers).await?;
+        presentation.broadcast.replay = None;
+    }
     let now = now_ms();
     let history = state.program_history.lock().await;
     let target = presentation
@@ -218,14 +248,33 @@ async fn program_state(
         live_telemetry
     };
     let mut streams = Vec::new();
-    let effective_scene = telemetry
-        .as_ref()
-        .and_then(|v| v.get("scene"))
-        .and_then(serde_json::Value::as_str)
-        .filter(|s| *s != "inherit")
-        .unwrap_or(&presentation.broadcast.layout);
+    // A taken studio scene owns the programme; the rundown's per-phase scene
+    // applies to the classic layouts only.
+    let effective_scene = if studio_override.is_some() || presentation.broadcast.layout == "studio" {
+        "studio"
+    } else {
+        telemetry
+            .as_ref()
+            .and_then(|v| v.get("scene"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| *s != "inherit")
+            .unwrap_or(&presentation.broadcast.layout)
+    };
+    let studio_scene = (effective_scene == "studio")
+        .then(|| {
+            studio_override.clone().or_else(|| {
+                let studio = &presentation.broadcast.studio;
+                let scene = studio.scene(&studio.program_scene_id)?;
+                let layout = studio.layouts.iter().find(|l| l.id == scene.layout_id)?;
+                Some((scene.clone(), layout.clone()))
+            })
+        })
+        .flatten();
     let no_video = presentation.broadcast.replay.is_none()
-        && matches!(effective_scene, "map" | "recorded-replay");
+        && (matches!(effective_scene, "map" | "recorded-replay")
+            || studio_scene.as_ref().is_some_and(|(scene, _)| {
+                !scene.sources.values().any(|id| id.starts_with("camera"))
+            }));
     // Maps, saved flight scenes and cached camera replays must not wait on a
     // disconnected live camera relay before updating telemetry/coordinates.
     let available = if no_video || presentation.broadcast.replay.is_some() {
@@ -233,10 +282,21 @@ async fn program_state(
     } else {
         fetch_streams(&state).await.unwrap_or_default().0
     };
+    let resolved = studio_scene
+        .as_ref()
+        .map(|(scene, layout)| super::super::studio::resolve(scene, layout, &available, &presentation));
     let chosen: Vec<String> = if no_video {
         Vec::new()
     } else if let Some(replay) = &presentation.broadcast.replay {
         replay.cameras.iter().map(|c| c.id.clone()).collect()
+    } else if let Some(resolved) = &resolved {
+        // Exactly the scene's cameras (a hidden camera named in a scene shows).
+        available
+            .iter()
+            .filter(|s| s.live && resolved.cameras.iter().any(|id| id == s.id.strip_prefix("transcoded-").unwrap_or(&s.id)))
+            .take(8)
+            .map(|s| s.id.clone())
+            .collect()
     } else {
         available
             .iter()
@@ -267,12 +327,28 @@ async fn program_state(
     }
     // Live diagram scenes carry their (static) topology; the delayed inputs
     // ride in the snapshot (`telemetry.diagram`).
-    let diagram_topology = crate::diagrams::is_scene(effective_scene)
-        .then(|| crate::diagrams::scene_topology(effective_scene))
+    let diagram_scene = match resolved.as_ref().and_then(|r| r.diagram.as_ref()) {
+        Some(id) => format!("diagram-{id}"),
+        None => effective_scene.to_owned(),
+    };
+    let diagram_topology = crate::diagrams::is_scene(&diagram_scene)
+        .then(|| crate::diagrams::scene_topology(&diagram_scene))
         .flatten();
+    let studio_mode = match (&query.source, &query.scene) {
+        (Some(_), _) => "source",
+        (None, Some(_)) => "preview",
+        _ => "program",
+    };
+    let studio = resolved.map(|r| {
+        let mut value = r.value;
+        value["mode"] = studio_mode.into();
+        value["take_seq"] = presentation.broadcast.studio.take_seq.into();
+        value["transition"] = serde_json::to_value(&presentation.broadcast.studio.transition).unwrap_or_default();
+        value
+    });
     // The page fetches the vehicle geometry (program_vehicle_geometry) only when this hash changes.
     let vehicle_geometry_hash = crate::vehicle_geometry::current(&state.app).source.hash.clone();
-    Ok(([(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"broadcast":presentation.broadcast,"streams":streams,"server_now_ms":now,"telemetry":telemetry,"diagram_topology":diagram_topology,"vehicle_geometry_hash":vehicle_geometry_hash}))).into_response())
+    Ok(([(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"broadcast":presentation.broadcast,"streams":streams,"server_now_ms":now,"telemetry":telemetry,"diagram_topology":diagram_topology,"studio":studio,"vehicle_geometry_hash":vehicle_geometry_hash}))).into_response())
 }
 
 /// The station's vehicle geometry for the programme page (its silhouettes);
@@ -331,7 +407,7 @@ async fn dashboard_status(
     )
         .into_response())
 }
-pub(super) fn telemetry_snapshot(
+pub(in crate::media) fn telemetry_snapshot(
     app: &AppState,
     presentation: &Presentation,
     now: u64,
@@ -374,7 +450,8 @@ pub(super) fn telemetry_snapshot(
     let sequence_visuals=crate::sequence_stream::project(stream_clock,Some(crate::gse::progress::stream_observation(app)),app.umbilical_stream_outputs(),app.umbilical_stream_commands());
     // Diagram inputs only while a diagram scene can be shown (no cost otherwise).
     let diagram_wanted = crate::diagrams::is_scene(&presentation.broadcast.layout)
-        || presentation.broadcast.rundown.profiles.values().any(|p| crate::diagrams::is_scene(&p.scene));
+        || presentation.broadcast.rundown.profiles.values().any(|p| crate::diagrams::is_scene(&p.scene))
+        || presentation.broadcast.studio.wants_diagram();
     let diagram = diagram_wanted.then(|| crate::diagrams::program_inputs(app, now));
     serde_json::json!({"phase":format!("{phase:?}"),"test_fire_mode":crate::runtime_mode::is_test_fire(),"stats":stats,"profile":profile_id,"cycle_seconds":profile.cycle_seconds,"stats_per_page":profile.stats_per_page,"scene":profile.scene,"positions":crate::antenna::snapshot(),"t_clock":program_t_clock(&clock,sampled),"sequence_visuals":sequence_visuals,"diagram":diagram})
 }

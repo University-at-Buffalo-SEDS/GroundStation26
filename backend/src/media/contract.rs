@@ -14,8 +14,8 @@ pub(super) struct Broadcast {
     comms_audio_enabled: bool,
     label: String,
     featured_stream_id: String,
-    hidden_stream_ids: Vec<String>,
-    layout: String,
+    pub(super) hidden_stream_ids: Vec<String>,
+    pub(super) layout: String,
     tiles: Vec<CameraTile>,
     pub(super) revision: u64,
     replay: Option<replay::Plan>,
@@ -24,6 +24,9 @@ pub(super) struct Broadcast {
     commentary_audio_enabled: bool,
     interview: Interview,
     pub(super) recorded_replay: Option<super::recorded_vehicle::RecordedReplayPlan>,
+    /// Layouts, scenes and the programme scene (`layout == "studio"`); only
+    /// `/api/studio/*` changes it (super::studio).
+    pub(super) studio: super::studio::Studio,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -57,6 +60,7 @@ impl Default for Broadcast {
             commentary_audio_enabled: false,
             interview: Default::default(),
             recorded_replay: None,
+            studio: Default::default(),
         }
     }
 }
@@ -424,6 +428,10 @@ pub(super) struct MediaQuery {
     ticket: Option<String>,
     session: Option<String>,
     playback_ms: Option<u64>,
+    /// Programme page: draw this studio scene (the manager's Preview monitor).
+    pub(super) scene: Option<String>,
+    /// Programme page: draw this one source full frame (a browser source).
+    pub(super) source: Option<String>,
 }
 
 #[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
@@ -659,6 +667,7 @@ async fn control_broadcast_inner(
             "interview",
             "map",
             "recorded-replay",
+            "studio",
         ]
         .contains(&broadcast.layout.as_str())
             && !crate::diagrams::is_scene(&broadcast.layout))
@@ -728,6 +737,12 @@ async fn control_broadcast_inner(
         // Scene/rundown/audio edits never own the saved replay clock. A draft
         // may predate automatic growth without being a stale operator edit.
         broadcast.recorded_replay = presentation.broadcast.recorded_replay.clone();
+    }
+    // The studio belongs to /api/studio/*: a broadcast form never edits it,
+    // and "studio" is on air only with a scene taken there.
+    broadcast.studio = presentation.broadcast.studio.clone();
+    if broadcast.layout == "studio" && broadcast.studio.scene(&broadcast.studio.program_scene_id).is_none() {
+        return Err(error(StatusCode::BAD_REQUEST, "Take a studio scene first"));
     }
     replay::prepare(&state, &mut broadcast, &presentation.broadcast).await?;
     broadcast.revision = presentation
