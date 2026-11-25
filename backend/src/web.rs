@@ -6332,6 +6332,37 @@ async fn handle_ws(
     let (session_close, mut session_closing) = tokio::sync::watch::channel(false);
     let receive_registry = state.control_ingress.clone();
     let mut recv_task = tokio::spawn(async move {
+        // Frames are handled in order, except an Abort: the frame before it may
+        // be waiting for a disk.
+        let (queue, mut queued) = mpsc::channel::<QueuedFrame>(WS_FRAME_QUEUE);
+        let handle: FrameHandler = {
+            let (state, source) = (state_for_recv.clone(), session_closing.clone());
+            Arc::new(move |text| {
+                let source = source.clone();
+                Box::pin(handle_ws_control_text_with_source(
+                    state.clone(),
+                    token.clone(),
+                    cmd_tx.clone(),
+                    text,
+                    Arc::new(move || !*source.borrow()),
+                ))
+            })
+        };
+        let ordered = {
+            let (state, handle) = (state_for_recv.clone(), handle.clone());
+            let (registry, session) = (registry_closing.clone(), session_closing.clone());
+            tokio::spawn(async move {
+                while let Some(QueuedFrame { lease, text, abort_epoch }) = queued.recv().await {
+                    // Not begun before the session or the station closed.
+                    if *registry.borrow() || *session.borrow() || overtaken_by_abort(&state, &text, abort_epoch) {
+                        lease.finish();
+                        continue;
+                    }
+                    lease.run(handle(text)).await;
+                }
+            })
+        };
+        let mut aborts = tokio::task::JoinSet::new();
         loop {
             if *registry_closing.borrow() || *session_closing.borrow() {
                 break;
@@ -6345,23 +6376,27 @@ async fn handle_ws(
                 break;
             };
             if let Message::Text(text) = message {
-                let Some(frame) = receive_registry.handler() else {
+                let Some(lease) = receive_registry.handler() else {
                     break;
                 };
-                frame
-                    .run(handle_ws_control_text_with_source(
-                        state_for_recv.clone(),
-                        token.clone(),
-                        cmd_tx.clone(),
-                        text.to_string(),
-                        {
-                            let source = session_closing.clone();
-                            Arc::new(move || !*source.borrow())
-                        },
-                    ))
-                    .await;
+                let text = text.to_string();
+                if ws_command_name(&text).as_deref() == Some("Abort") {
+                    let handle = handle.clone();
+                    aborts.spawn(async move { lease.run(handle(text)).await });
+                    continue;
+                }
+                let abort_epoch = state_for_recv.manual_abort_intent.epoch();
+                if let Err(refused) = queue.try_send(QueuedFrame { lease, text, abort_epoch }) {
+                    refused.into_inner().lease.finish();
+                    emit_notification_warning(&state_for_recv, "Command not handled: earlier commands are still waiting.");
+                }
             }
         }
+        drop(queue);
+        while let Some(abort) = aborts.join_next().await {
+            abort.expect("an Abort frame's handler failed");
+        }
+        ordered.await.expect("a frame's handler failed");
     });
     let received = tokio::select! {
         _=send_task=>false,
@@ -6379,6 +6414,36 @@ async fn handle_ws(
     if healthy {
         connection.finish();
     }
+}
+
+/// Frames of one connection waiting behind the one being handled. No operator
+/// presses this many buttons before the first is done.
+const WS_FRAME_QUEUE: usize = 64;
+type FrameHandler = Arc<dyn Fn(String) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+struct QueuedFrame {
+    lease: crate::control_ingress::Lease,
+    text: String,
+    /// The operator Abort epoch when the frame arrived.
+    abort_epoch: u64,
+}
+fn ws_command_name(text: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()?
+        .get("cmd")?
+        .as_str()
+        .map(str::to_owned)
+}
+/// A Launch or phase step that was still waiting when an Abort from the same
+/// connection overtook it is the press the Abort was about: never sent.
+fn overtaken_by_abort(state: &AppState, text: &str, abort_epoch: u64) -> bool {
+    if state.manual_abort_intent.epoch() == abort_epoch {
+        return false;
+    }
+    let Some(name) = ws_command_name(text).filter(|name| crate::board_abort::launch_command(name)) else {
+        return false;
+    };
+    emit_notification_warning(state, format!("{name} not sent: Abort was pressed after it."));
+    true
 }
 
 pub(crate) async fn handle_ws_control_text_with_source(
