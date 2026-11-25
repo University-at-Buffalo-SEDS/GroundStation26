@@ -1036,15 +1036,6 @@ pub(crate) fn set_flight_state_control_stamped(router: &Router, state: u8) -> Re
     set_flight_state_at(router, state, crate::system_clock::control_packet_stamp(router))
 }
 
-/// An RRLS in takeover writing its operator's Abort. It must not depend on
-/// network UTC (fullnet C-fix2): it is stamped like every other control
-/// (system_clock::control_packet_stamp), network UTC with its epoch when
-/// present and the station's wall clock otherwise. Boards take an Abort
-/// whatever its stamp.
-pub(crate) fn set_takeover_flight_state(router: &Router, state: u8) -> Result<()> {
-    set_flight_state_at(router, state, crate::system_clock::control_packet_stamp(router))
-}
-
 /// An RRLS writes FLIGHT_STATE only for its operator's takeover Abort (and that
 /// write's re-send), and never makes it writable to do so: a writable variable
 /// answers the boards' requests from the cache, and a request handled while a
@@ -1104,6 +1095,41 @@ fn set_flight_state_at(router: &Router, state: u8, stamp: Stamp) -> Result<()> {
     }
     submitted?;
     Ok(())
+}
+
+/// This station's own Aborted FLIGHT_STATE, handed to the SDK before it is
+/// saved (`record_aborted`): RF and PB take an Abort only from it, and it
+/// never waits for a disk. An RRLS in takeover must not depend on network UTC
+/// (fullnet C-fix2): its Abort is stamped like every other control
+/// (system_clock::control_packet_stamp), network UTC with its epoch when
+/// present and the station's wall clock otherwise. Boards take an Abort
+/// whatever its stamp.
+pub(crate) fn publish_aborted(router: &Router) -> Result<Packet> {
+    let stamp = if crate::rrls::is_rrls() {
+        crate::system_clock::control_packet_stamp(router)
+    } else {
+        control_stamp(router)?
+    };
+    let request = crate::qualification_requests::Request::begin("set_flight_state");
+    let packet = flight_state_wire_packet(NetworkFlightState::Aborted, stamp)?;
+    request.submit_with(router, packet.clone(), publish_flight_state)?;
+    Ok(packet)
+}
+/// Save a published Aborted FLIGHT_STATE, unless this station has written a
+/// newer one since.
+pub(crate) fn record_aborted(router: &Router, packet: &Packet) -> Result<()> {
+    let mut guard = store()
+        .lock()
+        .expect("network-variable store lock poisoned");
+    let ty = crate::telemetry_schema::data_type(FLIGHT_STATE_TYPE);
+    if router.own_network_variable(ty).is_some_and(|own| own.packet_id() != packet.packet_id()) {
+        return Ok(());
+    }
+    let mut next = guard.values;
+    next.flight_state = NetworkFlightState::Aborted as u8;
+    next.flight_state_stamp = packet.timestamp();
+    next.flight_state_epoch = packet.time_epoch();
+    guard.commit_flight_state(next)
 }
 
 /// FLIGHT_STATE is an ordered end-to-end stream: a write waits until every

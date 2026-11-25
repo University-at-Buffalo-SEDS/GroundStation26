@@ -1823,14 +1823,11 @@ impl AppState {
         self.set_local_flight_state_inner(next,None,false);
     }
 
-    /// Fire owns DISPATCH already. Carry its real lease through clock effects
-    /// instead of acquiring the non-reentrant mutex again.
-    pub(crate) fn set_local_flight_state_with_clock_claim(
-        &self,
-        next_state: FlightState,
-        claim: &crate::gse::OperatorDispatchClaim,
-    ) {
-        self.set_local_flight_state_inner(next_state, Some(claim), false);
+    /// Moves the RAM state only; `observe_local_flight_state_change` is owed
+    /// for the returned previous state. None: it was there already.
+    pub(crate) fn move_local_flight_state(&self, next_state: FlightState) -> Option<FlightState> {
+        let mut slot = self.state.lock().unwrap();
+        (*slot != next_state).then(|| std::mem::replace(&mut *slot, next_state))
     }
 
     fn set_local_flight_state_inner(
@@ -1839,14 +1836,9 @@ impl AppState {
         clock_claim: Option<&crate::gse::OperatorDispatchClaim>,
         publish_managed: bool,
     ) {
-        let mut slot = self.state.lock().unwrap();
-        if *slot == next_state {
-            return;
+        if let Some(previous_state) = self.move_local_flight_state(next_state) {
+            self.observe_local_flight_state_change(previous_state, next_state, clock_claim, publish_managed);
         }
-        let previous_state = *slot;
-        *slot = next_state;
-        drop(slot);
-        self.observe_local_flight_state_change(previous_state, next_state, clock_claim, publish_managed);
     }
 
     /// Everything a local flight-state change publishes after the RAM state
@@ -1907,25 +1899,39 @@ impl AppState {
         });
     }
 
-    /// Observations of an admitted LOCAL explicit Stop; never a state finalizer.
-    /// The live publisher Claim still prevents reset completion during this work.
-    pub(crate) fn observe_local_manual_stop_admission(&self) {
-        let actual = self.local_flight_state_snapshot();
-        crate::flight_sim::sync_local_flight_state(actual);
+    /// The Aborted FLIGHT_STATE of an admitted LOCAL explicit Stop, handed to
+    /// the SDK before anything is saved. None: this station writes none.
+    pub(crate) fn publish_local_manual_stop(&self, router: &Router) -> anyhow::Result<Option<sedsnet::packet::Packet>> {
         // An RRLS in takeover is the AV bay's station: its own Abort writes the
         // Aborted FLIGHT_STATE like the primary's (only RF and PB's way to take
         // it). Its projections of the primary's state still never publish.
-        if crate::rrls::is_rrls() {
-            if crate::rrls::takeover_active()
-                && let Some(router) = self.topology_router.get()
-                && let Err(err) = crate::network_variables::set_takeover_flight_state(router, actual as u8)
-            {
-                log::warn!("RRLS takeover: failed to publish the Aborted flight state: {err}");
-            }
-        } else {
-            self.queue_router_flight_state_update(actual);
+        if crate::rrls::is_rrls() && !crate::rrls::takeover_active() {
+            return Ok(None);
         }
-        let _ = self.state_tx.send(FlightStateMsg { state: actual });
+        crate::network_variables::publish_aborted(router).map(Some)
+    }
+    /// Tell the dashboards at once; `record_local_manual_stop` tells them
+    /// again once every earlier record is written.
+    pub(crate) fn show_local_manual_stop(&self) {
+        let _ = self.state_tx.send(FlightStateMsg { state: FlightState::Aborted });
+    }
+    /// Observations of an admitted LOCAL explicit Stop; never a state finalizer.
+    /// The live Recording still prevents reset completion during this work.
+    pub(crate) fn record_local_manual_stop(&self, flight_state: anyhow::Result<Option<sedsnet::packet::Packet>>) {
+        let saved = flight_state.and_then(|packet| match (self.topology_router.get(), packet) {
+            (Some(router), Some(packet)) => crate::network_variables::record_aborted(router, &packet),
+            _ => Ok(()),
+        });
+        if let Err(err) = saved {
+            log::warn!("failed to persist or publish the Aborted flight state: {err}");
+        }
+        // A Launch the SDK took before the press finishes its own records
+        // under the dispatch gate; show the Abort after it, never before.
+        crate::gse::with_command_gate(|| {
+            let actual = self.local_flight_state_snapshot();
+            crate::flight_sim::sync_local_flight_state(actual);
+            let _ = self.state_tx.send(FlightStateMsg { state: actual });
+        });
         self.broadcast_fill_targets_snapshot();
         let tx = self.db_queue_tx.clone();
         let timestamp_ms = telemetry_task::get_current_timestamp_ms() as i64;

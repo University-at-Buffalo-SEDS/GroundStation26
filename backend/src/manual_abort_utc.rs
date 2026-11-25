@@ -123,23 +123,61 @@ impl LocalStopAdmission {
             && self.timestamp == match self.wire { WirePolicy::Untimed => 0, WirePolicy::KnownUtc(original) => original.ms as u64 }
     }
 }
+/// What a published Abort still has to record. Writing it may wait on a disk.
+#[must_use]
+pub(crate) struct Published {
+    receipt: LocalStopAdmission,
+    flush_error: Option<sedsnet::TelemetryError>,
+    /// The Aborted FLIGHT_STATE of an Abort this station committed as its own.
+    flight_state: Option<anyhow::Result<Option<sedsnet::packet::Packet>>>,
+}
 /// Only the independent LOCAL publisher uses this entry. The Claim stays alive
 /// through commit/observations, so reset must wait for the real publisher owner.
+///
+/// Nothing here waits for a disk, a log, or a lock that is held across either:
+/// the ABORT and the Aborted FLIGHT_STATE (RF's and PB's only Abort) leave,
+/// and the station is Aborted, whatever else the station is waiting for.
+pub(crate) fn publish_local_claim_unrecorded(
+    state: &Arc<AppState>,
+    router: &Router,
+    claim: &mut Claim,
+    published: impl FnOnce(&Claim),
+) -> sedsnet::TelemetryResult<Option<Published>> {
+    let Some(receipt) = publish_claim_receipt(state, router, claim)? else { return Ok(None); };
+    // Transmit only: received packets are the router worker's, and their
+    // handlers wait on station state.
+    let flush_error = crate::telemetry_task::dispatch_abort_tx(router).err();
+    let committed = receipt.is_primary_original(state, router)
+        && crate::gse::commit_local_manual_stop(state, claim, &receipt);
+    published(claim);
+    let flight_state = committed.then(|| state.publish_local_manual_stop(router));
+    if committed {
+        let _ = crate::telemetry_task::dispatch_abort_tx(router);
+        state.show_local_manual_stop();
+    }
+    Ok(Some(Published { receipt, flush_error, flight_state }))
+}
+impl Published {
+    /// Everything the station keeps or shows of this Abort.
+    pub(crate) fn record(self, state: &Arc<AppState>) {
+        if let Some(error) = self.flush_error {
+            eprintln!("Manual Abort priority tx: {error:?}");
+        }
+        if let Some(flight_state) = self.flight_state {
+            state.record_local_manual_stop(flight_state);
+            log::debug!("local Manual Stop host admission packet={} epoch={} source_utc={}",
+                self.receipt.packet_id, self.receipt.epoch, self.receipt.timestamp);
+        }
+    }
+}
+#[cfg(test)]
 pub(crate) fn publish_local_claim(
     state: &Arc<AppState>,
     router: &Router,
     claim: &mut Claim,
 ) -> sedsnet::TelemetryResult<bool> {
-    let Some(receipt) = publish_claim_receipt(state, router, claim)? else { return Ok(false); };
-    // Preserve the emergency publisher's existing priority progress BEFORE any
-    // ordinary dispatch/state/provider bookkeeping can block this owner.
-    crate::telemetry_task::flush_command_tx(router, "Manual Abort priority tx");
-    if receipt.is_primary_original(state, router)
-        && crate::gse::commit_local_manual_stop(state, claim, &receipt) {
-        state.observe_local_manual_stop_admission();
-        log::debug!("local Manual Stop host admission packet={} epoch={} source_utc={}",
-            receipt.packet_id, receipt.epoch, receipt.timestamp);
-    }
+    let Some(published) = publish_local_claim_unrecorded(state, router, claim, |_| {})? else { return Ok(false); };
+    published.record(state);
     Ok(true)
 }
 fn publish_claim_receipt(

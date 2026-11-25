@@ -90,6 +90,7 @@ mod loadcell_zero;
 mod log_redaction;
 mod logger;
 mod manual_abort_intent;
+mod manual_abort_publisher;
 mod manual_abort_resend;
 mod manual_abort_utc;
 mod map;
@@ -2571,10 +2572,6 @@ async fn main() -> anyhow::Result<()> {
         db_queue_rx,
         telemetry_shutdown_rx,
     ));
-    // A bounded retained E-stop publisher is independent of the ordinary cmd
-    // channel. Local SDK callbacks retain observations and never wait on GSE.
-    let stop_state = state.clone();
-    let stop_router = router.clone();
     let _board_abort_publications = tokio::spawn(crate::board_abort::publish_service(
         state.clone(),
         state.shutdown_subscribe(),
@@ -2608,58 +2605,13 @@ async fn main() -> anyhow::Result<()> {
         state.clone(),
         state.shutdown_subscribe(),
     ));
-    let _abort_resend = tokio::spawn(crate::manual_abort_resend::service(
-        state.clone(),
-        router.clone(),
-        state.shutdown_subscribe(),
-    ));
     let _manual_utc_reservations = tokio::spawn(crate::manual_abort_utc::service(
         state.clone(),
         router.clone(),
         state.shutdown_subscribe(),
     ));
-    let _manual_stop_publisher = tokio::spawn(crate::manual_abort_intent::service_with_claim(
-        state.manual_abort_intent.clone(),
-        state.shutdown_subscribe(),
-        move |claim| {
-        // Read before the publish: a route that appears in between costs at
-        // most one extra ABORT, never a missing one.
-        let mark = crate::manual_abort_resend::send_mark(&stop_router);
-        let av_bay_routed = mark.av_bay_routed();
-        match crate::manual_abort_utc::publish_local_claim(&stop_state, &stop_router, claim)
-        {
-            Ok(true) => {
-                stop_state.board_abort.request_abort_confirmation();
-                if let Some(wire) = claim.wire() {
-                    let recovery = crate::board_recovery::coordinator::recovery_activity(&stop_state).flatten();
-                    stop_state.abort_resend.arm(claim.epoch(), wire, recovery, mark);
-                }
-                if av_bay_routed {
-                    log::info!(
-                        "manual Abort accepted by SDK epoch={} current={} pending={:?}",
-                        claim.epoch(),
-                        stop_state.manual_abort_intent.epoch(),
-                        stop_state.manual_abort_intent.pending_epoch()
-                    );
-                } else {
-                    // The SDK sends ABORT only along fresh discovery routes:
-                    // with no AV-bay route it went to the umbilical or nowhere.
-                    log::error!(
-                        "manual Abort accepted by SDK epoch={} current={} pending={:?}, but NOT sent to the AV bay: \
-                         no fresh discovery route to RF/FC/PB; held for re-send once the AV bay is rediscovered",
-                        claim.epoch(),
-                        stop_state.manual_abort_intent.epoch(),
-                        stop_state.manual_abort_intent.pending_epoch()
-                    );
-                }
-                true
-            }
-            // Logger WriteMode::Direct can wait on disk. A refused admission
-            // keeps the bounded RAM intent and retries without synchronous I/O.
-            Ok(false) | Err(_) => false,
-        }
-        },
-    ));
+    // Without them no operator Abort would leave this station.
+    let _manual_stop_publisher = crate::manual_abort_publisher::spawn(state.clone(), router.clone())?;
     let full_bay_discovery_ready = Arc::new(AtomicBool::new(false));
     // No allocation or command-path change outside simulator validation. Keep
     // the boot PilotOpen test from racing the soak's first PilotClose.

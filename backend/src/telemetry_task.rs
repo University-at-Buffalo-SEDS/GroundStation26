@@ -19,7 +19,7 @@ mod commands;
 use commands::log_command_dispatch;
 use commands::queue_locally_routed_flight_command_with_launch_revision;
 pub(crate) use commands::{
-    controller_packet, flush_command_tx, queue_abort_packet, queue_automatic_abort_packet,
+    controller_packet, dispatch_abort_tx, flush_command_tx, queue_abort_packet, queue_automatic_abort_packet,
     queue_automatic_controller_command, queue_locally_routed_flight_command,
     queue_manual_abort_wire_receipted,
 };
@@ -855,6 +855,11 @@ async fn send_flight_computer_launch(
         // An accepted first packet remains an honest SDK owner. Only a
         // zero-owner CoreBusy suffix was re-offered (inside the same window);
         // never retry here or undo durable inhibition after partial admission.
+        // An Abort ends this hold on mode changes, also one pressed during the
+        // save, before the hold was marked.
+        if state.abort_indicator_latched() {
+            state.launch_mode_gate.clear_sent();
+        }
         emit_notification_warning(&state, error);
         flush_command_tx(
             &router,

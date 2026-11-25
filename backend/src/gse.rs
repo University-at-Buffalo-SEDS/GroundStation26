@@ -5191,8 +5191,12 @@ pub(crate) fn queue_prepared_launch_packets(
                 "SDK admitted {accepted}/{total} Launch packets, desired publication failed: {e}"
             )
         })?;
-        with_stop_admission(state,ticket,||()).map_err(|e|format!("SDK admitted {accepted}/{total} Launch packets, newer Stop prevents local Launch publication: {e}"))?;
-        state.set_local_flight_state_with_clock_claim(FlightState::Launch, &claim);
+        // Moved inside the Stop boundary: an Abort is published without the
+        // dispatch gate, and one pressed after this check must end Aborted.
+        let previous = with_stop_admission(state,ticket,||state.move_local_flight_state(FlightState::Launch)).map_err(|e|format!("SDK admitted {accepted}/{total} Launch packets, newer Stop prevents local Launch publication: {e}"))?;
+        if let Some(previous) = previous {
+            state.observe_local_flight_state_change(previous, FlightState::Launch, Some(&claim), false);
+        }
     }
     result.map_err(|(accepted,error)|format!("Launch SDK admission accepted {accepted}/{total} packets: {error}; launch remains inhibited, explicit manual recovery required"))
 }
@@ -6140,24 +6144,47 @@ pub(crate) fn commit_local_manual_stop(
     claim: &crate::manual_abort_intent::Claim,
     receipt: &crate::manual_abort_utc::LocalStopAdmission,
 ) -> bool {
-    let _dispatch = dispatch_gate();
     if matches!(receipt.generation(), 0 | u64::MAX)
-        || receipt.generation() != automatic_generation(state)
         || receipt.epoch() != claim.epoch()
         || state.shutdown_requested.load(std::sync::atomic::Ordering::Acquire) {
         return false;
     }
-    claim.with_current_publication(&state.manual_abort_intent, receipt.wire(), || {
-        let mut current = state.state.lock().unwrap();
-        *current = FlightState::Aborted;
-        state.clear_launch_sequence_command_pending();
-        state.launch_mode_gate.clear_sent();
-        state.set_abort_indicator_latched(true);
-    }).is_some()
+    // Never the dispatch gate: it is held across disk writes. The Stop owner's
+    // own lock orders this instead. Every admission that moves the flight
+    // state, clears the latch or advances the generation does so inside
+    // `admit_if_unchanged`, which refuses while this Abort is published.
+    loop {
+        let committed = claim.with_current_publication(&state.manual_abort_intent, receipt.wire(), || {
+            if receipt.generation() != automatic_generation(state) {
+                return Some(false);
+            }
+            // Phase admission holds the flight state and then takes the Stop
+            // owner's lock, so it is only tried here.
+            let mut current = match state.state.try_lock() {
+                Ok(current) => current,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return None,
+            };
+            *current = FlightState::Aborted;
+            state.clear_launch_sequence_command_pending();
+            state.launch_mode_gate.clear_sent();
+            state.set_abort_indicator_latched(true);
+            Some(true)
+        });
+        match committed {
+            None => return false,
+            Some(Some(committed)) => return committed,
+            Some(None) => std::thread::sleep(std::time::Duration::from_micros(200)),
+        }
+    }
 }
 
 pub(crate) fn accept_observed_abort(state: &AppState, automatic: bool, generation: u64) -> bool {
-    let _dispatch = dispatch_gate();
+    // Only an automatic observation is judged against what the gate orders. A
+    // manual one stands whatever is being dispatched, and the gate is held
+    // across disk writes; Launch and recovery admission are ordered against it
+    // by the observation inbox (`admit_if_no_manual_since`).
+    let _dispatch = automatic.then(dispatch_gate);
     if automatic && (generation != automatic_generation(state) || !automatic_abort_allowed(state)) {
         return false;
     }

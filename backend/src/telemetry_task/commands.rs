@@ -288,6 +288,13 @@ mod control_clock_tests {
     }
 }
 
+/// Put what the SDK holds on its transports, an ABORT first, without running
+/// any received packet's handler and without logging.
+pub(crate) fn dispatch_abort_tx(router: &Router) -> sedsnet::TelemetryResult<()> {
+    crate::sd_download::leadup::note_command_traffic();
+    router.dispatch_tx_queue_with_timeout(ROUTER_TX_BUDGET_MS)
+}
+
 pub(crate) fn flush_command_tx(router: &Router, context: &str) {
     // Background SD lead-up fetches stay off the link around commands.
     crate::sd_download::leadup::note_command_traffic();

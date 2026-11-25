@@ -19,6 +19,10 @@ struct Pending {
     pending: bool,
     publishing: Option<u64>,
     renewed_during_claim: bool,
+    /// Published Aborts whose station records are still being written. They
+    /// keep every admission fenced as a pending Abort does, and never keep a
+    /// new Abort from being published.
+    recording: usize,
     wire: Option<WirePolicy>,
     attempted_known_highwater: crate::network_stamp::Stamp,
 }
@@ -79,7 +83,7 @@ impl ManualAbortIntent {
     }
     pub(crate) fn pending_epoch(&self) -> Option<u64> {
         let state = self.state.lock().unwrap();
-        state.pending.then_some(state.epoch)
+        (state.pending || state.recording != 0).then_some(state.epoch)
     }
     /// Final launch linearization only. `admit` may enqueue prebuilt SDK
     /// packets; it must never flush, await, log, or take GSE/journal/DB locks.
@@ -89,6 +93,7 @@ impl ManualAbortIntent {
             || state.epoch == u64::MAX
             || state.epoch != epoch
             || state.pending
+            || state.recording != 0
             || state.publishing.is_some()
         {
             return None;
@@ -184,6 +189,21 @@ impl Claim {
     pub(crate) fn accepted(mut self) {
         self.accepted = true;
     }
+    /// `accepted`, for an Abort whose station records are written after this
+    /// claim is released: they may wait on a disk, the next Abort must not.
+    pub(crate) fn accepted_recording_later(self) -> Recording {
+        self.owner.state.lock().unwrap().recording += 1;
+        let recording = Recording(self.owner.clone());
+        self.accepted();
+        recording
+    }
+}
+/// An Abort published and not yet fully recorded by this station.
+pub(crate) struct Recording(Arc<ManualAbortIntent>);
+impl Drop for Recording {
+    fn drop(&mut self) {
+        self.0.state.lock().unwrap().recording -= 1;
+    }
 }
 impl Drop for Claim {
     fn drop(&mut self) {
@@ -211,10 +231,22 @@ pub(crate) async fn service(
     service_with_claim(intent, shutdown, move |claim| admit(claim.epoch())).await
 }
 
+#[cfg(test)]
 pub(crate) async fn service_with_claim(
     intent: Arc<ManualAbortIntent>,
-    mut shutdown: broadcast::Receiver<()>,
+    shutdown: broadcast::Receiver<()>,
     mut admit: impl FnMut(&mut Claim) -> bool,
+) {
+    service_recording(intent, shutdown, move |claim| admit(claim).then_some(()), |(), _| {}).await
+}
+
+/// `admit` returns what is left to record once the SDK owns the Abort;
+/// `record` takes it, with the fence it keeps, off this publisher.
+pub(crate) async fn service_recording<T>(
+    intent: Arc<ManualAbortIntent>,
+    mut shutdown: broadcast::Receiver<()>,
+    mut admit: impl FnMut(&mut Claim) -> Option<T>,
+    mut record: impl FnMut(T, Recording),
 ) {
     loop {
         match shutdown.try_recv() {
@@ -222,8 +254,8 @@ pub(crate) async fn service_with_claim(
             _ => return,
         }
         if let Some(mut claim) = intent.try_claim() {
-            if admit(&mut claim) {
-                claim.accepted();
+            if let Some(left) = admit(&mut claim) {
+                record(left, claim.accepted_recording_later());
             } else {
                 drop(claim);
                 // A refused queue cannot erase Stop or create a busy retry loop.
@@ -277,6 +309,23 @@ mod tests {
         );
         renewed.accepted();
         assert_eq!(intent.try_known_highwater(), Some(crate::network_stamp::Stamp::raw(1234)));
+        assert!(intent.admit_if_unchanged(2, || ()).is_some());
+    }
+
+    #[test]
+    fn an_abort_still_being_recorded_fences_admission_and_delays_no_other_abort() {
+        let intent = Arc::new(ManualAbortIntent::default());
+        intent.request();
+        let recording = intent.try_claim().unwrap().accepted_recording_later();
+        assert_eq!(intent.pending_epoch(), Some(1), "not settled until it is recorded");
+        assert!(intent.admit_if_unchanged(1, || ()).is_none());
+        // The next press is published while the first is still being recorded.
+        intent.request();
+        let second = intent.try_claim().expect("the recorder holds no publisher").accepted_recording_later();
+        drop(recording);
+        assert!(intent.admit_if_unchanged(2, || ()).is_none());
+        drop(second);
+        assert_eq!(intent.pending_epoch(), None);
         assert!(intent.admit_if_unchanged(2, || ()).is_some());
     }
 
