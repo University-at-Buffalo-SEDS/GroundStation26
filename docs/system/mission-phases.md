@@ -106,11 +106,12 @@ state alone (the HITL column above).
   - automatic supply closes;
   - dispatch filter;
   - observed automatic abort.
-- **In-flight checks are the FC's.** Radio telemetry can drop out, so the station
-  evaluates no vehicle flight-sensor threshold (accelerometer, gyro, barometer, GPS
-  position, Kalman state). Vehicle health (PB/VB battery voltage, battery current, ox tank
-  pressure range) warns only in Startup through Armed, or Aborted, with no Launch attempt
-  on record (the launch lock); the GB's battery current in every phase (`safety_task.rs:vehicle_checks_on_pad`, `value_range_warnings`). The
+- **In-flight checks are the FC's.** Radio telemetry can drop out, so the station checks
+  the vehicle's sensors and health (gyro, barometer, GPS position, Kalman state, PB/VB
+  battery voltage, battery current, ox tank pressure range) only in Startup through Armed,
+  or Aborted, with no Launch attempt on record (the launch lock). It checks no
+  accelerometer threshold; the GB's battery current is checked in every phase
+  (`safety_task.rs:vehicle_checks_on_pad`, `value_range_warnings`). The
   FC owns its sensor plausibility and break-up abort; Abort stays an operator action.
 - **Rules that stay keyed on the detailed state, unchanged:**
   - launch lock and reset (see "Launch lock" below);

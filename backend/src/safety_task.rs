@@ -8,13 +8,36 @@ use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
 use tokio::time::{Duration, sleep};
 
-// In-flight control is the FC's alone: radio telemetry can drop out, so the
-// station evaluates no vehicle flight-sensor thresholds (accelerometer, gyro,
-// barometer, GPS position, Kalman state). The FC owns its sensor plausibility
-// and its break-up abort; the station shows those values only. (An X-axis
-// accel window of +/-2 m/s^2 also fired on the pad: X is vertical, 1 g at rest.)
-// Vehicle health checks below (PB/VB battery, battery current, tank pressure)
-// warn only while the vehicle is on the pad (`vehicle_checks_on_pad`).
+// In-flight control is the FC's alone: radio telemetry can drop out, so every
+// vehicle check below warns only while the vehicle is on the pad
+// (`vehicle_checks_on_pad`). No accelerometer check: X is vertical and reads
+// 1 g at rest, so a +/-2 m/s^2 window warned on every upright rocket.
+
+// Gyroscope thresholds (deg/s)
+const GYRO_X_MAX_THRESHOLD: f32 = 5.0; // deg/s
+const GYRO_Y_MAX_THRESHOLD: f32 = 5.0; // deg/s
+const GYRO_Z_MAX_THRESHOLD: f32 = 360.0; // deg/s
+const GYRO_X_MIN_THRESHOLD: f32 = -5.0;
+const GYRO_Y_MIN_THRESHOLD: f32 = -5.0;
+const GYRO_Z_MIN_THRESHOLD: f32 = -360.0;
+
+// Barometer thresholds, applied to BAROMETER_DATA (alt m, pressure Pa, temp C).
+const BARO_PRESSURE_MIN_THRESHOLD: f32 = 30000.0; // Pa
+const BARO_PRESSURE_MAX_THRESHOLD: f32 = 110000.0; // Pa
+// The BMP390's operating range; a winter pad sits below 0 °C.
+const BARO_TEMPERATURE_MIN_THRESHOLD: f32 = -40.0; // °C
+const BARO_TEMPERATURE_MAX_THRESHOLD: f32 = 85.0; // °C
+// The FC's own MIN_ALT: below it the FC rejects the sample. Pad weather moves
+// the relative altitude a few metres.
+const BARO_ALTITUDE_MIN_THRESHOLD: f32 = -30.0; // m
+const BARO_ALTITUDE_MAX_THRESHOLD: f32 = 11000.0; // m
+
+// GPS thresholds
+// Should be in texas
+const GPS_LATITUDE_MIN_THRESHOLD: f32 = 25.0; // degrees
+const GPS_LATITUDE_MAX_THRESHOLD: f32 = 36.5; // degrees
+const GPS_LONGITUDE_MIN_THRESHOLD: f32 = -106.5; // degrees
+const GPS_LONGITUDE_MAX_THRESHOLD: f32 = -93.5; // degrees
 
 // Default battery voltage thresholds (V), used as fallback sender ranges.
 const BATTERY_VOLTAGE_AV_BAY_MIN_THRESHOLD: f32 = 6.3; // V
@@ -36,6 +59,10 @@ const BATTERY_CURRENT_MAX_THRESHOLD: f32 = 50.0; // A
 // Ox Tank Pressure thresholds (psi)
 const OX_TANK_PRESSURE_MIN_THRESHOLD: f32 = 0.0; // psi
 const OX_TANK_PRESSURE_MAX_THRESHOLD: f32 = 3000.0; // psi
+
+// Kalman Filter thresholds
+const KALMAN_STATE_MIN_THRESHOLD: f32 = -5000.0; // arbitrary units
+const KALMAN_STATE_MAX_THRESHOLD: f32 = 5000.0; // arbitrary units
 
 // The testing build used the same thresholds.
 const BOARD_TIMEOUT_MS: u64 = 12000;
@@ -234,6 +261,48 @@ fn check_ox_tank_pressure(pkt: &sedsnet::packet::Packet, warnings: &mut HashSet<
 /// safety loop. While the lock is busy (or poisoned) the last answer stands.
 fn launch_attempted_now(state: &AppState, last: bool) -> bool {
     state.launch_history.try_lock().map_or(last, |history| history.launch_locked())
+}
+
+fn check_gyro_thresholds(values: &[f32], warnings: &mut HashSet<&'static str>) {
+    if let Some(gyro_x) = values.first()
+        && ((GYRO_X_MIN_THRESHOLD > *gyro_x) || (*gyro_x > GYRO_X_MAX_THRESHOLD))
+    {
+        warnings.insert("Critical: Gyro X threshold exceeded!");
+    }
+
+    if let Some(gyro_y) = values.get(1)
+        && ((GYRO_Y_MIN_THRESHOLD > *gyro_y) || (*gyro_y > GYRO_Y_MAX_THRESHOLD))
+    {
+        warnings.insert("Critical: Gyro Y threshold exceeded!");
+    }
+
+    if let Some(gyro_z) = values.get(2)
+        && ((GYRO_Z_MIN_THRESHOLD > *gyro_z) || (*gyro_z > GYRO_Z_MAX_THRESHOLD))
+    {
+        warnings.insert("Critical: Gyro Z threshold exceeded!");
+    }
+}
+
+/// One BAROMETER_DATA sample in the FC's order: altitude m, pressure Pa, temperature C.
+pub(crate) fn check_baro_thresholds(values: &[f32], warnings: &mut HashSet<&'static str>) {
+    use crate::telemetry_schema::baro;
+    if let Some(pressure) = values.get(baro::PRESSURE_PA)
+        && ((BARO_PRESSURE_MIN_THRESHOLD > *pressure) || (*pressure > BARO_PRESSURE_MAX_THRESHOLD))
+    {
+        warnings.insert("Critical: Barometer pressure threshold exceeded!");
+    }
+
+    if let Some(temp) = values.get(baro::TEMPERATURE_C)
+        && ((BARO_TEMPERATURE_MIN_THRESHOLD > *temp) || (*temp > BARO_TEMPERATURE_MAX_THRESHOLD))
+    {
+        warnings.insert("Critical: Barometer temperature threshold exceeded!");
+    }
+
+    if let Some(alt) = values.get(baro::ALTITUDE_M)
+        && ((BARO_ALTITUDE_MIN_THRESHOLD > *alt) || (*alt > BARO_ALTITUDE_MAX_THRESHOLD))
+    {
+        warnings.insert("Critical: Barometer altitude threshold exceeded!");
+    }
 }
 
 /// Vehicle health checks (PB/VB battery voltage, battery current, tank
@@ -671,10 +740,9 @@ async fn safety_loop(
     }
 }
 
-/// The value-range checks of one packet. No accel, gyro, IMU, barometer, GPS
-/// or Kalman-state check: in-flight control is the FC's (note at the top).
-/// Vehicle health (PB/VB battery, battery current, tank pressure) is checked
-/// on the pad only; the GB's battery current in every phase.
+/// The value-range checks of one packet. Vehicle sensors and health are checked
+/// on the pad only (in-flight control is the FC's: note at the top); the GB's
+/// battery current in every phase. No accelerometer check.
 fn value_range_warnings(
     state: &AppState,
     pkt: &sedsnet::packet::Packet,
@@ -682,6 +750,64 @@ fn value_range_warnings(
     warnings: &mut HashSet<&'static str>,
 ) {
     match pkt.data_type() {
+        ty if vehicle_on_pad && ty == crate::telemetry_schema::data_type("GYRO_DATA") => {
+            let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 3]);
+            check_gyro_thresholds(&values, warnings);
+        }
+
+        ty if vehicle_on_pad && ty == crate::telemetry_schema::data_type("IMU_DATA") => {
+            let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 6]);
+            if values.len() >= 6 {
+                check_gyro_thresholds(&values[3..6], warnings);
+            }
+        }
+
+        ty if vehicle_on_pad && ty == crate::telemetry_schema::data_type("BAROMETER_DATA") => {
+            let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 3]);
+            check_baro_thresholds(&values, warnings);
+        }
+
+        // GPS: [lat, lon] in "xy"
+        ty if vehicle_on_pad && ty == crate::telemetry_schema::data_type("GPS_DATA") => {
+            if !crate::runtime_mode::is_hitl() {
+                let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 3]);
+
+                // Latitude (x)
+                if let Some(lat) = values.first()
+                    && ((GPS_LATITUDE_MIN_THRESHOLD > *lat)
+                        || (*lat > GPS_LATITUDE_MAX_THRESHOLD))
+                {
+                    warnings
+                        .insert("Critical: GPS latitude out of bounds (Texas check)!");
+                }
+
+                // Longitude (y)
+                if let Some(lon) = values.get(1)
+                    && ((GPS_LONGITUDE_MIN_THRESHOLD > *lon)
+                        || (*lon > GPS_LONGITUDE_MAX_THRESHOLD))
+                {
+                    warnings
+                        .insert("Critical: GPS longitude out of bounds (Texas check)!");
+                }
+            }
+        }
+
+        // Ascent/descent Kalman filter state packets.
+        ty if vehicle_on_pad
+            && (ty == crate::telemetry_schema::data_type("ASCENT_STATE")
+                || ty == crate::telemetry_schema::data_type("DESCENT_STATE")) =>
+        {
+            let values = pkt.data_as_f32().unwrap_or_default();
+
+            if values.iter().any(|value| {
+                !value.is_finite()
+                    || *value < KALMAN_STATE_MIN_THRESHOLD
+                    || *value > KALMAN_STATE_MAX_THRESHOLD
+            }) {
+                warnings.insert("Critical: Kalman filter state out of range!");
+            }
+        }
+
         ty if ty == crate::telemetry_schema::data_type("BATTERY_CURRENT") => {
             let sender = state.canonical_network_sender_id(pkt.sender());
             if vehicle_on_pad || is_fill_system_battery_sender(&sender) {
@@ -835,28 +961,36 @@ mod tests {
         .unwrap()
     }
 
-    /// In-flight control is the FC's: the station raises no warning from the
-    /// vehicle's flight sensors, on the pad or in flight. The FC's X axis is
+    /// In-flight control is the FC's: the vehicle's flight sensors are checked
+    /// on the pad only, and the accelerometer never. The FC's X axis is
     /// vertical, so 1 g at rest used to trip "Acceleration X exceeded".
     #[tokio::test]
-    async fn the_station_checks_no_vehicle_flight_sensor_threshold() {
+    async fn flight_sensors_warn_on_the_pad_only_and_the_accelerometer_never() {
         let state = crate::state::tests::test_app_state().await;
-        let packets = [
-            f32_packet("ACCEL_DATA", "FC", &[9.81, 0.0, 0.0]),
-            f32_packet("ACCEL_DATA", "FC", &[300.0, -50.0, 500.0]),
-            f32_packet("GYRO_DATA", "FC", &[90.0, -90.0, 720.0]),
-            f32_packet("IMU_DATA", "FC", &[9.81, 3.0, 3.0, 90.0, 90.0, 900.0]),
-            f32_packet("BAROMETER_DATA", "FC", &[-40.0, 20_000.0, 90.0]),
-            f32_packet("GPS_DATA", "RF", &[0.0, 0.0, 0.0]),
-            f32_packet("ASCENT_STATE", "FC", &[f32::NAN, 9_000.0, -9_000.0, 0.0, 0.0, 0.0]),
-            f32_packet("DESCENT_STATE", "FC", &[f32::INFINITY, 9_000.0, 0.0, 0.0]),
-        ];
-        for on_pad in [true, false] {
+        let run = |pkt: sedsnet::packet::Packet, on_pad: bool| {
             let mut warnings = HashSet::new();
-            for pkt in &packets {
-                value_range_warnings(&state, pkt, on_pad, &mut warnings);
+            value_range_warnings(&state, &pkt, on_pad, &mut warnings);
+            warnings
+        };
+        for on_pad in [true, false] {
+            assert!(run(f32_packet("ACCEL_DATA", "FC", &[9.81, 0.0, 0.0]), on_pad).is_empty());
+            assert!(run(f32_packet("ACCEL_DATA", "FC", &[300.0, -50.0, 500.0]), on_pad).is_empty());
+            assert!(run(f32_packet("IMU_DATA", "FC", &[9.81, 3.0, 3.0, 0.0, 0.0, 0.0]), on_pad).is_empty());
+        }
+        let faults: [(&str, &str, &[f32], &'static str); 6] = [
+            ("GYRO_DATA", "FC", &[90.0, 0.0, 0.0], "Critical: Gyro X threshold exceeded!"),
+            ("IMU_DATA", "FC", &[9.81, 0.0, 0.0, 0.0, 0.0, 900.0], "Critical: Gyro Z threshold exceeded!"),
+            ("BAROMETER_DATA", "FC", &[0.0, 20_000.0, 20.0], "Critical: Barometer pressure threshold exceeded!"),
+            ("GPS_DATA", "RF", &[0.0, -102.0, 0.0], "Critical: GPS latitude out of bounds (Texas check)!"),
+            ("ASCENT_STATE", "FC", &[f32::NAN, 0.0, 0.0, 0.0, 0.0, 0.0], "Critical: Kalman filter state out of range!"),
+            ("DESCENT_STATE", "FC", &[9_000.0, 0.0, 0.0, 0.0], "Critical: Kalman filter state out of range!"),
+        ];
+        for (data_type, sender, values, warning) in faults {
+            // HITL bench positions are not checked against the launch site.
+            if data_type != "GPS_DATA" || !crate::runtime_mode::is_hitl() {
+                assert_eq!(run(f32_packet(data_type, sender, values), true), HashSet::from([warning]));
             }
-            assert!(warnings.is_empty(), "on_pad={on_pad}: {warnings:?}");
+            assert!(run(f32_packet(data_type, sender, values), false).is_empty(), "{data_type}");
         }
     }
 

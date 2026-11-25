@@ -447,7 +447,7 @@ const PHASES: &[Spec] = &[
     Spec {
         id: "fc-owns-in-flight-checks",
         title: "FC owns in-flight checks",
-        summary: "In-flight control is the FC's alone, because radio telemetry can drop out. The station checks no accelerometer, gyro, barometer, GPS-position or Kalman-state threshold; the FC owns its sensor plausibility and break-up abort, and the station only shows those values. Vehicle health (Power Board and Valve Board battery voltage, battery current, ox tank pressure) warns on the pad only: Startup through Armed, or Aborted, with no Launch attempt on record. The Gateway Board's battery current is checked in every phase.",
+        summary: "In-flight control is the FC's alone, because radio telemetry can drop out. The station checks the vehicle's sensors and health (gyro, barometer, GPS position, Kalman state, PB/VB battery, battery current, ox tank pressure range) on the pad only: Startup through Armed, or Aborted, with no Launch attempt on record. It checks no accelerometer threshold. The GB's battery current is checked in every phase. The FC owns its sensor plausibility and break-up abort; Abort stays an operator action.",
         details: &["These checks only warn; none sends a command. A board's own GENERIC_ERROR is shown in every phase but pauses the fill only on the pad."],
         modes: FLIGHT,
         enforced_in: &["backend/src/safety_task.rs:value_range_warnings", "backend/src/safety_task.rs:vehicle_checks_on_pad"],
