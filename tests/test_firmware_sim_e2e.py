@@ -143,7 +143,7 @@ class Helpers(unittest.TestCase):
                 if path == "/api/alert_conditions":
                     return 200, {"records": [{"key": "gateway_low_voltage:GB", "state": "active" if low else "resolved"}]}
                 if path.startswith("/api/alerts"):
-                    return 200, [{"message": "Critical: Battery voltage out of range!"}] if self.v["PB"] < 6.3 else []
+                    return 200, [{"message": "Critical: PB battery voltage out of range!"}] if self.v["PB"] < 6.3 else []
                 return 404, None
 
             def plant(self):

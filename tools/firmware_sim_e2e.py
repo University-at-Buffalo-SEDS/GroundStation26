@@ -338,9 +338,30 @@ def arm_and_launch(st: Station, check):
     if st.mode == "normal":
         return normal_launch(st, check)
     launched = False
+    # the station enables Launch a moment after the fill sequence ends (seconds to tens of seconds: the sequence's
+    # completion and the launch policy settle); wait for the control itself, as an operator waits for the button
+    t_gate = st.now()
+    reasons = []
+
+    def launch_enabled():
+        c = launch_control(st)
+        r = c.get("disabled_reason") if c else "no Launch control"
+        if not reasons or reasons[-1] != r:
+            reasons.append(r)
+        return c.get("enabled") if c else None
+    enabled = st.wait(launch_enabled, 120, "Launch control enabled", poll=1)
+    st.result["launch_gate"] = {"enabled_after_s": round(st.now() - t_gate, 1) if enabled else None, "reasons": reasons[-6:]}
+    st.log("Launch control", **st.result["launch_gate"])
+    def proofs_fresh():
+        code, snap = st.api("/api/board_abort")
+        return code == 200 and isinstance(snap, dict) and not snap.get("missing_required_state") and snap
     for _ in range(8):
+        # Launch with fresh board-state proofs (as the Normal path does): a Launch admitted while the AB/VB
+        # readbacks are stale publishes FLIGHT_STATE Launch, is then refused at ignition ("Ignition requires fresh
+        # non-Abort Actuator and Valve Board readbacks") and locks Launch until a board reset (r7 tf2)
         st.api("/api/board_abort/refresh", {})
-        st.sleep(2)
+        st.sleep(1)
+        st.wait(proofs_fresh, 20, "fresh board-state proofs", poll=0.5)
         code, body = st.command("Launch")
         # an accepted request can still be blocked a moment later ("Command Launch blocked by sequence/key
         # interlock" while the fill sequence finishes): Launch counts once the station is in Launch
@@ -352,6 +373,13 @@ def arm_and_launch(st: Station, check):
             st.sleep(6)
     check("Launch accepted by the station", launched)
     return launched
+
+
+def launch_control(st: Station) -> dict:
+    code, pol = st.api("/api/action_policy")
+    if code != 200 or not isinstance(pol, dict):
+        return {}
+    return next((c for c in pol.get("controls", []) if c.get("cmd") == "Launch"), {})
 
 
 def launch_started(st: Station):
@@ -519,11 +547,52 @@ def flight(st: Station, check, result):
 
 
 
+def abort_readback(st: Station, check, result, boards=None, timeout_s=30.0, av_bound_s=3.0):
+    """The operator's Abort and the station's per-board confirmation (backend board_recovery/abort_confirm.rs, GS
+    1eae783): "shown" is the board in /api/board_abort active_errors (a board's pushed latch sets it within about a
+    second), "readback" is the board's own query reply since the press reading Aborted (/api/board-recovery/status
+    rows: state Aborted or the abort latch, received after the press). Times on the station's clock. After liftoff
+    the umbilical is gone and the VB (on the vehicle, fill CAN only) is out of reach: it is not expected then."""
+    if boards is None:
+        boards = [b for b in BOARDS if b != "VB" or st.plant().get("umbilical_attached", True)]
+    t0 = st.now()
+    code, body = st.command("Abort")
+    shown, readback = {}, {}
+    while st.now() - t0 < timeout_s and len(readback) < len(boards):
+        elapsed = st.now() - t0
+        c1, snap = st.api("/api/board_abort")
+        if c1 == 200 and isinstance(snap, dict):
+            for e in snap.get("active_errors") or []:
+                if e.get("board") in boards and e.get("board") not in shown:
+                    shown[e["board"]] = round(elapsed, 2)
+        c2, rec = st.api("/api/board-recovery/status")
+        if c2 == 200 and isinstance(rec, dict):
+            for row in rec.get("boards") or []:
+                b = row.get("id")
+                age = row.get("receipt_age_ms")
+                fresh = age is not None and age / 1000.0 <= elapsed
+                if b in boards and b not in readback and fresh and (row.get("abort_latched") or row.get("state_label") == "Aborted"):
+                    readback[b] = round(elapsed, 2)
+                    shown.setdefault(b, round(elapsed, 2))
+        time.sleep(0.2)
+    result["abort"] = {"http": code, "boards": boards, "shown_s": shown, "readback_s": readback,
+                       "missing": [b for b in boards if b not in readback]}
+    st.log("Abort readback", **result["abort"])
+    check(f"Abort: every reachable board ({', '.join(boards)}) reads back Aborted", code in (200, 202) and len(readback) == len(boards),
+          readback_s=readback, shown_s=shown, http=code)
+    av = [readback.get(b) for b in ("FC", "PB", "RF") if b in boards]
+    check(f"Abort: the AV bay (FC, PB, RF) reads back within {av_bound_s:.0f} s",
+          all(x is not None and x <= av_bound_s for x in av), readback_s=readback)
+    return readback
+
+
 def scenario_hitl(st, check, result):
     boards_up(st, check)
     fill(st, check)
     arm_and_launch(st, check)
     flight(st, check, result)
+    if os.environ.get("FIRMWARE_SIM_E2E_ABORT", "1") != "0":
+        abort_readback(st, check, result)
 
 
 def scenario_testing(st, check, result):
@@ -534,6 +603,11 @@ def scenario_testing(st, check, result):
     dac_patch(st, check, result)
     fill(st, check)
     low_battery(st, check, result)
+    if os.environ.get("FIRMWARE_SIM_E2E_ABORT", "1") != "0":
+        # Testing has no flight-state authority: the station sends the ABORT packet but no FLIGHT_STATE Aborted, so
+        # only the boards that latch the ABORT packet themselves (AB, VB, FC) abort; PB, RF, GB and the DAQ follow
+        # FLIGHT_STATE and stay (recorded in result.json abort.shown_s; docs/firmware-sim.md r7)
+        abort_readback(st, check, result, boards=["AB", "VB", "FC"])
 
 
 def battery_v(st: Station, sender: str):
@@ -561,7 +635,7 @@ def low_battery(st: Station, check, result):
 
     def warned():
         code, alerts = st.api("/api/alerts?minutes=5")
-        return code == 200 and any("Battery voltage out of range" in (a.get("message") or "") for a in alerts or []) and alerts
+        return code == 200 and any("PB battery voltage out of range" in (a.get("message") or "") for a in alerts or []) and alerts
 
     cond = st.wait(condition, 30, "fill-system low-voltage condition")
     alert = st.wait(warned, 30, "battery out-of-range alert")
@@ -899,11 +973,15 @@ def scenario_igt(st, check, result):
     # swap the card for another dataset while the FC runs: out, choose, in, Retry SD (the FC mounts the new card
     # fresh, FlightComputer26 34c7835; Enter then loads its CSVs)
     st.api("/api/firmware-sim/control", {"faults": {"fc_sd_missing": True}})
-    st.wait(lambda: igt().get("sd_ready") is False, 20, "FC sees the card out", poll=1)
+    out_seen = st.wait(lambda: igt().get("sd_ready") is False, 20, "FC sees the card out", poll=1)
+    # recorded, not checked: the FC did not report the card out within 20 s in the r6b or r7 runs (docs/firmware-sim.md r7)
+    result["igt_card_out_seen"] = bool(out_seen)
     st.api("/api/firmware-sim/control", {"igt": {"dataset": IGT_SWAP_DATASET}})
     loaded = st.wait(lambda: (st.sim().get("sd_card") or {}).get("dataset") == IGT_SWAP_DATASET and st.sim()["sd_card"], 20, "card rewritten")
     check("the swapped card carries the other dataset", loaded, sd_card=st.sim().get("sd_card"))
-    st.api("/api/firmware-sim/control", {"faults": {}})
+    # card back in: the control merges faults per key (GS 02a519d), so an empty faults object would leave the card
+    # out and the FC would validate a card that is not there (r7 igt1: "validating" for good)
+    st.api("/api/firmware-sim/control", {"faults": {"fc_sd_missing": False}})
     st.sleep(2)
     st.command("FcSdRetry")
     ready = st.wait(lambda: igt().get("sd_ready") is True and not igt().get("sd_retry_pending") and igt(), 60, "FC SD ready after Retry SD", poll=2)
