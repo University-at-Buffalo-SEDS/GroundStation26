@@ -22,8 +22,9 @@ independently.
   watch-eligible page actions.
 - [Vehicle geometry](vehicle-geometry.md): the airframe the dashboard draws, generated
   from the station's OpenRocket design and served at `GET /api/vehicle/geometry`.
-- [Live diagrams](live-diagrams.md): the declarative fill, AV-bay, network and stand
-  topologies, the valve/flow rules and the programme scenes.
+- [Live diagrams](live-diagrams.md): one declarative view per station mode (flight,
+  test fire, ground test) plus the network overview, the mode mapping, full screen,
+  the valve/flow rules and the programme scenes.
 - [Raw stream feed](backend/raw-stream-feed.md): read-only WebSocket/NDJSON feed of every
   telemetry stream for overlays and external scripts; stream viewer tokens.
 - [Replay bundles](backend/replay-bundle.md): `.gsreplay` export of one recording for replay with no station.

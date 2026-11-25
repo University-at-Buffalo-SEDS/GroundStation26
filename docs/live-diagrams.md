@@ -1,15 +1,53 @@
 # Live diagrams
 
-The dashboard's **Live diagrams** tab draws four P&ID-style views from live
-telemetry. The audience programme can show the same views (delayed with the
-video).
+The dashboard's **Live diagrams** tab draws P&ID-style views from live
+telemetry: **one combined view per station mode**, opened automatically from
+the station mode, plus the system overview. The operator can still pick another
+view; a change of station mode returns to the new mode's view. Every view can
+be shown **full screen**. The audience programme can show the same views
+(delayed with the video).
 
-| Diagram | File | Shows |
-| --- | --- | --- |
-| Fill system | `backend/layout/diagrams/fill.json` | Bottles, regulator, AB solenoids, fill manifold, QD, run tank, VB vent/dump/main valves, chamber; tank PT, fill mass/level, chamber PT, igniter, fill battery |
-| AV bay in flight | `av_bay.json` | FC, PB, RF on the AV CAN bus; radio to the GS and RRLS; IMU, barometer, GPS; estimator, flight phase, pyro channels, underglow/buzzer, FC SD |
-| System overview | `network.json` | GS, RRLS, Pico-Fi, gateway, fill and AV CAN buses, every board, with live link health |
-| Test stand | `stand.json` | Tank, main valve, chamber, KG50 and KG1000; in IGT a second body: the rocket on the ground with its replaying FC |
+| View | File | Station modes | Shows |
+| --- | --- | --- | --- |
+| Flight: fill system and vehicle on the pad | `backend/layout/diagrams/flight.json` | normal, HITL, testing | The fill system (bottles, regulator, AB solenoids, fill manifold, QD, run tank, VB vent/dump/main valves; tank PT, fill level, igniter, fill battery) with the **KG50 under the motor** (fill mass). The vehicle's AV bay: FC, PB, RF on the AV CAN bus; radio to the GS and RRLS; IMU, barometer, GPS; estimator, FC phase, pyro channels, underglow/buzzer, FC SD; the vehicle drawn to scale. No KG1000 and no chamber PT. |
+| Test fire: fill system and motor on the stand | `test_fire.json` | test fire | The same fill system, and the motor on the stand: the **KG50** (hanging vehicle), the **KG1000** (thrust, in kg and × g in N) and the **chamber PT** (with "installed"). No AV bay. |
+| Integrated ground test: stand and rocket | `ground_test.json` | integrated ground test | The test-fire view, plus, only while the ground test runs, the rocket on the ground as a separate body: FC, PB and RF status, FC phase, ground-test mode, replayed estimator, pyro channels (DRY-RUN), simulated altitude and FC SD. |
+| System overview | `network.json` | any (picked by hand) | GS, RRLS, Pico-Fi, gateway, fill and AV CAN buses, every board, with live link health. |
+
+The overview stays a separate view rather than being folded into each mode
+view: board and link health for the whole system is a secondary question, and
+the mode views already show each board they depend on (AB, GW, DAQ, VB; FC, PB,
+RF) as live status chips.
+
+### Mode to view
+
+The layout chooses. Each layout file maps station modes to views:
+
+```json
+"live_diagrams": {"normal": "flight", "testing": "flight", "integrated_ground_test": "ground_test"}
+```
+
+`layout.json` serves normal, testing and IGT; `layout_hitl.json` maps `hitl`;
+`layout_test_fire.json` maps `test_fire`. The served layout (`GET /api/layout`)
+carries the view for the mode it is served in as `live_diagram`. A mode the map
+does not list gets the built-in default (`diagrams::default_view`, the same as
+the table above). A replay of a recording made in another mode gets that mode's
+layout, and so its view.
+
+A layout without `live_diagram` (an older station, an older replay bundle) is
+still shown correctly: the dashboard picks the view from `test_fire_mode` and
+the IGT status. Old per-system ids still resolve: `fill` and `av_bay` show
+`flight`, `stand` shows `ground_test`.
+
+### Full screen
+
+Each view has a **Full screen** button. On the web, the desktop app and
+Android it uses the Fullscreen API on the diagram (prefixed on Safari). Where
+the platform has none for elements (an iPhone) or refuses it, the diagram
+covers the whole viewport instead. **Esc**, the platform's own exit and
+**Exit full screen** all leave. The SVG scales to fill the screen and stays
+crisp and live. The programme page has the same button, shown only while the
+pointer moves, so a captured programme never shows it.
 
 Client side: Seds-Ground-Station-Frontend `src/telemetry_dashboard/live_diagrams/`
 (`docs/live-diagrams.md` there).
@@ -23,6 +61,7 @@ the dashboard picks them up on the next page load. No rebuild is needed.
 - `GS_DIAGRAMS_DIR` overrides the directory.
 - The file name must equal the topology `id`.
 - The station checks the structure (`diagrams::check`): schema, unique ids, and that every edge's nodes and valves exist. A failing file is reported in `errors` and not served.
+- The three mode views repeat the fill system; edit it in all three (the tests check that they carry the same valves and fill elements).
 - The client validates fully (`live_diagrams::topology::validate`) and falls back to its bundled copy of any file that fails.
 - Keep the client copies (`src/telemetry_dashboard/live_diagrams/topologies/`) identical to these files.
 
@@ -84,6 +123,7 @@ and `mechanical`.
 **Bindings.** Every value names exactly one source:
 
 - `{"telemetry": TYPE, "sender"?: ID, "index"?: n, "scale"?: k}`: the latest row. Its age is the receipt age.
+- Any binding may add `"stale_ms"`, which overrides the topology's (and a reading's) `stale_ms`. The flight view keeps the fill system at 5 s and gives the AV bay's radio data (boards, links, readings) 10 s.
 - `{"constant": v, "assumed": true}`: a nominal value, drawn with "≈".
 - `{"board": SENDER}`: up while the station hears the board.
 - `{"control": CMD}`: the action policy's confirmed `actuated`.
@@ -152,10 +192,14 @@ Both are tested on the same topology, by Rust unit tests and
 
 The Stream Manager's camera layout, and each rundown scene, offer:
 
-- `diagram-fill`
-- `diagram-av_bay`
+- `diagram-mode`: the view of the station's current mode
+- `diagram-flight`
+- `diagram-test_fire`
+- `diagram-ground_test`
 - `diagram-network`
-- `diagram-stand`
+
+A saved scene of the old set (`diagram-fill`, `diagram-av_bay`,
+`diagram-stand`) shows its successor.
 
 While such a scene can be selected, each 250 ms programme snapshot adds
 `telemetry.diagram` (`diagrams::program_inputs`). It contains:
@@ -180,6 +224,15 @@ The badge beside the title reads one of:
 - **IGT: FC flight data SIMULATED (replay)**
 - **IGT: live fill and stand**
 
-The existing SIMULATED and IGT banners stay on every view. In IGT the stand
-diagram draws the rocket as a separate body; its simulated altitude comes from
-`SIM_BAROMETER_DATA`.
+The existing SIMULATED and IGT banners stay on every view. In IGT the ground
+test view draws the rocket as a separate body; its simulated altitude comes
+from `SIM_BAROMETER_DATA`.
+
+## Load cells
+
+- **KG50** (`LOADCELL_50_WEIGHT_KG`): in every mode view. In flight it sits under the motor and gives the fill mass; on the stand it carries the hanging vehicle.
+- **KG1000** (`LOADCELL_WEIGHT_KG`, the 1000 kg thrust cell): test fire and the ground test only, in kg and as a force (× g, in N).
+- **Chamber PT** (`COMBUSTION_CHAMBER_PRESSURE`, PX309-1KG5V): test fire and the ground test only. The flight view draws the chamber open to the atmosphere through the nozzle.
+
+An ADC over-range channel shows `OVR` (or `−OVR`), never a number, in the
+dashboard and the programme.
