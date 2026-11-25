@@ -84,36 +84,23 @@ pub fn deployments_for_transition(previous: FlightState, next: FlightState) -> V
     out
 }
 
-/// One notification per deployment per launch cycle, per station state (a
-/// process has one; unit fixtures have many). A prelaunch state re-arms both.
-static LEDGER: Mutex<Vec<(usize, [bool; 2])>> = Mutex::new(Vec::new());
-
-fn station_key(state: &AppState) -> usize {
-    std::ptr::from_ref(state) as usize
-}
+/// One notification per deployment per launch cycle. Each `AppState` owns its
+/// ledger, so one state's deployments can never be taken for another's. A
+/// prelaunch state re-arms both.
+#[derive(Debug, Default)]
+pub struct Ledger(Mutex<[bool; 2]>);
 
 pub fn rearm_for_new_cycle(state: &AppState) {
-    let key = station_key(state);
-    LEDGER.lock().unwrap().retain(|(k, _)| *k != key);
+    *state.recovery_events.0.lock().unwrap() = [false; 2];
 }
 
 /// Whether this launch cycle already reported `kind` (FC message or state).
 pub fn already_deployed(state: &AppState, kind: Deployment) -> bool {
-    let key = station_key(state);
-    LEDGER.lock().unwrap().iter().any(|(k, seen)| *k == key && seen[kind.index()])
+    state.recovery_events.0.lock().unwrap()[kind.index()]
 }
 
 fn claim(state: &AppState, kind: Deployment) -> bool {
-    let key = station_key(state);
-    let mut ledger = LEDGER.lock().unwrap();
-    let index = match ledger.iter().position(|(k, _)| *k == key) {
-        Some(index) => index,
-        None => {
-            ledger.push((key, [false; 2]));
-            ledger.len() - 1
-        }
-    };
-    !std::mem::replace(&mut ledger[index].1[kind.index()], true)
+    !std::mem::replace(&mut state.recovery_events.0.lock().unwrap()[kind.index()], true)
 }
 
 fn format_utc(ms: i64) -> String {
@@ -340,6 +327,26 @@ mod tests {
             text,
             "Main parachute deployed at unknown altitude, 00:00:00 UTC"
         );
+    }
+
+    /// A new station state at a freed state's address starts with no
+    /// deployment: the ledger belongs to the state, not to its address.
+    #[tokio::test]
+    async fn a_new_state_at_a_freed_states_address_has_no_deployments() {
+        let mut state = crate::state::tests::test_app_state().await;
+        let address = std::sync::Arc::as_ptr(&state);
+        assert!(observe_fc_message(&state, "PD approx altitude: 900", 1_000).is_some());
+        assert!(observe_fc_message(&state, "PR approx altitude: 300", 2_000).is_some());
+        let fresh = std::sync::Arc::try_unwrap(crate::state::tests::test_app_state().await)
+            .unwrap_or_else(|_| panic!("the fixture is the only owner"));
+        // Frees the first state and puts another one in its place.
+        *std::sync::Arc::get_mut(&mut state).expect("the fixture is the only owner") = fresh;
+        assert_eq!(std::sync::Arc::as_ptr(&state), address);
+        for kind in [Deployment::Drogue, Deployment::Main] {
+            assert!(!already_deployed(&state, kind), "{} from the freed state", kind.label());
+        }
+        assert!(observe_fc_message(&state, "PD approx altitude: 800", 3_000).is_some());
+        assert!(observe_fc_message(&state, "PR approx altitude: 250", 4_000).is_some());
     }
 
     #[tokio::test]

@@ -254,6 +254,8 @@ pub struct AppState {
     pub(crate) manual_abort_intent: Arc<crate::manual_abort_intent::ManualAbortIntent>,
     /// Re-sends a retained operator Abort over radio loss (`manual_abort_resend`).
     pub(crate) abort_resend: Arc<crate::manual_abort_resend::AbortResend>,
+    /// Deployments this launch cycle already reported (`recovery_events`).
+    pub(crate) recovery_events: Arc<crate::recovery_events::Ledger>,
     pub(crate) deferred_abort: Arc<crate::deferred_abort::Inbox>,
     pub(crate) board_recovery: Arc<crate::board_recovery::Runtime>,
     pub(crate) igniter_sense: Arc<Mutex<crate::igniter_sense::Tracker>>,
@@ -4567,6 +4569,7 @@ pub(crate) mod tests {
             operator_dispatch_inflight: Arc::new(AtomicUsize::new(0)),
             manual_abort_intent: Arc::new(crate::manual_abort_intent::ManualAbortIntent::default()),
             abort_resend: Arc::new(crate::manual_abort_resend::AbortResend::default()),
+            recovery_events: Arc::default(),
             deferred_abort: Arc::new(crate::deferred_abort::Inbox::default()),
             igniter_sense: Arc::new(Mutex::new(crate::igniter_sense::Tracker::default())),
             board_recovery: Arc::new(crate::board_recovery::Runtime::default()),
