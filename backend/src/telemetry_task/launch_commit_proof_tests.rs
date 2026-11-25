@@ -27,7 +27,7 @@ async fn rig() -> Rig {
 }
 
 /// The boards' latest non-Abort proofs, as if their query was sent `age` ago.
-fn prove(state: &AppState, boards: &[Board], age: Duration) {
+pub(super) fn prove(state: &AppState, boards: &[Board], age: Duration) {
     for &board in boards {
         let now = Instant::now();
         state.board_abort.observe_status(
@@ -35,7 +35,7 @@ fn prove(state: &AppState, boards: &[Board], age: Duration) {
         );
     }
 }
-const PAIR: [Board; 2] = [Board::ActuatorBoard, Board::ValveBoard];
+pub(super) const PAIR: [Board; 2] = [Board::ActuatorBoard, Board::ValveBoard];
 
 fn assert_unsent_and_unlocked(rig: &Rig) {
     let history = rig.state.launch_history.lock().unwrap();

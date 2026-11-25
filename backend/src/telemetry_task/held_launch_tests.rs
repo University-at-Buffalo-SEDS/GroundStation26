@@ -118,11 +118,14 @@ fn press(rig: &Rig) -> bool {
 
 /// The worker's immediate (setting off) Launch path in this build.
 pub(super) async fn immediate(rig: &Rig) {
-    let revision = crate::board_abort::capture_launch_revision_named(&rig.state, "Launch");
+    immediate_on(&rig.state, &rig.router).await;
+}
+pub(super) async fn immediate_on(state: &Arc<AppState>, router: &Arc<Router>) {
+    let revision = crate::board_abort::capture_launch_revision_named(state, "Launch");
     if crate::runtime_mode::is_test_fire() {
-        handle_local_ground_station_launch_command(rig.state.clone(), rig.router.clone(), revision).await;
+        handle_local_ground_station_launch_command(state.clone(), router.clone(), revision).await;
     } else {
-        handle_flight_computer_launch_command(rig.state.clone(), rig.router.clone(), revision).await;
+        handle_flight_computer_launch_command(state.clone(), router.clone(), revision).await;
     }
 }
 

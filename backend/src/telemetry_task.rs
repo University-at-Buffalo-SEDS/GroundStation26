@@ -2,6 +2,8 @@ mod prelude;
 #[cfg(test)]
 mod umbilical_owner_tests;
 #[cfg(test)]
+mod abort_disk_stall_tests;
+#[cfg(test)]
 mod held_launch_tests;
 #[cfg(test)]
 mod launch_mode_gate_tests;
