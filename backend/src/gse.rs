@@ -5239,13 +5239,14 @@ pub(crate) fn queue_prepared_launch_packets(
         // behind the Launch; only a newer Stop or Abort (which the boards
         // also get, and which wins) keeps it from publishing Launch locally.
         crate::network_variables::note_admitted_launch();
-        // The durable FLIGHT_STATE save, before (never under) the dispatch gate.
-        let saved = crate::network_variables::commit_admitted_launch(&prepared);
         let mut late = Vec::new();
         let previous = {
             let _dispatch = dispatch_gate();
             with_stop_admission(state,ticket,||()) .map_err(|e|format!("SDK admitted {accepted}/{total} Launch packets, but {e}; explicit recovery required"))?;
-            match saved {
+            // The durable FLIGHT_STATE save stays where it always was (under
+            // the dispatch gate, after the Stop check): moving it changes which
+            // operator frames a stalled save holds back.
+            match crate::network_variables::commit_admitted_launch(&prepared) {
                 Ok(()) => {}
                 // Something else wrote FLIGHT_STATE since preparation (an
                 // Abort's Aborted among them): never publish Launch over it.
@@ -7048,12 +7049,15 @@ mod final_launch_admission_tests {
             let state=&scene.state;let router=&scene.host;
             let ticket=inhibit_automatic_actions_for_launch(state).unwrap();
             if let Err(message)=queue_prepared_launch_packets(state,router,ticket,vec![launch_packet(),valve()],None)
-                && message.contains("accepted 1/2") {
-                assert!(message.contains("manual recovery required"));
+                && message.contains("partly delivered (1/2)") {
+                // The rest was refused for good: the station aborts so every
+                // board agrees (launch-partial-delivery-abort), and reports
+                // the ownership truthfully.
+                assert!(message.contains("Launch only partly delivered (1/2): aborted so every board agrees"), "{message}");
                 assert!(router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type("FLIGHT_COMMAND")));
                 assert!(!router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type("VALVE_COMMAND")));
                 assert!(state.launch_history.lock().unwrap().automatic_actions_inhibited());
-                assert_eq!(state.manual_abort_intent.epoch(),0,"queue refusal never automatically Aborts");
+                assert_eq!(state.manual_abort_intent.epoch(),1,"a partial delivery requests the Abort");
                 partial_seen=true;
             }
             scene.state.request_shutdown();scene.state.telemetry_db_pool().close().await;scene.state.auth_db.close().await;

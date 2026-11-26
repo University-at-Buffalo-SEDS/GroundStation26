@@ -5653,14 +5653,16 @@ mod tests {
                 let original_clock=state.launch_clock_snapshot();let original_state=state.local_flight_state_snapshot();let original_desired=crate::network_variables::flight_state();
                 let result=crate::gse::queue_prepared_launch_packets(state,router,ticket,physical(router),Some(prepared));
                 // Never process, flush, clear or cancel after any pressure offer.
-                if let Err(error)=result && error.contains(&format!("accepted {admitted}/3 packets:"))&&error.contains("queue saturated"){
-                    assert!(error.contains(&format!("{admitted}/3")),"{error}");
+                // 0/3: refused with nothing sent. A partial prefix: the station
+                // aborts so every board agrees (launch-partial-delivery-abort)
+                // and never publishes Launch locally.
+                let refused = if admitted==0 { format!("accepted 0/3 packets:") } else { format!("Launch only partly delivered ({admitted}/3): aborted so every board agrees") };
+                if let Err(error)=result && error.contains(&refused)&&error.contains("queue saturated"){
                     assert_eq!(router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type("FLIGHT_COMMAND")),admitted>=2);
                     assert!(!router.has_pending_reliable_tx_type(crate::telemetry_schema::data_type("VALVE_COMMAND")));
-                    if admitted==0{assert_eq!(state.local_flight_state_snapshot(),original_state);assert_eq!(state.launch_clock_snapshot(),original_clock);assert_eq!(crate::network_variables::flight_state(),original_desired);}else{
-                        assert_eq!(state.local_flight_state_snapshot(),crate::types::FlightState::Launch);assert_eq!(crate::network_variables::flight_state(),7);assert!(error.contains("explicit manual recovery required"));
-                    }
-                    assert!(state.launch_history.lock().unwrap().automatic_actions_inhibited());assert_eq!(state.manual_abort_intent.epoch(),0,"queue refusal never automatically Aborts");
+                    assert_eq!(state.local_flight_state_snapshot(),original_state);assert_eq!(state.launch_clock_snapshot(),original_clock);assert_eq!(crate::network_variables::flight_state(),original_desired);
+                    assert!(state.launch_history.lock().unwrap().automatic_actions_inhibited());
+                    assert_eq!(state.manual_abort_intent.epoch(),u64::from(admitted>0),"only a partial delivery requests the Abort");
                     seen=true;
                 }
                 scene.state.request_shutdown();scene.state.telemetry_db_pool().close().await;scene.state.auth_db.close().await;
