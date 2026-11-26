@@ -164,9 +164,13 @@ impl Writer {
         }
         Err(anyhow!("Launch journal prefix is not durably complete"))
     }
-    /// Final reset prefix inspection: RAM only, never wait on the writer.
+    /// Final reset prefix inspection: RAM only, never waits for a save. It
+    /// waits for the state lock, which every holder (the writer thread among
+    /// them) keeps for a few field updates only, never across disk IO and
+    /// never with another lock; a try-lock here refused a recovery whenever
+    /// the writer thread was recording a finished save.
     pub(super) fn try_quiescent_through(&self, ticket: u64) -> Result<bool> {
-        let state = self.inner.state.try_lock().map_err(|_| anyhow!("Launch writer busy"))?;
+        let state = self.inner.state.lock().map_err(|_| anyhow!("Launch writer busy"))?;
         if state.next != ticket { return Err(anyhow!("Launch journal prefix changed")); }
         if state.writing || state.snapshot.is_some() { return Ok(false); }
         if state.written >= ticket { return Ok(true); }
@@ -211,5 +215,30 @@ impl Drop for Writer {
     fn drop(&mut self) {
         self.inner.state.lock().unwrap().stopped = true;
         self.inner.changed.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    /// The prefix check meets the writer thread recording a save: it waits
+    /// for those field updates instead of refusing as "busy".
+    #[test]
+    fn the_prefix_check_waits_for_the_writer_bookkeeping() {
+        let path = std::env::temp_dir().join(format!("gs-writer-test-{:032x}.json", rand::random::<u128>()));
+        let writer = Writer::start(path.clone(), false).unwrap();
+        let (held, holding) = std::sync::mpsc::channel();
+        let inner = writer.inner.clone();
+        let holder = std::thread::spawn(move || {
+            let state = inner.state.lock().unwrap();
+            held.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            drop(state);
+        });
+        holding.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(writer.try_quiescent_through(0).unwrap(), "nothing pending: quiescent");
+        holder.join().unwrap();
+        drop(writer);
+        let _ = std::fs::remove_file(path);
     }
 }
