@@ -99,6 +99,24 @@ impl Mesh {
     async fn observe_routes(&mut self) {
         tokio::time::timeout(Duration::from_secs(2),async {loop {self.pump();if crate::ignition_pair::require_routes(&self.state).is_ok(){break;}tokio::time::sleep(Duration::from_millis(2)).await;}}).await.expect("actual selected virtual command routes must be observed");
     }
+    /// One host frame to its virtual link. A link whose bridge queue is full
+    /// (a loaded host let retransmits pile up) is served first, as its own
+    /// polling would, and the same frame is offered again; nothing is dropped.
+    fn deliver(&mut self, index: usize, bytes: &[u8]) {
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match self.links[index].send_data(bytes) {
+                Ok(()) => return,
+                Err(error) if error.to_string().contains("shared priority queue saturated")
+                    && std::time::Instant::now() < until =>
+                {
+                    self.links[index].recv_packet(&self.host, &mut |_| {}).unwrap();
+                    self.host.process_all_queues().unwrap();
+                }
+                Err(error) => panic!("virtual link refused a host frame: {error}"),
+            }
+        }
+    }
     fn pump(&mut self) {
         for _ in 0..80 {
             self.host.process_all_queues().unwrap();
@@ -107,7 +125,7 @@ impl Mesh {
                 let Some((index, bytes)) = row else {
                     break;
                 };
-                self.links[index].send_data(&bytes).unwrap();
+                self.deliver(index, &bytes);
             }
             for link in &mut self.links {
                 link.recv_packet(&self.host, &mut |_| {}).unwrap();
@@ -120,7 +138,7 @@ impl Mesh {
             let Some((index, bytes)) = row else {
                 break;
             };
-            self.links[index].send_data(&bytes).unwrap();
+            self.deliver(index, &bytes);
         }
         for link in &mut self.links {
             link.recv_packet(&self.host, &mut |_| {}).unwrap();
