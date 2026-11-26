@@ -495,7 +495,10 @@ async fn r4_new_abort_episode_refuses_second_prepare_after_actual_quiet() {
     assert_ne!(old["success"], true);
     let start = Instant::now();
     let mut quiet = None;
-    while start.elapsed() < Duration::from_secs(7) {
+    // A bound for the premise, not a measured property: the automatic Idle
+    // and then its settle re-send are each pending until the SDK's retries
+    // to the refusing peer run out (about 8 s in all on an idle host).
+    while start.elapsed() < Duration::from_secs(20) {
         let s = f.state();
         let r = s.topology_router.get().unwrap();
         // A momentary SDK core-busy try is unknown, not pending: the managed
@@ -505,6 +508,10 @@ async fn r4_new_abort_episode_refuses_second_prepare_after_actual_quiet() {
             || crate::telemetry_task::RECOVERY_CONTROL_TYPES.iter().any(|name| {
                 matches!(r.try_has_pending_reliable_tx_type(crate::telemetry_schema::data_type(name)), Ok(true))
             });
+        // The latest FLIGHT_STATE write is sent once more three seconds after
+        // the writes settle (8705f26): until that re-send is decided, a quiet
+        // window could end with it, in the middle of the checks below.
+        let pending = pending || crate::network_variables::flight_state_settle_outstanding();
         if !pending {
             let since = quiet.get_or_insert_with(Instant::now);
             if since.elapsed() >= Duration::from_millis(1250) {

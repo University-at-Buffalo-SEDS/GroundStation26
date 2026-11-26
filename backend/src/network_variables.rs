@@ -1219,6 +1219,13 @@ struct Settle {
 static SETTLE: Mutex<Settle> =
     Mutex::new(Settle { last_write: None, settled_packet: None, settled_write: None, next_check: None });
 
+/// A FLIGHT_STATE write whose settle re-send has not been decided yet.
+#[cfg(test)]
+pub(crate) fn flight_state_settle_outstanding() -> bool {
+    let settle = SETTLE.lock().unwrap();
+    settle.last_write.is_some() && settle.settled_write != settle.last_write
+}
+
 /// Whether the latest FLIGHT_STATE write `latest_id` is due its settle re-send.
 pub(crate) fn settle_resend_due(
     last_write: Option<std::time::Instant>,
