@@ -153,6 +153,17 @@ async fn ignition_pair_hitl_opt_in_requires_proof_and_off_preserves_viewer_autho
     state
         .hitl_button_interlock_enabled
         .store(false, std::sync::atomic::Ordering::Release);
+    // HITL requires the pair proof only from the pair boards on the bench.
+    // Until the fixture's startup readbacks have shown AB and VB present the
+    // requirement is empty and every ignition command passes, so the refusal
+    // below would prove nothing (it failed when the readbacks were late).
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while crate::ignition_pair::required_pair(&state) != crate::ignition_pair::REQUIRED_MASK {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the fixture's Actuator and Valve Boards are on the bench");
     assert!(!state.is_command_allowed(&crate::types::TelemetryCommand::IgniterSequence));
     for principal in ["viewer", "operator"] {
         use tower::ServiceExt;
