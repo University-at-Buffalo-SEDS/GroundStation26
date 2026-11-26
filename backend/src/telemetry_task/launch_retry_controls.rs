@@ -3,8 +3,11 @@ use sedsnet::router::{EndpointHandler, RouterConfig, RouterSideOptions};
 use std::sync::{OnceLock, atomic::Ordering};
 
 fn isolated_child() -> bool {
+    isolated_child_named("telemetry_task::tests::launch_retry_controls::actual_launch_retry_preserves_originals_stop_and_terminal_prefixes")
+}
+fn isolated_child_named(name: &str) -> bool {
     const CHILD: &str = "GS_LAUNCH_RETRY_CONTROL_CHILD";
-    const NAME: &str = "telemetry_task::tests::launch_retry_controls::actual_launch_retry_preserves_originals_stop_and_terminal_prefixes";
+    let name_arg = name;
     if std::env::var(CHILD).as_deref() == Ok("1") {
         return false;
     }
@@ -38,7 +41,7 @@ fn isolated_child() -> bool {
     let out = root.0.join("stdout.log");
     let err = root.0.join("stderr.log");
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+        .args(["--exact", name_arg, "--nocapture", "--include-ignored", "--test-threads=1"])
         .env(CHILD, "1").env("GS_SIM_MODE","0")
         .env("TMPDIR", &root.0)
         .env("TMP", &root.0)
@@ -250,10 +253,12 @@ async fn actual_busy(kind: &str) {
     let pause = crate::gse::nonwaiting_admission_tests::Pause::install(&rig.state);
     let trace = pause.trace.clone();
     trace.enable(kind == "transient");
-    if kind != "permanent" {
+    if kind != "permanent" && kind != "held_past_old_window" {
         // The Core release, Stop or FC16 must land inside the retry window;
         // stop the window's clock so a loaded host cannot expire it first.
         // "permanent" keeps the real clock: it proves the window expires.
+        // "held_past_old_window" keeps it too: the core is held longer than
+        // the old 100 ms window and well inside LAUNCH_CORE_BUSY_WAIT.
         pause.freeze_retry_window();
     }
     if kind == "new_fc16" {
@@ -386,10 +391,19 @@ async fn actual_busy(kind: &str) {
             );
             result
         }
+        "held_past_old_window" => {
+            // Held 300 ms: past the old 100 ms window (which refused this
+            // Launch with "accepted 0/N" and left it inhibited, needing manual
+            // recovery), inside the bounded wait for the core.
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(rx.try_recv().is_err(), "a zero-owner Launch waits out the held core");
+            pause.release();
+            rx.recv_timeout(Duration::from_secs(5)).unwrap()
+        }
         "permanent" => {
             let result = rx
-                .recv_timeout(Duration::from_secs(2))
-                .expect("new100msbudget ends whileCorestillheld");
+                .recv_timeout(crate::gse::LAUNCH_CORE_BUSY_WAIT + Duration::from_secs(4))
+                .expect("the bounded core wait ends while the core is still held");
             pause.release();
             result
         }
@@ -406,7 +420,7 @@ async fn actual_busy(kind: &str) {
             .unwrap()
             .automatic_actions_inhibited()
     );
-    if kind == "transient" {
+    if kind == "transient" || kind == "held_past_old_window" {
         // Read/format only AFTER the original holder and caller joins and
         // inhibition assertion. No SDK/state owner is held by the ledger.
         let error = result.as_ref().err().map(|text| text.chars().take(512).collect::<String>());
@@ -608,10 +622,57 @@ async fn actual_launch_retry_preserves_originals_stop_and_terminal_prefixes() {
     if isolated_child() {
         return;
     }
-    for case in ["transient", "permanent", "stop", "new_fc16"] {
+    for case in ["transient", "held_past_old_window", "permanent", "stop", "new_fc16"] {
         actual_busy(case).await;
     }
     for case in ["capacity", "partial", "empty"] {
         queue_policy(case).await;
     }
+}
+
+/// Split state (not fixed; ignored until the partial/late-refusal handling is
+/// decided): every Launch packet, the Valve Board's Sequence among them, is
+/// admitted by the SDK, then the station refuses the Launch before its local
+/// publication (here: recovery admission closed in that instant, as a board
+/// reset or mode change does). Today the caller reports the error, keeps
+/// flushing the admitted packets, sends no Abort and never moves to Launch:
+/// the Valve Board starts its sequence while the station shows a refused
+/// Launch. Run with --ignored to see it fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "demonstrates the Launch split state described above; fix awaits review"]
+async fn a_launch_refused_after_full_sdk_admission_must_not_leave_the_valve_board_launching() {
+    if isolated_child_named("telemetry_task::tests::launch_retry_controls::a_launch_refused_after_full_sdk_admission_must_not_leave_the_valve_board_launching") {
+        return;
+    }
+    if crate::runtime_mode::is_hitl() {
+        // HITL publishes no local Launch FLIGHT_STATE: no such late refusal.
+        return;
+    }
+    let mut rig = Rig::new().await;
+    let ticket = rig.ticket();
+    crate::gse::nonwaiting_admission_tests::set_after_admission(&rig.state, |state| {
+        state.operator_admission_barrier.fetch_add(1, Ordering::AcqRel);
+    });
+    let packets = vec![
+        controller_packet(&rig.host, crate::telemetry_schema::data_type("FLIGHT_COMMAND"), &[1]).unwrap(),
+        controller_packet(&rig.host, crate::telemetry_schema::data_type("VALVE_COMMAND"), &[6]).unwrap(),
+    ];
+    let sequence_id = packets[1].packet_id();
+    let (state, router) = (rig.state.clone(), rig.host.clone());
+    let result = std::thread::spawn(move || crate::gse::queue_admitted_launch_packets(&state, &router, ticket, packets))
+        .join()
+        .unwrap();
+    rig.state.operator_admission_barrier.fetch_sub(1, Ordering::AcqRel);
+    rig.pump();
+    let sequence_delivered = rig.delivered.lock().unwrap().iter().any(|p| p.packet_id() == sequence_id);
+    let abort_sent = rig.wire.lock().unwrap().iter()
+        .any(|p| p.data_type() == crate::telemetry_schema::types::ABORT);
+    let station_launch = rig.state.local_flight_state_snapshot() == crate::types::FlightState::Launch;
+    eprintln!("LAUNCH_SPLIT result={result:?} valve_sequence_delivered={sequence_delivered} abort_sent={abort_sent} station_launch={station_launch}");
+    assert!(
+        !(sequence_delivered && result.is_err() && !station_launch && !abort_sent),
+        "split state: the Valve Board received its Sequence, the station refused the Launch ({result:?}), shows {:?} and sent no Abort",
+        rig.state.local_flight_state_snapshot()
+    );
+    rig.state.request_shutdown();
 }

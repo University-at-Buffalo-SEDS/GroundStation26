@@ -358,3 +358,19 @@ pub(crate) fn launch_retry_boundary(state:&AppState){
         assert!(!*held,"owned testretry gate must be released outsideallAppguards");
     }
 }
+
+/// Runs once a Launch's every packet was admitted by the SDK, before its local
+/// publication: a test sets what changes in that instant.
+type AfterAdmission = (usize, Box<dyn Fn(&AppState) + Send>);
+static AFTER_ADMISSION: Mutex<Option<AfterAdmission>> = Mutex::new(None);
+pub(crate) fn set_after_admission(state: &AppState, f: impl Fn(&AppState) + Send + 'static) {
+    *AFTER_ADMISSION.lock().unwrap() = Some((state as *const AppState as usize, Box::new(f)));
+}
+pub(crate) fn after_admission(state: &AppState) {
+    let slot = AFTER_ADMISSION.lock().unwrap();
+    if let Some((owner, f)) = slot.as_ref()
+        && *owner == state as *const AppState as usize
+    {
+        f(state);
+    }
+}

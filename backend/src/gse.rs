@@ -5053,6 +5053,13 @@ fn admission_window_elapsed(state: &AppState, at: Instant) -> std::time::Duratio
     at.elapsed()
 }
 
+/// How long a Launch none of whose packets the SDK admitted yet waits out a
+/// held SDK core (retrying, holding no guard in between) before it is refused.
+pub(crate) const LAUNCH_CORE_BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+/// The unadmitted rest of a partly admitted Launch: retried this long from the
+/// first attempt, as it always was.
+const LAUNCH_SUFFIX_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
+
 pub(crate) fn queue_prepared_launch_packets(
     state: &AppState,
     router: &sedsnet::router::Router,
@@ -5081,7 +5088,16 @@ pub(crate) fn queue_prepared_launch_packets(
         WindowExpired,
         Completed(Result<usize, (usize, sedsnet::TelemetryError)>),
     }
-    let retry_window = std::time::Duration::from_millis(100);
+    // While no packet is admitted, a core-busy refusal admitted nothing (the
+    // SDK returns before queueing): no frame of this Launch can reach a board.
+    // Waiting out the core for up to LAUNCH_CORE_BUSY_WAIT then costs nothing
+    // but time, where giving up left the saved Fire intent and inhibition in
+    // place with no Launch sent (manual recovery). No guard is held between
+    // attempts, and every attempt re-runs the Stop/board/route admission, so
+    // an Abort or Stop in the meantime refuses it at once. Once a packet is
+    // admitted, the unadmitted suffix keeps the original 100 ms window,
+    // counted from the first attempt as before.
+    let retry_window = |admitted: usize| if admitted == 0 { LAUNCH_CORE_BUSY_WAIT } else { LAUNCH_SUFFIX_RETRY_WINDOW };
     let mut first_sdk_attempt: Option<Instant> = None;
     let mut last_zero_busy = None;
     let mut retry_controller_types = None;
@@ -5094,7 +5110,7 @@ pub(crate) fn queue_prepared_launch_packets(
     let mut admitted_prefix = 0usize;
     let suffix_retry = !crate::runtime_mode::is_test_fire();
     let result = loop {
-        if first_sdk_attempt.is_some_and(|at| admission_window_elapsed(state, at) >= retry_window) {
+        if first_sdk_attempt.is_some_and(|at| admission_window_elapsed(state, at) >= retry_window(admitted_prefix)) {
             break Err((admitted_prefix, last_zero_busy.take().expect("retry follows a real zero-owner CoreBusy")));
         }
         if last_zero_busy.is_some() && admitted_prefix == 0 {
@@ -5133,7 +5149,7 @@ pub(crate) fn queue_prepared_launch_packets(
                 // A guard may have waited. No retry call starts after this
                 // window; after a non-busy refusal, preserve legacy behavior.
                 if accepted == 0
-                    && first_sdk_attempt.is_some_and(|at| admission_window_elapsed(state, at) >= retry_window)
+                    && first_sdk_attempt.is_some_and(|at| admission_window_elapsed(state, at) >= retry_window(admitted_prefix))
                 {
                     return QueueAttempt::WindowExpired;
                 }
@@ -5194,6 +5210,10 @@ pub(crate) fn queue_prepared_launch_packets(
     };
     // Even a partial batch has real SDK owners. Persist/describe that admitted
     // Launch truthfully; no implicit retry and no automatic Abort are allowed.
+    #[cfg(test)]
+    if accepted == total {
+        nonwaiting_admission_tests::after_admission(state);
+    }
     if let Some(prepared) = prepared.filter(|_| accepted > 0) {
         crate::network_variables::note_admitted_launch();
         let _dispatch = dispatch_gate();
