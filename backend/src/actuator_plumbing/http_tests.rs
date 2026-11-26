@@ -131,20 +131,25 @@ pub(crate) struct HeldCore {
     holder: Option<std::thread::JoinHandle<sedsnet::TelemetryResult<()>>>,
 }
 pub(crate) fn hold_host_core(fixture: &Fixture) -> HeldCore {
-    let pause = crate::gse::nonwaiting_admission_tests::Pause::install(&fixture.state);
+    hold_core(&fixture.state, &fixture.host)
+}
+/// As [`hold_host_core`], from the station state and host router alone (so a
+/// plain thread can take the hold).
+fn hold_core(state: &Arc<AppState>, host: &Arc<Router>) -> HeldCore {
+    let pause = crate::gse::nonwaiting_admission_tests::Pause::install(state);
     // A managed value nothing else in these fixtures publishes, so the seed
     // always reaches the SDK core (and its clock) instead of being dropped as stale.
     let seed = Packet::new(crate::telemetry_schema::data_type("AV_BAY_UNDERGLOW"),
         &[crate::telemetry_schema::endpoint("GROUND_STATION")], "GS", 100, Arc::from([0u8])).unwrap();
-    let host = fixture.host.clone();
+    let host_for_holder = host.clone();
     let holder = std::thread::Builder::new()
         .name("production-sdk-core-holder".into())
-        .spawn(move || host.seed_managed_variable(seed))
+        .spawn(move || host_for_holder.seed_managed_variable(seed))
         .unwrap();
     pause.core_entered.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
     assert!(
         matches!(
-            fixture.host.try_has_pending_reliable_tx_type(crate::telemetry_schema::types::ABORT),
+            host.try_has_pending_reliable_tx_type(crate::telemetry_schema::types::ABORT),
             Err(sedsnet::router::TryPendingTypeError::CoreBusy)
         ),
         "the real SDK core must be held"
@@ -700,19 +705,21 @@ async fn drive_set_waits_out_a_held_sdk_core() {
         reached,
         proceed: go,
     });
-    let set = f.http("POST", "/api/actuator/plumbing/settings", Some("operator"), f.body("auxiliary", true));
-    let hold = async {
-        tokio::task::spawn_blocking(move || at_offer.recv_timeout(std::time::Duration::from_secs(5)).unwrap())
-            .await
-            .unwrap();
+    // The hold is taken on a plain thread, not on the test's runtime: the
+    // paused handler holds the manual-abort lock, and a station task on the
+    // (single-threaded) test runtime that reads it blocks that runtime until
+    // the pause ends, so a hold taken there could never be reached.
+    let (state, host) = (f.state.clone(), f.host.clone());
+    let hold = std::thread::spawn(move || {
+        at_offer.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         // Admission has passed; the router worker now holds the core for
         // exactly the SET's SDK offer.
-        let core = hold_host_core(&f);
+        let core = hold_core(&state, &host);
         proceed.send(()).unwrap();
-        core.release_after(std::time::Duration::from_millis(60))
-    };
-    let (response, release) = tokio::join!(set, hold);
-    release.join().unwrap();
+        core.release_after(std::time::Duration::from_millis(60)).join().unwrap();
+    });
+    let response = f.http("POST", "/api/actuator/plumbing/settings", Some("operator"), f.body("auxiliary", true)).await;
+    hold.join().unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     f.pump();
     assert_eq!(f.sets().len(), 1, "exactly one SET reaches the board");
