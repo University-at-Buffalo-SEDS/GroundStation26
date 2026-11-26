@@ -176,9 +176,14 @@ impl Observer {
             })
     }
     pub(crate) fn read(&self, router: &Router, generation: u64) -> Result<Token, &'static str> {
+        // Waits for the worker storing a refresh: it holds the cache for a
+        // comparison and an assignment only (no other lock, no SDK call). A
+        // try-lock refused a Launch or ignition sequence whenever a press met
+        // that store, most often just after a router pass released the core
+        // the worker and the press were both waiting for.
         let token = self
             .cache
-            .try_lock()
+            .lock()
             .map_err(|_| "Ignition route observation owner busy")?
             .as_ref()
             .cloned()

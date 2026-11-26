@@ -155,6 +155,29 @@ fn late_capture_cannot_publish_as_fresh_and_reads_never_renew_capture_age() {
         "reading an expired original observation cannot renew it"
     );
 }
+/// A read that meets the worker storing a refresh waits for the store; it is
+/// not refused as "owner busy" (a Launch retry was, 2026-11-25).
+#[test]
+fn a_read_waits_for_a_refresh_being_stored() {
+    let _serial = serial();
+    let (router, side) = actual_peer_router();
+    let owner = Arc::new(Observer::default());
+    owner.register_connection(side, Some(Arc::new(AtomicU64::new(1))));
+    owner.request(router.clone(), 0);
+    completed(&owner);
+    let expected = owner.read(&router, 0).unwrap().requested;
+    let (held, holding) = std::sync::mpsc::channel();
+    let storer = owner.clone();
+    let store = std::thread::spawn(move || {
+        let cache = storer.cache.lock().unwrap();
+        held.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        drop(cache);
+    });
+    holding.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(owner.read(&router, 0).unwrap().requested, expected);
+    store.join().unwrap();
+}
 #[test]
 fn live_connection_fences_are_side_bound_and_old_tokens_cannot_cross_reconnects() {
     let _serial = serial();
