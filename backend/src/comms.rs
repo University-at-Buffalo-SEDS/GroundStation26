@@ -5885,6 +5885,9 @@ pub struct DummyComms {
     discovery_next_announce_ms: u64,
     timesync_next_announce_ms: u64,
     pending_rx: std::collections::VecDeque<sedsnet::packet::Packet>,
+    /// A virtual board frame the station's ingress queue had no room for:
+    /// offered again before the model is polled for another.
+    held_wire: Option<Vec<u8>>,
     /// Mode epoch the testing state above was built under. After a mode
     /// switch the stand-in starts over as if it had been opened in the new
     /// mode (it simulates boards only in testing; elsewhere it stays silent).
@@ -5904,6 +5907,55 @@ impl Drop for DummyComms {
     }
 }
 
+/// The next virtual board frame to the station's ingress: a frame held back
+/// earlier first, else the model's next. An ingress queue that is full or
+/// contended keeps the frame for the next call (Ok: the link is
+/// backpressured, not broken); it was polled from the model already, so
+/// returning the error dropped it. `None`: the model had nothing.
+fn offer_model_wire(
+    held: &mut Option<Vec<u8>>,
+    poll: impl FnOnce() -> TelemetryResult<Option<Vec<u8>>>,
+    enqueue: impl FnOnce(&[u8]) -> TelemetryResult<()>,
+) -> TelemetryResult<Option<TelemetryResult<()>>> {
+    let wire = match held.take() {
+        Some(wire) => wire,
+        None => match poll()? {
+            Some(wire) => wire,
+            None => return Ok(None),
+        },
+    };
+    match enqueue(&wire) {
+        Err(TelemetryError::Io("shared priority queue saturated" | "rx queue busy")) => {
+            *held = Some(wire);
+            Ok(Some(Ok(())))
+        }
+        result => Ok(Some(result)),
+    }
+}
+
+#[cfg(test)]
+mod offer_model_wire_tests {
+    use super::*;
+    /// A frame the station's ingress had no room for is offered again on the
+    /// next call, before the model is polled; nothing is lost.
+    #[test]
+    fn a_frame_refused_by_a_full_ingress_is_kept_and_offered_again() {
+        let mut held = None;
+        let mut delivered = Vec::new();
+        let first = offer_model_wire(&mut held, || Ok(Some(vec![1])), |_| Err(TelemetryError::Io("shared priority queue saturated"))).unwrap();
+        assert_eq!(first, Some(Ok(())), "a full ingress backpressures the link");
+        assert_eq!(held, Some(vec![1]));
+        let second = offer_model_wire(&mut held, || panic!("the held frame goes first"), |wire| { delivered.push(wire.to_vec()); Ok(()) }).unwrap();
+        assert_eq!(second, Some(Ok(())));
+        assert_eq!(delivered, vec![vec![1]]);
+        assert_eq!(held, None);
+        assert_eq!(offer_model_wire(&mut held, || Ok(None), |_| unreachable!()).unwrap(), None);
+        let other = offer_model_wire(&mut held, || Ok(Some(vec![2])), |_| Err(TelemetryError::BadArg)).unwrap();
+        assert_eq!(other, Some(Err(TelemetryError::BadArg)), "any other refusal is reported as before");
+        assert_eq!(held, None);
+    }
+}
+
 impl DummyComms {
     pub fn new(name: &'static str) -> Self {
         DUMMY_LINKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -5914,6 +5966,7 @@ impl DummyComms {
             discovery_next_announce_ms: 0,
             timesync_next_announce_ms: 0,
             pending_rx: std::collections::VecDeque::new(),
+            held_wire: None,
             epoch: crate::runtime_mode::epoch(),
         }
     }
@@ -5936,6 +5989,7 @@ impl DummyComms {
             self.discovery_next_announce_ms = 0;
             self.timesync_next_announce_ms = 0;
             self.pending_rx.clear();
+            self.held_wire = None;
         }
     }
 
@@ -6048,10 +6102,13 @@ impl CommsDevice for DummyComms {
             let side_id = self
                 .side_id
                 .ok_or(TelemetryError::HandlerError("comms side id not set"))?;
-            if let Some(model) = &mut self.modeled
-                && let Some(wire) = model.poll(_router.network_time_ms())?
-            {
-                return _router.rx_packed_queue_from_side(&wire, side_id);
+            if let Some(model) = &mut self.modeled {
+                let time = _router.network_time_ms();
+                if let Some(result) = offer_model_wire(&mut self.held_wire, || model.poll(time), |wire| {
+                    _router.rx_packed_queue_from_side(wire, side_id)
+                })? {
+                    return result;
+                }
             }
             if self.modeled.is_none(){self.maybe_queue_discovery()?;}
             self.maybe_queue_timesync()?;
