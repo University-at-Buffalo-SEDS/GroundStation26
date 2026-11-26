@@ -685,14 +685,22 @@ async fn routes_need_view_data_and_review_any_source() {
         "{body}"
     );
     assert!(body["motor"]["archive"]["id"] == "2026-11-16_static_fire");
-    let (status, _) = call(
-        &state,
-        "GET",
-        "/api/flight_review/recording/event.launch.missing.db/flight_export",
-        Some("viewer-token"),
-        "",
-    )
-    .await;
+    // Exports take one process-wide slot; another test's export answers 429 here.
+    let mut status = StatusCode::TOO_MANY_REQUESTS;
+    for _ in 0..600 {
+        (status, _) = call(
+            &state,
+            "GET",
+            "/api/flight_review/recording/event.launch.missing.db/flight_export",
+            Some("viewer-token"),
+            "",
+        )
+        .await;
+        if status != StatusCode::TOO_MANY_REQUESTS {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, _) = call(&state, "GET", "/api/flight_review/recording/..%2Fetc", Some("viewer-token"), "").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
