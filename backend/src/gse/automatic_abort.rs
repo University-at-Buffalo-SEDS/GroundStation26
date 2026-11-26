@@ -257,10 +257,12 @@ pub(crate) fn hold_for_mode_switch(state: &AppState) -> Result<ModeSwitchHold, S
 
 struct InFlight {
     owner: Arc<AbortOwner>,
-    _operator_claim: Option<OperatorDispatchClaim>,
+    operator_claim: Option<OperatorDispatchClaim>,
 }
 impl Drop for InFlight {
     fn drop(&mut self) {
+        // Its dispatch lease ends first: nothing finished still holds one.
+        drop(self.operator_claim.take());
         self.owner.release();
     }
 }
@@ -407,7 +409,7 @@ fn claim_from_source(
                     runtime: state.gse.clone(),
                     in_flight: Some(InFlight {
                         owner: owner.clone(),
-                        _operator_claim: Some(operator_claim),
+                        operator_claim: Some(operator_claim),
                     }),
                     durable: !hitl,
                 });
@@ -492,7 +494,7 @@ pub(super) fn reserve_abort_clear(state: &AppState) -> Option<AutomaticAbortClai
     state.gse.abort.reserve().then(|| AutomaticAbortClaim {
         runtime: state.gse.clone(),
         // Existing explicit clear already owns its outer dispatch reservation.
-        in_flight: Some(InFlight { owner: state.gse.abort.clone(), _operator_claim: None }),
+        in_flight: Some(InFlight { owner: state.gse.abort.clone(), operator_claim: None }),
         durable: false,
     })
 }
