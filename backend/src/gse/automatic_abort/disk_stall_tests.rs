@@ -74,7 +74,7 @@ impl Rig {
         )
         .unwrap();
         router.rx_packed_from_side(&sedsnet::wire_format::pack_packet(&announce), side).unwrap();
-        router.process_all_queues_with_timeout(0).unwrap();
+        drain(&router);
         let path = armed_fixture_for_test(&state, &router);
         operational::persist_diagnostic::take_saved(&path);
         Self { state, router, path, wire, sent }
@@ -95,7 +95,7 @@ impl Rig {
     }
     /// Every automatic ABORT the station sent.
     fn aborts_so_far(&self) -> usize {
-        self.router.process_all_queues_with_timeout(0).unwrap();
+        drain(&self.router);
         self.sent.lock().unwrap().iter().filter(|(kind, _)| kind == "ABORT").count()
     }
     fn saved(&self) -> Vec<(bool, bool)> {
@@ -904,7 +904,7 @@ async fn an_overpressure_and_a_fire_at_once_never_both_command() {
         overpressure::evaluate(&rig.state);
         let relief = rig.state.gse.overpressure.owns_valves();
         assert_ne!(fired, relief, "round {round}");
-        rig.router.process_all_queues_with_timeout(0).unwrap();
+        drain(&rig.router);
         assert_eq!(rig.sent.lock().unwrap().is_empty(), fired, "round {round}: {:?}", rig.sent.lock().unwrap());
         if fired { fires += 1 } else { reliefs += 1 }
     }
@@ -958,7 +958,7 @@ async fn a_fire_admitted_while_overpressure_decides_is_not_overridden() {
     });
     overpressure::evaluate(&rig.state);
     fired.lock().unwrap().take().unwrap().unwrap();
-    rig.router.process_all_queues_with_timeout(0).unwrap();
+    drain(&rig.router);
     assert!(rig.sent.lock().unwrap().is_empty(), "nothing commanded after Fire: {:?}", rig.sent.lock().unwrap());
     let latch = rig.state.gse.overpressure.lock().latch.clone().expect("alarmed");
     assert!(!latch.relief_commanded);
@@ -1338,7 +1338,7 @@ async fn a_late_reassertion_never_reopens_the_main_valve() {
         ab_abort_sent: true,
     }));
     overpressure::reassert_for_test(&rig.state);
-    rig.router.process_all_queues_with_timeout(0).unwrap();
+    drain(&rig.router);
     let sent = rig.sent.lock().unwrap().clone();
     assert!(sent.iter().any(|(kind, byte)| kind == "VALVE_COMMAND" && *byte == 2), "relief reasserted: {sent:?}");
     assert!(!sent.iter().any(|(kind, byte)| kind == "VALVE_COMMAND" && *byte == 0), "main valve reopened: {sent:?}");
@@ -1423,4 +1423,17 @@ async fn a_failed_overpressure_settlement_costs_no_later_one() {
     let panicked = !overpressure::watch::PANIC_NEXT_SETTLE.load(std::sync::atomic::Ordering::Acquire);
     rig.state.request_shutdown();
     assert!(panicked && later, "settled {}", settled());
+}
+
+/// One pass over the router's queues. The station's own router worker drains
+/// the same queues, and a contended ingress queue answers "rx queue busy":
+/// pass again until it is free (nothing was taken from it).
+fn drain(router: &Router) {
+    let until = Instant::now() + WAIT;
+    loop {
+        match router.process_all_queues_with_timeout(0) {
+            Err(sedsnet::TelemetryError::Io("rx queue busy")) if Instant::now() < until => std::thread::yield_now(),
+            result => break result.unwrap(),
+        }
+    }
 }
