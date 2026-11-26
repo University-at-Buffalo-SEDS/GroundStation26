@@ -1339,6 +1339,19 @@ async fn actual_cold_flow_preparation_busy_retains_origin_and_all_revocations() 
         );
         assert_eq!(file_count(&f), 1);
         f.pump();
+        // Another SDK core owner (the route observer's snapshot) can hold the
+        // core when the effects are applied: they are then retained, still
+        // the originals, and the next tick applies them. Only a retained plan
+        // may be waited for; nothing delivered and nothing retained fails.
+        let until = Instant::now() + std::time::Duration::from_secs(5);
+        while f.packets.lock().unwrap().is_empty() && Instant::now() < until {
+            assert!(
+                f.state.gse.lock().unwrap().cold_flow.as_ref().is_some_and(|s| s.pending.is_some()),
+                "initial close effects neither delivered nor retained"
+            );
+            tick(&f.state, true);
+            f.pump();
+        }
         let before: Vec<_> = f
             .packets
             .lock()

@@ -311,6 +311,9 @@ async fn ignition_pair_accepted_launch_is_not_automatically_stopped_on_later_rou
     } else {
         Some(crate::network_variables::prepare_launch_state(host).unwrap())
     };
+    // The fixture's pump shares the SDK core; a preempted pump must not
+    // expire the Launch's 100 ms core-busy retry window on a loaded host.
+    let _window = crate::gse::nonwaiting_admission_tests::FrozenWindow::new(&state);
     let admission_deadline = std::time::Instant::now() + Duration::from_secs(1);
     let accepted = loop {
         assert_eq!(state.ignition_observer.launch_sdk_offers.load(Ordering::Acquire), 0);
