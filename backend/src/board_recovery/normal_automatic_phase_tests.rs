@@ -531,6 +531,16 @@ async fn n6b_one_actual_safety_tick_refuses_busy_owner_without_partial_idle() {
     if separate("n6b_one_actual_safety_tick_refuses_busy_owner_without_partial_idle") { return; }
     let fixture = normal().await;
     let state = fixture.state();
+    if crate::runtime_mode::is_testing() {
+        // Testing declares the station's Startup FLIGHT_STATE once every board
+        // is seen (safety_task::testing_startup_due), a durable write of its
+        // own later in the same tick. It is made here first, as the safety
+        // loop makes it, so the observed tick's only candidate write is the
+        // refused Idle.
+        crate::network_variables::set_flight_state_control_stamped(
+            state.topology_router.get().unwrap(), FlightState::Startup as u8,
+        ).unwrap();
+    }
     let before = crate::network_variables::automatic_idle_test_snapshot();
     let generation = crate::gse::automatic_generation(&state);
     let epochs = (state.manual_abort_intent.epoch(), state.deferred_abort.manual_epoch());
