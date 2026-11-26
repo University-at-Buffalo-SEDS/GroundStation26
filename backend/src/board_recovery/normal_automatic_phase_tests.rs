@@ -177,7 +177,25 @@ async fn n2_healthy_normal_policy_keeps_live_idle_and_canonical_startup() {
     let state = fixture.state();
     assert!(state.manual_abort_intent.pending_epoch().is_none());
     let before = crate::network_variables::automatic_idle_test_snapshot();
-    crate::sequences::refresh_action_policy_now(&state);
+    // The automatic Idle is a nonwaiting SDK try: it is refused when the
+    // fixture's router worker holds the SDK core at that instant, and the
+    // station's periodic refresh offers it again. Refresh again only after
+    // such a refusal; any other outcome fails the checks below.
+    let outcomes = crate::normal_publication_probe::N6Outcomes::install(&state);
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    for attempt in 1.. {
+        crate::sequences::refresh_action_policy_now(&state);
+        let counts = &outcomes.snapshot()["counts"];
+        if state.local_flight_state_snapshot() != FlightState::Startup
+            || counts["publish_entered"] != attempt
+            || counts["commit_SDK_CoreBusy"] != attempt
+            || std::time::Instant::now() >= deadline
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    drop(outcomes);
     assert!(crate::network_variables::automatic_idle_test_snapshot().durable_unchanged(&before));
     println!("NORMAL_CAUSAL {}", facts(&state, "healthy_normal"));
     assert_eq!(state.local_flight_state_snapshot(), FlightState::Idle);

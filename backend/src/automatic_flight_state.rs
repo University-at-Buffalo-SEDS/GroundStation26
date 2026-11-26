@@ -230,7 +230,7 @@ pub(crate) fn publish(state: &Arc<AppState>, proposal: Proposal) -> bool {
     request.prepared_result(request_id, result.is_ok());
     #[cfg(all(test, not(feature = "firmware_sim")))]
     if !crate::runtime_mode::is_hitl_or_test_fire() {
-        crate::normal_publication_probe::n6_record(state, match &result { Ok(()) => 9, Err(Error::Busy) => 10, Err(Error::Retired) => 11, Err(Error::StateChanged) => 12, Err(Error::StoreChanged) => 13, Err(Error::PolicyChanged) => 14, Err(Error::Ineligible | Error::Sdk(_)) => 15 });
+        crate::normal_publication_probe::n6_record(state, match &result { Ok(()) => 9, Err(Error::Busy) => 10, Err(Error::Retired) => 11, Err(Error::StateChanged) => 12, Err(Error::StoreChanged) => 13, Err(Error::PolicyChanged) => 14, Err(Error::Sdk(sedsnet::router::TryManagedBatchError::CoreBusy)) => 16, Err(Error::Ineligible | Error::Sdk(_)) => 15 });
     }
     match result {
         Ok(()) => {

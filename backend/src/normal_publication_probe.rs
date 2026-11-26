@@ -267,7 +267,7 @@ pub(crate) fn claim_refused(state:&AppState,requested:u64) {
 
 // N6 ONLY: fixed branch counters. No clocks/providers/SDK/locks/formatting in record.
 static N6_OWNER: AtomicUsize = AtomicUsize::new(0);
-static N6_COUNTS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+static N6_COUNTS: [AtomicU64; 17] = [const { AtomicU64::new(0) }; 17];
 pub(crate) struct N6Outcomes;
 impl N6Outcomes {
     pub(crate) fn install(state: &Arc<AppState>) -> Self {
@@ -281,7 +281,7 @@ impl N6Outcomes {
             "publish_entered", "publication_claim_refused", "original_ownership_refused",
             "router_missing", "packet_preparation_refused", "SDK_preparation_refused",
             "commit_OK", "commit_Busy", "commit_Retired", "commit_StateChanged",
-            "commit_StoreChanged", "commit_PolicyChanged", "commit_Ineligible_or_SDK"];
+            "commit_StoreChanged", "commit_PolicyChanged", "commit_Ineligible_or_SDK", "commit_SDK_CoreBusy"];
         let counts = labels.into_iter().zip(N6_COUNTS.iter())
             .map(|(label,count)| (label.to_owned(),serde_json::json!(count.load(Ordering::Relaxed))))
             .collect::<serde_json::Map<_,_>>();
