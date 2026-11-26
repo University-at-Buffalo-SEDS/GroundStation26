@@ -456,6 +456,14 @@ async fn n6_healthy_actual_safety_worker_keeps_live_idle_and_canonical_startup()
     }
     let fixture = normal().await;
     let state = fixture.state();
+    if crate::runtime_mode::is_testing() {
+        // As in n6b: Testing declares the station's Startup FLIGHT_STATE (a
+        // durable write) in a tick whose Idle publication was refused (a
+        // busy SDK core); make it first so the Idle is the only change.
+        crate::network_variables::set_flight_state_control_stamped(
+            state.topology_router.get().unwrap(), FlightState::Startup as u8,
+        ).unwrap();
+    }
     let before = crate::network_variables::automatic_idle_test_snapshot();
     let n6_outcomes = crate::normal_publication_probe::N6Outcomes::install(&state);
     let pause = CausalPause::install(&state, Site::SafetyReady);
