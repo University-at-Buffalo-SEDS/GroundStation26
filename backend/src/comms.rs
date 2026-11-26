@@ -3112,6 +3112,38 @@ fn abort_critical_id(payload: &[u8]) -> Option<u64> {
         || (is_abort_flight_state(payload) && !SENDING_ABORT_STATE_COPY.load(std::sync::atomic::Ordering::Acquire));
     critical.then(|| serialize::unpack_packet(payload).ok().map(|packet| packet.packet_id())).flatten()
 }
+/// Abort-critical SDK packets (see `abort_critical_id`) this station has
+/// written, on any link: AbortCopies keeps them only on a recovery link, for
+/// its re-send policy.
+static ABORT_CRITICAL_WRITTEN: std::sync::Mutex<VecDeque<u64>> = std::sync::Mutex::new(VecDeque::new());
+/// A new Abort: an Abort-critical write whose packet this station has not yet
+/// written. It is never held by a pacing model (the modem packet gap, the
+/// air-share debt or the control loans of earlier writes, all of which run on
+/// clocks a host stall inflates); only bytes still on the wire (and CTS) make
+/// it wait. Its own air is still charged, so the frames after it pay for it.
+/// Re-sends keep their pacing and AbortCopies policy.
+fn new_abort_write(payload: &[u8]) -> bool {
+    abort_critical_id(payload).is_some_and(|id| {
+        !ABORT_CRITICAL_WRITTEN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&id)
+    })
+}
+fn note_abort_critical_written(payload: &[u8]) {
+    let Some(id) = abort_critical_id(payload) else {
+        return;
+    };
+    let mut written = ABORT_CRITICAL_WRITTEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !written.contains(&id) {
+        written.push_back(id);
+        if written.len() > 32 {
+            written.pop_front();
+        }
+    }
+}
 impl UartComms {
     /// No ABORT gap copies on an RRLS link or while the primary relays.
     fn relay_link_state(&self, state: &UartWriteState) -> bool {
@@ -4022,15 +4054,17 @@ impl UartComms {
                 .into());
             }
             let virtual_now = if simulated_serial_pty() { clock } else { None };
+            // A new Abort in the pair waits only for bytes still on the wire.
+            let new_abort = frames.iter().any(|(_, payload)| new_abort_write(payload));
             if virtual_now.is_some_and(|now| !state.wire.ready(now))
-                || state.radio_capacity.as_ref().is_some_and(|cap| {
+                || (!new_abort && state.radio_capacity.as_ref().is_some_and(|cap| {
                     !cap.ready_for_command_batch(
                         wall,
                         clock,
                         &contracts[..frames.len()],
                         bytes.len(),
                     )
-                })
+                }))
             {
                 return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into());
             }
@@ -4105,6 +4139,9 @@ impl UartComms {
             }
             if result.is_ok() {
                 report_write_leases_drained(leases);
+                for (_, payload) in frames {
+                    note_abort_critical_written(payload);
+                }
             }
             result.map_err(Into::into)
         }
@@ -4287,8 +4324,9 @@ impl UartComms {
             )
             .into());
         }
+        let new_abort = new_abort_write(sdk_payload);
         let readback = abort_readback_query(sdk_payload);
-        if write_state.radio_capacity.as_ref().is_some_and(|cap| {
+        if !new_abort && write_state.radio_capacity.as_ref().is_some_and(|cap| {
             if readback {
                 return !cap.ready_for(capacity_wall, capacity_clock, true);
             }
@@ -4317,7 +4355,7 @@ impl UartComms {
             )
             .into());
         }
-        if command_id.is_none() && canonical_receipt.is_none() {
+        if command_id.is_none() && canonical_receipt.is_none() && !new_abort {
             let ready = write_state.radio_capacity.as_ref().is_none_or(|cap| {
                 cap.ready_for(capacity_wall, capacity_clock, close_batch || radio_liveness_frame(priority, payload))
                     || (!close_batch
@@ -4498,6 +4536,9 @@ impl UartComms {
         }
         if io_result.is_ok() && matches!(self.protocol, SerialProtocol::RawUart) {
             report_write_leases_drained(leases);
+            for written in core::iter::once(sdk_payload).chain(follower.filter(|_| follower_framed.is_some())) {
+                note_abort_critical_written(written);
+            }
             if self.recovery.is_some() {
                 for written in core::iter::once(sdk_payload).chain(follower.filter(|_| follower_framed.is_some())) {
                     // An Abort's FLIGHT_STATE=15 write: schedule its early copies.
@@ -4907,8 +4948,9 @@ impl CommsDevice for UartComms {
             trace_radio_gate_refusal("recovery_capacity", priority, payload, String::new);
             return false;
         }
+        let new_abort = new_abort_write(payload);
         let readback = abort_readback_query(payload);
-        if state.radio_capacity.as_ref().is_some_and(|cap| {
+        if !new_abort && state.radio_capacity.as_ref().is_some_and(|cap| {
             if readback {
                 return !cap.ready_for(wall, clock, true);
             }
@@ -4926,7 +4968,8 @@ impl CommsDevice for UartComms {
             });
             return false;
         }
-        if control.is_none()
+        if !new_abort
+            && control.is_none()
             && !state.ordinary_ready(
                 wall,
                 clock,
@@ -8773,6 +8816,104 @@ mod raw_uart_tests {
             assert!(start.elapsed() < Duration::from_millis(ABORT_RESEND_FREE_JITTER_MS + 30), "a re-send with RF silent waits only its jitter");
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    /// A new Abort waits only for bytes still on the wire. The modem's packet
+    /// gap after an earlier write, and the air-share debt of earlier writes,
+    /// are pacing models, not wire time: a host stall of 30 ms or more after
+    /// the first copy put the new Abort past the turn's burst window but
+    /// inside the 55 ms gap, and it was refused ("simulated UART wire is still
+    /// transmitting") with the wire long quiet. Simulation clock, no sleeps.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_new_abort_waits_only_for_bytes_still_on_the_wire() {
+        if !cfg!(feature = "firmware_sim") {
+            crate::mode_suite!(Hitl);
+        }
+        const CHILD: &str = "GS_NEW_ABORT_WIRE_CHILD";
+        const NAME: &str = "comms::raw_uart_tests::a_new_abort_waits_only_for_bytes_still_on_the_wire";
+        if std::env::var_os(CHILD).is_none() {
+            let clock = std::env::temp_dir().join(format!("gs-new-abort-wire-{}.clock", std::process::id()));
+            std::fs::write(&clock, "30000").unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("GS_SIM_CLOCK_FILE", &clock)
+                .env("GS_SIMULATED_SERIAL_PTY", "1")
+                .env_remove("GS_RADIO_TURN_TAKING")
+                .output()
+                .unwrap();
+            let _ = std::fs::remove_file(clock);
+            assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        crate::telemetry_schema::initialize().unwrap();
+        let clock = std::path::PathBuf::from(std::env::var_os("GS_SIM_CLOCK_FILE").unwrap());
+        let set_clock = |now: u64| std::fs::write(&clock, now.to_string()).unwrap();
+        let abort = |stamp: u64| {
+            serialize::pack_packet(
+                &Packet::new(
+                    crate::telemetry_schema::data_type("ABORT"),
+                    &[crate::telemetry_schema::endpoint("ABORT")],
+                    "GS",
+                    stamp,
+                    std::sync::Arc::from(&b"SEDS_MANUAL_ABORT_V1:K"[..]),
+                )
+                .unwrap(),
+            )
+            .to_vec()
+        };
+        let (mut peer, port) = serialport::TTYPort::pair().unwrap();
+        peer.set_timeout(Duration::from_millis(1)).unwrap();
+        let mut drain = move || {
+            let mut buf = [0u8; 4096];
+            let mut total = 0;
+            while let Ok(n) = peer.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                total += n;
+            }
+            total
+        };
+        let (mut uart, mesh, _) = recovery_uart_fixture(port);
+        {
+            let mut capacity = rfd_capacity::Capacity::new(64000, 100, 16).with_turn_period(200);
+            capacity.enable_turn_gate();
+            uart.write_lock.lock().unwrap().radio_capacity = Some(capacity);
+        }
+        uart.enable_radio_capacity_control();
+        mesh.lock().unwrap().incoming(true, b"RS\x01\x00\x00\x00\x00\x00\x00", 30_000);
+
+        // RF holds the air. The first copy goes at once.
+        note_air_rx_now();
+        uart.send_data_with_priority(&abort(1), 255).expect("the first copy goes at once");
+        assert!(drain() > 0, "the first copy is on the wire");
+        // 40 ms later (a host stall): past the turn's 30 ms burst window,
+        // inside the 55 ms packet gap, the wire quiet since about 30 006.
+        set_clock(30_040);
+        note_air_rx_now();
+        uart.send_data_with_priority(&abort(2), 255).expect("a new Abort is not held by the packet gap");
+        assert!(drain() > 0, "the new Abort is on the wire");
+
+        // RF silent past the free-run time: per-frame air-share pacing. An
+        // earlier large write is still on the wire (about 35 ms at 115200
+        // baud) and leaves air debt well past the critical loan's reach.
+        {
+            let mut state = uart.write_lock.lock().unwrap();
+            state.wire.committed(32_000, 400, 115_200);
+            let cap = state.radio_capacity.as_mut().unwrap();
+            // 4 KiB of earlier air: about 0.5 s of debt at 64 kbit/s.
+            cap.committed(Instant::now(), Some(32_000), 4096);
+            assert!(!cap.ready_for(Instant::now(), Some(32_030), true), "the air debt holds ordinary frames");
+        }
+        // Bytes really still on the wire hold even a new Abort.
+        set_clock(32_001);
+        assert!(uart.send_data_with_priority(&abort(3), 255).is_err(), "a new Abort waits for bytes still on the wire");
+        // The wire done (within its 10 ms lookahead), the air debt is not wire time.
+        set_clock(32_030);
+        uart.send_data_with_priority(&abort(3), 255).expect("a new Abort is not held by air-share debt");
+        assert!(drain() > 0, "the new Abort is on the wire");
     }
 
     /// R30: an ABORT written out of turn (inside RF's burst) went alone, and
