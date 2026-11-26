@@ -581,11 +581,15 @@ async fn queue_policy(case: &str) {
             assert_eq!(host.export_runtime_stats().queues.tx_len, 1);
         }
         "partial" => {
+            // The rest was refused for good: the station aborts so every
+            // board agrees (the FC Launch is already the SDK's).
             let error = result.unwrap_err();
             assert!(
-                error.contains("accepted 1/2") && error.contains("priority queue saturated"),
+                error.contains("Launch only partly delivered (1/2): aborted so every board agrees")
+                    && error.contains("priority queue saturated"),
                 "{error}"
             );
+            assert_eq!(state.manual_abort_intent.epoch(), 1, "the Abort was requested");
             assert_eq!(calls, 2);
             assert_eq!(host.export_runtime_stats().queues.tx_len, 1);
             assert!(
@@ -630,16 +634,13 @@ async fn actual_launch_retry_preserves_originals_stop_and_terminal_prefixes() {
     }
 }
 
-/// Split state (not fixed; ignored until the partial/late-refusal handling is
-/// decided): every Launch packet, the Valve Board's Sequence among them, is
-/// admitted by the SDK, then the station refuses the Launch before its local
-/// publication (here: recovery admission closed in that instant, as a board
-/// reset or mode change does). Today the caller reports the error, keeps
-/// flushing the admitted packets, sends no Abort and never moves to Launch:
-/// the Valve Board starts its sequence while the station shows a refused
-/// Launch. Run with --ignored to see it fail.
+/// Every Launch packet, the Valve Board's Sequence among them, is admitted by
+/// the SDK, then recovery admission closes before the local publication (as
+/// a board reset or mode change does). The old code refused the Launch there:
+/// the Valve Board started its sequence while the station showed a refused
+/// Launch and sent no Abort. The station now stands behind it: Launch is
+/// published locally and a warning names the late failure.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "demonstrates the Launch split state described above; fix awaits review"]
 async fn a_launch_refused_after_full_sdk_admission_must_not_leave_the_valve_board_launching() {
     if isolated_child_named("telemetry_task::tests::launch_retry_controls::a_launch_refused_after_full_sdk_admission_must_not_leave_the_valve_board_launching") {
         return;
@@ -673,6 +674,11 @@ async fn a_launch_refused_after_full_sdk_admission_must_not_leave_the_valve_boar
         !(sequence_delivered && result.is_err() && !station_launch && !abort_sent),
         "split state: the Valve Board received its Sequence, the station refused the Launch ({result:?}), shows {:?} and sent no Abort",
         rig.state.local_flight_state_snapshot()
+    );
+    assert!(sequence_delivered && station_launch && result.is_ok(), "the station stands behind the admitted Launch: {result:?}");
+    assert!(
+        rig.state.notifications_snapshot().iter().any(|n| n.message.contains("Launch sent to every board and published here, but recovery admission had closed")),
+        "the late failure is named: {:?}", rig.state.notifications_snapshot()
     );
     rig.state.request_shutdown();
 }

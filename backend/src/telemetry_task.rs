@@ -4536,15 +4536,37 @@ mod tests {
     }
 
     /// The SDK core is taken right after the FC Launch was admitted, so the
-    /// valve Sequence (ignition) is refused with a zero-owner CoreBusy. Flight
-    /// builds re-offer only that unadmitted packet inside the same window:
-    /// the FC Launch is sent once and the Sequence follows. Test-fire keeps
-    /// the original partial-admission inhibition (suffix_retry is false there).
+    /// valve Sequence (ignition) is refused with a zero-owner CoreBusy. The
+    /// unadmitted packet alone is offered again: the FC Launch is sent once
+    /// and the Sequence follows.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn launch_core_busy_after_fc_launch_completes_only_the_unadmitted_sequence() {
         crate::mode_suite!(Normal, Hitl, Testing);
         if launch_core_fixture_in_fresh_process("telemetry_task::tests::launch_core_busy_after_fc_launch_completes_only_the_unadmitted_sequence") { return; }
-        launch_suffix_busy_case().await;
+        launch_suffix_busy_case(Duration::from_millis(15), true).await;
+    }
+
+    /// As above with the core held 300 ms, past the old 100 ms window for the
+    /// rest (which left the FC launched, no Sequence, the station inhibited):
+    /// the rest gets in within the bounded wait and every board proceeds,
+    /// with no Abort.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_partly_admitted_launch_whose_rest_gets_in_later_completes_without_abort() {
+        crate::mode_suite!(Normal, Hitl, Testing);
+        if launch_core_fixture_in_fresh_process("telemetry_task::tests::a_partly_admitted_launch_whose_rest_gets_in_later_completes_without_abort") { return; }
+        launch_suffix_busy_case(Duration::from_millis(300), true).await;
+    }
+
+    /// The core stays held past the bounded wait after the FC Launch was
+    /// admitted: the Sequence never gets in. The station aborts so every
+    /// board agrees (ABORT on the wire, station Aborted) and the Valve Board
+    /// never gets its Sequence. The old code left the FC launched and the
+    /// station inhibited, with no Abort.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_partly_admitted_launch_whose_rest_never_gets_in_is_aborted() {
+        crate::mode_suite!(Normal, Hitl, Testing);
+        if launch_core_fixture_in_fresh_process("telemetry_task::tests::a_partly_admitted_launch_whose_rest_never_gets_in_is_aborted") { return; }
+        launch_suffix_busy_case(crate::gse::LAUNCH_CORE_BUSY_WAIT + Duration::from_millis(600), false).await;
     }
 
     // These three legacy cases own fresh processes, so process-wide checklist
@@ -4606,7 +4628,7 @@ mod tests {
     }
 
 
-    async fn launch_suffix_busy_case() {
+    async fn launch_suffix_busy_case(hold: Duration, rest_gets_in: bool) {
         let (db_tx, _db_rx) = mpsc::channel(8);
         let state = test_app_state(db_tx).await;
         let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
@@ -4637,6 +4659,27 @@ mod tests {
         if state.topology_router.get().is_none() {
             state.topology_router.set(router.clone()).unwrap();
         }
+        if !rest_gets_in {
+            // The Valve Board also takes ABORT and FLIGHT_STATE, so the Abort
+            // shows on its wire.
+            let abort_route = sedsnet::discovery::build_discovery_announce(
+                Board::ValveBoard.sender_id(), 124, &[crate::telemetry_schema::endpoint("VALVE_BOARD"),
+                    crate::telemetry_schema::endpoint("ABORT"), crate::telemetry_schema::endpoint("FLIGHT_STATE")],
+            ).unwrap();
+            router.rx_packed_from_side(&serialize::pack_packet(&abort_route), valve_side).unwrap();
+            router.process_all_queues_with_timeout(0).unwrap();
+        }
+        // The station's operator Abort publisher, as main runs it.
+        let publisher = (!rest_gets_in).then(|| {
+            let (stop_state, stop_router) = (state.clone(), router.clone());
+            tokio::spawn(crate::manual_abort_intent::service_with_claim(
+                state.manual_abort_intent.clone(), state.shutdown_subscribe(), move |claim| {
+                    match crate::manual_abort_utc::publish_local_claim(&stop_state, &stop_router, claim) {
+                        Ok(true) => { flush_command_tx(&stop_router, "partial Launch Abort"); true }
+                        _ => false,
+                    }
+                }))
+        });
         let pause = crate::gse::nonwaiting_admission_tests::Pause::install(&state);
         // [state, FLIGHT_COMMAND Launch, VALVE_COMMAND Sequence] (HITL has no
         // state packet): stop right after the FC Launch admission.
@@ -4660,19 +4703,46 @@ mod tests {
         pause.suffix.proceed();
         // The third offer is refused while the core is held.
         pause.busy.recv_timeout(Duration::from_secs(2)).unwrap();
-        std::thread::sleep(Duration::from_millis(15));
+        std::thread::sleep(hold);
         pause.release_core();
         holder.join().unwrap().unwrap();
         worker.await.unwrap();
         drop(pause);
-        router.process_all_queues_with_timeout(0).unwrap();
+        for _ in 0..20 {
+            router.process_all_queues_with_timeout(0).unwrap();
+        }
         let notes = state.notifications_snapshot();
         let partial = notes.iter().any(|n| n.message.contains("Launch SDK admission accepted"));
-        let wires: Vec<_> = sent.lock().unwrap().iter().filter_map(|w| serialize::unpack_packet(w).ok()).collect();
-        let sequences = wires.iter().filter(|p| p.data_type() == crate::telemetry_schema::data_type("VALVE_COMMAND")
+        let partly = notes.iter().any(|n| n.message.contains("Launch only partly delivered"));
+        let wires = || -> Vec<Packet> { sent.lock().unwrap().iter().filter_map(|w| serialize::unpack_packet(w).ok()).collect() };
+        let sequences = wires().iter().filter(|p| p.data_type() == crate::telemetry_schema::data_type("VALVE_COMMAND")
             && p.payload() == [ValveBoardCommands::Sequence as u8]).count();
-        assert!(!partial, "a zero-owner CoreBusy suffix must complete the same Launch: {notes:?}");
-        assert_eq!(sequences, 1, "exactly one valve Sequence; SDK={:?}", router.export_runtime_stats());
+        assert!(!partial, "a partial Launch is never left as an inhibited half-admission: {notes:?}");
+        if rest_gets_in {
+            assert!(!partly, "the rest got in: no Abort: {notes:?}");
+            assert_eq!(sequences, 1, "exactly one valve Sequence; SDK={:?}", router.export_runtime_stats());
+            assert_eq!(state.manual_abort_intent.epoch(), 0, "no Abort was requested");
+            if !crate::runtime_mode::is_hitl() {
+                assert_eq!(state.local_flight_state_snapshot(), FlightState::Launch);
+            }
+        } else {
+            let expected = if crate::runtime_mode::is_hitl() { "(1/2)" } else { "(2/3)" };
+            assert!(notes.iter().any(|n| n.message.contains(&format!("Launch only partly delivered {expected}: aborted so every board agrees"))), "{notes:?}");
+            assert_eq!(sequences, 0, "the Valve Board never gets its Sequence");
+            let aborted = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    for _ in 0..4 { let _ = router.process_all_queues_with_timeout(0); }
+                    if state.local_flight_state_snapshot() == FlightState::Aborted
+                        && wires().iter().any(|p| p.data_type() == crate::telemetry_schema::types::ABORT) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }).await;
+            assert!(aborted.is_ok(), "ABORT sent and the station shows Aborted: state={:?} notes={notes:?}", state.local_flight_state_snapshot());
+            state.request_shutdown();
+            if let Some(publisher) = publisher { let _ = tokio::time::timeout(Duration::from_secs(2), publisher).await; }
+        }
         if let Some(qualification) = qualification {
             std::fs::remove_file(qualification).unwrap();
         }

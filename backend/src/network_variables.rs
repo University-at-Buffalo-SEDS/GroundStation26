@@ -1349,7 +1349,23 @@ pub(crate) fn last_flight_state_wire_for_test() -> Option<std::time::Instant> {
 }
 /// Post-admission CAS. Never overwrite a later reset/Abort desired revision.
 /// No packet is submitted here: its EXACT original packet already owns SDK work.
-pub(crate) fn commit_admitted_launch(prepared: &PreparedLaunchState) -> Result<()> {
+/// Why an admitted Launch's FLIGHT_STATE was not saved.
+#[derive(Debug)]
+pub(crate) enum AdmittedLaunchCommitError {
+    /// Another writer changed FLIGHT_STATE since preparation (an Abort's
+    /// Aborted among them): Launch must not be published over it.
+    Changed(anyhow::Error),
+    /// The value is current but the file could not be written.
+    NotSaved(anyhow::Error),
+}
+impl std::fmt::Display for AdmittedLaunchCommitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Changed(e) | Self::NotSaved(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+pub(crate) fn commit_admitted_launch(prepared: &PreparedLaunchState) -> std::result::Result<(), AdmittedLaunchCommitError> {
     let mut guard = store()
         .lock()
         .expect("network-variable store lock poisoned");
@@ -1361,15 +1377,16 @@ pub(crate) fn commit_admitted_launch(prepared: &PreparedLaunchState) -> Result<(
         // admitted packet first. Do not rewrite, enqueue, or freshen its stamp.
         return Ok(());
     }
-    anyhow::ensure!(
-        (guard.values.flight_state, guard.values.flight_state_stamp) == prepared.expected,
-        "Desired flight state changed after launch preparation; admitted launch is uncertain, explicit recovery required"
-    );
+    if (guard.values.flight_state, guard.values.flight_state_stamp) != prepared.expected {
+        return Err(AdmittedLaunchCommitError::Changed(anyhow::anyhow!(
+            "Desired flight state changed after launch preparation; admitted launch is uncertain, explicit recovery required"
+        )));
+    }
     let mut next = guard.values;
     next.flight_state = 7;
     next.flight_state_stamp = prepared.packet.timestamp();
     next.flight_state_epoch = prepared.packet.time_epoch();
-    guard.commit_flight_state(next)
+    guard.commit_flight_state(next).map_err(AdmittedLaunchCommitError::NotSaved)
 }
 
 /// Coordinator-only staging: disk IO is outside DISPATCH/Stop/SDK locks.

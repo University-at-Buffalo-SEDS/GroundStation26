@@ -5053,12 +5053,10 @@ fn admission_window_elapsed(state: &AppState, at: Instant) -> std::time::Duratio
     at.elapsed()
 }
 
-/// How long a Launch none of whose packets the SDK admitted yet waits out a
-/// held SDK core (retrying, holding no guard in between) before it is refused.
+/// How long a Launch whose packets the SDK has not all admitted waits out a
+/// held SDK core (retrying, holding no guard in between), from its first
+/// attempt: refused if none got in, aborted if only some did.
 pub(crate) const LAUNCH_CORE_BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
-/// The unadmitted rest of a partly admitted Launch: retried this long from the
-/// first attempt, as it always was.
-const LAUNCH_SUFFIX_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
 
 pub(crate) fn queue_prepared_launch_packets(
     state: &AppState,
@@ -5094,10 +5092,11 @@ pub(crate) fn queue_prepared_launch_packets(
     // but time, where giving up left the saved Fire intent and inhibition in
     // place with no Launch sent (manual recovery). No guard is held between
     // attempts, and every attempt re-runs the Stop/board/route admission, so
-    // an Abort or Stop in the meantime refuses it at once. Once a packet is
-    // admitted, the unadmitted suffix keeps the original 100 ms window,
-    // counted from the first attempt as before.
-    let retry_window = |admitted: usize| if admitted == 0 { LAUNCH_CORE_BUSY_WAIT } else { LAUNCH_SUFFIX_RETRY_WINDOW };
+    // an Abort or Stop in the meantime refuses it at once. A partly admitted
+    // Launch retries its unadmitted rest under the same bound from the first
+    // attempt: once the rest is in, every board proceeds; if it never gets in,
+    // the station aborts so every board agrees (below).
+    let retry_window = |_admitted: usize| LAUNCH_CORE_BUSY_WAIT;
     let mut first_sdk_attempt: Option<Instant> = None;
     let mut last_zero_busy = None;
     let mut retry_controller_types = None;
@@ -5105,10 +5104,11 @@ pub(crate) fn queue_prepared_launch_packets(
     // prepared Launch. A zero-owner CoreBusy refusal of a later packet admits
     // nothing, so (flight builds) only the unadmitted suffix of the SAME
     // vector is offered again inside the same window, after the same
-    // admission checks; an accepted packet is never offered twice. Test-fire
-    // keeps the original no-suffix-retry behavior.
+    // admission checks; an accepted packet is never offered twice. Every
+    // mode retries the rest (test fire too: a rest that never got in would
+    // otherwise abort a Launch whose Valve Board Sequence only met a busy core).
     let mut admitted_prefix = 0usize;
-    let suffix_retry = !crate::runtime_mode::is_test_fire();
+    let suffix_retry = true;
     let result = loop {
         if first_sdk_attempt.is_some_and(|at| admission_window_elapsed(state, at) >= retry_window(admitted_prefix)) {
             break Err((admitted_prefix, last_zero_busy.take().expect("retry follows a real zero-owner CoreBusy")));
@@ -5208,27 +5208,75 @@ pub(crate) fn queue_prepared_launch_packets(
         Ok(n) => *n,
         Err((n, _)) => *n,
     };
-    // Even a partial batch has real SDK owners. Persist/describe that admitted
-    // Launch truthfully; no implicit retry and no automatic Abort are allowed.
+    // Safety catalog (About safety): launch-partial-delivery-abort. Keep
+    // backend/src/safety_catalog_rules.rs in step.
+    if accepted > 0 && accepted < total {
+        // Some boards have their Launch packet and the rest never got in (the
+        // Valve Board's Sequence is always last, so it is among the missing).
+        // Stopping the boards that accepted is the only way every board and
+        // the station agree: the normal operator Abort dispatch (which waits
+        // for no disk and no guard held here) sends ABORT and the Aborted
+        // FLIGHT_STATE and latches the station Aborted. A newer Stop already
+        // does that; it is not pressed a second time.
+        let cause = match &result {
+            Err((_, error)) => format!("{error:?}"),
+            Ok(_) => unreachable!("a partial admission is an error"),
+        };
+        let reason = format!("Launch only partly delivered ({accepted}/{total}): aborted so every board agrees");
+        if state.manual_abort_intent.epoch() == ticket.manual_epoch {
+            state.manual_abort_intent.request();
+        }
+        log::error!("{reason} (the rest was refused: {cause})");
+        return Err(format!("{reason} (the rest was refused: {cause})"));
+    }
     #[cfg(test)]
     if accepted == total {
         nonwaiting_admission_tests::after_admission(state);
     }
-    if let Some(prepared) = prepared.filter(|_| accepted > 0) {
+    if let Some(prepared) = prepared.filter(|_| accepted == total) {
+        // Every packet, the Valve Board's Sequence among them, is the SDK's
+        // now: the boards will act on them. From here the station stands
+        // behind the Launch; only a newer Stop or Abort (which the boards
+        // also get, and which wins) keeps it from publishing Launch locally.
         crate::network_variables::note_admitted_launch();
-        let _dispatch = dispatch_gate();
-        with_stop_admission(state,ticket,||()) .map_err(|e|format!("SDK admitted {accepted}/{total} Launch packets, but {e}; explicit recovery required"))?;
-        let claim=claim_operator_dispatch_under_gate(state,ticket.generation).ok_or_else(||format!("SDK admitted {accepted}/{total} Launch packets, recovery closed before publication"))?;
-        crate::network_variables::commit_admitted_launch(&prepared).map_err(|e| {
-            format!(
-                "SDK admitted {accepted}/{total} Launch packets, desired publication failed: {e}"
-            )
-        })?;
-        // Moved inside the Stop boundary: an Abort is published without the
-        // dispatch gate, and one pressed after this check must end Aborted.
-        let previous = with_stop_admission(state,ticket,||state.move_local_flight_state(FlightState::Launch)).map_err(|e|format!("SDK admitted {accepted}/{total} Launch packets, newer Stop prevents local Launch publication: {e}"))?;
-        if let Some(previous) = previous {
-            state.observe_local_flight_state_change(previous, FlightState::Launch, Some(&claim), false);
+        // The durable FLIGHT_STATE save, before (never under) the dispatch gate.
+        let saved = crate::network_variables::commit_admitted_launch(&prepared);
+        let mut late = Vec::new();
+        let previous = {
+            let _dispatch = dispatch_gate();
+            with_stop_admission(state,ticket,||()) .map_err(|e|format!("SDK admitted {accepted}/{total} Launch packets, but {e}; explicit recovery required"))?;
+            match saved {
+                Ok(()) => {}
+                // Something else wrote FLIGHT_STATE since preparation (an
+                // Abort's Aborted among them): never publish Launch over it.
+                Err(crate::network_variables::AdmittedLaunchCommitError::Changed(e)) => {
+                    return Err(format!("SDK admitted {accepted}/{total} Launch packets, desired publication failed: {e}"));
+                }
+                Err(crate::network_variables::AdmittedLaunchCommitError::NotSaved(e)) => {
+                    late.push(format!("its FLIGHT_STATE could not be saved ({e:#})"));
+                }
+            }
+            // Admission closed (a reset or mode change raised its barrier) after
+            // the boards got every packet: this publication still runs, as work
+            // already in flight that the barrier's owner waits out. The
+            // generation is current (checked just above, under this gate).
+            let claim = claim_operator_dispatch_under_gate(state,ticket.generation).or_else(|| {
+                late.push("recovery admission had closed before its local publication".to_string());
+                claim_operator_inflight(state)
+            });
+            // Moved inside the Stop boundary: an Abort is published without the
+            // dispatch gate, and one pressed after this check must end Aborted.
+            let previous = with_stop_admission(state,ticket,||state.move_local_flight_state(FlightState::Launch)).map_err(|e|format!("SDK admitted {accepted}/{total} Launch packets, newer Stop prevents local Launch publication: {e}"))?;
+            if let Some(previous) = previous {
+                state.observe_local_flight_state_change(previous, FlightState::Launch, claim.as_ref(), false);
+            }
+            previous
+        };
+        let _ = previous;
+        if !late.is_empty() {
+            let warning = format!("Launch sent to every board and published here, but {}", late.join("; and "));
+            log::error!("{warning}");
+            crate::web::emit_notification_warning(state, warning);
         }
     }
     result.map_err(|(accepted,error)|format!("Launch SDK admission accepted {accepted}/{total} packets: {error}; launch remains inhibited, explicit manual recovery required"))
