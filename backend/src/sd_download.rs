@@ -426,6 +426,8 @@ pub(crate) struct BoardStream {
     open: bool,
     /// The last transfer id used on this stream.
     xfer: u8,
+    /// CANCELs sent on this stream whose answer has not come back yet.
+    unanswered_cancels: u32,
 }
 
 impl BoardStream {
@@ -495,6 +497,7 @@ impl BoardStream {
             rx,
             open: true,
             xfer: NEXT_XFER.fetch_add(97, Ordering::Relaxed),
+            unanswered_cancels: 0,
         };
         let deadline = Instant::now() + CONNECT_TIMEOUT;
         loop {
@@ -555,6 +558,7 @@ impl BoardStream {
             let event = self.next_event(deadline, gate, cancel).await?;
             match event.kind {
                 P2pStreamEventKind::Data => {
+                    self.note_answer(&event.payload);
                     if let Some(frame) = decode_frame(&event.payload) {
                         return Ok(frame);
                     }
@@ -588,7 +592,10 @@ impl BoardStream {
             }
             match tokio::time::timeout(deadline - now, self.rx.recv()).await {
                 Ok(Some(event)) if event.stream_id == self.stream && event.peer == self.board => match event.kind {
-                    P2pStreamEventKind::Data => return Ok(Some(event.payload)),
+                    P2pStreamEventKind::Data => {
+                        self.note_answer(&event.payload);
+                        return Ok(Some(event.payload));
+                    }
                     P2pStreamEventKind::Closed | P2pStreamEventKind::Reset => {
                         self.open = false;
                         return Err(StreamError::Other(format!("{} closed the SD stream (state change or reboot)", self.board)));
@@ -602,12 +609,41 @@ impl BoardStream {
         }
     }
 
-    fn send(&self, payload: &[u8]) -> Result<(), StreamError> {
+    fn send(&mut self, payload: &[u8]) -> Result<(), StreamError> {
         self.router
             .send_p2p_stream(self.stream, payload)
             .map_err(|err| {
                 StreamError::Other(format!("SD stream send to {} failed: {err}", self.board))
-            })
+            })?;
+        if payload == [OP_CANCEL] {
+            self.unanswered_cancels += 1;
+        }
+        Ok(())
+    }
+
+    fn note_answer(&mut self, payload: &[u8]) {
+        if matches!(payload, [b, _] if *b == OP_CANCEL | RESPONSE_FLAG) {
+            self.unanswered_cancels = self.unanswered_cancels.saturating_sub(1);
+        }
+    }
+
+    /// Waits (until `deadline` at most) for the board to answer every CANCEL
+    /// sent on this stream. The SDK does not keep two sends on one stream in
+    /// order: a frame refused by a busy side is queued for retry and the next
+    /// one can go out ahead of it. A request that must reach the board after
+    /// a CANCEL is sent only once the CANCEL has been answered.
+    async fn settle_cancels(&mut self, deadline: Instant, gate: &Gate, cancel: &AtomicBool) -> Result<(), StreamError> {
+        while self.unanswered_cancels > 0 {
+            match self.next_frame(deadline, gate, cancel).await {
+                Ok(_) => {}
+                Err(StreamError::Other(e)) if e.starts_with("timed out") => {
+                    // An answer lost on the link: carry on as before.
+                    self.unanswered_cancels = 0;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
     }
 
     /// Clean close: CANCEL drops any queued answer on the board, then FIN.
@@ -1320,6 +1356,8 @@ async fn board_hash(stream: &mut BoardStream, req: &TransferRequest, gate: &Gate
         if std::mem::take(&mut cancel_first) {
             stream.send(&[OP_CANCEL])?;
         }
+        // A HASH that overtook the CANCEL would have its hash abandoned by it.
+        stream.settle_cancels((Instant::now() + timing::OPEN_RETRY).min(deadline), gate, cancel).await?;
         stream.send(&xfer::encode_hash(req.dir, &req.name))?;
         let retry = (Instant::now() + timing::HASH_RETRY).min(deadline);
         let answer = loop {
