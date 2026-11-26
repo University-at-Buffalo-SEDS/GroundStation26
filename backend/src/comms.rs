@@ -17,6 +17,7 @@ pub(crate) mod rfd_profile;
 #[cfg(any(target_os = "linux", test))]
 #[path = "comms/virtual_uart.rs"]
 pub(crate) mod virtual_uart;
+pub(crate) mod ingress_hold;
 #[cfg(target_os = "linux")]
 type MailboxReceiveResult = Result<Option<(u8, Vec<u8>)>, Box<dyn std::error::Error + Send + Sync>>;
 use crate::comms_config::{
@@ -1983,10 +1984,8 @@ fn queue_uart_router_payload_at(
     maybe_log_raw_uart_decoded(payload, protocol);
     maybe_log_raw_uart_router_queue_before(payload, protocol);
     tap_non_groundstation_gps_payload(payload, packet_tap);
-    match rx_ns {
-        Some(rx_ns) => router.rx_packed_queue_from_side_at(payload, side_id, rx_ns)?,
-        None => router.rx_packed_queue_from_side(payload, side_id)?,
-    }
+    // A busy or full ingress queue keeps the frame for the next pass.
+    ingress_hold::queue(router, side_id, payload, rx_ns)?;
     maybe_log_raw_uart_router_queue_after(payload, protocol);
     Ok(())
 }
@@ -4991,6 +4990,7 @@ impl CommsDevice for UartComms {
         let side_id = self
             .side_id
             .ok_or(TelemetryError::HandlerError("comms side id not set"))?;
+        ingress_hold::pass_logged(router, side_id);
 
         if self.rx_buf.len() < 2
             && let Err(err) = self.fill_rx_buf()
@@ -5456,6 +5456,7 @@ impl CommsDevice for I2cComms {
         let side_id = self
             .side_id
             .ok_or(TelemetryError::HandlerError("comms side id not set"))?;
+        ingress_hold::pass_logged(router, side_id);
 
         #[cfg(target_os = "linux")]
         {
@@ -5638,6 +5639,7 @@ impl CommsDevice for SpiComms {
         let side_id = self
             .side_id
             .ok_or(TelemetryError::HandlerError("comms side id not set"))?;
+        ingress_hold::pass_logged(router, side_id);
 
         #[cfg(target_os = "linux")]
         {
@@ -5659,7 +5661,7 @@ impl CommsDevice for SpiComms {
                 return Ok(());
             }
             tap_non_groundstation_gps_payload(payload, packet_tap);
-            router.rx_packed_queue_from_side(payload, side_id)
+            ingress_hold::queue(router, side_id, payload, None)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -5758,6 +5760,7 @@ impl CommsDevice for CanComms {
         let side_id = self
             .side_id
             .ok_or(TelemetryError::HandlerError("comms side id not set"))?;
+        ingress_hold::pass_logged(router, side_id);
 
         #[cfg(target_os = "linux")]
         {
@@ -5820,7 +5823,7 @@ impl CommsDevice for CanComms {
                 return Ok(());
             }
             tap_non_groundstation_gps_payload(&packet, packet_tap);
-            router.rx_packed_queue_from_side(&packet, side_id)
+            ingress_hold::queue(router, side_id, &packet, None)
         }
         #[cfg(not(target_os = "linux"))]
         {

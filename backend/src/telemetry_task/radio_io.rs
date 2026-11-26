@@ -5100,7 +5100,11 @@ pub(super) fn spawn_dedicated_radio_io_threads(
 
                 let payload = match incoming_rx.recv_timeout(Duration::from_millis(20)) {
                     Ok(payload) => payload,
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        // Frames the ingress queue refused as busy go now.
+                        crate::comms::ingress_hold::pass_logged(&router, side_id);
+                        continue;
+                    }
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 };
 
@@ -5126,7 +5130,9 @@ pub(super) fn spawn_dedicated_radio_io_threads(
                     }
                 }
 
-                if let Err(err) = router.rx_packed_queue_from_side(&payload, side_id) {
+                // A busy or full ingress queue keeps the frame, in order, for
+                // the next pass instead of dropping it.
+                if let Err(err) = crate::comms::ingress_hold::queue(&router, side_id, &payload, None) {
                     log_repeated_worker_error(
                         &format!("{worker_name} radio ingress queue failed"),
                         &format!("{err:?}"),
