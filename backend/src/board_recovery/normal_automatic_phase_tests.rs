@@ -361,11 +361,18 @@ async fn n5_original_ticket_before_claim_is_rejected_after_actual_completed_rese
     let generation = crate::gse::automatic_generation(&state);
     let pause = crate::normal_publication_probe::TicketPause::install(&state);
     let (shutdown, rx) = tokio::sync::broadcast::channel(1);
-    let worker = tokio::spawn(crate::safety_task::safety_task(
-        state.clone(),
-        state.topology_router.get().unwrap().clone(),
-        rx,
-    ));
+    // The pause blocks the thread the Safety tick runs on. On a worker of this
+    // runtime it also held whatever task that worker had just woken (tokio's
+    // unstealable next-task slot), and the reset below then sat out the
+    // pause's whole 5 s bound. The tick runs on a runtime of its own.
+    let worker = {
+        let (state, router) = (state.clone(), state.topology_router.get().unwrap().clone());
+        let thread = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+                .block_on(crate::safety_task::safety_task(state, router, rx))
+        });
+        tokio::task::spawn_blocking(move || thread.join().unwrap())
+    };
     let original = pause.entered().await;
     assert_eq!(original, (generation, 0, 0));
     assert_eq!(
