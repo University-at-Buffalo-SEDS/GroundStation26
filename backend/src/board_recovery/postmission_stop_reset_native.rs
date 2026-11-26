@@ -128,12 +128,25 @@ async fn local_stop_active_startup_abort_reset_actual_runtime_diagnostic() {
         let router=state.topology_router.get().unwrap();
         let gb_side=router.export_topology().routes.iter().find(|row|
             row.announcers.iter().any(|peer|peer.sender_id=="GB")).expect("actual GB discovery route").side_id;
-        router.rx_from_side(&sedsnet::discovery::build_discovery_announce("GB",1,&[
+        // The fixture's wire pump enqueues on the same side at the same time;
+        // a contended ingress queue keeps the frame (as the pump itself does).
+        let busy_retry = |mut attempt: Box<dyn FnMut() -> sedsnet::TelemetryResult<()> + '_>| {
+            let until = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                match attempt() {
+                    Err(sedsnet::TelemetryError::Io("rx queue busy")) if std::time::Instant::now() < until => std::thread::yield_now(),
+                    result => break result.unwrap(),
+                }
+            }
+        };
+        let announce = |packet: Packet| busy_retry(Box::new(move || router.rx_from_side(&packet, gb_side)));
+        let drain = || busy_retry(Box::new(|| router.process_all_queues_with_timeout(0).map(|_| ())));
+        announce(sedsnet::discovery::build_discovery_announce("GB",1,&[
             crate::telemetry_schema::endpoint(endpoint(Board::GatewayBoard)),
             crate::telemetry_schema::endpoint("FLIGHT_STATE"),
             crate::telemetry_schema::endpoint("VALVE_BOARD"),
-            crate::telemetry_schema::endpoint("ACTUATOR_BOARD")]).unwrap(),gb_side).unwrap();
-        router.process_all_queues_with_timeout(0).unwrap();
+            crate::telemetry_schema::endpoint("ACTUATOR_BOARD")]).unwrap());
+        drain();
         let active=crate::gse::native_owned_startup_prime(&state);
         eprintln!("ACTIVE_STARTUP_BEFORE {}",active);
         assert_eq!(active["operational_running"],true,"actual operational tick must own startup");
@@ -141,10 +154,10 @@ async fn local_stop_active_startup_abort_reset_actual_runtime_diagnostic() {
         // Restore this fixture's original direct-peer route before issuing Stop.
         // Startup ownership is real and retained; no operational flag or phase
         // is rewritten and no new GSE tick runs between this route event and Stop.
-        router.rx_from_side(&sedsnet::discovery::build_discovery_announce("GB",1,&[
+        announce(sedsnet::discovery::build_discovery_announce("GB",1,&[
             crate::telemetry_schema::endpoint(endpoint(Board::GatewayBoard)),
-            crate::telemetry_schema::endpoint("FLIGHT_STATE")]).unwrap(),gb_side).unwrap();
-        router.process_all_queues_with_timeout(0).unwrap();
+            crate::telemetry_schema::endpoint("FLIGHT_STATE")]).unwrap());
+        drain();
         let (deferred, drain) = crate::deferred_abort::spawn(state.clone());
         let stop_state = state.clone();
         let stop_router = state.topology_router.get().unwrap().clone();
