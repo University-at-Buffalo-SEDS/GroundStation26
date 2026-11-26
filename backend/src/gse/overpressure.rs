@@ -65,6 +65,10 @@ pub(crate) enum AbortStage {
     NotRequired,
     /// Main valve commanded open; Abort follows at `until_ms`.
     PilotOpen { until_ms: u64 },
+    /// Main valve commanded closed; the Abort is still owed (a Launch was
+    /// being saved, or another abort's record or a Clear was). Asked again
+    /// at each evaluation; the main valve is never opened again.
+    AbortOwed,
     /// Main valve commanded closed and Abort dispatched (or refused).
     Aborted,
 }
@@ -585,6 +589,17 @@ impl Monitor {
                     step.alarms.insert(0, message);
                 }
             }
+            (Some(latch), _) if latch.abort == AbortStage::AbortOwed => {
+                if let Some(l) = &mut self.latch {
+                    l.abort = AbortStage::Aborted;
+                }
+                if burn {
+                    // A Launch admitted meanwhile: no automatic Abort from then on.
+                    log::error!("tank overpressure Abort not sent: Launch admitted while it was owed");
+                } else {
+                    step.abort = true;
+                }
+            }
             (Some(latch), _) => {
                 if let AbortStage::PilotOpen { until_ms } = latch.abort
                     && now >= until_ms
@@ -651,7 +666,10 @@ fn act(state: &Arc<AppState>) -> Vec<Sent> {
         }
         true
     };
-    // Each reading as it was received, in order, then the runtime's newest.
+    // Each reading as it was received, in order. While the watch runs it is
+    // the one source: the runtime's copy lags behind it (the telemetry worker
+    // replays its backlog) and, under boot-clock stamps, would come back
+    // looking fresh, resetting timers and raising false sensor faults.
     while let Some(sample) = protection.0.watch.next(state, &protection.published()) {
         if !decide(Some(sample), &protection.published()) {
             protection.0.watch.put_back(sample);
@@ -659,7 +677,9 @@ fn act(state: &Arc<AppState>) -> Vec<Sent> {
         }
     }
     let published = protection.published();
-    decide(published.sample, &published);
+    let sample = (!protection.0.watch.running()).then_some(published.sample).flatten();
+    // Time alone (the main-valve window, an owed Abort) without a reading.
+    decide(sample, &published);
     done
 }
 /// Leaves the step's runtime part to the next holder of the GSE lock. Called
@@ -669,6 +689,11 @@ fn owe(protection: &Protection, step: &mut Step) {
     if step.retire.is_some() || step.status.is_some() {
         leaf(&protection.0.owed).push(Owed { retire: step.retire.take(), status: step.status.take() });
     }
+}
+/// The main-valve reassertion of a contended relief (tests).
+#[cfg(test)]
+pub(crate) fn reassert_for_test(state: &Arc<AppState>) {
+    reassert(state);
 }
 /// Decide and send, and leave the rest unsettled (tests).
 #[cfg(test)]
@@ -746,11 +771,15 @@ enum AbortOutcome {
     NotAdmitted,
     NoRouter,
     /// Asked again with the next evaluation.
-    LaunchSaving,
+    Owed,
 }
 impl Sent {
     /// May wait for the GSE lock.
     fn settle(self, state: &Arc<AppState>) {
+        #[cfg(test)]
+        if watch::PANIC_NEXT_SETTLE.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            panic!("test: settlement fails");
+        }
         let step = self.step;
         if self.contended {
             drop(dispatch_gate());
@@ -803,7 +832,7 @@ impl Sent {
             let _ = state.add_notification_with_persistence(alarm, true);
         }
         match self.abort {
-            None | Some(AbortOutcome::LaunchSaving) => {}
+            None | Some(AbortOutcome::Owed) => {}
             Some(AbortOutcome::Sent) => {
                 crate::sequences::refresh_action_policy_now(state);
                 state.broadcast_action_policy_snapshot();
@@ -831,8 +860,11 @@ fn reassert(state: &Arc<AppState>) {
     let protection = &state.gse.overpressure;
     let _turn = leaf(&protection.0.turn);
     let mut valves = RELIEF.to_vec();
+    let now = protection.published().now();
     match protection.lock().latch.as_ref().filter(|latch| latch.relief_commanded).map(|latch| latch.abort) {
-        Some(AbortStage::PilotOpen { .. }) => valves.push((0, true)),
+        // Only inside its window: once it has passed the main valve is
+        // closed for good, whatever comes later.
+        Some(AbortStage::PilotOpen { until_ms }) if now < until_ms => valves.push((0, true)),
         Some(_) => {}
         None => return,
     }
@@ -1009,13 +1041,13 @@ fn send_abort(state: &Arc<AppState>) -> AbortOutcome {
             }
             AbortOutcome::Sent
         }
-        automatic_abort::Decision::LaunchSaving => {
-            // Due again at the next evaluation, once the Launch is decided.
-            let now = state.gse.overpressure.published().now();
+        automatic_abort::Decision::LaunchSaving | automatic_abort::Decision::Busy => {
+            // Owed: asked again at the next evaluation, once the Launch, the
+            // record or the Clear is done. The main valve stays closed.
             if let Some(latch) = &mut state.gse.overpressure.lock().latch {
-                latch.abort = AbortStage::PilotOpen { until_ms: now };
+                latch.abort = AbortStage::AbortOwed;
             }
-            AbortOutcome::LaunchSaving
+            AbortOutcome::Owed
         }
         automatic_abort::Decision::Startup(_) | automatic_abort::Decision::Unavailable => {
             log::error!("tank overpressure abort not admitted (already aborted, Stop pending or launch admitted)");
@@ -1072,6 +1104,9 @@ pub(crate) fn acknowledge(state: &AppState) -> Result<(), String> {
         },
         (None, None) => return Err("No tank overpressure error is latched".into()),
     };
+    if latch.abort == AbortStage::AbortOwed {
+        return Err("The overpressure Abort is still waiting to be sent".into());
+    }
     if matches!(latch.abort, AbortStage::PilotOpen { .. })
         || board
             .as_ref()

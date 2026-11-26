@@ -5,8 +5,9 @@
 //! turbocharge), so no operation can observe the intermediate state.
 use super::*;
 
-/// `hold` keeps automatic aborts undecided until the old qualification is gone;
-/// the saved one is read without it, and adds its latch to any new one.
+/// `hold` keeps automatic aborts undecided until the saved qualification is
+/// restored and published. This includes reading the file: an abort decided in
+/// the meantime waits for that read (it is held, not dropped).
 pub(crate) fn reset_for_mode_switch(state: &AppState, hold: ModeSwitchHold) {
     {
         let mut rt = state.gse.lock().unwrap();
@@ -24,8 +25,11 @@ pub(crate) fn reset_for_mode_switch(state: &AppState, hold: ModeSwitchHold) {
         rt.turbo_binding = None;
         reset_phase_control_locked(state, &mut rt);
     }
-    drop(hold);
+    // Held until the restored qualification is published (by the guard that
+    // restores it): until then an automatic abort reads neither the old
+    // claim nor the old Fire stage, so none is decided.
     restore_operational(state);
+    drop(hold);
 }
 
 /// HITL phase control (ground station or rocket) starts on the ground station

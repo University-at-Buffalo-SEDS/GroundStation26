@@ -4596,6 +4596,8 @@ pub(super) fn spawn_comms_worker_threads(
                     let ingress_generation = crate::gse::automatic_generation(&tap_state);
                     tap_state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
                     tap_state.mark_packet_received(get_current_timestamp_ms());
+                    // Overpressure protection reads every tank pressure as received.
+                    crate::gse::overpressure::watch::receive(&tap_state, pkt);
                     let mut rb = tap_state.ring_buffer.lock().unwrap();
                     rb.push(crate::ring_buffer::ReceivedPacket::Telemetry { packet: pkt.clone(), ingress_generation });
                 };
@@ -4665,6 +4667,8 @@ fn spawn_legacy_comms_worker_thread(
                     let ingress_generation = crate::gse::automatic_generation(&tap_state);
                     tap_state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
                     tap_state.mark_packet_received(get_current_timestamp_ms());
+                    // Overpressure protection reads every tank pressure as received.
+                    crate::gse::overpressure::watch::receive(&tap_state, pkt);
                     let mut rb = tap_state.ring_buffer.lock().unwrap();
                     rb.push(crate::ring_buffer::ReceivedPacket::Telemetry { packet: pkt.clone(), ingress_generation });
                 };
@@ -5171,6 +5175,8 @@ fn spawn_rx_priority_comms_worker_thread(
                     let ingress_generation = crate::gse::automatic_generation(&tap_state);
                     tap_state.mark_board_seen(pkt.sender(), get_current_timestamp_ms());
                     tap_state.mark_packet_received(get_current_timestamp_ms());
+                    // Overpressure protection reads every tank pressure as received.
+                    crate::gse::overpressure::watch::receive(&tap_state, pkt);
                     let mut rb = tap_state.ring_buffer.lock().unwrap();
                     rb.push(crate::ring_buffer::ReceivedPacket::Telemetry { packet: pkt.clone(), ingress_generation });
                 };

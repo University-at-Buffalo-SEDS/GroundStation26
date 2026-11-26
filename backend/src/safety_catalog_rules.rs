@@ -24,7 +24,8 @@ const TANK: &[Spec] = &[
         details: &[
             "Order: relief (as above), PILOT open, and the Actuator Board overpressure abort immediately if the relief stage has not already sent it; after the window: PILOT close, then the broadcast automatic Abort. The Actuator Board command never touches PILOT, so it does not wait. The broadcast Abort is sent only after the window, so neither the station's abort fence nor the Valve Board's abort safe state (which closes PILOT) can cut it short.",
             "If Abort is not admitted (already aborted, Stop pending, Launch admitted) the station alarms; Dump and Vent stay open.",
-            "Detection, relief and Abort wait for no disk: they run on a thread of their own, from the readings as the radio or umbilical delivers them. Only while a Launch is being saved is nothing judged; the readings are judged when the save ends.",
+            "While a Launch, another abort's record or a Clear GSE abort is being saved, the Abort is owed: it is sent once that is done (not after a saved Launch), and PILOT is not opened again.",
+            "Detection, relief and Abort wait for no disk: they run on a thread of their own, from the readings as the radio or umbilical delivers them (the only source while that thread runs). Only while a Launch is being saved is nothing judged; the readings are judged when the save ends.",
         ],
         modes: ALL,
         enforced_in: &["backend/src/gse/overpressure.rs:decide", "backend/src/gse/overpressure.rs:send_abort"],
@@ -370,7 +371,7 @@ const STOP: &[Spec] = &[
         summary: "From Launch admission onward (the Launch, In flight and Landed mission phases) the station issues no automatic abort of any kind, valve correction or sequence action. Disconnect aborts apply only in Idle and Fill. Operator Abort and Stop stay available.",
         details: &[
             "Covered paths: board-offline (disconnect) aborts, unclassified-fault and ADC/tare-failure aborts, tank overpressure abort and the Actuator Board overpressure abort, queued automatic aborts and automatic supply closes, and acceptance of observed automatic aborts.",
-            "A Launch is admitted just before it is saved. An automatic abort that comes up while the save runs waits for it: not sent if the Launch was saved, sent if the save failed.",
+            "A Launch is admitted just before it is saved. An automatic abort, or an automatic supply close, that comes up while the save runs (or while a station mode change restores the qualification) waits for it: not sent if the Launch was saved, sent if the save failed.",
             "The one automatic valve action after Launch is the Valve Board's own auto-vent once its link or continuity has been lost for 150 s (never before Launch + 60 s); it is not an Abort. See \"Valve Board auto-vent after Launch\".",
         ],
         modes: ALL,

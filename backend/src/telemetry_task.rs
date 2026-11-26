@@ -92,12 +92,17 @@ fn command_at_dispatch_with_manual_origin(
     {
         return None;
     }
+    // A Launch being saved or a mode change decides whether these still may
+    // go: they pass here undecided, and the claim (an Abort) or the dispatch
+    // gate (a supply close) decides once the outcome is known. Never dropped
+    // for not knowing yet.
+    let open = || crate::gse::automatic_abort_undecided_or_allowed(state);
     if matches!(
         command,
         TelemetryCommand::AutomaticNitrogenClose { .. }
             | TelemetryCommand::AutomaticNitrousClose { .. }
     ) {
-        return crate::gse::automatic_abort_allowed(state).then_some(match command {
+        return open().then_some(match command {
             TelemetryCommand::AutomaticNitrogenClose { .. } => TelemetryCommand::NitrogenClose,
             _ => TelemetryCommand::NitrousClose,
         });
@@ -105,7 +110,7 @@ fn command_at_dispatch_with_manual_origin(
     if matches!(command, TelemetryCommand::AutomaticAbort { .. }) {
         // A failed tare can enqueue before Fire commits and be consumed after
         // it. Preserve its automatic origin until this final policy check.
-        crate::gse::automatic_abort_allowed(state).then_some(TelemetryCommand::Abort)
+        open().then_some(TelemetryCommand::Abort)
     } else {
         Some(command)
     }
@@ -1237,8 +1242,11 @@ pub async fn telemetry_task(
                         let claim = loop {
                             match crate::gse::decide_automatic_abort(&state, generation) {
                                 crate::gse::AbortDecision::Claimed(claim) => break Some(claim),
-                                // Decided by how the Launch being saved ends.
-                                crate::gse::AbortDecision::LaunchSaving => tokio::time::sleep(Duration::from_millis(5)).await,
+                                // Decided by how the Launch being saved, the mode
+                                // change, or the Clear ends.
+                                crate::gse::AbortDecision::LaunchSaving | crate::gse::AbortDecision::Busy => {
+                                    tokio::time::sleep(Duration::from_millis(5)).await
+                                }
                                 crate::gse::AbortDecision::Startup(_) | crate::gse::AbortDecision::Unavailable => break None,
                             }
                         };

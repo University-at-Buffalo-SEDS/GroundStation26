@@ -78,6 +78,9 @@ impl Watch {
             }
         }
     }
+    pub(super) fn running(&self) -> bool {
+        self.running.load(Ordering::Acquire)
+    }
     pub(super) fn put_back(&self, sample: Sample) {
         leaf(&self.inbox).held = Some(sample);
     }
@@ -98,6 +101,13 @@ pub(crate) fn receive(state: &AppState, packet: &Packet) {
     watch.received.notify_one();
 }
 
+/// Steps the settling thread finished (tests).
+#[cfg(test)]
+pub(crate) static SETTLED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The next settlement panics (tests).
+#[cfg(test)]
+pub(crate) static PANIC_NEXT_SETTLE: AtomicBool = AtomicBool::new(false);
+
 /// The thread, until the station shuts down.
 pub(crate) fn spawn(state: Arc<AppState>) -> std::io::Result<std::thread::JoinHandle<()>> {
     // The runtime and the operator are told by a thread that may wait.
@@ -105,7 +115,12 @@ pub(crate) fn spawn(state: Arc<AppState>) -> std::io::Result<std::thread::JoinHa
     let settled = state.clone();
     crate::runtime_mode::spawn_thread("overpressure_record", move || {
         for sent in settling {
-            sent.settle(&settled);
+            // A failed settlement must not cost the next one.
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sent.settle(&settled))).is_err() {
+                log::error!("An overpressure step could not be settled; later ones still are");
+            }
+            #[cfg(test)]
+            SETTLED.fetch_add(1, Ordering::AcqRel);
         }
     })?;
     state.gse.overpressure.0.watch.running.store(true, Ordering::Release);
@@ -113,6 +128,8 @@ pub(crate) fn spawn(state: Arc<AppState>) -> std::io::Result<std::thread::JoinHa
         let protection = state.gse.overpressure.clone();
         let watch = &protection.0.watch;
         while !state.shutdown_requested.load(Ordering::Acquire) {
+            // A recorder that could not be started is tried again.
+            state.gse.abort.start();
             evaluate_without_waiting(&state, |sent| {
                 let _ = unsettled.send(sent);
             });

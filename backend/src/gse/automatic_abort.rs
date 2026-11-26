@@ -51,6 +51,37 @@ fn ram<T>(lock: &std::sync::Mutex<T>) -> MutexGuard<'_, T> {
     lock.lock().unwrap_or_else(PoisonError::into_inner)
 }
 type Record = Box<dyn FnOnce() + Send>;
+/// The recorder thread, and records waiting for one when it could not be
+/// started. A record is never written by the thread that sent its abort.
+#[derive(Default)]
+struct Records {
+    sender: Option<mpsc::Sender<Record>>,
+    waiting: Vec<Record>,
+    /// Test seam: refuse this many thread starts.
+    #[cfg(test)]
+    refuse: usize,
+}
+impl Records {
+    fn deliver(&mut self) {
+        if self.sender.is_none() {
+            #[cfg(test)]
+            if self.refuse > 0 {
+                self.refuse -= 1;
+                log::error!("Automatic abort recorder thread could not be started: test");
+                return;
+            }
+            self.sender = start_recorder();
+        }
+        let Some(sender) = self.sender.clone() else { return };
+        for record in std::mem::take(&mut self.waiting) {
+            if let Err(unsent) = sender.send(record) {
+                // The thread is gone: start another with the next attempt.
+                self.waiting.push(unsent.0);
+                self.sender = None;
+            }
+        }
+    }
+}
 
 #[derive(Default)]
 struct Claims {
@@ -64,6 +95,8 @@ struct Claims {
     launches: u64,
     /// A station mode change is replacing the runtime's qualification.
     switching: bool,
+    /// The in-flight owner is a Clear: the claim it clears may be gone soon.
+    clearing: bool,
 }
 /// The runtime's qualification as of the last release of the GSE lock.
 #[derive(Default)]
@@ -76,7 +109,7 @@ pub(crate) struct AbortOwner {
     claims: std::sync::Mutex<Claims>,
     published: std::sync::Mutex<Published>,
     finished: std::sync::Condvar,
-    records: std::sync::Mutex<Option<mpsc::Sender<Record>>>,
+    records: std::sync::Mutex<Records>,
     /// Cycles the abort watch finished deciding.
     #[cfg(test)]
     pub(crate) cycles: std::sync::atomic::AtomicUsize,
@@ -115,8 +148,13 @@ impl AbortOwner {
         claims.unapplied || ram(&self.published).claimed
     }
     fn open(&self, claims: &Claims, hitl: bool) -> Result<u64, Closed> {
-        if claims.in_flight || (!hitl && self.claimed(claims)) {
+        if claims.clearing {
+            Err(Closed::Busy)
+        } else if !hitl && self.claimed(claims) {
             Err(Closed::Refused)
+        } else if claims.in_flight {
+            // Another abort being recorded, or a Clear being saved.
+            Err(Closed::Busy)
         } else if claims.saving != 0 || claims.switching {
             Err(Closed::Later)
         } else if !hitl && ram(&self.published).fire_committed {
@@ -158,35 +196,44 @@ impl AbortOwner {
     }
     /// For a Clear, which excludes new aborts and Fire while it runs.
     fn reserve(&self) -> bool {
-        !std::mem::replace(&mut ram(&self.claims).in_flight, true)
+        let mut claims = ram(&self.claims);
+        if claims.in_flight {
+            return false;
+        }
+        claims.in_flight = true;
+        claims.clearing = true;
+        true
     }
     fn release(&self) {
-        ram(&self.claims).in_flight = false;
+        let mut claims = ram(&self.claims);
+        claims.in_flight = false;
+        claims.clearing = false;
+        drop(claims);
         self.finished.notify_all();
     }
-    /// Run on the recorder thread, in order. It may wait on a disk.
+    /// Run on the recorder thread, in order. It may wait on a disk. If no
+    /// thread can be started, it waits (the claim stays in flight and
+    /// latched) until one can: `start` is tried again by the overpressure
+    /// thread and by every later record.
     pub(crate) fn record(&self, record: impl FnOnce() + Send + 'static) {
         let mut records = ram(&self.records);
-        if records.is_none() {
-            *records = start_recorder();
-        }
-        let record: Record = Box::new(record);
-        let refused = match records.as_ref() {
-            Some(sender) => sender.send(record).err().map(|unsent| unsent.0),
-            None => Some(record),
-        };
-        drop(records);
-        // No thread could be started: the ABORT is already sent.
-        if let Some(record) = refused {
-            record();
+        records.waiting.push(Box::new(record));
+        records.deliver();
+        if !records.waiting.is_empty() {
+            log::error!(
+                "{} automatic abort record(s) wait for a recorder thread; Launch and Fire stay refused",
+                records.waiting.len()
+            );
         }
     }
-    /// Before it is needed, so that an abort starts no thread.
+    /// Before it is needed, so that an abort starts no thread; and again
+    /// after a start failed.
     pub(crate) fn start(&self) {
-        let mut records = ram(&self.records);
-        if records.is_none() {
-            *records = start_recorder();
-        }
+        ram(&self.records).deliver();
+    }
+    #[cfg(test)]
+    pub(crate) fn refuse_recorder_starts(&self, starts: usize) {
+        ram(&self.records).refuse = starts;
     }
     /// Wait until no claim or Clear is unfinished. False: not in time.
     pub(crate) fn finished_within(&self, timeout: std::time::Duration) -> bool {
@@ -218,6 +265,7 @@ fn start_recorder() -> Option<mpsc::Sender<Record>> {
 }
 enum Closed {
     Refused,
+    Busy,
     Later,
 }
 fn latch(rt: &mut Runtime) {
@@ -320,6 +368,9 @@ pub(crate) enum Decision {
     /// A Launch is being saved. Whether this abort may go depends on the
     /// outcome: decide again later.
     LaunchSaving,
+    /// Another abort's record, or a Clear, is being saved: not now, and
+    /// perhaps once it is done.
+    Busy,
     Unavailable,
 }
 #[cfg(test)]
@@ -381,6 +432,7 @@ fn claim_from_source(
         let launches = match owner.check(hitl) {
             Ok(launches) => launches,
             Err(Closed::Later) => return Decision::LaunchSaving,
+            Err(Closed::Busy) => return Decision::Busy,
             Err(Closed::Refused) => return Decision::Unavailable,
         };
         match launch_inhibited(state) {
@@ -417,6 +469,7 @@ fn claim_from_source(
             // A Launch or a mode change came and went since the check.
             Ok(false) => continue,
             Err(Closed::Later) => return Decision::LaunchSaving,
+            Err(Closed::Busy) => return Decision::Busy,
             Err(Closed::Refused) => return Decision::Unavailable,
         }
     }

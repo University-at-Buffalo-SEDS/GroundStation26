@@ -1034,7 +1034,7 @@ fn dispatch_safety_abort_reason(
         crate::gse::AbortDecision::Startup(stage) => {
             return SafetyDispatch::StartupLivenessCancelled(stage);
         }
-        crate::gse::AbortDecision::LaunchSaving | crate::gse::AbortDecision::Unavailable => {
+        crate::gse::AbortDecision::LaunchSaving | crate::gse::AbortDecision::Busy | crate::gse::AbortDecision::Unavailable => {
             return SafetyDispatch::Unavailable;
         }
     };

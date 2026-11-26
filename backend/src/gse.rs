@@ -1886,25 +1886,43 @@ pub(crate) fn start_fill_after_automatic_zero(state: &Arc<AppState>, generation:
     progress::flush(state);
 }
 
+/// Times an automatic supply close waited for an undecided boundary (tests).
+#[cfg(test)]
+pub(crate) static SUPPLY_CLOSE_WAITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 pub(crate) fn queue_automatic_supply_close(
     state: &Arc<AppState>,
     router: &sedsnet::router::Router,
     command: u8,
     generation: u64,
 ) -> sedsnet::TelemetryResult<bool> {
-    let _dispatch = dispatch_gate();
-    let Some(_claim) = claim_operator_dispatch_under_gate(state, generation) else {
-        return Ok(false);
-    };
-    if generation != automatic_generation(state) || !automatic_abort_allowed(state) {
-        return Ok(false);
+    // A Launch holds the gate while it is saved, so it is decided by then; a
+    // mode change does not, and is waited out without the gate.
+    loop {
+        let _dispatch = dispatch_gate();
+        let Some(_claim) = claim_operator_dispatch_under_gate(state, generation) else {
+            return Ok(false);
+        };
+        if generation != automatic_generation(state) || automatic_abort_superseded(state) {
+            return Ok(false);
+        }
+        match automatic_abort::abort_boundary(state) {
+            Some(false) => return Ok(false),
+            Some(true) => {
+                crate::telemetry_task::queue_automatic_controller_command(
+                    router,
+                    crate::telemetry_schema::data_type("ACTUATOR_COMMAND"),
+                    command,
+                )?;
+                return Ok(true);
+            }
+            None => {}
+        }
+        drop(_claim);
+        drop(_dispatch);
+        #[cfg(test)]
+        SUPPLY_CLOSE_WAITS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        crate::unpin::blocking(|| std::thread::sleep(std::time::Duration::from_millis(5)));
     }
-    crate::telemetry_task::queue_automatic_controller_command(
-        router,
-        crate::telemetry_schema::data_type("ACTUATOR_COMMAND"),
-        command,
-    )?;
-    Ok(true)
 }
 
 /// A sequence failure that is not a physical hazard. Retire any trim or
@@ -4058,6 +4076,11 @@ pub(crate) fn set_operational_prerequisites_for_test(state: &AppState) {
 /// lock held across one; while a Launch is being saved the answer is no.
 pub fn automatic_abort_allowed(state: &AppState) -> bool {
     !automatic_abort_superseded(state) && automatic_abort::abort_boundary(state) == Some(true)
+}
+/// As `automatic_abort_allowed`, except that "not decided yet" (a Launch being
+/// saved, a mode change) passes: for an intent decided again later.
+pub(crate) fn automatic_abort_undecided_or_allowed(state: &AppState) -> bool {
+    !automatic_abort_superseded(state) && automatic_abort::abort_boundary(state) != Some(false)
 }
 
 #[derive(serde::Deserialize)]
