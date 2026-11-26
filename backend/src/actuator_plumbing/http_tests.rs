@@ -2293,6 +2293,15 @@ async fn public438_actual_prepared_control_retract_and_launch_refuse_held_core_w
             .await
             .expect("actual motion worker refuses busy core before holder release");
             "owned worker terminal".to_owned()
+        } else if case == "launch" {
+            // A Launch none of whose packets is admitted waits out a held
+            // core (bounded, holding no guard); the Stop below must still be
+            // prompt, and it refuses the waiting Launch.
+            assert!(
+                result_rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+                "a zero-owner Launch waits out the held core"
+            );
+            "waiting for the core".to_owned()
         } else {
             format!(
                 "{:?}",
@@ -2317,6 +2326,10 @@ async fn public438_actual_prepared_control_retract_and_launch_refuse_held_core_w
         requester.join().unwrap();
         if let Some(worker) = worker {
             worker.join().unwrap();
+        }
+        if case == "launch" {
+            let result = result_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            assert!(result.is_err(), "the Stop refuses the Launch that waited for the core: {result:?}");
         }
         assert_eq!(
             f.host.queue_counters()[2],
