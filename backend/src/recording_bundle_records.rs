@@ -58,6 +58,12 @@ mod tests {
     /// under their routes; an anonymous bundle lists the checklist ones as missing.
     #[tokio::test]
     async fn records_are_the_station_answers_at_bundle_time() {
+        // The checklist store is one per process: another test changing it
+        // between the bundle and the GET below made them differ. A process
+        // of its own, with private configuration, compares them alone.
+        if crate::operator_queue::isolated_case(module_path!(), "records_are_the_station_answers_at_bundle_time") {
+            return;
+        }
         let root = TestDirectory::new();
         let state = export_state(&root.0, true).await;
         std::fs::write(root.0.join("auth.json"), json!({"anonymous":{"view_data":true},"users":[{"username":"viewer","roles":[],"password":{"salt_b64":"","hash_b64":""},"permissions":{"view_data":true}}]}).to_string()).unwrap();
