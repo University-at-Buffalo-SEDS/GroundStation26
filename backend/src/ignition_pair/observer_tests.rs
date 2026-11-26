@@ -163,9 +163,18 @@ fn a_read_waits_for_a_refresh_being_stored() {
     let (router, side) = actual_peer_router();
     let owner = Arc::new(Observer::default());
     owner.register_connection(side, Some(Arc::new(AtomicU64::new(1))));
-    owner.request(router.clone(), 0);
-    completed(&owner);
-    let expected = owner.read(&router, 0).unwrap().requested;
+    // The observer has one global worker with a one-job queue: a request
+    // made while another test's job holds it is dropped. Ask until stored.
+    let until = Instant::now() + Duration::from_secs(5);
+    let expected = loop {
+        owner.request(router.clone(), 0);
+        completed(&owner);
+        match owner.read(&router, 0) {
+            Ok(token) => break token.requested,
+            Err(error) => assert!(Instant::now() < until, "no observation stored: {error}"),
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
     let (held, holding) = std::sync::mpsc::channel();
     let storer = owner.clone();
     let store = std::thread::spawn(move || {
