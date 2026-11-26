@@ -339,7 +339,7 @@ mod tests {
             "nitrogen-hold", "nitrogen-hold-choice", "pause-resume-cancel", "launch-board-abort",
             "launch-lock-reset", "launch-turbocharge", "launch-failure-pause", "launch-mass-window", "launch-signoff",
             "turbocharge-limits", "auto-zero-before-launch", "valve-board-autonomy",
-            "automatic-abort", "no-automatic-abort-after-launch", "manual-stop", "reset-all-boards", "recover-station", "radio-reject-test", "board-resync",
+            "automatic-abort", "no-automatic-abort-after-launch", "launch-partial-delivery-abort", "manual-stop", "reset-all-boards", "recover-station", "radio-reject-test", "board-resync",
             "ignition-pair", "hitl-interlocks", "key-interlock", "plumbing-retraction", "checklists",
             "valve-freshness", "supply-interlock", "fill-limits", "qd-settle", "igniter-sense",
             "stale-data", "connectivity-loss", "mission-phases", "fc-owns-landing", "fc-owns-in-flight-checks", "board-heartbeat-abort", "board-vb-post-launch-vent", "board-vb-overpressure", "board-abort-latch", "board-fc-vigilant",
