@@ -342,6 +342,11 @@ async fn measure(site: Site, press: Press, load: Load) -> Latency {
         log::set_max_level(log::LevelFilter::Info);
     }
     let rig = rig().await;
+    // The Launch is only the setup that reaches the stalled save. The rig's
+    // router worker shares the SDK core; on a loaded host a preempted worker
+    // must not expire the Launch's 100 ms core-busy retry window (a Launch so
+    // refused never reaches the save the test stalls).
+    let _window = crate::gse::nonwaiting_admission_tests::FrozenWindow::new(&rig.state);
     let presser = Presser::new(press, &rig).await;
     let reports = feed_reports(&rig, load == Load::Busy);
     tokio::time::sleep(Duration::from_millis(100)).await;
