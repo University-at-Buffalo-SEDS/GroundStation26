@@ -8239,6 +8239,21 @@ mod raw_uart_tests {
     /// phase in RF's turn; copies stop once the AV bay shows the Abort.
     #[test]
     fn rf_hears_the_abort_flight_state_before_400_ms_when_the_first_copy_is_lost() {
+        // The burst's "the AV bay shows the Abort" mask is one per process,
+        // and any concurrent test whose boards read back Aborted sets it,
+        // which stopped every copy here. A process of its own runs it alone.
+        const CHILD: &str = "GS_ABORT_STATE_HEARD_CHILD";
+        const NAME: &str = "comms::raw_uart_tests::rf_hears_the_abort_flight_state_before_400_ms_when_the_first_copy_is_lost";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(output.status.success() && text.contains("1 passed"), "{text}");
+            return;
+        }
         crate::telemetry_schema::initialize().unwrap();
         let state = |value: u8, stamp: u64| {
             serialize::pack_packet(
