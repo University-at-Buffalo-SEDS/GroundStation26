@@ -272,9 +272,10 @@ const LAUNCH: &[Spec] = &[
             "HITL releases the lock whenever no board reports Abort and the station is in Startup or Idle; absent, unreachable or not-yet-read-back boards never hold it.",
             "Resetting only the T-clock changes none of these inputs and never unlocks Launch.",
             "While a board recovery is unfinished, Launch is refused with its own message until the recovery completes.",
+            "A Launch that ends with none of its packets taken for sending reached no board: what the press recorded (the Fire stage, the inhibition and the lock) is undone and the journal keeps the attempt as refused and undone, so Launch is available again (\"Launch refused, nothing was sent; Launch is available again\"). Never once any packet was taken, and never after a newer Stop, Abort or reset or while an Abort is latched: Launch then stays locked.",
         ],
         modes: ALL,
-        enforced_in: &["backend/src/board_abort.rs:blocked_message", "backend/src/board_abort.rs:note_reset_completed", "backend/src/launch_history.rs:launch_locked", "backend/src/board_recovery.rs:try_release_launch_lock", "backend/src/gse.rs:launch_journal_block"],
+        enforced_in: &["backend/src/board_abort.rs:blocked_message", "backend/src/board_abort.rs:note_reset_completed", "backend/src/launch_history.rs:launch_locked", "backend/src/board_recovery.rs:try_release_launch_lock", "backend/src/gse.rs:launch_journal_block", "backend/src/gse/launch_undo.rs:undo_unsent_launch"],
         config_keys: &[],
     },
     Spec {
@@ -386,8 +387,9 @@ const STOP: &[Spec] = &[
         details: &[
             "The Abort goes through the operator Abort dispatch, which waits for no disk. A Stop or Abort already pressed is not pressed again.",
             "Between attempts the station holds no lock, and every attempt re-checks Stop, Abort, board proofs and routes, so an Abort is never delayed by it.",
-            "A Launch none of whose packets got in after that time is refused with nothing sent (Launch stays locked until a reset).",
+            "A Launch none of whose packets got in after that time is refused with nothing sent, and what its press recorded is undone so Launch is available again (see \"Launch lock after a launch attempt\"); after a newer Stop or Abort it stays locked.",
             "Once every packet is taken, the station stands behind the Launch: a late local failure (recovery admission closed, or the Launch state could not be saved) still publishes Launch locally and raises a warning naming it. Only a newer Stop or Abort keeps it from publishing Launch.",
+            "The Launch state is saved after the local publication, outside the operator command gate, so a slow disk holds back no other command; an Abort's Aborted saved before it is never overwritten, and one saved after it replaces it.",
         ],
         modes: ALL,
         enforced_in: &["backend/src/gse.rs:queue_prepared_launch_packets"],
