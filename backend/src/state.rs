@@ -159,6 +159,12 @@ impl BoardStatus {
     }
 }
 
+thread_local! {
+    /// Set while `AppState::deferring_daq_launch_clock` holds this thread's
+    /// DAQ launch-clock publication back; true once one was held back.
+    static DEFERRED_DAQ_CLOCK: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub(crate) fill_recording: std::sync::Arc<crate::fill_recording::Runtime>,
@@ -838,6 +844,24 @@ impl AppState {
         );
     }
 
+    /// Run `publish` with this thread's DAQ launch-clock publication held
+    /// back: it writes the network-variable file, which a caller under the
+    /// dispatch gate must not wait for. Returns `publish`'s value and whether
+    /// a publication was held back; the caller then makes it with
+    /// `publish_current_daq_launch_clock` once the gate is released.
+    pub(crate) fn deferring_daq_launch_clock<T>(publish: impl FnOnce() -> T) -> (T, bool) {
+        let outer = DEFERRED_DAQ_CLOCK.with(|deferred| deferred.replace(Some(false)));
+        let value = publish();
+        let held = DEFERRED_DAQ_CLOCK.with(|deferred| deferred.replace(outer)) == Some(true);
+        (value, held)
+    }
+    /// The held-back DAQ launch-clock publication: the clock in force now,
+    /// so a newer one published meanwhile is never replaced by an older one.
+    pub(crate) fn publish_current_daq_launch_clock(&self, claim: &crate::gse::OperatorDispatchClaim) {
+        let clock = self.launch_clock_snapshot();
+        self.publish_daq_launch_clock(&clock, claim);
+    }
+
     fn publish_daq_launch_clock(
         &self,
         clock: &LaunchClockMsg,
@@ -846,6 +870,10 @@ impl AppState {
         // RRLS displays the primary's launch clock without creating a DAQ
         // recording session or asking its read-only router to publish one.
         if crate::rrls::is_rrls() {
+            return;
+        }
+        if DEFERRED_DAQ_CLOCK.with(|deferred| deferred.get().is_some()) {
+            DEFERRED_DAQ_CLOCK.with(|deferred| deferred.set(Some(true)));
             return;
         }
         let mut session = self.daq_log_session.lock().unwrap();

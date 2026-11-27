@@ -1342,6 +1342,12 @@ pub(crate) fn prepare_launch_state(router: &Router) -> Result<PreparedLaunchStat
 pub(crate) fn note_admitted_launch() {
     note_flight_state_wire(NetworkFlightState::Launch);
 }
+/// The FLIGHT_STATE in the network-variable file, as a restart reads it.
+#[cfg(test)]
+pub(crate) fn flight_state_on_disk_for_test() -> Option<u8> {
+    let path = store().lock().expect("network-variable store lock poisoned").path.clone();
+    read_persisted(&path).map(|values| values.flight_state)
+}
 /// When this process last put a FLIGHT_STATE write on the wire.
 #[cfg(test)]
 pub(crate) fn last_flight_state_wire_for_test() -> Option<std::time::Instant> {

@@ -5279,23 +5279,17 @@ pub(crate) fn queue_prepared_launch_packets_counted(
         crate::network_variables::note_admitted_launch();
         let admitted = |message: String| LaunchQueueError { admitted: accepted, message };
         let mut late = Vec::new();
-        let previous = {
+        // The local publication is decided and shown under the dispatch gate,
+        // as before: a Stop or Abort pressed before this point refuses it;
+        // one pressed after it is shown after it (the Abort's own record
+        // re-shows the actual state under this gate), so the station ends
+        // Aborted. Nothing under the gate waits for a disk: the writes of the
+        // network-variable file (the DAQ launch clock, the FLIGHT_STATE save)
+        // follow once it is released, so a slow disk holds back no other
+        // operator command.
+        let (claim, daq_clock_held) = {
             let _dispatch = dispatch_gate();
             with_stop_admission(state,ticket,||()) .map_err(|e|admitted(format!("SDK admitted {accepted}/{total} Launch packets, but {e}; explicit recovery required")))?;
-            // The durable FLIGHT_STATE save stays where it always was (under
-            // the dispatch gate, after the Stop check): moving it changes which
-            // operator frames a stalled save holds back.
-            match crate::network_variables::commit_admitted_launch(&prepared) {
-                Ok(()) => {}
-                // Something else wrote FLIGHT_STATE since preparation (an
-                // Abort's Aborted among them): never publish Launch over it.
-                Err(crate::network_variables::AdmittedLaunchCommitError::Changed(e)) => {
-                    return Err(admitted(format!("SDK admitted {accepted}/{total} Launch packets, desired publication failed: {e}")));
-                }
-                Err(crate::network_variables::AdmittedLaunchCommitError::NotSaved(e)) => {
-                    late.push(format!("its FLIGHT_STATE could not be saved ({e:#})"));
-                }
-            }
             // Admission closed (a reset or mode change raised its barrier) after
             // the boards got every packet: this publication still runs, as work
             // already in flight that the barrier's owner waits out. The
@@ -5307,12 +5301,40 @@ pub(crate) fn queue_prepared_launch_packets_counted(
             // Moved inside the Stop boundary: an Abort is published without the
             // dispatch gate, and one pressed after this check must end Aborted.
             let previous = with_stop_admission(state,ticket,||state.move_local_flight_state(FlightState::Launch)).map_err(|e|admitted(format!("SDK admitted {accepted}/{total} Launch packets, newer Stop prevents local Launch publication: {e}")))?;
-            if let Some(previous) = previous {
-                state.observe_local_flight_state_change(previous, FlightState::Launch, claim.as_ref(), false);
-            }
-            previous
+            let ((), held) = AppState::deferring_daq_launch_clock(|| {
+                if let Some(previous) = previous {
+                    state.observe_local_flight_state_change(previous, FlightState::Launch, claim.as_ref(), false);
+                }
+            });
+            (claim, held)
         };
-        let _ = previous;
+        #[cfg(test)]
+        nonwaiting_admission_tests::before_admitted_launch_save(state);
+        // The durable FLIGHT_STATE save, with the dispatch gate released. It
+        // is a compare-and-set against the value Launch was prepared over,
+        // under the network-variable store lock that every FLIGHT_STATE write
+        // takes: an Abort's Aborted (or any other write) saved first is never
+        // overwritten, and one saved after it replaces it, on disk and on
+        // restart. The in-flight claim is kept until the publication is done.
+        let saved = crate::network_variables::commit_admitted_launch(&prepared);
+        // The DAQ launch clock the publication started, also off the gate:
+        // the clock in force now, never an older one over a newer.
+        if daq_clock_held && let Some(claim) = &claim {
+            state.publish_current_daq_launch_clock(claim);
+        }
+        drop(claim);
+        match saved {
+            Ok(()) => {}
+            Err(crate::network_variables::AdmittedLaunchCommitError::Changed(e)) => {
+                // A newer Stop or Abort saved its FLIGHT_STATE first: it wins
+                // (the station is, or is about to be, Aborted).
+                with_stop_admission(state,ticket,||()).map_err(|stop|admitted(format!("SDK admitted {accepted}/{total} Launch packets, newer Stop prevents the Launch FLIGHT_STATE save: {stop}")))?;
+                late.push(format!("a newer FLIGHT_STATE was saved before its own and is kept ({e:#})"));
+            }
+            Err(crate::network_variables::AdmittedLaunchCommitError::NotSaved(e)) => {
+                late.push(format!("its FLIGHT_STATE could not be saved ({e:#})"));
+            }
+        }
         if !late.is_empty() {
             let warning = format!("Launch sent to every board and published here, but {}", late.join("; and "));
             log::error!("{warning}");

@@ -374,3 +374,18 @@ pub(crate) fn after_admission(state: &AppState) {
         f(state);
     }
 }
+
+/// Runs once an admitted Launch was published locally and the dispatch gate
+/// released, just before its FLIGHT_STATE is saved.
+static BEFORE_SAVE: Mutex<Option<AfterAdmission>> = Mutex::new(None);
+pub(crate) fn set_before_admitted_launch_save(state: &AppState, f: impl Fn(&AppState) + Send + 'static) {
+    *BEFORE_SAVE.lock().unwrap() = Some((state as *const AppState as usize, Box::new(f)));
+}
+pub(crate) fn before_admitted_launch_save(state: &AppState) {
+    let slot = BEFORE_SAVE.lock().unwrap();
+    if let Some((owner, f)) = slot.as_ref()
+        && *owner == state as *const AppState as usize
+    {
+        f(state);
+    }
+}

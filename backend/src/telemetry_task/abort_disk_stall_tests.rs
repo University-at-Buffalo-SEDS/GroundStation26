@@ -459,19 +459,36 @@ async fn measure(site: Site, press: Press, load: Load) -> Latency {
     tokio::time::sleep(Duration::from_millis(200)).await;
     seen.launch_on_wire = rig.wire.lock().unwrap().iter().any(|(_, kind, _)| *kind == "LAUNCH");
     if press == Press::WebSocket && load == Load::Busy && site != Site::Log {
-        let overtaken = "Launch not sent: Abort was pressed after it";
+        // The second Launch press, queued on the Abort's connection, never
+        // goes out. A save made before the Launch is admitted holds the
+        // dispatch gate, so the press is still queued when the Abort comes
+        // and the Abort overtakes it. The admitted Launch's FLIGHT_STATE save
+        // holds no gate, so there the queued presses are handled during the
+        // stall, before the Abort, and the second Launch is refused by the
+        // lock the first one's attempt holds.
+        let never_sent = if site == Site::Variables {
+            "Launch is locked after the last attempt"
+        } else {
+            "Launch not sent: Abort was pressed after it"
+        };
         tokio::time::timeout(Duration::from_secs(10), async {
-            while !rig.state.notifications_snapshot().iter().any(|note| note.message.contains(overtaken)) {
+            while !rig.state.notifications_snapshot().iter().any(|note| note.message.contains(never_sent)) {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
-        .expect("the Launch the Abort overtook is not sent");
+        .expect("the queued Launch press is not sent");
+        let launches = rig.wire.lock().unwrap().iter().filter(|(_, kind, _)| *kind == "LAUNCH").map(|(.., id)| *id)
+            .collect::<std::collections::HashSet<_>>();
+        assert!(launches.len() <= 1, "the queued Launch press sent nothing: {launches:?} {:?}",
+            rig.state.notifications_snapshot().iter().map(|n| n.message.clone()).collect::<Vec<_>>());
     }
     // What the disk kept, and what the station is.
     assert_eq!(rig.state.local_flight_state_snapshot(), FlightState::Aborted);
     assert!(rig.state.abort_indicator_latched());
     assert_eq!(crate::network_variables::flight_state(), FlightState::Aborted as u8);
+    // The late Launch save never overwrote it: a restart reads Aborted.
+    assert_eq!(crate::network_variables::flight_state_on_disk_for_test(), Some(FlightState::Aborted as u8));
     if site != Site::Log {
         assert!(rig.state.launch_mode_gate.launch_hold().is_none(), "an aborted Launch holds no mode change");
         assert!(rig.state.launch_history.lock().unwrap().launch_locked(), "a saved attempt is never released here");
@@ -752,5 +769,120 @@ async fn session_database_write_http() {
     sqlx::query("ROLLBACK").execute(&mut *writer).await.unwrap();
     assert_eq!(status, 202);
     assert!(took < BOUND, "{took:?}");
+    rig.state.request_shutdown();
+}
+
+/// Press a Launch through to its stalled FLIGHT_STATE save, as `measure`
+/// does: the press is made again only if a late warm-up reply refused it.
+fn launch_into_stalled_save(rig: &Rig) -> tokio::task::JoinHandle<()> {
+    let (state, router) = (rig.state.clone(), rig.router.clone());
+    tokio::spawn(async move {
+        for _ in 0..20 {
+            let refused = rig_refusals(&state);
+            prove(&state, &PAIR, Duration::ZERO);
+            immediate_on(&state, &router).await;
+            if rig_refusals(&state) == refused || state.manual_abort_intent.epoch() != 0 {
+                break;
+            }
+        }
+    })
+}
+
+/// The admitted Launch's FLIGHT_STATE save holds no dispatch gate: while that
+/// save is stalled, an operator command takes the gate at once, and presses
+/// queued on a WebSocket are handled, not held behind the disk. The old code
+/// saved it under the gate, so both waited for the whole stall.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stalled_launch_save_holds_back_no_operator_command() {
+    crate::mode_suite!(Normal);
+    if crate::operator_queue::isolated_native_case(module_path!(), "a_stalled_launch_save_holds_back_no_operator_command") {
+        return;
+    }
+    let rig = rig().await;
+    let _window = crate::gse::nonwaiting_admission_tests::FrozenWindow::new(&rig.state);
+    let presser = Presser::new(Press::WebSocket, &rig).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let stall = Stall::begin(Site::Variables);
+    let launch = launch_into_stalled_save(&rig);
+    let rig = Arc::new(rig);
+    let observer = rig.clone();
+    let (gate, handled, notes) = tokio::task::spawn_blocking(move || {
+        let rig = observer;
+        assert!(stall.entered(), "the Launch never reached its FLIGHT_STATE save");
+        let taken = Instant::now();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            crate::gse::with_command_gate(|| ());
+            let _ = tx.send(());
+        });
+        let gate = rx.recv_timeout(STALL).ok().map(|()| taken.elapsed());
+        // A second Launch press behind another press on the same connection:
+        // both are handled while the disk still answers nothing.
+        let before = rig.state.notifications_snapshot().len();
+        let pressed = Instant::now();
+        presser.earlier();
+        let mut handled = None;
+        while pressed.elapsed() < STALL - Duration::from_millis(500) {
+            if rig.state.notifications_snapshot().len() > before {
+                handled = Some(pressed.elapsed());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let notes = rig.state.notifications_snapshot().into_iter().skip(before).map(|n| n.message).collect::<Vec<_>>();
+        drop(stall);
+        (gate, handled, notes)
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), launch).await.expect("the Launch handler returns").unwrap();
+    eprintln!("STALLED_LAUNCH_SAVE gate={gate:?} handled={handled:?} notes={notes:?}");
+    assert!(gate.is_some_and(|at| at < BOUND), "the dispatch gate waited for the Launch save: {gate:?}");
+    assert!(handled.is_some_and(|at| at < BOUND), "queued presses waited for the Launch save: {handled:?} {notes:?}");
+    // The second press sent nothing.
+    assert_eq!(rig.wire.lock().unwrap().iter().filter(|(_, kind, _)| *kind == "LAUNCH").count(), 1);
+    // Once the disk answers, the Launch is saved: on disk as on restart.
+    assert_eq!(crate::network_variables::flight_state(), FlightState::Launch as u8);
+    assert_eq!(crate::network_variables::flight_state_on_disk_for_test(), Some(FlightState::Launch as u8));
+    assert_eq!(rig.state.local_flight_state_snapshot(), FlightState::Launch);
+    rig.state.request_shutdown();
+}
+
+/// An Abort pressed after the admitted Launch was published here, and saved
+/// before the Launch's own FLIGHT_STATE save: the late Launch save never
+/// overwrites it. The station ends Aborted, on disk and on restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_launch_save_never_overwrites_a_newer_aborted() {
+    crate::mode_suite!(Normal);
+    if crate::operator_queue::isolated_native_case(module_path!(), "a_late_launch_save_never_overwrites_a_newer_aborted") {
+        return;
+    }
+    let rig = rig().await;
+    let _window = crate::gse::nonwaiting_admission_tests::FrozenWindow::new(&rig.state);
+    let saved_first = Arc::new(Mutex::new(None));
+    let seen = saved_first.clone();
+    crate::gse::nonwaiting_admission_tests::set_before_admitted_launch_save(&rig.state, move |state| {
+        assert_eq!(state.local_flight_state_snapshot(), FlightState::Launch);
+        state.manual_abort_intent.request();
+        let pressed = Instant::now();
+        while crate::network_variables::flight_state() != FlightState::Aborted as u8 && pressed.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        *seen.lock().unwrap() = Some(crate::network_variables::flight_state());
+    });
+    launch_into_stalled_save(&rig).await.unwrap();
+    assert_eq!(*saved_first.lock().unwrap(), Some(FlightState::Aborted as u8), "the Abort's Aborted was saved first");
+    let notes = rig.state.notifications_snapshot().iter().map(|n| n.message.clone()).collect::<Vec<_>>();
+    assert!(notes.iter().any(|n| n.contains("newer Stop prevents the Launch FLIGHT_STATE save")), "{notes:?}");
+    assert_eq!(crate::network_variables::flight_state(), FlightState::Aborted as u8);
+    assert_eq!(crate::network_variables::flight_state_on_disk_for_test(), Some(FlightState::Aborted as u8));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while rig.state.local_flight_state_snapshot() != FlightState::Aborted {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the station ends Aborted");
+    assert!(rig.state.abort_indicator_latched());
     rig.state.request_shutdown();
 }
