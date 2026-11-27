@@ -42,6 +42,30 @@ class FlightSimEnvironmentTests(unittest.TestCase):
                 module.prepare_environment(self.base / "sessions", {key: "physical"}, self.assets)
         self.assertFalse((self.base / "sessions").exists())
 
+    def test_every_variable_the_launcher_sets_is_one_the_backend_accepts(self):
+        """The backend refuses FlightSim for any GS_ variable outside its
+        PATHS/VALUES lists or the named build keys, and for any VALUES entry
+        with another value. GS_STATION_MODE was set here but missing there, so
+        FlightSim never started."""
+        import re
+        rust = (ROOT / "backend/src/flight_sim_runtime.rs").read_text()
+        block = lambda name: rust[rust.index(f"const {name}: &[(&str, &str)] = &["):]
+        paths = dict(re.findall(r'\(\s*"(GS_[A-Z_]+)",\s*"([^"]*)",?\s*\)', block("PATHS").split("];", 1)[0]))
+        values = dict(re.findall(r'\(\s*"(GS_[A-Z_]+)",\s*"([^"]*)",?\s*\)', block("VALUES").split("];", 1)[0]))
+        named = set(re.findall(r'key == "(GS_[A-Z_]+)"', rust))
+        root, env = module.prepare_environment(self.base, {"PATH": os.defpath, "GS_FRONTEND_SOURCE_DIR": "/src"}, self.assets)
+        for key, value in env.items():
+            if not key.startswith("GS_"):
+                continue
+            with self.subTest(key=key):
+                self.assertTrue(key in paths or key in values or key in named, f"backend refuses {key}")
+                if key in values:
+                    self.assertEqual(value, values[key])
+                if key in paths:
+                    self.assertEqual(value, str(root / paths[key]))
+        for key in values:
+            self.assertIn(key, env, f"launcher never sets {key}, which the backend requires")
+
     def test_missing_ui_bundle_refused_before_allocating_session(self):
         (self.assets / "index.html").unlink()
         with self.assertRaises(ValueError):

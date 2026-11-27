@@ -36,6 +36,9 @@ const PATHS: &[(&str, &str)] = &[
 ];
 const VALUES: &[(&str, &str)] = &[
     ("GS_EXECUTION_MODE", "flight_sim"),
+    // FlightSim runs testing mode's flight model; validate_startup requires
+    // the process to have booted in testing mode, so the launcher sets it.
+    ("GS_STATION_MODE", "testing"),
     ("GS_SIM_MODE", "1"),
     ("GS_RRLS_ROLE", "off"),
     ("GS_VIDEO_MANAGED", "0"),
@@ -191,6 +194,13 @@ pub(crate) fn unavailable_media_routes() -> axum::Router<std::sync::Arc<crate::s
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_testing_mode_flightsim_requires_is_an_allowed_option() {
+        // validate_startup requires testing mode and refuses any GS_ key not
+        // listed here; without this entry FlightSim could never start.
+        assert!(super::VALUES.contains(&("GS_STATION_MODE", "testing")));
+    }
+
     #[test]
     fn namespace_contract_is_not_a_hardware_mode_alias() {
         assert_eq!(
