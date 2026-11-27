@@ -28,6 +28,8 @@ pub(crate) use automatic_abort::{
 mod operational_policy;
 use operational_policy::*;
 mod operational;
+mod launch_undo;
+pub(crate) use launch_undo::{LaunchAttempt, UNDONE_MESSAGE as LAUNCH_UNDONE_MESSAGE, undo_unsent_launch};
 use crate::{
     auth::Permission,
     sequences::{ActionControl, ActionPolicyMsg, BlinkMode},
@@ -5005,28 +5007,54 @@ fn with_launch_admission<T>(
         .and_then(|v| v.map_err(|error| error.to_string()))
 }
 
-/// Registry SDK438 try_tx_queue does not wait for the router-core mutex or
-/// invoke local/side callbacks. Schema/configuration and allocation may still
-/// contend; no universal wait-free bound is promised. Packets are prepared
-/// before entering the short intent locks. A second admission can fail
-/// after the first succeeds; that is not an atomic batch or an automatic retry.
+/// `queue_admitted_launch_packets_counted` with its refusal as text.
+#[cfg(test)]
 pub(crate) fn queue_admitted_launch_packets(
     state: &AppState,
     router: &sedsnet::router::Router,
     ticket: LaunchAdmission,
     packets: Vec<sedsnet::packet::Packet>,
 ) -> Result<usize, String> {
-    with_stop_admission(state, ticket, || ()).map_err(str::to_string)?;
+    queue_admitted_launch_packets_counted(state, router, ticket, packets).map_err(|error| error.message)
+}
+
+/// A Launch that did not go out whole: how many of its packets the SDK took
+/// (the boards may act on those) and why the rest did not go.
+#[derive(Debug)]
+pub(crate) struct LaunchQueueError {
+    pub(crate) admitted: usize,
+    pub(crate) message: String,
+}
+impl LaunchQueueError {
+    fn none_taken(message: impl Into<String>) -> Self {
+        Self { admitted: 0, message: message.into() }
+    }
+}
+
+/// Registry SDK438 try_tx_queue does not wait for the router-core mutex or
+/// invoke local/side callbacks. Schema/configuration and allocation may still
+/// contend; no universal wait-free bound is promised. Packets are prepared
+/// before entering the short intent locks. A second admission can fail
+/// after the first succeeds; that is not an atomic batch or an automatic retry.
+/// A refusal says how many packets were taken (the FLIGHT_STATE Launch,
+/// outside HITL, is the first of them).
+pub(crate) fn queue_admitted_launch_packets_counted(
+    state: &AppState,
+    router: &sedsnet::router::Router,
+    ticket: LaunchAdmission,
+    packets: Vec<sedsnet::packet::Packet>,
+) -> Result<usize, LaunchQueueError> {
+    with_stop_admission(state, ticket, || ()).map_err(LaunchQueueError::none_taken)?;
     let prepared = if crate::runtime_mode::is_hitl() {
         None
     } else {
         Some(
             crate::network_variables::prepare_launch_state(router).map_err(|e| {
-                format!("Launch preparation failed with no SDK launch admitted: {e}")
+                LaunchQueueError::none_taken(format!("Launch preparation failed with no SDK launch admitted: {e}"))
             })?,
         )
     };
-    queue_prepared_launch_packets(state, router, ticket, packets, prepared)
+    queue_prepared_launch_packets_counted(state, router, ticket, packets, prepared)
 }
 
 pub(crate) fn queue_state_launch(
@@ -5062,16 +5090,26 @@ pub(crate) fn queue_prepared_launch_packets(
     state: &AppState,
     router: &sedsnet::router::Router,
     ticket: LaunchAdmission,
-    mut packets: Vec<sedsnet::packet::Packet>,
+    packets: Vec<sedsnet::packet::Packet>,
     prepared: Option<crate::network_variables::PreparedLaunchState>,
 ) -> Result<usize, String> {
+    queue_prepared_launch_packets_counted(state, router, ticket, packets, prepared).map_err(|error| error.message)
+}
+
+pub(crate) fn queue_prepared_launch_packets_counted(
+    state: &AppState,
+    router: &sedsnet::router::Router,
+    ticket: LaunchAdmission,
+    mut packets: Vec<sedsnet::packet::Packet>,
+    prepared: Option<crate::network_variables::PreparedLaunchState>,
+) -> Result<usize, LaunchQueueError> {
     if let Some(prepared) = &prepared {
         packets.insert(0, prepared.packet.clone());
     }
     let ignition_pair_required = packets.iter().any(|packet|
         crate::ignition_pair::packet_requires_pair(packet.data_type(), packet.payload()));
     if ignition_pair_required && !crate::ignition_pair::same_router(state,router) {
-        return Err(OTHER_ROUTER_REFUSAL.into());
+        return Err(LaunchQueueError::none_taken(OTHER_ROUTER_REFUSAL));
     }
     let total = packets.len();
     #[cfg(test)] nonwaiting_admission_tests::record_launch_packets(state,&packets);
@@ -5117,7 +5155,7 @@ pub(crate) fn queue_prepared_launch_packets(
             // A zero-owner refusal must not outlive a newly retained controller
             // command. These conservative snapshots run outside ALL app guards;
             // they are not an atomic multi-type check-and-queue operation.
-            with_stop_admission(state, ticket, || ()).map_err(str::to_string)?;
+            with_stop_admission(state, ticket, || ()).map_err(LaunchQueueError::none_taken)?;
             let mut inspection_busy = false;
             // The generator exports only a subset of types. Resolve these
             // existing configured names once, outside all application guards,
@@ -5130,7 +5168,7 @@ pub(crate) fn queue_prepared_launch_packets(
                 match crate::abort_retirement::try_has_pending_reliable_tx_type(router, kind) {
                     Ok(false) => {}
                     Ok(true) if crate::runtime_mode::is_hitl() => {}
-                    Ok(true) => return Err("Controller command delivery is pending; launch was not dispatched".into()),
+                    Ok(true) => return Err(LaunchQueueError::none_taken("Controller command delivery is pending; launch was not dispatched")),
                     Err(sedsnet::router::TryPendingTypeError::CoreBusy) => {
                         inspection_busy = true;
                         break;
@@ -5182,7 +5220,7 @@ pub(crate) fn queue_prepared_launch_packets(
                 break Err((admitted_prefix, sedsnet::TelemetryError::Io(
                     "launch suffix re-admission refused")));
             }
-            Err(message) => return Err(message),
+            Err(message) => return Err(LaunchQueueError::none_taken(message)),
         };
         match attempt {
             Err((0, error @ sedsnet::TelemetryError::Io("router core busy"))) => {
@@ -5227,7 +5265,7 @@ pub(crate) fn queue_prepared_launch_packets(
             state.manual_abort_intent.request();
         }
         log::error!("{reason} (the rest was refused: {cause})");
-        return Err(format!("{reason} (the rest was refused: {cause})"));
+        return Err(LaunchQueueError { admitted: accepted, message: format!("{reason} (the rest was refused: {cause})") });
     }
     #[cfg(test)]
     if accepted == total {
@@ -5239,10 +5277,11 @@ pub(crate) fn queue_prepared_launch_packets(
         // behind the Launch; only a newer Stop or Abort (which the boards
         // also get, and which wins) keeps it from publishing Launch locally.
         crate::network_variables::note_admitted_launch();
+        let admitted = |message: String| LaunchQueueError { admitted: accepted, message };
         let mut late = Vec::new();
         let previous = {
             let _dispatch = dispatch_gate();
-            with_stop_admission(state,ticket,||()) .map_err(|e|format!("SDK admitted {accepted}/{total} Launch packets, but {e}; explicit recovery required"))?;
+            with_stop_admission(state,ticket,||()) .map_err(|e|admitted(format!("SDK admitted {accepted}/{total} Launch packets, but {e}; explicit recovery required")))?;
             // The durable FLIGHT_STATE save stays where it always was (under
             // the dispatch gate, after the Stop check): moving it changes which
             // operator frames a stalled save holds back.
@@ -5251,7 +5290,7 @@ pub(crate) fn queue_prepared_launch_packets(
                 // Something else wrote FLIGHT_STATE since preparation (an
                 // Abort's Aborted among them): never publish Launch over it.
                 Err(crate::network_variables::AdmittedLaunchCommitError::Changed(e)) => {
-                    return Err(format!("SDK admitted {accepted}/{total} Launch packets, desired publication failed: {e}"));
+                    return Err(admitted(format!("SDK admitted {accepted}/{total} Launch packets, desired publication failed: {e}")));
                 }
                 Err(crate::network_variables::AdmittedLaunchCommitError::NotSaved(e)) => {
                     late.push(format!("its FLIGHT_STATE could not be saved ({e:#})"));
@@ -5267,7 +5306,7 @@ pub(crate) fn queue_prepared_launch_packets(
             });
             // Moved inside the Stop boundary: an Abort is published without the
             // dispatch gate, and one pressed after this check must end Aborted.
-            let previous = with_stop_admission(state,ticket,||state.move_local_flight_state(FlightState::Launch)).map_err(|e|format!("SDK admitted {accepted}/{total} Launch packets, newer Stop prevents local Launch publication: {e}"))?;
+            let previous = with_stop_admission(state,ticket,||state.move_local_flight_state(FlightState::Launch)).map_err(|e|admitted(format!("SDK admitted {accepted}/{total} Launch packets, newer Stop prevents local Launch publication: {e}")))?;
             if let Some(previous) = previous {
                 state.observe_local_flight_state_change(previous, FlightState::Launch, claim.as_ref(), false);
             }
@@ -5280,8 +5319,10 @@ pub(crate) fn queue_prepared_launch_packets(
             crate::web::emit_notification_warning(state, warning);
         }
     }
-    result.map_err(|(accepted,error)|format!("Launch SDK admission accepted {accepted}/{total} packets: {error}; launch remains inhibited, explicit manual recovery required"))
+    result.map_err(|(accepted,error)|LaunchQueueError { admitted: accepted, message: format!("Launch SDK admission accepted {accepted}/{total} packets: {error}{LAUNCH_STAYS_INHIBITED}") })
 }
+/// How a refused Launch's report ends when its records are kept.
+pub(crate) const LAUNCH_STAYS_INHIBITED: &str = "; launch remains inhibited, explicit manual recovery required";
 
 /// Testing mode only (the old testing build was the only one with it).
 pub(crate) fn admit_simulated_retraction_stamped(
@@ -5359,6 +5400,16 @@ pub(crate) fn inhibit_automatic_actions_for_pressed_launch(
     launch_revision: Option<u64>,
     pressed: Option<LaunchAdmission>,
 ) -> Result<LaunchAdmission, String> {
+    record_inhibition_for_pressed_launch(state, launch_revision, pressed).map(|attempt| attempt.ticket)
+}
+
+/// `inhibit_automatic_actions_for_pressed_launch`, returning what it
+/// recorded so that a Launch none of whose packets is taken can be undone.
+pub(crate) fn record_inhibition_for_pressed_launch(
+    state: &Arc<AppState>,
+    launch_revision: Option<u64>,
+    pressed: Option<LaunchAdmission>,
+) -> Result<LaunchAttempt, String> {
     // Freeze the original ticket once, before provider work or retry waits.
     let ticket = LaunchAdmission::capture_for_launch_from(state, launch_revision, pressed)?;
     if !ticket.trackable() {
@@ -5386,12 +5437,10 @@ pub(crate) fn inhibit_automatic_actions_for_pressed_launch(
     if state.gse.overpressure.owns_valves() {
         return Err(OVERPRESSURE_LATCHED.into());
     }
-    state
-        .launch_history
-        .lock()
-        .unwrap()
+    let mut history = state.launch_history.lock().unwrap();
+    history
         .inhibit_automatic_actions()
-        .map(|()| ticket)
+        .map(|()| LaunchAttempt::inhibited(ticket, history.launch_attempt_mark()))
         .map_err(|error| {
             format!("Launch was not dispatched: cannot save automatic-action inhibition: {error}")
         })
@@ -5417,11 +5466,22 @@ pub(crate) fn commit_fire_intent_revision(
 }
 
 /// `pressed` is the ticket captured when a held Launch was pressed.
+#[cfg(test)]
 pub(crate) fn commit_fire_intent_for_pressed_launch(
     state: &Arc<AppState>,
     launch_revision: Option<u64>,
     pressed: Option<LaunchAdmission>,
 ) -> Result<LaunchAdmission, String> {
+    record_fire_intent_for_pressed_launch(state, launch_revision, pressed).map(|attempt| attempt.ticket)
+}
+
+/// `commit_fire_intent_for_pressed_launch`, returning what it recorded so
+/// that a Launch none of whose packets is taken can be undone.
+pub(crate) fn record_fire_intent_for_pressed_launch(
+    state: &Arc<AppState>,
+    launch_revision: Option<u64>,
+    pressed: Option<LaunchAdmission>,
+) -> Result<LaunchAttempt, String> {
     // Freeze the original ticket once, before provider work or retry waits.
     let ticket = LaunchAdmission::capture_for_launch_from(state, launch_revision, pressed)?;
     if !ticket.trackable() {
@@ -5467,15 +5527,20 @@ pub(crate) fn commit_fire_intent_for_pressed_launch(
     if state.gse.overpressure.latched() {
         return Err(OVERPRESSURE_LATCHED.into());
     }
-    rt.operational.commit_fire()?;
-    state.launch_history.lock().unwrap().inhibit_automatic_actions()
-        .map_err(|error| format!("Fire intent saved, but launch inhibition could not be saved; launch was not dispatched: {error}"))?;
+    let prior_claimed = rt.engine.claimed;
+    let fire = rt.operational.commit_fire()?;
+    let journal_mark = {
+        let mut history = state.launch_history.lock().unwrap();
+        history.inhibit_automatic_actions()
+            .map_err(|error| format!("Fire intent saved, but launch inhibition could not be saved; launch was not dispatched: {error}"))?;
+        history.launch_attempt_mark()
+    };
     rt.engine.claimed = true;
     // From this point even a checklist-storage failure must not re-arm the operation.
     let checklist_result = rt.operational.flush_checklists();
     drop(rt);
     // Actual Launch publication follows final SDK admission, never preparation.
-    checklist_result.map(|()| ticket).map_err(|error| {
+    checklist_result.map(|()| LaunchAttempt::fired(ticket, journal_mark, fire, prior_claimed)).map_err(|error| {
         format!("Fire intent saved, but checklist update failed; manual recovery required: {error}")
     })
 }

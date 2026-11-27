@@ -134,8 +134,21 @@ state alone (the HITL column above).
   `gse.rs:admit_launch_intent`): the Actuator and Valve Board proof and routes, the fresh states of
   the mode's boards, the SDK router, network time and cold flow. The proofs must stay fresh 2 s
   past the check (`ignition_pair.rs:LAUNCH_COMMIT_ALLOWANCE`) so they outlast the save. A refusal
-  here sends nothing and leaves Launch unlocked; one after the save (the save stalled for longer, a
-  board aborted meanwhile) sends nothing either but keeps the lock.
+  here sends nothing and leaves Launch unlocked. One after the save (the save stalled for longer, a
+  board aborted meanwhile, or the SDK core stayed busy past its 1 s wait) sends nothing either.
+- **Nothing sent: undone.** When a Launch ends with none of its packets taken by the SDK, no
+  board received anything, so the station undoes exactly what the press recorded: the Fire stage
+  (the qualification goes back to Armed and the nitrogen test's checklist progress is given
+  back), the inhibition and launch lock, and `engine.claimed`
+  (`gse/launch_undo.rs:undo_unsent_launch`). The launch journal keeps the attempt as refused and
+  undone (`undone_launches`). The operator sees "Launch refused, nothing was sent; Launch is
+  available again" with the reason, and can simply press Launch again; a restart right after keeps
+  it undone. It is never undone once any packet was taken (a partly delivered Launch is aborted,
+  a fully delivered one is published), nor after a newer Stop, Abort or reset, nor while an Abort
+  is latched or the station is Aborted: the Abort wins and Launch stays locked as before. The undo
+  changes no Abort latch or flight state, holds neither the dispatch gate nor the GSE lock across
+  its disk writes, and a manual Abort never waits for it. If it cannot be completed (a record
+  changed meanwhile, a write failed), the message says why and Launch stays locked.
 - **What releases it.** Either Reset all boards, or the verified healthy-board release
   (`board_recovery.rs:try_release_launch_lock`): every board on the network has a fresh verified
   readback, taken at least 10 s after the attempt, that is not aborted, is in Startup or Idle with

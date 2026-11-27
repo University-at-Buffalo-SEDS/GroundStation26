@@ -705,19 +705,20 @@ async fn send_local_ground_station_launch(
     }
     let admitted = crate::unpin::blocking(|| {
         if crate::runtime_mode::is_hitl() {
-            crate::gse::inhibit_automatic_actions_for_pressed_launch(&state, launch_revision, pressed)
+            crate::gse::record_inhibition_for_pressed_launch(&state, launch_revision, pressed)
         } else {
-            crate::gse::commit_fire_intent_for_pressed_launch(&state, launch_revision, pressed)
+            crate::gse::record_fire_intent_for_pressed_launch(&state, launch_revision, pressed)
         }
     });
-    let ticket = match admitted {
-        Ok(ticket) => ticket,
+    let attempt = match admitted {
+        Ok(attempt) => attempt,
         Err(error) => {
             state.clear_launch_sequence_command_pending();
             emit_notification_warning(&state, error);
             return;
         }
     };
+    let ticket = attempt.ticket;
     let packet = match build_launch_packet(
         &router,
         "VALVE_COMMAND",
@@ -727,21 +728,22 @@ async fn send_local_ground_station_launch(
         Ok(packet) => packet,
         Err(error) => {
             state.clear_launch_sequence_command_pending();
-            emit_notification_warning(
-                &state,
-                format!("Launch packet preparation failed; inhibition retained: {error}"),
-            );
+            let refusal = crate::gse::LaunchQueueError {
+                admitted: 0,
+                message: format!("Launch packet preparation failed: {error}"),
+            };
+            report_refused_launch(&state, attempt, refusal, launch_packet_count(1));
             return;
         }
     };
     // Station mode changes stay refused until the countdown starts.
     state.launch_mode_gate.mark_sent();
     let queued =
-        crate::unpin::blocking(|| crate::gse::queue_admitted_launch_packets(&state, &router, ticket, vec![packet]));
-    if let Err(error) = queued {
+        crate::unpin::blocking(|| crate::gse::queue_admitted_launch_packets_counted(&state, &router, ticket, vec![packet]));
+    if let Err(refusal) = queued {
         state.clear_launch_sequence_command_pending();
         state.launch_mode_gate.clear_sent();
-        emit_notification_warning(&state, error);
+        report_refused_launch(&state, attempt, refusal, launch_packet_count(1));
         return;
     }
     state.begin_daq_launch_log();
@@ -763,6 +765,42 @@ async fn send_local_ground_station_launch(
     gs_debug_println!(
         "Ground-station launch sequence command sent; waiting for valve-board clock start"
     );
+}
+
+/// Packets a Launch has: `commands` and, outside HITL, the FLIGHT_STATE
+/// Launch ahead of them.
+fn launch_packet_count(commands: usize) -> usize {
+    commands + usize::from(!crate::runtime_mode::is_hitl())
+}
+
+/// Report a Launch that did not go out whole. One none of whose `packets`
+/// the SDK took reached no board: what its press recorded is undone so that
+/// Launch is available again (unless a newer Stop, Abort or reset, or a
+/// changed record, keeps it, which the message then names). Any other keeps
+/// its own handling and report.
+fn report_refused_launch(
+    state: &Arc<AppState>,
+    attempt: crate::gse::LaunchAttempt,
+    refusal: crate::gse::LaunchQueueError,
+    packets: usize,
+) {
+    if refusal.admitted != 0 {
+        emit_notification_warning(state, refusal.message);
+        return;
+    }
+    match crate::unpin::blocking(|| crate::gse::undo_unsent_launch(state, attempt, &refusal, packets)) {
+        Ok(()) => {
+            log::warn!("Launch refused with no packet taken, and undone: {}", refusal.message);
+            let reason = refusal.message.trim_end_matches(crate::gse::LAUNCH_STAYS_INHIBITED);
+            emit_notification_warning(state, format!("{}. Reason: {reason}", crate::gse::LAUNCH_UNDONE_MESSAGE));
+            sequences::refresh_action_policy_now(state);
+            state.broadcast_action_policy_snapshot();
+        }
+        Err(why) => {
+            log::error!("Launch refused with no packet taken, not undone ({why}): {}", refusal.message);
+            emit_notification_warning(state, format!("{} (not undone: {why})", refusal.message));
+        }
+    }
 }
 
 async fn handle_flight_computer_launch_command(
@@ -823,19 +861,20 @@ async fn send_flight_computer_launch(
     }
     let admitted = crate::unpin::blocking(|| {
         if crate::runtime_mode::is_hitl() {
-            crate::gse::inhibit_automatic_actions_for_pressed_launch(&state, launch_revision, pressed)
+            crate::gse::record_inhibition_for_pressed_launch(&state, launch_revision, pressed)
         } else {
-            crate::gse::commit_fire_intent_for_pressed_launch(&state, launch_revision, pressed)
+            crate::gse::record_fire_intent_for_pressed_launch(&state, launch_revision, pressed)
         }
     });
-    let ticket = match admitted {
-        Ok(ticket) => ticket,
+    let attempt = match admitted {
+        Ok(attempt) => attempt,
         Err(error) => {
             state.clear_launch_sequence_command_pending();
             emit_notification_warning(&state, error);
             return;
         }
     };
+    let ticket = attempt.ticket;
     let packets = (|| -> sedsnet::TelemetryResult<Vec<Packet>> {
         Ok(vec![
             build_launch_packet(
@@ -855,28 +894,31 @@ async fn send_flight_computer_launch(
     let packets = match packets {
         Ok(packets) => packets,
         Err(error) => {
-            emit_notification_warning(
-                &state,
-                format!("Launch packet preparation failed; inhibition retained: {error}"),
-            );
+            let refusal = crate::gse::LaunchQueueError {
+                admitted: 0,
+                message: format!("Launch packet preparation failed: {error}"),
+            };
+            report_refused_launch(&state, attempt, refusal, launch_packet_count(2));
             return;
         }
     };
+    let total = launch_packet_count(packets.len());
     // Station mode changes stay refused until the countdown starts. A partly
     // admitted Launch below keeps refusing them: a packet may be on its way.
     state.launch_mode_gate.mark_sent();
     let queued =
-        crate::unpin::blocking(|| crate::gse::queue_admitted_launch_packets(&state, &router, ticket, packets));
-    if let Err(error) = queued {
+        crate::unpin::blocking(|| crate::gse::queue_admitted_launch_packets_counted(&state, &router, ticket, packets));
+    if let Err(refusal) = queued {
         // An accepted first packet remains an honest SDK owner. Only a
         // zero-owner CoreBusy suffix was re-offered (inside the same window);
         // never retry here or undo durable inhibition after partial admission.
         // An Abort ends this hold on mode changes, also one pressed during the
-        // save, before the hold was marked.
-        if state.abort_indicator_latched() {
+        // save, before the hold was marked. A Launch none of whose packets
+        // was taken holds none either: nothing is on its way.
+        if state.abort_indicator_latched() || refusal.admitted == 0 {
             state.launch_mode_gate.clear_sent();
         }
-        emit_notification_warning(&state, error);
+        report_refused_launch(&state, attempt, refusal, total);
         flush_command_tx(
             &router,
             "Launch admission failure: progress already accepted owners",
@@ -4529,10 +4571,26 @@ mod tests {
         launch_queue_case(false).await;
     }
 
+    /// The SDK core stays held past the bounded wait, so none of the
+    /// Launch's packets is taken and no board receives anything. The press's
+    /// records (Fire stage, inhibition, launch lock) are undone and the
+    /// attempt is journaled as refused and undone: Launch is available again,
+    /// also after a restart. The old code kept the inhibition and the Fire
+    /// stage ("explicit manual recovery required").
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn launch_actual_sdk_core_busy_keeps_inhibition_and_reports_zero_owners() {
-        if launch_core_fixture_in_fresh_process("telemetry_task::tests::launch_actual_sdk_core_busy_keeps_inhibition_and_reports_zero_owners") { return; }
+    async fn launch_actual_sdk_core_busy_undoes_the_unsent_attempt() {
+        if launch_core_fixture_in_fresh_process("telemetry_task::tests::launch_actual_sdk_core_busy_undoes_the_unsent_attempt") { return; }
         launch_queue_case(true).await;
+    }
+
+    /// An operator Abort while the zero-admission Launch waits out the held
+    /// core: the Launch is refused at its next attempt, the station ends
+    /// Aborted with the Abort latched, and nothing is undone (the attempt
+    /// stays recorded and Launch locked, as before).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_abort_while_a_launch_waits_out_the_core_is_never_undone() {
+        if launch_core_fixture_in_fresh_process("telemetry_task::tests::an_abort_while_a_launch_waits_out_the_core_is_never_undone") { return; }
+        zero_admission_abort_case().await;
     }
 
     /// The SDK core is taken right after the FC Launch was admitted, so the
@@ -4718,6 +4776,13 @@ mod tests {
         let sequences = wires().iter().filter(|p| p.data_type() == crate::telemetry_schema::data_type("VALVE_COMMAND")
             && p.payload() == [ValveBoardCommands::Sequence as u8]).count();
         assert!(!partial, "a partial Launch is never left as an inhibited half-admission: {notes:?}");
+        // A packet was taken: the attempt is never undone.
+        assert!(!notes.iter().any(|n| n.message.starts_with(crate::gse::LAUNCH_UNDONE_MESSAGE)), "{notes:?}");
+        assert!(state.launch_history.lock().unwrap().launch_locked(), "the attempt stays recorded");
+        if let Some(qualification) = &qualification {
+            let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(qualification).unwrap()).unwrap();
+            assert_eq!(saved["qualification"]["fire_started"], true);
+        }
         if rest_gets_in {
             assert!(!partly, "the rest got in: no Abort: {notes:?}");
             assert_eq!(sequences, 1, "exactly one valve Sequence; SDK={:?}", router.export_runtime_stats());
@@ -4798,6 +4863,9 @@ mod tests {
             .then(|| crate::gse::armed_fixture_for_test(&state, &router));
         let _actual_peers=crate::ignition_pair::fixture::Peers::warm(&state,router.clone()).await;
         let launch_revision = crate::board_abort::capture_launch_revision_named(&state, "Launch");
+        let journal = std::env::temp_dir().join(format!("launch-core-busy-journal-{:032x}.json", rand::random::<u128>()));
+        *state.launch_history.lock().unwrap() =
+            crate::launch_history::Store::open(journal.clone(), false, None, 10_000, 0).unwrap();
         if force_core_busy {
             if state.topology_router.get().is_none() {
                 state.topology_router.set(router.clone()).unwrap();
@@ -4830,7 +4898,22 @@ mod tests {
             holder.join().unwrap().unwrap();
             worker.await.unwrap();
             assert!(refused.is_ok(), "actual nonwaiting core refusal was not reported: {:?}", state.notifications_snapshot());
-            assert!(state.launch_history.lock().unwrap().automatic_actions_inhibited());
+            // Nothing was sent: what the press recorded is undone.
+            let total = if crate::runtime_mode::is_hitl() { 2 } else { 3 };
+            assert!(state.notifications_snapshot().iter().any(|n| n.message.starts_with(crate::gse::LAUNCH_UNDONE_MESSAGE)
+                && n.message.contains(&format!("accepted 0/{total}")) && !n.message.contains("manual recovery")),
+                "{:?}", state.notifications_snapshot());
+            {
+                let history = state.launch_history.lock().unwrap();
+                assert!(!history.automatic_actions_inhibited() && !history.launch_locked());
+                assert_eq!(history.undone_launches().len(), 1);
+                assert_eq!(history.undone_launches()[0].packets, total);
+            }
+            assert!(state.launch_mode_gate.launch_hold().is_none(), "nothing is on its way: no mode change is held");
+            // A restart right after the undo keeps it undone.
+            let reopened = crate::launch_history::Store::open(journal.clone(), false, None, 10_000, 0).unwrap();
+            assert!(!reopened.automatic_actions_inhibited() && !reopened.launch_locked());
+            assert_eq!(reopened.undone_launches().len(), 1);
             assert!(router.export_reliable_pending_stats().iter().all(|entry|
                 entry.data_type != crate::telemetry_schema::data_type("FLIGHT_COMMAND") &&
                 entry.data_type != crate::telemetry_schema::data_type("VALVE_COMMAND")));
@@ -4842,9 +4925,12 @@ mod tests {
         if let Some(qualification) = qualification {
             let saved: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&qualification).unwrap()).unwrap();
-            assert_eq!(saved["qualification"]["fire_started"], true);
+            // An undone Launch leaves the station armed, on disk too.
+            assert_eq!(saved["qualification"]["fire_started"], !force_core_busy);
+            assert_eq!(saved["qualification"]["fill_target"], force_core_busy);
             std::fs::remove_file(qualification).unwrap();
         }
+        let _ = std::fs::remove_file(&journal);
         router
             .process_all_queues_with_timeout(0)
             .expect("failed to process launch command queues");
@@ -4871,6 +4957,118 @@ mod tests {
                 "normal launch should also queue valve sequence; notifications={:?} SDK={:?}",
                 diagnostic_notifications, diagnostic_sdk);
         }
+    }
+
+    async fn zero_admission_abort_case() {
+        let (db_tx, _db_rx) = mpsc::channel(8);
+        let state = test_app_state(db_tx).await;
+        let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let sent_clone = sent.clone();
+        let owner = Arc::as_ptr(&state) as usize;
+        let clock = std::time::Instant::now();
+        let router = Arc::new(Router::new_with_clock(
+            sedsnet::router::RouterConfig::new([crate::ignition_pair::fixture::handler(&state, |_| Ok(()))]),
+            Box::new(move || {
+                crate::gse::nonwaiting_admission_tests::clock_pause(owner);
+                clock.elapsed().as_millis() as u64
+            }),
+        ));
+        let valve_side = router.add_side_packed_with_options(
+            "umbilical_comms",
+            move |bytes| { sent_clone.lock().unwrap().push(bytes.to_vec()); Ok(()) },
+            sedsnet::router::RouterSideOptions { reliable_enabled: true, link_local_enabled: true, ..Default::default() },
+        );
+        // The Valve Board also takes ABORT and FLIGHT_STATE, so the Abort
+        // shows on its wire.
+        let discovery = sedsnet::discovery::build_discovery_announce(
+            Board::ValveBoard.sender_id(), 123, &[crate::telemetry_schema::endpoint("VALVE_BOARD"),
+                crate::telemetry_schema::endpoint("ABORT"), crate::telemetry_schema::endpoint("FLIGHT_STATE")],
+        ).unwrap();
+        router.rx_packed_from_side(&serialize::pack_packet(&discovery), valve_side).unwrap();
+        router.process_all_queues_with_timeout(0).unwrap();
+        let qualification = (!crate::runtime_mode::is_hitl())
+            .then(|| crate::gse::armed_fixture_for_test(&state, &router));
+        let _actual_peers = crate::ignition_pair::fixture::Peers::warm(&state, router.clone()).await;
+        let launch_revision = crate::board_abort::capture_launch_revision_named(&state, "Launch");
+        if state.topology_router.get().is_none() {
+            state.topology_router.set(router.clone()).unwrap();
+        }
+        let journal = std::env::temp_dir().join(format!("launch-abort-wait-journal-{:032x}.json", rand::random::<u128>()));
+        *state.launch_history.lock().unwrap() =
+            crate::launch_history::Store::open(journal.clone(), false, None, 10_000, 0).unwrap();
+        // The station's operator Abort publisher, as main runs it.
+        let publisher = {
+            let (stop_state, stop_router) = (state.clone(), router.clone());
+            tokio::spawn(crate::manual_abort_intent::service_with_claim(
+                state.manual_abort_intent.clone(), state.shutdown_subscribe(), move |claim| {
+                    match crate::manual_abort_utc::publish_local_claim(&stop_state, &stop_router, claim) {
+                        Ok(true) => { flush_command_tx(&stop_router, "Abort during the Launch wait"); true }
+                        _ => false,
+                    }
+                }))
+        };
+        let pause = crate::gse::nonwaiting_admission_tests::Pause::install(&state);
+        let (owned_state, owned_router) = (state.clone(), router.clone());
+        let worker = tokio::spawn(async move {
+            handle_flight_computer_launch_command(owned_state, owned_router, launch_revision).await;
+        });
+        pause.prepared.recv_timeout(Duration::from_secs(2)).unwrap();
+        let seed = Packet::new(
+            crate::telemetry_schema::data_type("AV_BAY_UNDERGLOW"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+            "GS", 100, Arc::from([0u8]),
+        ).unwrap();
+        let held = router.clone();
+        let holder = std::thread::Builder::new().name("production-sdk-core-holder".into())
+            .spawn(move || held.seed_managed_variable(seed)).unwrap();
+        pause.core_entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        pause.proceed.send(()).unwrap();
+        // The Launch is waiting out the core with nothing admitted.
+        pause.busy.recv_timeout(Duration::from_secs(2)).unwrap();
+        // The Abort request returns at once: it waits for nothing the Launch holds.
+        let epoch = state.manual_abort_intent.request_while_contended();
+        assert_eq!(epoch, 1);
+        // The Launch is refused at its next attempt, with the core still held
+        // (its refusal flush then waits for the core, as before).
+        let refused = tokio::time::timeout(Duration::from_secs(2), async {
+            while !state.notifications_snapshot().iter().any(|n| n.message.contains("Manual Abort invalidated launch admission")) {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }).await;
+        pause.release();
+        holder.join().unwrap().unwrap();
+        assert!(refused.is_ok(), "the Launch ends at its next attempt: {:?}", state.notifications_snapshot());
+        tokio::time::timeout(Duration::from_secs(5), worker).await.expect("the Launch handler returns").unwrap();
+        drop(pause);
+        let aborted = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                for _ in 0..4 { let _ = router.process_all_queues_with_timeout(0); }
+                if state.local_flight_state_snapshot() == FlightState::Aborted && state.abort_indicator_latched() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await;
+        let notes = state.notifications_snapshot().iter().map(|n| n.message.clone()).collect::<Vec<_>>();
+        assert!(aborted.is_ok(), "the station ends Aborted: state={:?} notes={notes:?}", state.local_flight_state_snapshot());
+        assert!(!notes.iter().any(|n| n.starts_with(crate::gse::LAUNCH_UNDONE_MESSAGE)), "{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("Manual Abort invalidated launch admission") && n.contains("not undone")), "{notes:?}");
+        {
+            let history = state.launch_history.lock().unwrap();
+            assert!(history.launch_locked() && history.automatic_actions_inhibited(), "the attempt stays recorded");
+            assert!(history.undone_launches().is_empty());
+        }
+        let wires = sent.lock().unwrap().iter().filter_map(|w| serialize::unpack_packet(w).ok()).collect::<Vec<_>>();
+        assert!(!wires.iter().any(|p| p.data_type() == crate::telemetry_schema::data_type("VALVE_COMMAND")
+            && p.payload() == [ValveBoardCommands::Sequence as u8]), "no Launch went out");
+        if let Some(qualification) = qualification {
+            let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&qualification).unwrap()).unwrap();
+            assert_eq!(saved["qualification"]["fire_started"], true, "the Fire stage stays recorded");
+            std::fs::remove_file(qualification).unwrap();
+        }
+        state.request_shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(2), publisher).await;
+        let _ = std::fs::remove_file(&journal);
     }
 
     type SchedulerObservations = Arc<Mutex<Vec<(u8, bool)>>>;

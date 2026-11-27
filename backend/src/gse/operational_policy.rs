@@ -715,9 +715,9 @@ pub(super) fn check_report_safety(state: &Arc<AppState>) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
-    async fn fixture() -> Arc<AppState> {
+    pub(in crate::gse) async fn fixture() -> Arc<AppState> {
         let state = crate::state::tests::test_app_state().await;
         state.set_local_flight_state(FlightState::Idle);
         let router = Arc::new(sedsnet::router::Router::new(

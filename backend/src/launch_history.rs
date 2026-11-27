@@ -350,7 +350,24 @@ struct Disk {
     /// cleared without resetting any board (newest last, bounded).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     station_recoveries: Vec<StationRecovery>,
+    /// Launch attempts refused with nothing sent and undone, so Launch was
+    /// available again (newest last, bounded). Evidence only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    undone_launches: Vec<UndoneLaunch>,
 }
+/// A Launch attempt the station recorded, then refused before the SDK took
+/// any of its packets (no board received anything), and undid: its Fire
+/// stage, inhibition and launch lock were reverted.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UndoneLaunch {
+    pub utc_ms: u64,
+    pub mode: crate::station_mode::Mode,
+    /// Packets the Launch had; none of them was taken.
+    pub packets: usize,
+    pub reason: String,
+}
+const UNDONE_LAUNCH_LIMIT: usize = 32;
 /// One explicit "finish recovery without absent boards" decision.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -443,6 +460,9 @@ pub struct Store {
     /// When the current launch lock began (process start for a restored lock).
     /// Board readbacks must be observed after this to release it.
     launch_locked_at: Instant,
+    /// Bumped whenever inhibition or the launch lock is set or released, so
+    /// an undo can tell that nothing else changed them since its Launch.
+    launch_inhibit_serial: u64,
     baseline_mono_ms: u64,
     baseline_elapsed_ms: Option<i64>,
 }
@@ -528,6 +548,7 @@ impl Store {
                 new_cycle_confirmed: false,
                 recovery_waivers: Vec::new(),
                 station_recoveries: Vec::new(),
+                undone_launches: Vec::new(),
             }
         };
         ensure!(
@@ -574,6 +595,7 @@ impl Store {
             error: None,
             born: Instant::now(),
             launch_locked_at: Instant::now(),
+            launch_inhibit_serial: 0,
             baseline_mono_ms: mono,
             baseline_elapsed_ms,
         })
@@ -606,12 +628,14 @@ impl Store {
                 new_cycle_confirmed: false,
                 recovery_waivers: Vec::new(),
                 station_recoveries: Vec::new(),
+                undone_launches: Vec::new(),
             },
             observer: false,
             synchronized: true,
             error: None,
             born: Instant::now(),
             launch_locked_at: Instant::now(),
+            launch_inhibit_serial: 0,
             baseline_mono_ms: 0,
             baseline_elapsed_ms: None,
         }
@@ -718,6 +742,7 @@ impl Store {
         next.automatic_actions_inhibited = false;
         self.last_write = writer.enqueue(next.clone())?;
         self.data = next;
+        self.launch_inhibit_serial += 1;
         Ok(true)
     }
     pub fn automatic_actions_inhibited(&self) -> bool {
@@ -732,11 +757,62 @@ impl Store {
         // Only launch admission calls this: it is the real attempt.
         self.data.launch_attempt = Some(true);
         self.launch_locked_at = Instant::now();
+        self.launch_inhibit_serial += 1;
         if let Some(writer) = &self.writer {
             self.last_write = writer.enqueue(self.data.clone())?;
             writer.wait(self.last_write)?;
         }
         Ok(())
+    }
+    /// Identifies the inhibition and launch lock as they are now: read right
+    /// after `inhibit_automatic_actions`, it names that Launch attempt's.
+    pub(crate) fn launch_attempt_mark(&self) -> u64 {
+        self.launch_inhibit_serial
+    }
+    /// Undo a Launch attempt none of whose packets the SDK took: clear the
+    /// inhibition and launch lock it set (both were clear before it, or it
+    /// would not have been admitted) and journal it as refused and undone.
+    /// Refused unless the journal is open and nothing has set or released
+    /// inhibition since `mark` (a recovery, a reset, another attempt). Only
+    /// enqueues: the caller waits for the returned ticket without this lock.
+    /// A journal with no file (`ephemeral`) changes RAM only and returns None.
+    pub(crate) fn undo_unsent_launch(&mut self, mark: u64, record: UndoneLaunch) -> Result<Option<(Arc<Writer>, u64)>> {
+        ensure!(
+            !self.closed && !self.observer && self.error.is_none() && self.recovery_owner == 0
+                && !self.recovery_activation_pending,
+            "Launch journal is not open for an undo"
+        );
+        ensure!(
+            self.data.recovery_pending.as_ref().is_none_or(|p| p.published && p.verified),
+            "A board recovery keeps Launch locked"
+        );
+        ensure!(
+            self.launch_inhibit_serial == mark
+                && self.data.launch_attempt == Some(true)
+                && self.data.automatic_actions_inhibited,
+            "The launch journal changed since the Launch was recorded"
+        );
+        let mut next = self.data.clone();
+        next.launch_attempt = Some(false);
+        next.automatic_actions_inhibited = false;
+        next.undone_launches.push(record);
+        let excess = next.undone_launches.len().saturating_sub(UNDONE_LAUNCH_LIMIT);
+        next.undone_launches.drain(..excess);
+        let pending = match self.writer.clone() {
+            Some(writer) => {
+                let ticket = writer.enqueue(next.clone())?;
+                self.last_write = ticket;
+                Some((writer, ticket))
+            }
+            None => None,
+        };
+        self.data = next;
+        self.launch_inhibit_serial += 1;
+        Ok(pending)
+    }
+    #[cfg(test)]
+    pub(crate) fn undone_launches(&self) -> &[UndoneLaunch] {
+        &self.data.undone_launches
     }
     pub fn launch_action_utc_ms(&self) -> Option<i64> {
         self.analytics.action(&self.data.current)
@@ -1122,6 +1198,7 @@ impl Store {
         let launch_attempt = self.launch_locked();
         next.launch_attempt = Some(launch_attempt);
         next.automatic_actions_inhibited = launch_attempt;
+        self.launch_inhibit_serial += 1;
         self.last_write = writer.enqueue(next.clone())?;
         self.data = next;
         self.closed = false;
@@ -1181,6 +1258,7 @@ impl Store {
         // never recorded as a launch attempt.
         self.data.launch_attempt = Some(self.launch_locked());
         self.data.automatic_actions_inhibited = true;
+        self.launch_inhibit_serial += 1;
         if !self.closed {
             self.last_write = self.writer.as_ref().unwrap().enqueue(self.data.clone())?;
         }
@@ -1311,6 +1389,7 @@ impl Store {
         let launch_attempt = !expected.verified_startup_policy() && self.launch_locked();
         next.launch_attempt = Some(launch_attempt);
         next.automatic_actions_inhibited = launch_attempt;
+        self.launch_inhibit_serial += 1;
         let writer = self.writer.clone().context("Writer missing")?;
         let ticket = writer.enqueue(next.clone())?;
         self.data = next;
