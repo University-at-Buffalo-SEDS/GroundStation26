@@ -222,7 +222,7 @@ async fn suite() {
         checklist_id: "setup".into(),
         revision: approval.document.revision,
     };
-    access(|store| store.update(|doc| doc.sign(&request, "reviewer", 20))).unwrap();
+    mutate(|store| store.update(|doc| doc.sign(&request, "reviewer", 20))).unwrap();
     approval.publish().await.unwrap();
     assert!(
         approval

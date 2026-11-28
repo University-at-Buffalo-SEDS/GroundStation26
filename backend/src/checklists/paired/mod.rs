@@ -416,14 +416,14 @@ impl Service {
             .storage
             .next_revision(revision.max(self.document.revision))
             .await?;
-        let mut global = store().lock().map_err(|_| "Checklist store unavailable")?;
         let mut next = self.document.clone();
-        let store = global.as_mut().map_err(|error| error.clone())?;
-        next.preserve_signoffs(
-            &store.document,
-            crate::telemetry_task::get_current_timestamp_ms() as i64,
-        );
-        let saved = store.persist(next)?;
+        let saved = mutate(|store| {
+            next.preserve_signoffs(
+                &store.document,
+                crate::telemetry_task::get_current_timestamp_ms() as i64,
+            );
+            store.persist(next)
+        })?;
         self.document = saved.clone();
         Ok(saved)
     }
@@ -718,6 +718,8 @@ impl Service {
             {
                 return Ok(());
             }
+            // A writer's turn first (never waits on readers), then the store.
+            let _writer = writer().map_err(anyhow::Error::msg)?;
             let mut global = store()
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Checklist store unavailable"))?;
@@ -743,7 +745,7 @@ impl Service {
         }
         // Retiring old allocations and directory durability never hold GSE locks.
         drop(retired);
-        access(|store| store.persist(store.document.clone())).map_err(anyhow::Error::msg)?;
+        mutate(|store| store.persist(store.document.clone())).map_err(anyhow::Error::msg)?;
         self.finish_selection(&snapshot).await
     }
     async fn stage_template(&mut self, request: Document) -> Result<(), String> {
@@ -996,7 +998,7 @@ pub(super) async fn sign(request: &Sign, actor: &str, now: i64) -> Result<Docume
     if let Some(reason) = extra_launch_block() {
         return Err(reason);
     }
-    let document = access(|store| store.update(|doc| doc.sign(request, actor, now)))?;
+    let document = mutate(|store| store.update(|doc| doc.sign(request, actor, now)))?;
     service.document.signoffs = document.signoffs.clone();
     service.document.revision = document.revision;
     Ok(document)

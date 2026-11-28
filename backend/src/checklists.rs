@@ -441,6 +441,7 @@ fn serialize_document(document: &Document) -> Result<Vec<u8>, String> {
     serde_json::to_writer_pretty(&mut writer, document).map_err(|error| error.to_string())?;
     Ok(writer.0)
 }
+#[derive(Clone)]
 struct Store {
     path: PathBuf,
     document: Document,
@@ -493,6 +494,9 @@ impl Store {
             .ok_or("Checklist revision overflow")?;
         self.persist(next)
     }
+    /// Writes `next` durably (temporary file, fsync, rename, directory fsync)
+    /// and only then makes it this store's document. On failure the document
+    /// is unchanged, so `document` is always what the file holds.
     fn persist(&mut self, next: Document) -> Result<Document, String> {
         next.validate()?;
         let data = serialize_document(&next)?;
@@ -529,7 +533,27 @@ impl Store {
         Ok(next)
     }
 }
+// The station's checklist document.
+//
+// `STORE` holds the authoritative in-memory copy and is only ever locked for
+// in-memory work: readers (the Launch gate in `launch_block`, every
+// action-policy refresh, the Launch sends and the routes) never wait on disk.
+// Writers go through `mutate`, which serializes them on `WRITER` and performs
+// the durable write on a private copy with `STORE` released. Lock order:
+// (GSE runtime) -> `WRITER` -> `STORE`; nothing holding `WRITER` or `STORE`
+// takes the GSE runtime lock.
+//
+// What callers see:
+// - A write returns only after its document is durable (or with the write's
+//   error), exactly as before. A caller may therefore wait for its own (and an
+//   earlier queued) write, but never blocks readers while it does.
+// - The in-memory document changes only after the file holds it: readers
+//   during an in-flight write see the last durable document, never one that a
+//   failed write could still lose. A failed write leaves memory unchanged.
+// - Writes are applied one at a time, each to the newest durable document, so
+//   an older document can never overwrite a newer one on disk.
 static STORE: OnceLock<Mutex<Result<Store, String>>> = OnceLock::new();
+static WRITER: Mutex<()> = Mutex::new(());
 fn store() -> &'static Mutex<Result<Store, String>> {
     STORE.get_or_init(|| Mutex::new(Store::open(store_path())))
 }
@@ -566,13 +590,37 @@ fn default_store_path() -> PathBuf {
         .clone()
     }
 }
-fn access<T>(f: impl FnOnce(&mut Store) -> Result<T, String>) -> Result<T, String> {
-    let mut guard = store().lock().map_err(|_| "Checklist store unavailable")?;
-    match guard.as_mut() {
+/// Reads the in-memory document. Never waits on disk I/O: `STORE` is only held
+/// for in-memory work.
+fn access<T>(f: impl FnOnce(&Store) -> Result<T, String>) -> Result<T, String> {
+    let guard = store().lock().map_err(|_| "Checklist store unavailable")?;
+    match guard.as_ref() {
         Ok(store) => f(store),
         Err(error) => Err(error.clone()),
     }
 }
+/// Holds off other checklist writers (not readers) while a write is prepared,
+/// written and published.
+fn writer() -> Result<std::sync::MutexGuard<'static, ()>, String> {
+    WRITER.lock().map_err(|_| "Checklist store unavailable".into())
+}
+/// Runs a checklist write on a private copy of the store with `STORE`
+/// released, then publishes that copy. `Store::persist` changes the copy's
+/// document only once the file holds it, so the published document is always
+/// the durable one, also when `f` fails after (or before) writing.
+fn mutate<T>(f: impl FnOnce(&mut Store) -> Result<T, String>) -> Result<T, String> {
+    let _writer = writer()?;
+    let mut working = access(|store| Ok(store.clone()))?;
+    let result = f(&mut working);
+    let mut guard = store().lock().map_err(|_| "Checklist store unavailable")?;
+    if let Ok(store) = guard.as_mut() {
+        *store = working;
+    }
+    result
+}
+/// Why the checklists hold Launch. Never waits on disk I/O (see `STORE`): the
+/// command loop reaches it through the Launch sends and through the policy
+/// refresh that precedes queueing an Abort.
 pub fn launch_block() -> Option<String> {
     if !crate::runtime_mode::is_hitl()
         && let Some(reason) = paired::extra_launch_block()
@@ -585,7 +633,7 @@ pub fn launch_block() -> Option<String> {
 /// Called only after a successful, durably recorded sequence completion.
 /// It is deliberately event-driven: refreshing/restarting never rechecks a manually cleared item.
 pub(crate) fn sequence_completed(event: &CompletionEvent) -> Result<(), String> {
-    access(|store| store.record_sequence(event))
+    mutate(|store| store.record_sequence(event))
 }
 impl Store {
     fn record_sequence(&mut self, event: &CompletionEvent) -> Result<(), String> {
@@ -642,7 +690,7 @@ pub(crate) fn reset_sequence_completions() -> Result<(), String> {
     if paired::requested() {
         return Ok(());
     } // Explicit reset events are durable in local qualification.
-    access(|store| {
+    mutate(|store| {
         let mut next = store.document.clone();
         if next.clear_sequence_completions() {
             store.update(|document| {
@@ -696,7 +744,7 @@ async fn sign_list(
         }
         return response(result);
     }
-    let result = access(|store| {
+    let result = mutate(|store| {
         store.update(|document| {
             document.sign(
                 &request,
@@ -846,7 +894,7 @@ async fn check_item(
         }
         return response(result);
     }
-    let result = access(|s| {
+    let result = mutate(|s| {
         s.update(|doc| {
             doc.check(
                 &request,
@@ -875,7 +923,7 @@ async fn edit_lists(
         }
         return response(result);
     }
-    let result = access(|s| s.update(|doc| doc.edit(request)));
+    let result = mutate(|s| s.update(|doc| doc.edit(request)));
     if result.is_ok() {
         crate::sequences::refresh_action_policy_now(&state);
     }
@@ -1601,5 +1649,96 @@ mod workflow_event_tests {
             Some(CompletionSource::ManualOverride)
         );
         std::fs::remove_file(path).unwrap();
+    }
+    fn completion(id: &str) -> CompletionEvent {
+        CompletionEvent {
+            id: id.into(),
+            sequence: Sequence::NitrogenTest,
+            at_ms: 1,
+            action: CompletionAction::Passed,
+        }
+    }
+    fn on_disk() -> Option<Document> {
+        std::fs::read(store_path())
+            .ok()
+            .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+    }
+    /// Runs `work` on its own thread. Returning before the 30 s stall limit
+    /// while the disk is stalled proves it never waited for the stalled write;
+    /// no wall-clock budget a loaded host could overrun.
+    fn without_waiting<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(work());
+        });
+        result
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("waited behind the stalled checklist write")
+    }
+    /// A checklist write whose disk has stopped answering holds no reader: the
+    /// Launch gate and the action-policy refresh return, and still show the
+    /// last durable document. The writer's caller hears back only once its
+    /// write is durable, and a second write queued behind it lands on top of it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn readers_never_wait_for_a_slow_checklist_write() {
+        use crate::disk_stall::{Site, Stall};
+        if crate::operator_queue::isolated_native_case(module_path!(), "readers_never_wait_for_a_slow_checklist_write") {
+            return;
+        }
+        let state = crate::state::tests::test_app_state().await;
+        let before = access(|store| Ok(store.document.clone())).unwrap();
+        let stall = Stall::begin(Site::Checklists);
+        let (first_done, first) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = first_done.send(sequence_completed(&completion("first-write")));
+        });
+        assert!(tokio::task::block_in_place(|| stall.entered()), "the write never reached the disk");
+        // Readers go on, and see only what is durable.
+        let block = without_waiting(launch_block);
+        assert_eq!(block, before.launch_block());
+        let refreshed = state.clone();
+        without_waiting(move || {
+            let mut policy = refreshed.action_policy_snapshot();
+            policy.key_enabled = !policy.key_enabled;
+            refreshed.set_action_policy(policy);
+        });
+        assert_eq!(without_waiting(|| access(|store| Ok(store.document.clone()))).unwrap(), before);
+        // The writer's caller is still waiting: nothing is durable yet.
+        assert!(first.try_recv().is_err(), "the write reported before it was durable");
+        assert!(on_disk().is_none_or(|disk| !disk.completion_events.contains(&"first-write".into())));
+        // A second write waits its turn behind the first.
+        let (second_done, second) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = second_done.send(sequence_completed(&completion("second-write")));
+        });
+        drop(stall);
+        let timeout = std::time::Duration::from_secs(20);
+        assert_eq!(first.recv_timeout(timeout).unwrap(), Ok(()));
+        assert!(on_disk().unwrap().completion_events.contains(&"first-write".into()), "reported before durable");
+        assert_eq!(second.recv_timeout(timeout).unwrap(), Ok(()));
+        let disk = on_disk().unwrap();
+        let tail = &disk.completion_events[disk.completion_events.len() - 2..];
+        assert_eq!(tail, ["first-write".to_string(), "second-write".to_string()]);
+        assert_eq!(disk.revision, before.revision + 2, "each write builds on the one before");
+        assert_eq!(access(|store| Ok(store.document.clone())).unwrap(), disk);
+    }
+    /// A checklist write that fails reports its error and leaves the in-memory
+    /// document as it was: nothing the file does not hold is ever shown.
+    #[tokio::test]
+    async fn a_failed_checklist_write_changes_nothing_and_reports() {
+        if crate::operator_queue::isolated_native_case(module_path!(), "a_failed_checklist_write_changes_nothing_and_reports") {
+            return;
+        }
+        let before = access(|store| Ok(store.document.clone())).unwrap();
+        // The document cannot be renamed over a directory.
+        let path = store_path();
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(sequence_completed(&completion("refused-write")).is_err());
+        assert_eq!(access(|store| Ok(store.document.clone())).unwrap(), before);
+        std::fs::remove_dir(&path).unwrap();
+        sequence_completed(&completion("refused-write")).unwrap();
+        let after = access(|store| Ok(store.document.clone())).unwrap();
+        assert_eq!(after.revision, before.revision + 1);
+        assert_eq!(on_disk().unwrap(), after);
     }
 }
