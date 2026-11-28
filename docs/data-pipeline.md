@@ -300,12 +300,12 @@ above 15 V (`telemetry_task/derived.rs:4-5`).
 | `MESSAGE_DATA` / `ORDERED_MESSAGE` | string | event | `recovery_events`, `flight_maxima` | messages table |
 | `LAUNCH_SITE` | f32[3] | echo | `launch_site::observe_echo` | |
 
-FC evaluation abort (FlightComputer26 `docs/rud-abort.md`): the operator's
-`EvaluationAbort` (FC byte 16) stops the FC estimator in every flight phase,
-so no automatic drogue or main follows; manual `DeployParachute` and
-`ExpandParachute` still work. The station sends it only on an explicit
-press (it is also allowed while the station Abort is latched,
-`gse.rs` `abort_safe_control`). The FC raises the same stop by itself only
+FC evaluation abort (FlightComputer26 `docs/rud-abort.md`): it stops the FC
+estimator in every flight phase, so no automatic drogue or main follows;
+manual `DeployParachute` and `ExpandParachute` still work. The operator
+command for it (`EvaluationAbort`, FC byte 16) is retired: Reset all boards
+(the FC's reset to Startup) cancels the FC's evaluation instead, so nothing
+from a previous evaluation survives it. The FC raises the stop by itself only
 on a break-up between Launch and Apogee: the IMU tumbling (pitch/yaw rate of
 at least 360 deg/s) or loaded sideways (at least 5 g) on 22 of the last 25
 estimator steps, and at the same time the barometer altitude moving faster

@@ -1,27 +1,53 @@
-# Flight-computer test controls
+# Flight-computer operator commands
 
-HITL controls use FC's existing one-byte compatibility protocol. The recovery
-threshold buttons configure sensor-failure thresholds; they are not countdowns.
+The station sends the FC one-byte commands on its compatibility protocol
+(`FlightComputerCommands`, `backend/src/rocket_commands.rs`; the FC's
+`remote_cmd_compat` and `extmap`). The operator set is deliberately small.
 
-| Control | Wire byte |
-| --- | --- |
-| Abort threshold 40 | 23 |
-| Abort threshold 100 | 24 |
-| Abort threshold 250 | 25 |
-| Reinit threshold 15 | 26 |
-| Reinit threshold 30 | 27 |
-| Reinit threshold 50 | 28 |
+| Group | Control | Command | Wire byte | FC decree | Where |
+| --- | --- | --- | --- | --- | --- |
+| Sensors | Reinit Sensors | `ReinitSensors` | 17 | `Reinit_Sensors` | HITL layout; FC accepts in any flight state |
+| Sensors | Reinit Barometer | `ReinitBarometer` | 18 | `Reinit_Barometer` | HITL layout; any flight state |
+| Sensors | Reinit IMU | `ReinitIMU` (formerly `EnableIMU`) | 19 | `Reinit_IMU` | HITL layout; any flight state |
+| Sensors | Disable IMU | `DisableIMU` | 20 | `Disable_IMU` | HITL layout; any flight state |
+| Recovery | Deploy drogue | `DeployParachute` | 12 | `Deploy_Parachute` | HITL layout; manual, any flight state (unchanged) |
+| Recovery | Deploy main (reef release) | `ExpandParachute` | 13 | `Expand_Parachute` | HITL layout; manual, any flight state (unchanged) |
+| Logging | Retry FC SD | `FcSdRetry` | 33 | `SD_Retry` | every mode with an FC (below) |
+| Flight state | State +1 / State -1 | `AdvanceFlightState` / `RewindFlightState` | 21 / 22 | `Advance_State` / `Rewind_State` | HITL only (test fire steps the station's own state) |
+| Ground test | Enter / LIVE PYRO / Dry-run / Exit | `IgtEnter` .. `IgtExit` | 29..32 | `IGT_*` | integrated ground test mode (and HITL with the replay); below |
+| Sequence | none (no button) | `Postinit`, `Launch` | 0, 1 | `Postinit_Signal`, `Launch_Signal` | sent by the station's launch sequence |
 
-These values match `remote_cmd_compat` and `extmap` in FlightComputer26.
-Earlier GroundStation layouts exposed unsupported 15/70 abort and 12/26/44
-reinit labels; five requests were accepted but never dispatched. The shipped
-layout and backend now use the actual FC values. No FC firmware change or
-new command IDs are required.
+Reset all boards (board recovery op 3, `RESET_STARTUP_ANY`) returns the FC to
+Startup from any state. That reset also cancels the FC's evaluation (what the
+retired Evaluation Abort did): the estimator is stopped and its flight memory
+(filter history, extremes, plausibility verdicts, break-up detector, drogue
+timer, sensor-failure counts and thresholds) returns to its boot values, so
+nothing from a previous evaluation survives into the next flight. The station
+sends no separate FC command for it.
 
-Custom layouts and per-command account grants using those old request names
-must be reviewed in the admin/configuration tools. They are not automatically
-converted to different thresholds or granted permission to the replacement
-commands. Existing deployment, launch and HITL interlock behavior is unchanged.
+While the operator Abort is latched the station sends the FC no command at
+all (`gse.rs` `abort_safe_control`) until Reset all clears it.
+
+## Retired bytes
+
+These bytes are reserved and never reused. The FC refuses them (acknowledged,
+never executed) and keeps its compiled defaults:
+
+| Bytes | Retired command | FC default kept |
+| --- | --- | --- |
+| 2 / 3 | MonitorAltitude / Revoke (`Vigilant_Mode`) | on (the FC also sets it itself on a GPS fallback) |
+| 4 / 5 | ConsecutiveSamples / Revoke (`Eval_Successive`) | off |
+| 6 / 7 | ResetFailures / Revoke (`Reset_Failures`) | on (the FC also sets it on ground-station loss) |
+| 8 / 9 | ValidateMeasms / Revoke (`Measm_Reports`) | on (the FC also sets it on a GPS fallback) |
+| 10 / 11 | velocity checks / Revoke (`Velocity_Checks`, never sent by the GS) | on |
+| 14 / 15 | EvaluationRelax / EvaluationFocus | - |
+| 16 | EvaluationAbort | replaced by the reset's evaluation cancel |
+| 23..25 | AbortAfter40 / 100 / 250 (`Abortion_Thresholds`) | `TO_ABORT` 120 failures |
+| 26..28 | ReinitAfter15 / 30 / 50 (`Reinit_Thresholds`) | `TO_REINIT` 40 failures |
+
+Custom layouts and per-command account grants that name a retired command no
+longer match any control; an account grant of `EnableIMU` is read as
+`ReinitIMU`.
 
 Tests cover every visible flight command's payload and discovered destination
 using captured packets only. They do not trigger hardware outputs.

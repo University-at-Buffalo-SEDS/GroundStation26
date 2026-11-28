@@ -46,10 +46,12 @@ async fn hitl_deploy_after_an_operator_abort_is_refused_with_its_reason() {
         assert!(rx.try_recv().is_err(), "{cmd:?} must not be queued only to be dropped");
         assert!(state.notifications_snapshot().iter().any(|n| n.message == body), "refusal is shown: {body}");
     }
-    // EvaluationAbort is abort-safe: the fence passes it, so it is still admitted.
-    let (status, body) = press(&state, TelemetryCommand::EvaluationAbort).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(rx.try_recv().is_ok());
+    // No flight-computer command is abort-safe any more (the Evaluation
+    // Abort that was is retired): a sensor re-init is refused the same way.
+    let (status, body) = press(&state, TelemetryCommand::ReinitSensors).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("Abort"), "{body}");
+    assert!(rx.try_recv().is_err());
     // Without a latched Abort a Deploy is admitted as before.
     state.set_abort_indicator_latched(false);
     let (status, body) = press(&state, TelemetryCommand::DeployParachute).await;

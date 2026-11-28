@@ -20,7 +20,7 @@ def main():
  with tempfile.TemporaryDirectory(prefix='paired-station-test-') as temporary:
   root=Path(temporary);origins={s:f'http://127.0.0.1:{port()}' for s in ['primary','rrls']};pair.provision(root/'pair',origins['primary'],origins['rrls'])
   salt=os.urandom(16);verifier=hashlib.pbkdf2_hmac('sha256',b'test-only-password',salt,120000)
-  user={'username':'operator','password':{'algorithm':'pbkdf2_sha256','iterations':120000,'salt_b64':base64.b64encode(salt).decode(),'hash_b64':base64.b64encode(verifier).decode()},'roles':[],'permissions':{'view_data':True,'send_commands':True},'command_access':{'allowed_commands':['EnableIMU']},'calibration_access':{'view':True,'edit':False}}
+  user={'username':'operator','password':{'algorithm':'pbkdf2_sha256','iterations':120000,'salt_b64':base64.b64encode(salt).decode(),'hash_b64':base64.b64encode(verifier).decode()},'roles':[],'permissions':{'view_data':True,'send_commands':True},'command_access':{'allowed_commands':['ReinitIMU']},'calibration_access':{'view':True,'edit':False}}
   processes=[];logs=[];contexts=[]
   try:
    for station in origins:
@@ -47,7 +47,7 @@ def main():
    code,login=request(origins['primary'],'/api/auth/login',{'username':'operator','challenge_id':c['challenge_id'],'client_nonce_b64':client_nonce,'remember_me':True,'proof_b64':proof});assert code==200
    token=login['token'];assert token.startswith('paired1.')
    for station in origins:
-    code,status=request(origins[station],'/api/auth/session',token=token);assert code==200 and status['authenticated'] and status['username']=='operator';assert status['allowed_commands']==['EnableIMU'];assert not status['can_edit_calibration']
+    code,status=request(origins[station],'/api/auth/session',token=token);assert code==200 and status['authenticated'] and status['username']=='operator';assert status['allowed_commands']==['ReinitIMU'];assert not status['can_edit_calibration']
    def restart(index):
     processes[index].terminate();processes[index].wait(timeout=10)
     directory,env,log=contexts[index]
@@ -62,7 +62,7 @@ def main():
      time.sleep(.1)
    assert restart(0)['authenticated'] and restart(1)['authenticated'],'paired login must survive service restarts'
    target=root/'rrls/users.json';account=json.loads(target.read_text());account['users'][0]['roles']=['admin'];target.write_text(json.dumps(account))
-   code,status=request(origins['rrls'],'/api/auth/session',token=token);assert code==200;assert 'admin' not in status['roles'];assert status['allowed_commands']==['EnableIMU'];assert not status['can_edit_calibration']
+   code,status=request(origins['rrls'],'/api/auth/session',token=token);assert code==200;assert 'admin' not in status['roles'];assert status['allowed_commands']==['ReinitIMU'];assert not status['can_edit_calibration']
    account['users'][0]['roles']=[];account['users'][0]['command_access']={'allowed_commands':['OtherCommand']};target.write_text(json.dumps(account))
    code,status=request(origins['rrls'],'/api/auth/session',token=token);assert code==200 and status['allowed_commands']==['__no_paired_commands__'],'disjoint grants must not become unrestricted'
    account['users'][0]['disabled']=True;target.write_text(json.dumps(account));assert not request(origins['rrls'],'/api/auth/session',token=token)[1]['authenticated']

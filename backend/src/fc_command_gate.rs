@@ -27,14 +27,11 @@ const REASONS: [(u32, &str); 5] = [
 ];
 /// Word 6 bit 28: the FC's watchdog inhibit (FlightComputer26 fc_recovery_watchdog_inhibited).
 const WATCHDOG_INHIBIT: u32 = 16;
-/// Flight commands the FC refuses while it holds its sequence. Deploy, Expand and
-/// EvaluationAbort pass that hold (FC recovery.c fc_recovery_command_admissible).
-const HELD_COMMANDS: [&str; 23] = [
-    "Postinit", "Launch", "GroundStationLaunch", "MonitorAltitude", "RevokeMonitorAltitude", "ConsecutiveSamples",
-    "RevokeConsecutiveSamples", "ResetFailures", "RevokeResetFailures", "ValidateMeasms", "RevokeValidateMeasms",
-    "ReinitSensors", "ReinitBarometer", "EnableIMU", "DisableIMU",
-    "AdvanceFlightState", "RewindFlightState", "AbortAfter40", "AbortAfter100", "AbortAfter250", "ReinitAfter15",
-    "ReinitAfter30", "ReinitAfter50",
+/// Flight commands the FC refuses while it holds its sequence. Only Deploy and
+/// Expand pass that hold (FC control_thread.c fc_recovery_command_admissible).
+const HELD_COMMANDS: [&str; 9] = [
+    "Postinit", "Launch", "GroundStationLaunch", "ReinitSensors", "ReinitBarometer", "ReinitIMU",
+    "DisableIMU", "AdvanceFlightState", "RewindFlightState",
 ];
 /// A report older than this no longer describes the FC (reports every 5 s).
 const REPORT_FRESH: Duration = Duration::from_secs(12);
@@ -200,7 +197,7 @@ mod tests {
     }
 
     /// FC watchdog reset with no resumable record (word 6 bit 28): every ordinary flight command is refused
-    /// inline with the reason; Deploy, Expand and EvaluationAbort, which the FC still admits, stay available.
+    /// inline with the reason; Deploy and Expand, which the FC still admits, stay available.
     #[tokio::test]
     async fn a_watchdog_inhibited_fc_refuses_flight_commands_inline() {
         let state = crate::state::tests::test_app_state().await;
@@ -212,8 +209,8 @@ mod tests {
         let mut policy = state.action_policy.lock().unwrap().clone();
         block_policy(&state, &mut policy);
         let control = |cmd: &str| policy.controls.iter().find(|c| c.cmd == cmd).cloned();
-        assert!(control("MonitorAltitude").is_some(), "MonitorAltitude control missing");
-        for cmd in ["MonitorAltitude", "ReinitSensors", "EnableIMU", "Postinit"] {
+        assert!(control("Postinit").is_some(), "Postinit control missing");
+        for cmd in ["Postinit", "ReinitSensors", "ReinitIMU", "DisableIMU"] {
             let Some(c) = control(cmd) else { continue };
             assert!(!c.enabled, "{cmd}");
             assert!(c.disabled_reason.unwrap_or_default().contains("power cycle"), "{cmd}");

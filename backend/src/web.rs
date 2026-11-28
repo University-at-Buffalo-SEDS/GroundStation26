@@ -3042,7 +3042,7 @@ fn abort_fence_block(state: &AppState, cmd: &TelemetryCommand) -> Option<String>
         return None;
     }
     Some(format!(
-        "{} refused: the operator Abort is latched, and the station sends no flight-computer command except Evaluation Abort until Reset all clears it",
+        "{} refused: the operator Abort is latched, and the station sends no flight-computer command until Reset all clears it",
         command_name(cmd)
     ))
 }

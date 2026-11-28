@@ -236,7 +236,7 @@
         "group": "Flight controls"
       },
       {
-        "label": "Deploy Parachute",
+        "label": "Deploy drogue",
         "cmd": "DeployParachute",
         "border": "#38bdf8",
         "bg": "#0b1220",
@@ -244,7 +244,7 @@
         "group": "Flight controls"
       },
       {
-        "label": "Expand Parachute",
+        "label": "Deploy main (reef release)",
         "cmd": "ExpandParachute",
         "border": "#38bdf8",
         "bg": "#0b1220",
@@ -260,14 +260,6 @@
         "group": "Flight controls"
       },
       {
-        "label": "Evaluation Abort",
-        "cmd": "EvaluationAbort",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe",
-        "group": "Flight controls"
-      },
-      {
         "label": "Reinit Barometer",
         "cmd": "ReinitBarometer",
         "border": "#38bdf8",
@@ -276,8 +268,8 @@
         "group": "Flight controls"
       },
       {
-        "label": "Enable IMU",
-        "cmd": "EnableIMU",
+        "label": "Reinit IMU",
+        "cmd": "ReinitIMU",
         "border": "#38bdf8",
         "bg": "#0b1220",
         "fg": "#e0f2fe",
@@ -286,118 +278,6 @@
       {
         "label": "Disable IMU",
         "cmd": "DisableIMU",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe",
-        "group": "Flight controls"
-      },
-      {
-        "label": "Monitor Altitude",
-        "cmd": "MonitorAltitude",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe",
-        "group": "Flight controls"
-      },
-      {
-        "label": "Revoke Monitor Alt",
-        "cmd": "RevokeMonitorAltitude",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe",
-        "group": "Flight controls"
-      },
-      {
-        "label": "Consecutive Samples",
-        "cmd": "ConsecutiveSamples",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe",
-        "group": "Flight controls"
-      },
-      {
-        "label": "Revoke Consecutive",
-        "cmd": "RevokeConsecutiveSamples",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe",
-        "group": "Flight controls"
-      },
-      {
-        "label": "Reset Failures",
-        "cmd": "ResetFailures",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe",
-        "group": "Flight controls"
-      },
-      {
-        "label": "Revoke Reset Fail",
-        "cmd": "RevokeResetFailures",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe",
-        "group": "Flight controls"
-      },
-      {
-        "label": "Validate Measms",
-        "cmd": "ValidateMeasms",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe",
-        "group": "Flight controls"
-      },
-      {
-        "label": "Revoke Validate",
-        "cmd": "RevokeValidateMeasms",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe",
-        "group": "Flight controls"
-      },
-      {
-        "label": "Abort threshold 100",
-        "cmd": "AbortAfter100",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe",
-        "group": "Flight controls"
-      },
-      {
-        "label": "Abort threshold 40",
-        "cmd": "AbortAfter40",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe",
-        "group": "Flight controls"
-      },
-      {
-        "label": "Abort threshold 250",
-        "cmd": "AbortAfter250",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe",
-        "group": "Flight controls"
-      },
-      {
-        "label": "Reinit threshold 15",
-        "cmd": "ReinitAfter15",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe",
-        "group": "Flight controls"
-      },
-      {
-        "label": "Reinit threshold 30",
-        "cmd": "ReinitAfter30",
-        "border": "#38bdf8",
-        "bg": "#0b1220",
-        "fg": "#e0f2fe",
-        "group": "Flight controls"
-      },
-      {
-        "label": "Reinit threshold 50",
-        "cmd": "ReinitAfter50",
         "border": "#38bdf8",
         "bg": "#0b1220",
         "fg": "#e0f2fe",

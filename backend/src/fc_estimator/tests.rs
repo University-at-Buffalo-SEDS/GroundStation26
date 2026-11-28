@@ -157,10 +157,10 @@ fn stopped_or_diverged_after_launch_warns_once_each() {
     let status = tracker.status(t + Duration::from_secs(11));
     assert_eq!((status.state, status.label.as_str()), ("faulted", "FC estimator: faulted (diverged)"));
     assert!(status.warning.unwrap().starts_with("FC flight estimator diverged:"));
-    // Evaluation Abort: stopped, then the sensor restart's Launch runs it again.
+    // A break-up abort: stopped, then the sensor restart's Launch runs it again.
     let notices = tracker.observe(&health(5, 560, 1_001, 13_201), t + Duration::from_secs(12), None, FLIGHT);
     assert_eq!(warnings(&notices), vec![
-        "FC flight estimator stopped: the FC's Kalman filter is no longer running (Evaluation Abort or a sensor restart)."
+        "FC flight estimator stopped: the FC's Kalman filter is no longer running (a break-up abort or a sensor restart)."
     ]);
     let notices = tracker.observe(&health(2, 570, 13_501, 13_701), t + Duration::from_secs(13), None, FLIGHT);
     assert_eq!(infos(&notices), vec!["FC flight estimator running (Kalman filter started at T+12.8 s)"]);

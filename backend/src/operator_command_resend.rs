@@ -469,9 +469,7 @@ pub(crate) fn verdict(c: &Context) -> Verdict {
 fn command_for(byte: u8) -> Option<TelemetryCommand> {
     use TelemetryCommand::*;
     [
-        DeployParachute, ExpandParachute, EvaluationAbort, ReinitSensors,
-        ReinitBarometer, EnableIMU, DisableIMU, AbortAfter40, AbortAfter100, AbortAfter250, ReinitAfter15,
-        ReinitAfter30, ReinitAfter50,
+        DeployParachute, ExpandParachute, ReinitSensors, ReinitBarometer, ReinitIMU, DisableIMU,
     ]
     .into_iter()
     .find(|cmd| crate::telemetry_task::hitl_flight_command_id(cmd) == Some(byte))

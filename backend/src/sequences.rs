@@ -1106,14 +1106,6 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         TelemetryCommand::ValveSelfTest => "ValveSelfTest",
         TelemetryCommand::NitrogenTest => "NitrogenTest",
         TelemetryCommand::Turbocharge => "Turbocharge",
-        TelemetryCommand::MonitorAltitude => "MonitorAltitude",
-        TelemetryCommand::RevokeMonitorAltitude => "RevokeMonitorAltitude",
-        TelemetryCommand::ConsecutiveSamples => "ConsecutiveSamples",
-        TelemetryCommand::RevokeConsecutiveSamples => "RevokeConsecutiveSamples",
-        TelemetryCommand::ResetFailures => "ResetFailures",
-        TelemetryCommand::RevokeResetFailures => "RevokeResetFailures",
-        TelemetryCommand::ValidateMeasms => "ValidateMeasms",
-        TelemetryCommand::RevokeValidateMeasms => "RevokeValidateMeasms",
         TelemetryCommand::GroundStationLaunch => "GroundStationLaunch",
         TelemetryCommand::ToggleButtonInterlock => "ToggleButtonInterlock",
         TelemetryCommand::ToggleGroundStationControl => "ToggleGroundStationControl",
@@ -1130,19 +1122,12 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         TelemetryCommand::ResetTClock => "ResetTClock",
         TelemetryCommand::DeployParachute => "DeployParachute",
         TelemetryCommand::ExpandParachute => "ExpandParachute",
-        TelemetryCommand::EvaluationAbort => "EvaluationAbort",
         TelemetryCommand::ReinitSensors => "ReinitSensors",
         TelemetryCommand::ReinitBarometer => "ReinitBarometer",
-        TelemetryCommand::EnableIMU => "EnableIMU",
+        TelemetryCommand::ReinitIMU => "ReinitIMU",
         TelemetryCommand::DisableIMU => "DisableIMU",
         TelemetryCommand::AdvanceFlightState => "AdvanceFlightState",
         TelemetryCommand::RewindFlightState => "RewindFlightState",
-        TelemetryCommand::AbortAfter100 => "AbortAfter100",
-        TelemetryCommand::AbortAfter40 => "AbortAfter40",
-        TelemetryCommand::AbortAfter250 => "AbortAfter250",
-        TelemetryCommand::ReinitAfter15 => "ReinitAfter15",
-        TelemetryCommand::ReinitAfter30 => "ReinitAfter30",
-        TelemetryCommand::ReinitAfter50 => "ReinitAfter50",
         TelemetryCommand::IgtEnter => "IgtEnter",
         TelemetryCommand::IgtLivePyro => "IgtLivePyro",
         TelemetryCommand::IgtDryRun => "IgtDryRun",
@@ -1194,14 +1179,6 @@ fn all_command_names_default() -> Vec<&'static str> {
         "ContinueFillSequence",
         "Postinit",
         "Launch",
-        "MonitorAltitude",
-        "RevokeMonitorAltitude",
-        "ConsecutiveSamples",
-        "RevokeConsecutiveSamples",
-        "ResetFailures",
-        "RevokeResetFailures",
-        "ValidateMeasms",
-        "RevokeValidateMeasms",
         "FcSdRetry",
     ];
     if crate::flight_sim::sim_mode_enabled() {
@@ -1224,14 +1201,6 @@ fn all_command_names_hitl() -> Vec<&'static str> {
         "ContinueFillSequence",
         "Postinit",
         "Launch",
-        "MonitorAltitude",
-        "RevokeMonitorAltitude",
-        "ConsecutiveSamples",
-        "RevokeConsecutiveSamples",
-        "ResetFailures",
-        "RevokeResetFailures",
-        "ValidateMeasms",
-        "RevokeValidateMeasms",
         "GroundStationLaunch",
         "ToggleButtonInterlock",
         "ToggleGroundStationControl",
@@ -1248,19 +1217,12 @@ fn all_command_names_hitl() -> Vec<&'static str> {
         "ResetTClock",
         "DeployParachute",
         "ExpandParachute",
-        "EvaluationAbort",
         "ReinitSensors",
         "ReinitBarometer",
-        "EnableIMU",
+        "ReinitIMU",
         "DisableIMU",
         "AdvanceFlightState",
         "RewindFlightState",
-        "AbortAfter100",
-        "AbortAfter40",
-        "AbortAfter250",
-        "ReinitAfter15",
-        "ReinitAfter30",
-        "ReinitAfter50",
         "FcSdRetry",
         // The Ground test controls, refused unless the HITL replay is on.
         "IgtEnter",
@@ -1287,14 +1249,6 @@ fn all_command_names_test_fire() -> Vec<&'static str> {
         "Postinit",
         "Launch",
         "GroundStationLaunch",
-        "MonitorAltitude",
-        "RevokeMonitorAltitude",
-        "ConsecutiveSamples",
-        "RevokeConsecutiveSamples",
-        "ResetFailures",
-        "RevokeResetFailures",
-        "ValidateMeasms",
-        "RevokeValidateMeasms",
         "AdvanceFlightState",
         "RewindFlightState",
     ]
@@ -1326,7 +1280,7 @@ pub enum ControlSection {
     FillSystem,
     /// Fill, test and cold-flow sequences, ignition, Launch and the T-clock.
     Sequences,
-    /// FC setup, flight-state stepping, pyro and evaluation thresholds.
+    /// FC setup, sensors, flight-state stepping, recovery pyro and SD retry.
     FlightComputer,
     /// AV-bay network outputs (underglow, buzzer).
     AvBay,
@@ -1348,12 +1302,8 @@ pub(crate) fn control_section(cmd: &str) -> Option<ControlSection> {
             Sequences
         }
         "Postinit" | "AdvanceFlightState" | "RewindFlightState" | "DeployParachute"
-        | "ExpandParachute" | "EvaluationAbort"
-        | "ReinitSensors" | "ReinitBarometer" | "EnableIMU" | "DisableIMU" | "MonitorAltitude"
-        | "RevokeMonitorAltitude" | "ConsecutiveSamples" | "RevokeConsecutiveSamples"
-        | "ResetFailures" | "RevokeResetFailures" | "ValidateMeasms" | "RevokeValidateMeasms"
-        | "AbortAfter100" | "AbortAfter40" | "AbortAfter250" | "ReinitAfter15"
-        | "ReinitAfter30" | "ReinitAfter50" | "FcSdRetry" => FlightComputer,
+        | "ExpandParachute" | "ReinitSensors" | "ReinitBarometer" | "ReinitIMU" | "DisableIMU"
+        | "FcSdRetry" => FlightComputer,
         "ToggleAvBayUnderglow" | "ToggleFlightBuzzer" => AvBay,
         "IgtEnter" | "IgtLivePyro" | "IgtDryRun" | "IgtExit" => GroundTest,
         // RecoverStation is an HTTP action (board_recovery::coordinator::station_recover),

@@ -37,23 +37,15 @@ RADIO_AIR_FRAME_OVERHEAD_BYTES = int(os.environ.get("GS_RADIO_AIR_FRAME_OVERHEAD
 RADIO_TX_COOLDOWN_S = float(os.environ.get("GS_RADIO_TX_COOLDOWN_MS", "25")) / 1000.0
 FLIGHT_COMMANDS = {
     "Launch": 1,
-    "MonitorAltitude": 2,
-    "RevokeMonitorAltitude": 3,
-    "ConsecutiveSamples": 4,
-    "RevokeConsecutiveSamples": 5,
-    "ResetFailures": 6,
-    "RevokeResetFailures": 7,
-    "ValidateMeasms": 8,
-    "RevokeValidateMeasms": 9,
+    # 2..11, 14..16 and 23..28 are retired (runtime options, EvaluationRelax/
+    # Focus, EvaluationAbort, failure thresholds); the FC refuses them.
     "DeployParachute": 12,
     "ExpandParachute": 13,
-    # 14 and 15 (EvaluationRelax/Focus) are retired; the FC refuses them.
-    "EvaluationAbort": 16,
     "ReinitSensors": 17,
     "ReinitBarometer": 18,
-    "EnableIMU": 19,
+    "ReinitIMU": 19,
     "DisableIMU": 20,
-    "AbortAfter40": 23,
+    "FcSdRetry": 33,
 }
 
 
@@ -1097,7 +1089,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-yield", action="store_true")
     parser.add_argument("--once", action="store_true", help="Run one scripted send instead of the TUI.")
     parser.add_argument("--kind", choices=("heartbeat", "flight-command"), default="heartbeat")
-    parser.add_argument("--flight-command", choices=sorted(FLIGHT_COMMANDS), default="MonitorAltitude")
+    parser.add_argument("--flight-command", choices=sorted(FLIGHT_COMMANDS), default="FcSdRetry")
     parser.add_argument("--packet-hex", help="Serialized SEDS packet hex for --once mode.")
     parser.add_argument("--count", type=int, default=1)
     parser.add_argument("--duration", type=float, default=15.0)

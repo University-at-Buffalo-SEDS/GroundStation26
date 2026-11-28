@@ -118,7 +118,7 @@ async fn run_case(settle_before_launch: bool, hold_retry: bool) -> bool {
         "version":1,"anonymous":{"view_data":true,"send_commands":false},
         "users":[{"username":"eval-operator","password":{"iterations":120000,"salt_b64":"","hash_b64":""},
         "permissions":{"view_data":true,"send_commands":true},
-        "command_access":{"allowed_commands":["EvaluationAbort","Launch"]}}]
+        "command_access":{"allowed_commands":["ReinitSensors","Launch"]}}]
     }).to_string()).unwrap();
     let journal = root.0.join("launch-journal.json");
     {
@@ -253,9 +253,9 @@ async fn run_case(settle_before_launch: bool, hold_retry: bool) -> bool {
                             .to_vec(),
                         });
                     }
-                    if packet.data_type() == fc_type && packet.payload() == [16] {
+                    if packet.data_type() == fc_type && packet.payload() == [17] {
                         if mode.load(Ordering::SeqCst) == 0 {
-                            return Err(sedsnet::TelemetryError::Io("diagnostic FC16 refused"));
+                            return Err(sedsnet::TelemetryError::Io("diagnostic FC17 refused"));
                         }
                         if mode.load(Ordering::SeqCst) == 1 {
                             entered.store(true, Ordering::SeqCst);
@@ -288,7 +288,7 @@ async fn run_case(settle_before_launch: bool, hold_retry: bool) -> bool {
     //Use the current supported HITL state/interlocks. This is not FC ready evidence.
     *state.state.lock().unwrap() = FlightState::Armed;
     state.set_action_policy(default_action_policy());
-    assert!(state.is_command_allowed(&TelemetryCommand::EvaluationAbort));
+    assert!(state.is_command_allowed(&TelemetryCommand::ReinitSensors));
     assert!(state.is_command_allowed(&TelemetryCommand::Launch));
     assert!(
         !state
@@ -311,14 +311,14 @@ async fn run_case(settle_before_launch: bool, hold_retry: bool) -> bool {
         .await
     });
     assert_eq!(
-        public_command(state.clone(), "EvaluationAbort").await,
+        public_command(state.clone(), "ReinitSensors").await,
         StatusCode::OK
     );
-    wait_until("actual SDK retained FC16 owner", || {
+    wait_until("actual SDK retained FC17 owner", || {
         let controls = wire_controls.lock().unwrap();
         controls.iter().any(|row| {
             row.ty == fc_type.as_u32()
-                && row.payload == [16]
+                && row.payload == [17]
                 && host
                     .export_reliable_pending_stats()
                     .iter()
@@ -330,7 +330,7 @@ async fn run_case(settle_before_launch: bool, hold_retry: bool) -> bool {
         .lock()
         .unwrap()
         .iter()
-        .find(|row| row.ty == fc_type.as_u32() && row.payload == [16])
+        .find(|row| row.ty == fc_type.as_u32() && row.payload == [17])
         .unwrap()
         .clone();
     let fc_owner = sedsnet::packet::hash_bytes_u64(0x517C_C1B7_2722_0A95, b"FC");
@@ -372,7 +372,7 @@ async fn run_case(settle_before_launch: bool, hold_retry: bool) -> bool {
             let _ = held.periodic(0);
             let _ = held.process_all_queues_with_timeout(0);
         });
-        wait_until("actual SDK held FC16 retry callback", || {
+        wait_until("actual SDK held FC17 retry callback", || {
             entered.load(Ordering::SeqCst)
         })
         .await;
@@ -432,13 +432,13 @@ async fn run_case(settle_before_launch: bool, hold_retry: bool) -> bool {
             snapshot.iter().any(|row| row.packet_id == stop.id
                 && row.data_type == fc_type
                 && row.pending_destinations == vec![fc_owner]),
-            "exact unretired FC16 owner must still exist at launch decision"
+            "exact unretired FC17 owner must still exist at launch decision"
         );
     }
     if !settle_before_launch {
         assert!(
             !admitted,
-            "pending FC16 must deny before journal inhibition"
+            "pending FC17 must deny before journal inhibition"
         );
         assert_ne!(journal_json["automatic_actions_inhibited"], true);
         assert!(
@@ -453,7 +453,7 @@ async fn run_case(settle_before_launch: bool, hold_retry: bool) -> bool {
                 .iter()
                 .any(|row| (row.ty == fc_type.as_u32() && row.payload == [1])
                     || (row.ty == valve_type.as_u32() && row.payload == [6])),
-            "no launch wire may precede FC16 receipt"
+            "no launch wire may precede FC17 receipt"
         );
     }
     let delivered_at_decision = delivered.lock().unwrap().clone();
@@ -464,7 +464,7 @@ async fn run_case(settle_before_launch: bool, hold_retry: bool) -> bool {
     }
 
     eprintln!(
-        "EVAL16_LAUNCH_CAUSAL: settled={settle_before_launch} held_retry={hold_retry} fc16={stop:?} owners_before={before:?} http={response} admitted={admitted} journal={journal_json} owners_at_decision={snapshot:?} wire_at_decision={controls_at_decision:?}"
+        "FC17_LAUNCH_CAUSAL: settled={settle_before_launch} held_retry={hold_retry} fc17={stop:?} owners_before={before:?} http={response} admitted={admitted} journal={journal_json} owners_at_decision={snapshot:?} wire_at_decision={controls_at_decision:?}"
     );
     mode.store(2, Ordering::SeqCst);
     {
@@ -488,7 +488,7 @@ async fn run_case(settle_before_launch: bool, hold_retry: bool) -> bool {
         // turn after the foreground pump. Let that worker and its exact ACK
         // finish at the SAME virtual time, under the existing bounded wait.
         // No retry deadline or launch-admission assertion is relaxed here.
-        wait_until("exact FC16 receipt after retry", || {
+        wait_until("exact FC17 receipt after retry", || {
             let _ = host.process_all_queues_with_timeout(0);
             for peer in &peers {
                 peer.process_all_queues_with_timeout(0).unwrap();
@@ -499,7 +499,7 @@ async fn run_case(settle_before_launch: bool, hold_retry: bool) -> bool {
             host.export_reliable_pending_stats()
                 .iter()
                 .all(|row| row.packet_id != stop.id),
-            "retry requires exact FC16 owner retired by receipt"
+            "retry requires exact FC17 owner retired by receipt"
         );
         assert_eq!(
             delivered
@@ -509,7 +509,7 @@ async fn run_case(settle_before_launch: bool, hold_retry: bool) -> bool {
                 .filter(|row| row.id == stop.id)
                 .count(),
             1,
-            "actual SDK peer must accept FC16 exactly once"
+            "actual SDK peer must accept FC17 exactly once"
         );
         eprintln!(
             "EVAL16_RETRY_QUIESCENCE_BEFORE: fc_pending={} counters={:?} owners={:?} state={:?} clock={:?} allowed={} notifications={:?}",
@@ -522,7 +522,7 @@ async fn run_case(settle_before_launch: bool, hold_retry: bool) -> bool {
             state.notifications_snapshot()
         );
         wait_until(
-            "exact FC16 accepted type fully quiescent after receipt",
+            "exact FC17 accepted type fully quiescent after receipt",
             || !host.has_pending_reliable_tx_type(fc_type),
         )
         .await;
@@ -532,7 +532,7 @@ async fn run_case(settle_before_launch: bool, hold_retry: bool) -> bool {
             host.queue_counters()
         );
         // Explicit new operator retry follows a fresh real readiness check;
-        // no queries run inside the held-FC16 admission decision above.
+        // no queries run inside the held-FC17 admission decision above.
         warm_eval_ignition_pair(&state, &host, &peers, &readiness_peers).await;
         let retry_start = std::time::Instant::now();
         let mut public_duplicates = 0usize;
@@ -577,9 +577,9 @@ async fn run_case(settle_before_launch: bool, hold_retry: bool) -> bool {
         }
         assert!(
             retry_result.is_ok(),
-            "fresh retry must be admitted after exact FC16 receipt and accepted-type quiescence"
+            "fresh retry must be admitted after exact FC17 receipt and accepted-type quiescence"
         );
-        wait_until("fresh retry admitted after exact FC16 receipt", || {
+        wait_until("fresh retry admitted after exact FC17 receipt", || {
             state
                 .launch_history
                 .lock()
@@ -674,7 +674,7 @@ async fn run_case(settle_before_launch: bool, hold_retry: bool) -> bool {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn eval_abort_retained_owner_must_block_public_fresh_launch() {
+async fn fc_command_retained_owner_must_block_public_fresh_launch() {
     // A non-HITL test inside the HITL-only module: no build compiled it
     // before modes moved to run time, so no mode runs it.
     if !crate::runtime_mode::test_support::suite(&[]) {
@@ -682,12 +682,12 @@ async fn eval_abort_retained_owner_must_block_public_fresh_launch() {
     }
     assert!(
         !run_case(false, false).await,
-        "retained exact FC16 owner did not block public Launch journal admission"
+        "retained exact FC17 owner did not block public Launch journal admission"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn eval_abort_held_retry_must_block_public_fresh_launch() {
+async fn fc_command_held_retry_must_block_public_fresh_launch() {
     // A non-HITL test inside the HITL-only module: no build compiled it
     // before modes moved to run time, so no mode runs it.
     if !crate::runtime_mode::test_support::suite(&[]) {
@@ -695,12 +695,12 @@ async fn eval_abort_held_retry_must_block_public_fresh_launch() {
     }
     assert!(
         !run_case(false, true).await,
-        "held exact FC16 retry did not block public Launch journal admission"
+        "held exact FC17 retry did not block public Launch journal admission"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn eval_abort_settled_owner_public_fresh_launch_control() {
+async fn fc_command_settled_owner_public_fresh_launch_control() {
     crate::mode_suite!(Hitl);
     assert!(run_case(true, false).await);
 }

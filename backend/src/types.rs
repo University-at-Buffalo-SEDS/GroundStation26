@@ -25,14 +25,6 @@ pub enum TelemetryCommand {
     NitrousClose,
     ResetSim,
     ContinueFillSequence,
-    MonitorAltitude,
-    RevokeMonitorAltitude,
-    ConsecutiveSamples,
-    RevokeConsecutiveSamples,
-    ResetFailures,
-    RevokeResetFailures,
-    ValidateMeasms,
-    RevokeValidateMeasms,
     GroundStationLaunch,
     ToggleButtonInterlock,
     ToggleGroundStationControl,
@@ -49,19 +41,12 @@ pub enum TelemetryCommand {
     ResetTClock,
     DeployParachute,
     ExpandParachute,
-    EvaluationAbort,
     ReinitSensors,
     ReinitBarometer,
-    EnableIMU,
+    ReinitIMU,
     DisableIMU,
     AdvanceFlightState,
     RewindFlightState,
-    AbortAfter100,
-    AbortAfter40,
-    AbortAfter250,
-    ReinitAfter15,
-    ReinitAfter30,
-    ReinitAfter50,
     StartFill,
     /// Retained pre-auth Fill admission; never accepted from a client.
     #[serde(skip)]
@@ -145,45 +130,35 @@ impl<'de> Deserialize<'de> for TelemetryCommand {
 const NORMAL_CLIENT_COMMANDS: &[&str] = &[
     "Postinit", "Launch", "Dump", "Abort", "NormallyOpen", "Pilot", "Igniter",
     "RetractPlumbing", "Nitrogen", "NitrogenClose", "Nitrous", "NitrousClose",
-    "ResetSim", "ContinueFillSequence", "MonitorAltitude", "RevokeMonitorAltitude",
-    "ConsecutiveSamples", "RevokeConsecutiveSamples", "ResetFailures", "RevokeResetFailures",
-    "ValidateMeasms", "RevokeValidateMeasms", "ToggleAvBayUnderglow", "ToggleFlightBuzzer",
+    "ResetSim", "ContinueFillSequence", "ToggleAvBayUnderglow", "ToggleFlightBuzzer",
     "ResetTClock", "StartFill", "PauseFill", "CancelFill", "ValveSelfTest", "NitrogenTest",
     "Turbocharge", "FcSdRetry",
 ];
 const IGT_CLIENT_COMMANDS: &[&str] = &[
     "Postinit", "Launch", "Dump", "Abort", "NormallyOpen", "Pilot", "Igniter",
     "RetractPlumbing", "Nitrogen", "NitrogenClose", "Nitrous", "NitrousClose",
-    "ResetSim", "ContinueFillSequence", "MonitorAltitude", "RevokeMonitorAltitude",
-    "ConsecutiveSamples", "RevokeConsecutiveSamples", "ResetFailures", "RevokeResetFailures",
-    "ValidateMeasms", "RevokeValidateMeasms", "ToggleAvBayUnderglow", "ToggleFlightBuzzer",
+    "ResetSim", "ContinueFillSequence", "ToggleAvBayUnderglow", "ToggleFlightBuzzer",
     "ResetTClock", "StartFill", "PauseFill", "CancelFill", "ValveSelfTest", "NitrogenTest",
     "Turbocharge", "IgtEnter", "IgtLivePyro", "IgtDryRun", "IgtExit", "FcSdRetry",
 ];
 const TEST_FIRE_CLIENT_COMMANDS: &[&str] = &[
     "Postinit", "Launch", "Dump", "Abort", "NormallyOpen", "Pilot", "Igniter",
     "RetractPlumbing", "Nitrogen", "NitrogenClose", "Nitrous", "NitrousClose",
-    "ResetSim", "ContinueFillSequence", "MonitorAltitude", "RevokeMonitorAltitude",
-    "ConsecutiveSamples", "RevokeConsecutiveSamples", "ResetFailures", "RevokeResetFailures",
-    "ValidateMeasms", "RevokeValidateMeasms", "GroundStationLaunch", "ToggleAvBayUnderglow",
+    "ResetSim", "ContinueFillSequence", "GroundStationLaunch", "ToggleAvBayUnderglow",
     "ToggleFlightBuzzer", "ResetTClock", "AdvanceFlightState", "RewindFlightState",
     "StartFill", "PauseFill", "CancelFill", "ValveSelfTest", "NitrogenTest", "Turbocharge",
 ];
 const HITL_CLIENT_COMMANDS: &[&str] = &[
     "Postinit", "Launch", "Dump", "Abort", "NormallyOpen", "Pilot", "Igniter",
     "IgniterSequence", "RetractPlumbing", "Nitrogen", "NitrogenClose", "Nitrous",
-    "NitrousClose", "ResetSim", "ContinueFillSequence", "MonitorAltitude",
-    "RevokeMonitorAltitude", "ConsecutiveSamples", "RevokeConsecutiveSamples", "ResetFailures",
-    "RevokeResetFailures", "ValidateMeasms", "RevokeValidateMeasms", "GroundStationLaunch",
+    "NitrousClose", "ResetSim", "ContinueFillSequence", "GroundStationLaunch",
     "ToggleButtonInterlock", "ToggleGroundStationControl", "ToggleLaunchInterlock",
     "TogglePlumbingDelayInterlock", "ToggleChecklistInterlock", "ToggleSupplyInterlock",
     "ToggleBoardStateProofInterlock", "TogglePhysicalLaunchMode", "ToggleAvBayUnderglow",
     "ToggleFlightBuzzer", "ResetLaunchLatch", "ResetFlightState", "ResetTClock",
     "DeployParachute", "ExpandParachute",
-    "EvaluationAbort", "ReinitSensors", "ReinitBarometer", "EnableIMU", "DisableIMU",
-    "AdvanceFlightState", "RewindFlightState", "AbortAfter100", "AbortAfter40",
-    "AbortAfter250", "ReinitAfter15", "ReinitAfter30", "ReinitAfter50", "StartFill",
-    "PauseFill", "CancelFill", "ValveSelfTest", "NitrogenTest", "Turbocharge",
+    "ReinitSensors", "ReinitBarometer", "ReinitIMU", "DisableIMU",
+    "AdvanceFlightState", "RewindFlightState", "StartFill", "PauseFill", "CancelFill", "ValveSelfTest", "NitrogenTest", "Turbocharge",
     "IgtEnter", "IgtLivePyro", "IgtDryRun", "IgtExit", "FcSdRetry",
 ];
 pub(crate) fn client_command_names(mode: crate::station_mode::Mode) -> &'static [&'static str] {
@@ -224,17 +199,10 @@ impl TelemetryCommand {
             | TelemetryCommand::ResetFlightState
             | TelemetryCommand::DeployParachute
             | TelemetryCommand::ExpandParachute
-            | TelemetryCommand::EvaluationAbort
             | TelemetryCommand::ReinitSensors
             | TelemetryCommand::ReinitBarometer
-            | TelemetryCommand::EnableIMU
+            | TelemetryCommand::ReinitIMU
             | TelemetryCommand::DisableIMU
-            | TelemetryCommand::AbortAfter100
-            | TelemetryCommand::AbortAfter40
-            | TelemetryCommand::AbortAfter250
-            | TelemetryCommand::ReinitAfter15
-            | TelemetryCommand::ReinitAfter30
-            | TelemetryCommand::ReinitAfter50
             => mode == Mode::Hitl,
             _ => true,
         }

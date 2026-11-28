@@ -1383,14 +1383,7 @@ pub(crate) fn takeover_operation(name: &str) -> bool {
     matches!(
         name,
         "DeployParachute" | "ExpandParachute"
-            | "MonitorAltitude" | "RevokeMonitorAltitude"
-            | "ConsecutiveSamples" | "RevokeConsecutiveSamples"
-            | "ResetFailures" | "RevokeResetFailures"
-            | "ValidateMeasms" | "RevokeValidateMeasms"
-            | "EvaluationAbort"
-            | "ReinitSensors" | "ReinitBarometer" | "EnableIMU" | "DisableIMU"
-            | "AbortAfter40" | "AbortAfter100" | "AbortAfter250"
-            | "ReinitAfter15" | "ReinitAfter30" | "ReinitAfter50"
+            | "ReinitSensors" | "ReinitBarometer" | "ReinitIMU" | "DisableIMU"
             | "ToggleAvBayUnderglow" | "ToggleFlightBuzzer"
     )
 }
@@ -2723,6 +2716,8 @@ pub(crate) fn start(state: Arc<crate::state::AppState>) -> Option<tokio::task::J
 
 // Application protocol catalog, independent of this executable's feature set.
 // Append only: bit positions are fixed for the host control protocol version.
+// A retired command keeps its slot as "Retired:<name>", which no command
+// deserializes to, so its bit is never supported or enabled again.
 pub(crate) fn command_catalog() -> &'static [&'static str] {
     &[
         "Postinit",
@@ -2740,14 +2735,14 @@ pub(crate) fn command_catalog() -> &'static [&'static str] {
         "NitrousClose",
         "ResetSim",
         "ContinueFillSequence",
-        "MonitorAltitude",
-        "RevokeMonitorAltitude",
-        "ConsecutiveSamples",
-        "RevokeConsecutiveSamples",
-        "ResetFailures",
-        "RevokeResetFailures",
-        "ValidateMeasms",
-        "RevokeValidateMeasms",
+        "Retired:MonitorAltitude",
+        "Retired:RevokeMonitorAltitude",
+        "Retired:ConsecutiveSamples",
+        "Retired:RevokeConsecutiveSamples",
+        "Retired:ResetFailures",
+        "Retired:RevokeResetFailures",
+        "Retired:ValidateMeasms",
+        "Retired:RevokeValidateMeasms",
         "GroundStationLaunch",
         "ToggleButtonInterlock",
         "ToggleGroundStationControl",
@@ -2759,19 +2754,19 @@ pub(crate) fn command_catalog() -> &'static [&'static str] {
         "ResetFlightState",
         "DeployParachute",
         "ExpandParachute",
-        "EvaluationAbort",
+        "Retired:EvaluationAbort",
         "ReinitSensors",
         "ReinitBarometer",
-        "EnableIMU",
+        "ReinitIMU",
         "DisableIMU",
         "AdvanceFlightState",
         "RewindFlightState",
-        "AbortAfter100",
-        "AbortAfter40",
-        "AbortAfter250",
-        "ReinitAfter15",
-        "ReinitAfter30",
-        "ReinitAfter50",
+        "Retired:AbortAfter100",
+        "Retired:AbortAfter40",
+        "Retired:AbortAfter250",
+        "Retired:ReinitAfter15",
+        "Retired:ReinitAfter30",
+        "Retired:ReinitAfter50",
         "StartFill",
         "PauseFill",
         "CancelFill",

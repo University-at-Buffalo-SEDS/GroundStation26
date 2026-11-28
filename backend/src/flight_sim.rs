@@ -795,15 +795,7 @@ impl FlightSimState {
             | TelemetryCommand::ResetSim => {
                 // Backend-local controls are handled outside the simulator command stream.
             }
-            TelemetryCommand::MonitorAltitude
-            | TelemetryCommand::Postinit
-            | TelemetryCommand::RevokeMonitorAltitude
-            | TelemetryCommand::ConsecutiveSamples
-            | TelemetryCommand::RevokeConsecutiveSamples
-            | TelemetryCommand::ResetFailures
-            | TelemetryCommand::RevokeResetFailures
-            | TelemetryCommand::ValidateMeasms
-            | TelemetryCommand::RevokeValidateMeasms => {
+            TelemetryCommand::Postinit => {
                 // A combined testing+HITL build must forward FC controls too.
                 // Pure software simulation retains its existing no-op behavior.
                 if crate::runtime_mode::is_hitl() {
@@ -829,16 +821,9 @@ impl FlightSimState {
             | TelemetryCommand::DeployParachute
             | TelemetryCommand::ExpandParachute
             | TelemetryCommand::ReinitSensors
-            | TelemetryCommand::EvaluationAbort
             | TelemetryCommand::ReinitBarometer
-            | TelemetryCommand::EnableIMU
+            | TelemetryCommand::ReinitIMU
             | TelemetryCommand::DisableIMU
-            | TelemetryCommand::AbortAfter100
-            | TelemetryCommand::AbortAfter40
-            | TelemetryCommand::AbortAfter250
-            | TelemetryCommand::ReinitAfter15
-            | TelemetryCommand::ReinitAfter30
-            | TelemetryCommand::ReinitAfter50
                 if crate::runtime_mode::is_hitl() =>
             {
                 // Let telemetry_task forward HITL controls. Consuming a no-op
@@ -2036,16 +2021,11 @@ mod tests {
             RewindFlightState,
             DeployParachute,
             ExpandParachute,
-            EvaluationAbort,
-            MonitorAltitude,
+            ReinitSensors,
+            ReinitBarometer,
+            ReinitIMU,
+            DisableIMU,
             Postinit,
-            RevokeMonitorAltitude,
-            ConsecutiveSamples,
-            RevokeConsecutiveSamples,
-            ResetFailures,
-            RevokeResetFailures,
-            ValidateMeasms,
-            RevokeValidateMeasms,
         ] {
             assert!(
                 !sim.apply_command(&command, 1_000),

@@ -127,20 +127,13 @@ pub(crate) fn hitl_flight_command_id(cmd: &TelemetryCommand) -> Option<u8> {
     Some(match cmd {
         TelemetryCommand::DeployParachute => FlightComputerCommands::DeployParachute as u8,
         TelemetryCommand::ExpandParachute => FlightComputerCommands::ExpandParachute as u8,
-        TelemetryCommand::EvaluationAbort => FlightComputerCommands::EvaluationAbort as u8,
         TelemetryCommand::ReinitSensors => FlightComputerCommands::ReinitSensors as u8,
         TelemetryCommand::ReinitBarometer => FlightComputerCommands::ReinitBarometer as u8,
-        TelemetryCommand::EnableIMU => FlightComputerCommands::EnableIMU as u8,
+        TelemetryCommand::ReinitIMU => FlightComputerCommands::ReinitIMU as u8,
         TelemetryCommand::DisableIMU => FlightComputerCommands::DisableIMU as u8,
         TelemetryCommand::Postinit => FlightComputerCommands::Postinit as u8,
         TelemetryCommand::AdvanceFlightState => FlightComputerCommands::AdvanceFlightState as u8,
         TelemetryCommand::RewindFlightState => FlightComputerCommands::RewindFlightState as u8,
-        TelemetryCommand::AbortAfter40 => FlightComputerCommands::AbortAfter40 as u8,
-        TelemetryCommand::AbortAfter100 => FlightComputerCommands::AbortAfter100 as u8,
-        TelemetryCommand::AbortAfter250 => FlightComputerCommands::AbortAfter250 as u8,
-        TelemetryCommand::ReinitAfter15 => FlightComputerCommands::ReinitAfter15 as u8,
-        TelemetryCommand::ReinitAfter30 => FlightComputerCommands::ReinitAfter30 as u8,
-        TelemetryCommand::ReinitAfter50 => FlightComputerCommands::ReinitAfter50 as u8,
         TelemetryCommand::IgtEnter
         | TelemetryCommand::IgtLivePyro
         | TelemetryCommand::IgtDryRun
@@ -1342,7 +1335,6 @@ pub async fn telemetry_task(
                     }
                     if crate::gse::manual_stop_pending(&state)
                         && !matches!(cmd, TelemetryCommand::Abort | TelemetryCommand::NitrogenClose | TelemetryCommand::NitrousClose | TelemetryCommand::PauseFill | TelemetryCommand::CancelFill)
-                        && crate::sequences::command_name(&cmd) != "EvaluationAbort"
                         && !crate::sequences::is_station_utility_command(crate::sequences::command_name(&cmd)) {
                         emit_notification_warning(&state, "Manual Stop is pending; new control action was not dispatched");
                         continue;
@@ -1635,94 +1627,6 @@ pub async fn telemetry_task(
                                 }) { continue; }
                                 handle_local_ground_station_launch_command(state.clone(), router.clone(),launch_revision).await;
                             }
-                        TelemetryCommand::MonitorAltitude => {
-                                if let Err(e) = queue_locally_routed_flight_command(
-                                    &state,
-                                    &router,
-                                    "MonitorAltitude command",
-                                    &[FlightComputerCommands::MonitorAltitude as u8],
-                                ) {
-                                    log_telemetry_error("failed to log MonitorAltitude command", e);
-                                }
-                                gs_debug_println!("MonitorAltitude command sent");
-                            }
-                        TelemetryCommand::RevokeMonitorAltitude => {
-                                if let Err(e) = queue_locally_routed_flight_command(
-                                    &state,
-                                    &router,
-                                    "RevokeMonitorAltitude command",
-                                    &[FlightComputerCommands::RevokeMonitorAltitude as u8],
-                                ) {
-                                    log_telemetry_error("failed to log RevokeMonitorAltitude command", e);
-                                }
-                                gs_debug_println!("RevokeMonitorAltitude command sent");
-                            }
-                        TelemetryCommand::ConsecutiveSamples => {
-                                if let Err(e) = queue_locally_routed_flight_command(
-                                    &state,
-                                    &router,
-                                    "ConsecutiveSamples command",
-                                    &[FlightComputerCommands::ConsecutiveSamples as u8],
-                                ) {
-                                    log_telemetry_error("failed to log ConsecutiveSamples command", e);
-                                }
-                                gs_debug_println!("ConsecutiveSamples command sent");
-                            }
-                        TelemetryCommand::RevokeConsecutiveSamples => {
-                                if let Err(e) = queue_locally_routed_flight_command(
-                                    &state,
-                                    &router,
-                                    "RevokeConsecutiveSamples command",
-                                    &[FlightComputerCommands::RevokeConsecutiveSamples as u8],
-                                ) {
-                                    log_telemetry_error("failed to log RevokeConsecutiveSamples command", e);
-                                }
-                                gs_debug_println!("RevokeConsecutiveSamples command sent");
-                            }
-                        TelemetryCommand::ResetFailures => {
-                                if let Err(e) = queue_locally_routed_flight_command(
-                                    &state,
-                                    &router,
-                                    "ResetFailures command",
-                                    &[FlightComputerCommands::ResetFailures as u8],
-                                ) {
-                                    log_telemetry_error("failed to log ResetFailures command", e);
-                                }
-                                gs_debug_println!("ResetFailures command sent");
-                            }
-                        TelemetryCommand::RevokeResetFailures => {
-                                if let Err(e) = queue_locally_routed_flight_command(
-                                    &state,
-                                    &router,
-                                    "RevokeResetFailures command",
-                                    &[FlightComputerCommands::RevokeResetFailures as u8],
-                                ) {
-                                    log_telemetry_error("failed to log RevokeResetFailures command", e);
-                                }
-                                gs_debug_println!("RevokeResetFailures command sent");
-                            }
-                        TelemetryCommand::ValidateMeasms => {
-                                if let Err(e) = queue_locally_routed_flight_command(
-                                    &state,
-                                    &router,
-                                    "ValidateMeasms command",
-                                    &[FlightComputerCommands::ValidateMeasms as u8],
-                                ) {
-                                    log_telemetry_error("failed to log ValidateMeasms command", e);
-                                }
-                                gs_debug_println!("ValidateMeasms command sent");
-                            }
-                        TelemetryCommand::RevokeValidateMeasms => {
-                                if let Err(e) = queue_locally_routed_flight_command(
-                                    &state,
-                                    &router,
-                                    "RevokeValidateMeasms command",
-                                    &[FlightComputerCommands::RevokeValidateMeasms as u8],
-                                ) {
-                                    log_telemetry_error("failed to log RevokeValidateMeasms command", e);
-                                }
-                                gs_debug_println!("RevokeValidateMeasms command sent");
-                            }
                         TelemetryCommand::ToggleButtonInterlock if crate::runtime_mode::is_hitl() => {
                                 let enabled = state.toggle_hitl_button_interlock();
                                 sequences::refresh_action_policy_now(&state);
@@ -1842,17 +1746,10 @@ pub async fn telemetry_task(
                         }
                         TelemetryCommand::DeployParachute
                         | TelemetryCommand::ExpandParachute
-                        | TelemetryCommand::EvaluationAbort
                         | TelemetryCommand::ReinitSensors
                         | TelemetryCommand::ReinitBarometer
-                        | TelemetryCommand::EnableIMU
-                        | TelemetryCommand::DisableIMU
-                        | TelemetryCommand::AbortAfter100
-                        | TelemetryCommand::AbortAfter40
-                        | TelemetryCommand::AbortAfter250
-                        | TelemetryCommand::ReinitAfter15
-                        | TelemetryCommand::ReinitAfter30
-                        | TelemetryCommand::ReinitAfter50 if crate::runtime_mode::is_hitl() => {
+                        | TelemetryCommand::ReinitIMU
+                        | TelemetryCommand::DisableIMU if crate::runtime_mode::is_hitl() => {
                             if let Some(cmd_id) = hitl_flight_command_id(&cmd) {
                                 // An operator press is held, not queued, while an
                                 // earlier FC command could drop it (Deploy/Expand).
@@ -4184,14 +4081,17 @@ mod tests {
     fn flight_command_discriminants_match_current_layout() {
         assert_eq!(FlightComputerCommands::Postinit as u8, 0);
         assert_eq!(FlightComputerCommands::Launch as u8, 1);
-        assert_eq!(FlightComputerCommands::MonitorAltitude as u8, 2);
-        assert_eq!(FlightComputerCommands::RevokeMonitorAltitude as u8, 3);
-        assert_eq!(FlightComputerCommands::ConsecutiveSamples as u8, 4);
-        assert_eq!(FlightComputerCommands::RevokeConsecutiveSamples as u8, 5);
-        assert_eq!(FlightComputerCommands::ResetFailures as u8, 6);
-        assert_eq!(FlightComputerCommands::RevokeResetFailures as u8, 7);
-        assert_eq!(FlightComputerCommands::ValidateMeasms as u8, 8);
-        assert_eq!(FlightComputerCommands::RevokeValidateMeasms as u8, 9);
+        // 2..11, 14..16 and 23..28 are retired and never reused.
+        assert_eq!(FlightComputerCommands::DeployParachute as u8, 12);
+        assert_eq!(FlightComputerCommands::ExpandParachute as u8, 13);
+        assert_eq!(FlightComputerCommands::ReinitSensors as u8, 17);
+        assert_eq!(FlightComputerCommands::ReinitBarometer as u8, 18);
+        assert_eq!(FlightComputerCommands::ReinitIMU as u8, 19);
+        assert_eq!(FlightComputerCommands::DisableIMU as u8, 20);
+        assert_eq!(FlightComputerCommands::AdvanceFlightState as u8, 21);
+        assert_eq!(FlightComputerCommands::RewindFlightState as u8, 22);
+        assert_eq!(FlightComputerCommands::IgtEnter as u8, 29);
+        assert_eq!(FlightComputerCommands::FcSdRetry as u8, 33);
     }
 
     #[tokio::test]
@@ -4316,10 +4216,6 @@ mod tests {
                 FlightComputerCommands::ExpandParachute as u8,
             ),
             (
-                TelemetryCommand::EvaluationAbort,
-                FlightComputerCommands::EvaluationAbort as u8,
-            ),
-            (
                 TelemetryCommand::ReinitSensors,
                 FlightComputerCommands::ReinitSensors as u8,
             ),
@@ -4328,8 +4224,8 @@ mod tests {
                 FlightComputerCommands::ReinitBarometer as u8,
             ),
             (
-                TelemetryCommand::EnableIMU,
-                FlightComputerCommands::EnableIMU as u8,
+                TelemetryCommand::ReinitIMU,
+                FlightComputerCommands::ReinitIMU as u8,
             ),
             (
                 TelemetryCommand::DisableIMU,
@@ -4342,30 +4238,6 @@ mod tests {
             (
                 TelemetryCommand::RewindFlightState,
                 FlightComputerCommands::RewindFlightState as u8,
-            ),
-            (
-                TelemetryCommand::AbortAfter40,
-                FlightComputerCommands::AbortAfter40 as u8,
-            ),
-            (
-                TelemetryCommand::AbortAfter100,
-                FlightComputerCommands::AbortAfter100 as u8,
-            ),
-            (
-                TelemetryCommand::AbortAfter250,
-                FlightComputerCommands::AbortAfter250 as u8,
-            ),
-            (
-                TelemetryCommand::ReinitAfter15,
-                FlightComputerCommands::ReinitAfter15 as u8,
-            ),
-            (
-                TelemetryCommand::ReinitAfter30,
-                FlightComputerCommands::ReinitAfter30 as u8,
-            ),
-            (
-                TelemetryCommand::ReinitAfter50,
-                FlightComputerCommands::ReinitAfter50 as u8,
             ),
         ];
 
@@ -4415,34 +4287,20 @@ mod tests {
     async fn exposed_flight_commands_transmit_to_the_discovered_rocket_side() {
         if crate::operator_queue::isolated_native_case(module_path!(),"exposed_flight_commands_transmit_to_the_discovered_rocket_side"){return;}
         crate::telemetry_schema::initialize().unwrap();
-        // Match FC's existing compatibility protocol, including every visible
-        // threshold control. These are isolated packet captures, not outputs.
+        // Match FC's existing compatibility protocol for every operator
+        // command. These are isolated packet captures, not outputs.
         for command in [
             FlightComputerCommands::Postinit,
             FlightComputerCommands::Launch,
-            FlightComputerCommands::MonitorAltitude,
-            FlightComputerCommands::RevokeMonitorAltitude,
-            FlightComputerCommands::ConsecutiveSamples,
-            FlightComputerCommands::RevokeConsecutiveSamples,
-            FlightComputerCommands::ResetFailures,
-            FlightComputerCommands::RevokeResetFailures,
-            FlightComputerCommands::ValidateMeasms,
-            FlightComputerCommands::RevokeValidateMeasms,
             FlightComputerCommands::DeployParachute,
             FlightComputerCommands::ExpandParachute,
-            FlightComputerCommands::EvaluationAbort,
             FlightComputerCommands::ReinitSensors,
             FlightComputerCommands::ReinitBarometer,
-            FlightComputerCommands::EnableIMU,
+            FlightComputerCommands::ReinitIMU,
             FlightComputerCommands::DisableIMU,
             FlightComputerCommands::AdvanceFlightState,
             FlightComputerCommands::RewindFlightState,
-            FlightComputerCommands::AbortAfter40,
-            FlightComputerCommands::AbortAfter100,
-            FlightComputerCommands::AbortAfter250,
-            FlightComputerCommands::ReinitAfter15,
-            FlightComputerCommands::ReinitAfter30,
-            FlightComputerCommands::ReinitAfter50,
+            FlightComputerCommands::FcSdRetry,
         ]
         .into_iter()
         .filter(|command| {
@@ -5387,7 +5245,7 @@ mod tests {
         let (state, cmd_rx) = test_app_state_with_cmd_rx(db_tx).await;
         let mut policy = state.action_policy_snapshot();
         for control in policy.controls.iter_mut() {
-            if control.cmd == "MonitorAltitude" {
+            if control.cmd == "Postinit" {
                 control.enabled = true;
             }
         }
@@ -5486,14 +5344,14 @@ mod tests {
             queue_locally_routed_flight_command(
                 &state,
                 &router,
-                "MonitorAltitude test command",
-                &[FlightComputerCommands::MonitorAltitude as u8],
+                "Postinit test command",
+                &[FlightComputerCommands::Postinit as u8],
             )
             .expect("failed to queue test command through router");
         } else {
             state
                 .cmd_tx
-                .send(TelemetryCommand::MonitorAltitude)
+                .send(TelemetryCommand::Postinit)
                 .await
                 .expect("failed to send command through AppState command channel");
             tokio::time::timeout(Duration::from_secs(1), async {
@@ -5502,7 +5360,7 @@ mod tests {
                         .last_command_ms
                         .lock()
                         .expect("failed to lock last command map")
-                        .contains_key("MonitorAltitude")
+                        .contains_key("Postinit")
                     {
                         break;
                     }
@@ -5510,7 +5368,7 @@ mod tests {
                 }
             })
             .await
-            .expect("timed out waiting for telemetry task to accept MonitorAltitude command");
+            .expect("timed out waiting for telemetry task to accept Postinit command");
         }
 
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -5538,7 +5396,7 @@ mod tests {
                         .filter_map(|payload| serialize::unpack_packet(payload).ok())
                         .any(|pkt| {
                             pkt.data_type() == crate::telemetry_schema::data_type("FLIGHT_COMMAND")
-                                && pkt.payload() == [FlightComputerCommands::MonitorAltitude as u8]
+                                && pkt.payload() == [FlightComputerCommands::Postinit as u8]
                                 && pkt.endpoints().contains(&crate::telemetry_schema::endpoint(
                                     "FLIGHT_CONTROLLER",
                                 ))
@@ -5611,7 +5469,7 @@ mod tests {
             &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")],
             Board::GroundStation.sender_id(),
             123,
-            Arc::from([FlightComputerCommands::MonitorAltitude as u8]),
+            Arc::from([FlightComputerCommands::Postinit as u8]),
         )
         .expect("failed to build flight command packet");
         let wire = serialize::pack_packet(&pkt).to_vec();
@@ -5664,7 +5522,7 @@ mod tests {
         assert!(!flight_packets.is_empty());
         assert_eq!(
             flight_packets[0].payload(),
-            &[FlightComputerCommands::MonitorAltitude as u8]
+            &[FlightComputerCommands::Postinit as u8]
         );
         assert!(
             flight_packets[0]
@@ -5695,7 +5553,7 @@ mod tests {
             &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")],
             Board::GroundStation.sender_id(),
             123,
-            Arc::from([FlightComputerCommands::MonitorAltitude as u8]),
+            Arc::from([FlightComputerCommands::Postinit as u8]),
         )
         .expect("failed to build flight command packet");
         let wire = serialize::pack_packet(&pkt).to_vec();
@@ -5796,7 +5654,7 @@ mod tests {
             &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")],
             Board::GroundStation.sender_id(),
             123,
-            Arc::from([FlightComputerCommands::MonitorAltitude as u8]),
+            Arc::from([FlightComputerCommands::Postinit as u8]),
         )
         .expect("failed to build flight command packet");
         let wire = serialize::pack_packet(&pkt).to_vec();
@@ -5867,7 +5725,7 @@ mod tests {
             &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")],
             Board::GroundStation.sender_id(),
             123,
-            Arc::from([FlightComputerCommands::MonitorAltitude as u8]),
+            Arc::from([FlightComputerCommands::Postinit as u8]),
         )
         .expect("failed to build flight command packet");
         let wire = serialize::pack_packet(&pkt).to_vec();
@@ -5946,7 +5804,7 @@ mod tests {
             &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")],
             Board::GroundStation.sender_id(),
             124,
-            Arc::from([FlightComputerCommands::MonitorAltitude as u8]),
+            Arc::from([FlightComputerCommands::Postinit as u8]),
         )
         .expect("failed to build flight command packet");
         let command_wire = serialize::pack_packet(&command_pkt).to_vec();
@@ -6040,7 +5898,7 @@ mod tests {
             &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")],
             Board::GroundStation.sender_id(),
             123,
-            Arc::from([FlightComputerCommands::MonitorAltitude as u8]),
+            Arc::from([FlightComputerCommands::Postinit as u8]),
         )
         .expect("failed to build flight command packet");
         let wire = serialize::pack_packet(&pkt).to_vec();
@@ -6127,7 +5985,7 @@ mod tests {
             &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")],
             Board::GroundStation.sender_id(),
             123,
-            Arc::from([FlightComputerCommands::MonitorAltitude as u8]),
+            Arc::from([FlightComputerCommands::Postinit as u8]),
         )
         .expect("failed to build flight command packet");
         let wire = serialize::pack_packet(&pkt).to_vec();
@@ -6199,7 +6057,7 @@ mod tests {
             &[crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER")],
             Board::GroundStation.sender_id(),
             123,
-            Arc::from([FlightComputerCommands::MonitorAltitude as u8]),
+            Arc::from([FlightComputerCommands::Postinit as u8]),
         )
         .expect("failed to build flight command packet");
         let wire = serialize::pack_packet(&pkt).to_vec();
@@ -6758,57 +6616,6 @@ mod tests {
         assert!(accepted.contains_key("Postinit"));
         assert_eq!(crate::gse::automatic_generation(&state), old + 1);
         assert_eq!(state.operator_dispatch_inflight.load(Ordering::Acquire), 0);
-    }
-
-    #[tokio::test]
-    async fn explicit_fc_evaluation_abort_reaches_actual_worker_while_manual_stop_is_retained() {
-        crate::mode_suite!(Hitl);
-        let (db_tx, db_rx) = mpsc::channel(8);
-        let (state, cmd_rx) = test_app_state_with_cmd_rx(db_tx).await;
-        if state.hitl_button_interlock_enabled() {
-            state.toggle_hitl_button_interlock();
-        }
-        assert!(state.is_command_allowed(&TelemetryCommand::EvaluationAbort));
-        state.manual_abort_intent.request();
-        state.set_abort_indicator_latched(true);
-        let (sent, mut received) = mpsc::unbounded_channel();
-        let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([
-            sedsnet::router::EndpointHandler::new_packet_handler(
-                crate::telemetry_schema::endpoint("FLIGHT_CONTROLLER"),
-                move |packet| {
-                    if packet.data_type() == crate::telemetry_schema::data_type("FLIGHT_COMMAND") {
-                        let _ = sent.send(packet.payload().to_vec());
-                    }
-                    Ok(())
-                },
-            ),
-        ])));
-        state.topology_router.set(router.clone()).unwrap();
-        let worker = tokio::spawn(telemetry_task(
-            state.clone(),
-            router,
-            Vec::new(),
-            cmd_rx,
-            db_rx,
-            state.shutdown_subscribe(),
-        ));
-        state
-            .cmd_tx
-            .send(TelemetryCommand::QueuedOperator {
-            launch_hold: None,
-            recovery_origin: None,
-                launch_revision: None,
-                plumbing_origin: None,
-                generation: crate::gse::automatic_generation(&state),
-                command: Box::new(TelemetryCommand::EvaluationAbort),
-            })
-            .await
-            .unwrap();
-        let delivered = tokio::time::timeout(Duration::from_secs(2), received.recv()).await;
-        state.request_shutdown();
-        worker.await.unwrap();
-        assert_eq!(delivered.unwrap(), Some(vec![16]));
-        assert!(state.manual_abort_intent.pending_epoch().is_some());
     }
 
     include!("igniter_sense_ingress_tests.rs");
@@ -9172,9 +8979,9 @@ mod tests {
         include!("telemetry_task/loadcell_zero_ingress_tests.rs");
     }
 
-    mod eval_abort_launch_ingress {
+    mod fc_command_launch_ingress {
         use super::*;
-        include!("telemetry_task/eval_abort_launch_diagnostic.rs");
+        include!("telemetry_task/fc_command_launch_diagnostic.rs");
     }
     mod launch_preflight {
         use super::*;

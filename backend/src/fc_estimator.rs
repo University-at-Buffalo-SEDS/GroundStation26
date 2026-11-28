@@ -360,7 +360,7 @@ fn running_text(seen: &Seen, launch: Option<Instant>) -> String {
 fn fault_text(phase: Phase) -> String {
     match phase {
         Phase::Diverged => "FC flight estimator diverged: its Kalman filter state is not finite or the FC no longer trusts it; the FC falls back to its barometer for flight events.".into(),
-        _ => "FC flight estimator stopped: the FC's Kalman filter is no longer running (Evaluation Abort or a sensor restart).".into(),
+        _ => "FC flight estimator stopped: the FC's Kalman filter is no longer running (a break-up abort or a sensor restart).".into(),
     }
 }
 

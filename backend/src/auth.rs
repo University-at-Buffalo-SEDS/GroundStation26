@@ -128,6 +128,9 @@ impl CommandAccess {
             .into_iter()
             .map(|cmd| cmd.trim().to_string())
             .filter(|cmd| !cmd.is_empty())
+            // FC byte 19 was named EnableIMU before it was renamed ReinitIMU:
+            // an account that allowed it keeps allowing it.
+            .map(|cmd| if cmd == "EnableIMU" { "ReinitIMU".to_string() } else { cmd })
             .collect();
         self.allowed_commands.sort();
         self.allowed_commands.dedup();

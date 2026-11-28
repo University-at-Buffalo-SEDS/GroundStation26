@@ -68,6 +68,6 @@ independently.
 - [Optional RRLS radio voice](rrls-radio-voice.md): opt-in push-to-talk and radio budget.
 - [Pico-Fi over Ethernet](picofi-ethernet.md): TCP client/server setup.
 
-- [Flight command controls](flight-command-controls.md): threshold meanings and custom-layout migration.
+- [Flight command controls](flight-command-controls.md): the FC operator command set, wire bytes and retired bytes.
 
 - [Software acceptance](software-acceptance-2026-10-16.md): tested paths, platform results and device-validation limits.

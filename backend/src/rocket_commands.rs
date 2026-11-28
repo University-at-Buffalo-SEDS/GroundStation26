@@ -4,33 +4,30 @@
 pub enum FlightComputerCommands {
     Postinit = 0,
     Launch = 1,
-    MonitorAltitude = 2,
-    RevokeMonitorAltitude = 3,
-    ConsecutiveSamples = 4,
-    RevokeConsecutiveSamples = 5,
-    ResetFailures = 6,
-    RevokeResetFailures = 7,
-    ValidateMeasms = 8,
-    RevokeValidateMeasms = 9,
+    // Bytes 2..11 are retired: the FC's runtime options and their revokes
+    // (MonitorAltitude 2/3, ConsecutiveSamples 4/5, ResetFailures 6/7,
+    // ValidateMeasms 8/9, velocity checks 10/11, which the GS never sent).
+    // The FC keeps its compiled defaults and refuses them. Never reuse them.
+    /// Deploy drogue (FC `Deploy_Parachute`).
     DeployParachute = 12,
+    /// Deploy main / reef release (FC `Expand_Parachute`).
     ExpandParachute = 13,
     // Bytes 14 and 15 (EvaluationRelax, EvaluationFocus) are retired: the
     // FC's estimator guard made them meaningless and the FC refuses them.
     // Never reuse them for another command.
-    EvaluationAbort = 16,
+    // Byte 16 (EvaluationAbort) is retired: Reset all boards (the FC's reset
+    // to Startup) cancels the FC's evaluation. The FC refuses it. Never reuse.
     ReinitSensors = 17,
     ReinitBarometer = 18,
-    // Historical API name: FC byte 19 reinitializes the IMU.
-    EnableIMU = 19,
+    /// Re-initialize the IMU (FC `Reinit_IMU`; formerly named EnableIMU).
+    ReinitIMU = 19,
     DisableIMU = 20,
     AdvanceFlightState = 21,
     RewindFlightState = 22,
-    AbortAfter40 = 23,
-    AbortAfter100 = 24,
-    AbortAfter250 = 25,
-    ReinitAfter15 = 26,
-    ReinitAfter30 = 27,
-    ReinitAfter50 = 28,
+    // Bytes 23..28 are retired: the FC's failure thresholds (AbortAfter40,
+    // AbortAfter100, AbortAfter250, ReinitAfter15, ReinitAfter30,
+    // ReinitAfter50). The FC keeps its compiled thresholds and refuses them.
+    // Never reuse them.
     // Integrated ground test (FC fc_msg Actionable_Decrees + 17..20).
     IgtEnter = 29,
     IgtLivePyro = 30,
@@ -83,20 +80,11 @@ mod flight_command_wire_tests {
         let mut cases = [
             (Postinit, "Compat_Postinit_Signal"),
             (Launch, "Compat_Launch_Signal"),
-            (MonitorAltitude, "Compat_Vigilant_Mode"),
-            (RevokeMonitorAltitude, "Revoke_Vigilant_Mode"),
-            (ConsecutiveSamples, "Compat_Eval_Successive"),
-            (RevokeConsecutiveSamples, "Revoke_Eval_Successive"),
-            (ResetFailures, "Compat_Reset_Failures"),
-            (RevokeResetFailures, "Revoke_Reset_Failures"),
-            (ValidateMeasms, "Compat_Measm_Reports"),
-            (RevokeValidateMeasms, "Revoke_Measm_Reports"),
             (DeployParachute, "Compat_Deploy_Parachute"),
             (ExpandParachute, "Compat_Expand_Parachute"),
-            (EvaluationAbort, "Compat_Evaluation_Abort"),
             (ReinitSensors, "Compat_Reinit_Sensors"),
             (ReinitBarometer, "Compat_Reinit_Barometer"),
-            (EnableIMU, "Compat_Reinit_IMU"),
+            (ReinitIMU, "Compat_Reinit_IMU"),
             (DisableIMU, "Compat_Disable_IMU"),
         ]
         .to_vec();
@@ -107,12 +95,6 @@ mod flight_command_wire_tests {
             ]);
         }
         cases.extend([
-            (AbortAfter40, "Compat_Abort_After_40"),
-            (AbortAfter100, "Compat_Abort_After_100"),
-            (AbortAfter250, "Compat_Abort_After_250"),
-            (ReinitAfter15, "Compat_Reinit_After_15"),
-            (ReinitAfter30, "Compat_Reinit_After_30"),
-            (ReinitAfter50, "Compat_Reinit_After_50"),
             (IgtEnter, "Compat_IGT_Enter"),
             (IgtLivePyro, "Compat_IGT_Live_Pyro"),
             (IgtDryRun, "Compat_IGT_Dry_Run"),
@@ -122,11 +104,31 @@ mod flight_command_wire_tests {
         for (command, expected) in cases {
             assert_eq!(contract["remote_commands_compat"][command as usize], expected);
         }
-        // Bytes 10 and 11 are intentionally not reused by another GS command.
-        assert_eq!(contract["remote_commands_compat"][10], "Compat_Velocity_Checks");
-        assert_eq!(contract["remote_commands_compat"][11], "Revoke_Velocity_Checks");
-        // Bytes 14 and 15 are retired (EvaluationRelax/Focus) and stay unused.
-        assert_eq!(contract["remote_commands_compat"][14], "Compat_Retired_Evaluation_Relax");
-        assert_eq!(contract["remote_commands_compat"][15], "Compat_Retired_Evaluation_Focus");
+        // Retired bytes stay reserved on the FC and unused by the GS.
+        let retired = [
+            (2, "Compat_Retired_Vigilant_Mode"),
+            (3, "Compat_Retired_Revoke_Vigilant_Mode"),
+            (4, "Compat_Retired_Eval_Successive"),
+            (5, "Compat_Retired_Revoke_Eval_Successive"),
+            (6, "Compat_Retired_Reset_Failures"),
+            (7, "Compat_Retired_Revoke_Reset_Failures"),
+            (8, "Compat_Retired_Measm_Reports"),
+            (9, "Compat_Retired_Revoke_Measm_Reports"),
+            (10, "Compat_Retired_Velocity_Checks"),
+            (11, "Compat_Retired_Revoke_Velocity_Checks"),
+            (14, "Compat_Retired_Evaluation_Relax"),
+            (15, "Compat_Retired_Evaluation_Focus"),
+            (16, "Compat_Retired_Evaluation_Abort"),
+            (23, "Compat_Retired_Abort_After_40"),
+            (24, "Compat_Retired_Abort_After_100"),
+            (25, "Compat_Retired_Abort_After_250"),
+            (26, "Compat_Retired_Reinit_After_15"),
+            (27, "Compat_Retired_Reinit_After_30"),
+            (28, "Compat_Retired_Reinit_After_50"),
+        ];
+        for (byte, expected) in retired {
+            assert_eq!(contract["remote_commands_compat"][byte], expected);
+        }
+        assert_eq!(contract["remote_commands_compat"].as_array().unwrap().len(), 34);
     }
 }

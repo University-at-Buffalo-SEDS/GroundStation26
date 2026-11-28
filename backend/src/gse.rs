@@ -4636,9 +4636,10 @@ pub(crate) fn abort_safe_control(kind: sedsnet::config::DataType, payload: &[u8]
         return false;
     }
     if kind == crate::telemetry_schema::data_type("FLIGHT_COMMAND") {
-        // Existing explicit manual FC stop only. The high bit is not an FC
-        // automatic provenance tag and must never alias this permission.
-        return payload[0] == crate::rocket_commands::FlightComputerCommands::EvaluationAbort as u8;
+        // No flight-computer command passes a latched Abort. (The operator
+        // Evaluation Abort that did is retired: Reset all boards cancels the
+        // FC's evaluation as part of its reset to Startup.)
+        return false;
     }
     let command = payload[0] & 0x7f;
     if kind == crate::telemetry_schema::data_type("VALVE_COMMAND") {
@@ -7300,7 +7301,7 @@ mod retained_stop_fence_tests {
 mod explicit_fc_stop_tests {
     use super::*;
     #[tokio::test]
-    async fn retained_stop_still_admits_exact_manual_fc_evaluation_abort_through_actual_sdk() {
+    async fn retained_stop_admits_no_flight_computer_command_through_actual_sdk() {
         use sedsnet::router::{Router, RouterConfig};
         let state = crate::state::tests::test_app_state().await;
         state.manual_abort_intent.request();
@@ -7316,23 +7317,18 @@ mod explicit_fc_stop_tests {
             Ok(())
         });
         let kind = crate::telemetry_schema::data_type("FLIGHT_COMMAND");
-        let stop = crate::rocket_commands::FlightComputerCommands::EvaluationAbort as u8;
-        assert_eq!(stop, 16);
-        crate::telemetry_task::queue_locally_routed_flight_command(
-            &state,
-            &router,
-            "explicit FC evaluation stop",
-            &[stop],
-        )
-        .unwrap();
-        assert!(router.has_pending_reliable_tx_type(kind));
-        for forbidden in [1u8, 12, 13, 0x90] {
+        // Every byte, the retired Evaluation Abort (16) included, and the
+        // high bit, which is no FC provenance tag.
+        for byte in 0u8..=0xff {
+            assert!(!abort_safe_control(kind.clone(), &[byte]), "byte {byte}");
+        }
+        for forbidden in [1u8, 12, 13, 16, 17, 33, 0x90] {
             assert!(
-                !queue_controller_with_stop_fence(&state, &router, kind, &[forbidden]).unwrap()
+                !queue_controller_with_stop_fence(&state, &router, kind.clone(), &[forbidden]).unwrap()
             );
         }
         router.process_all_queues_with_timeout(0).unwrap();
-        assert_eq!(sent.lock().unwrap().as_slice(), [vec![16]]);
+        assert!(sent.lock().unwrap().is_empty());
         assert!(state.manual_abort_intent.pending_epoch().is_some());
     }
 }

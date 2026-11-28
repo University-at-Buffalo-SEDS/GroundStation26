@@ -90,54 +90,6 @@
       {
         "actuated": null,
         "blink": "none",
-        "cmd": "MonitorAltitude",
-        "enabled": true
-      },
-      {
-        "actuated": null,
-        "blink": "none",
-        "cmd": "RevokeMonitorAltitude",
-        "enabled": true
-      },
-      {
-        "actuated": null,
-        "blink": "none",
-        "cmd": "ConsecutiveSamples",
-        "enabled": true
-      },
-      {
-        "actuated": null,
-        "blink": "none",
-        "cmd": "RevokeConsecutiveSamples",
-        "enabled": true
-      },
-      {
-        "actuated": null,
-        "blink": "none",
-        "cmd": "ResetFailures",
-        "enabled": true
-      },
-      {
-        "actuated": null,
-        "blink": "none",
-        "cmd": "RevokeResetFailures",
-        "enabled": true
-      },
-      {
-        "actuated": null,
-        "blink": "none",
-        "cmd": "ValidateMeasms",
-        "enabled": true
-      },
-      {
-        "actuated": null,
-        "blink": "none",
-        "cmd": "RevokeValidateMeasms",
-        "enabled": true
-      },
-      {
-        "actuated": null,
-        "blink": "none",
         "cmd": "FcSdRetry",
         "disabled_reason": "No recent FC BOARD_HEALTH; Retry FC SD needs the FC's current SD status.",
         "enabled": false
