@@ -8,6 +8,10 @@
 //! monitor, abort claims, published copies. The GSE lock and the gate are only
 //! ever tried under the turn. Nothing is read from or written to a disk, and no
 //! other lock is waited for, under the last three.
+//!
+//! A manual Abort's own outputs (supply close, dump and vent open) do not wait
+//! for the lock either while it is held: they are decided from what was
+//! published at its last release (`manual_stop_safing`).
 use super::{automatic_abort::AbortOwner, overpressure, *};
 use std::sync::{LockResult, MutexGuard, PoisonError, TryLockError, TryLockResult};
 
@@ -15,12 +19,16 @@ pub struct Owner {
     runtime: crate::unpin::Mutex<Runtime>,
     pub(crate) abort: Arc<AbortOwner>,
     pub(crate) overpressure: overpressure::Protection,
+    /// An engine sequence owned the fill-side valves at the last release of
+    /// the lock (`manual_stop_safing` reads it without the lock).
+    sequence_owns_valves: std::sync::atomic::AtomicBool,
 }
 impl Owner {
     pub(crate) fn new(runtime: Runtime) -> Self {
         let owner = Self {
             abort: Default::default(),
             overpressure: runtime.overpressure.clone(),
+            sequence_owns_valves: Default::default(),
             runtime: crate::unpin::Mutex::new(runtime),
         };
         drop(owner.lock());
@@ -42,6 +50,11 @@ impl Owner {
             }
             Err(TryLockError::WouldBlock) => Err(TryLockError::WouldBlock),
         }
+    }
+    /// Whether an engine sequence (not a ColdFlow session, which handles its
+    /// own Abort) owned the fill-side valves when the lock was last released.
+    pub(crate) fn sequence_owned_valves(&self) -> bool {
+        self.sequence_owns_valves.load(std::sync::atomic::Ordering::Acquire)
     }
     #[cfg(test)]
     pub(crate) fn abort_watch_cycles_for_test(&self) -> usize {
@@ -84,5 +97,9 @@ impl Drop for Guard<'_> {
         }
         self.owner.abort.publish(&self.runtime);
         self.owner.overpressure.publish(&self.runtime);
+        self.owner.sequence_owns_valves.store(
+            self.runtime.engine.active() && !cold_flow::runtime_active(&self.runtime),
+            std::sync::atomic::Ordering::Release,
+        );
     }
 }

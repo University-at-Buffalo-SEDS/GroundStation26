@@ -4631,6 +4631,54 @@ pub(crate) fn abort_latch_output_refusal(state: &AppState, name: &str) -> Option
     let (kind, byte) = crate::telemetry_task::fill_output_packet(state, name)?;
     (!abort_safe_control(kind, &[byte])).then_some(ABORT_LATCH_OUTPUT_REFUSAL)
 }
+/// A manual Abort's GSE outputs while the GSE lock or the dispatch gate is
+/// held, as by a qualification record waiting on its disk: the supply closes
+/// and the dump and vent opens that `handle_command` sends for that Abort
+/// (`Engine::fault`), sent now instead of once the holder lets go. Nothing
+/// when no engine sequence owned the valves at the last release of the lock,
+/// or when both are free (the ordinary path then reacts at once). Waits for
+/// no lock held across a disk write; the ordinary handling still follows and
+/// repeats the same safe directions. Returns how many outputs were queued.
+pub(crate) fn manual_stop_safing(state: &AppState) -> Result<usize, String> {
+    if !state.gse.sequence_owned_valves() {
+        return Ok(0);
+    }
+    let free = try_dispatch_gate().is_some_and(|_gate| match state.gse.try_lock() {
+        Ok(_) | Err(std::sync::TryLockError::Poisoned(_)) => true,
+        Err(std::sync::TryLockError::WouldBlock) => false,
+    });
+    if free {
+        return Ok(0);
+    }
+    let Some(router) = state.topology_router.get() else {
+        return Err("no hardware command router is available".into());
+    };
+    let mut queued = 0;
+    for (index, open) in gse_sequence::RELIEVED.into_iter().enumerate() {
+        let kind = crate::telemetry_schema::data_type(if index < 3 { "VALVE_COMMAND" } else { "ACTUATOR_COMMAND" });
+        let payload = [if open { OPEN[index] } else { CLOSE[index] } | 0x80];
+        // Only the hardware abort-safe directions: these pass every fence.
+        if !abort_safe_control(kind, &payload) {
+            continue;
+        }
+        match queue_controller_with_stop_fence(state, router, kind, &payload) {
+            Ok(true) => {
+                state.set_pending_umbilical_valve_state(KEYS[index], open);
+                queued += 1;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                let _ = crate::telemetry_task::dispatch_abort_tx(router);
+                return Err(format!("{} not queued: {error:?}", ["Pilot", "Vent", "Dump", "Nitrogen", "Nitrous"][index]));
+            }
+        }
+    }
+    // Transmit only: received packets' handlers wait on the GSE lock.
+    if let Err(error) = crate::telemetry_task::dispatch_abort_tx(router) {
+        log::error!("Manual Abort GSE safing tx: {error:?}");
+    }
+    Ok(queued)
+}
 pub(crate) fn abort_safe_control(kind: sedsnet::config::DataType, payload: &[u8]) -> bool {
     if payload.len() != 1 {
         return false;
@@ -7936,6 +7984,9 @@ pub(crate) fn try_commit_automatic_policy(
 
 #[cfg(test)]
 mod local_stop_priority_tests { include!("gse/local_stop_priority_tests.rs"); }
+#[cfg(test)]
+#[path = "gse/manual_stop_safing_tests.rs"]
+mod manual_stop_safing_tests;
 
 #[cfg(test)]
 mod sequence_access_tests { include!("gse/sequence_access_tests.rs"); }

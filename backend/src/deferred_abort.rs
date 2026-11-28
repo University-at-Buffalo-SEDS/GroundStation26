@@ -216,6 +216,18 @@ fn apply(state: &Arc<AppState>, observation: &Observation) -> bool {
         // worker. Preserve its local cancellation after SDK admission without
         // putting GSE/calibration locks back into the SDK callback.
         let command = crate::types::TelemetryCommand::Abort;
+        // The GSE lock may be held across a qualification write: the GSE's
+        // own safe outputs for this Abort do not wait for it.
+        match crate::gse::manual_stop_safing(state) {
+            Ok(0) => {}
+            Ok(queued) => log::warn!("manual Abort: {queued} GSE safe outputs sent while the GSE was busy"),
+            Err(error) => {
+                log::error!("manual Abort GSE safe outputs: {error}");
+                state.add_notification(format!(
+                    "Abort sent, but the GSE safe outputs could not be sent at once ({error}); they follow when the GSE is free. Verify supply valves are closed."
+                ));
+            }
+        }
         state.auto_zero.lock().unwrap().cancel_for_command(&command);
         crate::gse::handle_command(state, &command);
         crate::flight_sim::handle_command(&command);
