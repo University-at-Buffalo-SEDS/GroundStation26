@@ -614,6 +614,7 @@ impl Tracker {
                     .clock
                     .filter(|(_, at)| elapsed(now, *at) <= TIMEOUT_MS)
                     .map(|(offset, _)| offset),
+                health_lines: Vec::new(),
             });
         }
         rows.sort_by(|a, b| a.sender_id.cmp(&b.sender_id));

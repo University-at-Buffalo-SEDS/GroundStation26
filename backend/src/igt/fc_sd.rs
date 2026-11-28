@@ -46,6 +46,22 @@ pub(super) fn fresh_bits(inner: &Inner, now: Instant) -> Option<u32> {
         .map(|(bits, _)| bits)
 }
 
+/// The SD line of the FC's card in the network health section, from a fresh
+/// FC BOARD_HEALTH (word 6 bits 30..31); stale without one.
+pub(crate) fn health_line(state: &AppState) -> crate::types::BackendHealthLine {
+    let bits = fresh_bits(&state.igt.inner.lock().unwrap(), Instant::now());
+    let (badge, tone, value) = match bits {
+        None => ("Unknown", "stale", "No recent FC report".to_string()),
+        Some(bits) if bits & NOT_READY != 0 => (
+            "Unhealthy",
+            "unhealthy",
+            if bits & RETRY_PENDING != 0 { "Not mounted / not writable · retry pending" } else { "Not mounted / not writable" }.to_string(),
+        ),
+        Some(_) => ("Healthy", "healthy", "Mounted, writable".to_string()),
+    };
+    crate::types::BackendHealthLine { key: "sd".into(), name: "SD".into(), badge: badge.into(), tone: tone.into(), value }
+}
+
 /// A test fire has no AV bay: the FC's SD is not alerted there.
 fn quiet() -> bool {
     crate::station_mode::local_mode() == crate::station_mode::Mode::TestFire

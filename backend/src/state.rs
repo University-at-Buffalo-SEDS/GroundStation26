@@ -1365,6 +1365,7 @@ impl AppState {
                         .unwrap()
                         .snapshot(std::time::Instant::now(), crate::runtime_mode::is_test_fire());
                     crate::host_temperature::append_local(&mut rows, now_ms, simulated);
+                    crate::fc_estimator::project_network_health(self, &mut rows);
                     rows
                 },
             };
@@ -1393,6 +1394,7 @@ impl AppState {
             let mut rows = tracker.snapshot(now, crate::runtime_mode::is_test_fire());
             drop(tracker);
             crate::host_temperature::append_local(&mut rows, now_ms, simulated);
+            crate::fc_estimator::project_network_health(self, &mut rows);
             rows
         };
         let mut traffic_sampler = self.network_traffic.lock().unwrap();

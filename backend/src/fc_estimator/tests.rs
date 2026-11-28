@@ -29,9 +29,10 @@ fn infos(notices: &[Notice]) -> Vec<&str> {
 
 #[test]
 fn decodes_the_fc_words_and_nothing_else() {
-    let report = decode(&health(2, 0x1_0005, 40_001, 40_251)).unwrap();
+    let report = decode(&health(2, 0x1005, 40_001, 40_251)).unwrap();
     assert_eq!(report.phase, Phase::Running);
-    assert_eq!(report.cycles, 0x1_0005);
+    // Twelve cycle bits: bits 12..19 are the estimator status.
+    assert_eq!(report.cycles, 0x005);
     // Word 15 carries the start in 16-tick units.
     assert_eq!(report.start_tick, Some(40_000));
     assert_eq!(report.since_start(), Some(Duration::from_millis(251)));
@@ -301,4 +302,83 @@ fn shows_the_barometer_ground_reference() {
     let later = t + REPORT_FRESH + Duration::from_secs(1);
     let status = tracker.status(later);
     assert_eq!((status.baro_mode, status.baro_ref_hpa, status.baro_label), (None, None, None));
+}
+
+
+/// `health` with the estimator status byte (mode, origin, FC flight state).
+fn health_with_status(mode: u32, origin: u32, fc_state: u32, uptime_ms: u64) -> [u32; 24] {
+    let mut words = health(if mode == 2 { 2 } else { 0 }, 7, if mode == 2 { 1 } else { 0 }, uptime_ms);
+    words[13] |= (mode | (origin << 2) | (fc_state << 4)) << 12;
+    words
+}
+
+#[test]
+fn decodes_the_estimator_status() {
+    let running = decode(&health_with_status(2, 3, 4, 10_000)).unwrap();
+    assert_eq!((running.mode, running.origin, running.fc_state, running.cycles), (Mode::Running, Some(Origin::FcItself), Some(4), 7));
+    let station = decode(&health_with_status(2, 1, 5, 10_000)).unwrap();
+    assert_eq!(station.origin, Some(Origin::StationLaunch));
+    assert_eq!(decode(&health_with_status(2, 2, 3, 10_000)).unwrap().origin, Some(Origin::OperatorStart));
+    let armed = decode(&health_with_status(1, 0, 2, 10_000)).unwrap();
+    assert_eq!((armed.mode, armed.origin, armed.fc_state), (Mode::Armed, None, Some(2)));
+    assert_eq!(decode(&health_with_status(3, 0, 2, 10_000)).unwrap().mode, Mode::Stopped);
+    assert_eq!(decode(&health_with_status(0, 0, 0, 10_000)).unwrap().mode, Mode::Disabled);
+    // An FC flight state beyond Recovery is not shown.
+    assert_eq!(decode(&health_with_status(1, 0, 15, 10_000)).unwrap().fc_state, None);
+}
+
+#[test]
+fn the_kalman_health_line_says_disabled_armed_or_running_and_goes_stale() {
+    let tracker = Tracker::default();
+    let t0 = Instant::now();
+    assert_eq!(health_line(&tracker.status(t0)).badge, "Unknown");
+    tracker.observe(&health_with_status(1, 0, 2, 10_000), t0, None, PAD);
+    let line = health_line(&tracker.status(t0));
+    assert_eq!((line.key.as_str(), line.badge.as_str(), line.tone.as_str()), ("kalman", "Armed", "healthy"));
+    assert!(line.value.starts_with("Armed: starts at Launch"), "{}", line.value);
+    // A false detection: running in Ascent, started by the FC itself.
+    tracker.observe(&health_with_status(2, 3, 4, 15_000), t0 + Duration::from_secs(5), None, PAD);
+    let status = tracker.status(t0 + Duration::from_secs(5));
+    assert_eq!((status.filter, status.filter_flight_state, status.filter_origin), (Some(Mode::Running), Some("Ascent"), Some(Origin::FcItself)));
+    let line = health_line(&status);
+    assert_eq!(line.badge, "Running");
+    assert!(line.value.contains("Ascent") && line.value.contains("FC itself, no station Launch"), "{}", line.value);
+    // Kalman stop: disabled (stopped), back in Armed; no origin.
+    tracker.observe(&health_with_status(3, 0, 2, 20_000), t0 + Duration::from_secs(10), None, PAD);
+    let status = tracker.status(t0 + Duration::from_secs(10));
+    assert_eq!((status.filter, status.filter_origin), (Some(Mode::Stopped), None));
+    let line = health_line(&status);
+    assert_eq!((line.badge.as_str(), line.tone.as_str()), ("Disabled", "warning"));
+    // A station Launch run says so.
+    tracker.observe(&health_with_status(2, 1, 3, 25_000), t0 + Duration::from_secs(15), None, FLIGHT);
+    assert!(health_line(&tracker.status(t0 + Duration::from_secs(15))).value.contains("station Launch"));
+    // No fresh report: unknown, never the last value.
+    let stale = tracker.status(t0 + Duration::from_secs(15) + REPORT_FRESH + Duration::from_millis(1));
+    assert_eq!(stale.filter, None);
+    let line = health_line(&stale);
+    assert_eq!((line.badge.as_str(), line.tone.as_str()), ("Unknown", "stale"));
+}
+
+#[tokio::test]
+async fn the_fc_card_in_network_health_carries_sd_and_kalman_lines() {
+    let state = crate::state::tests::test_app_state().await;
+    let mut rows = vec![
+        crate::types::NetworkBoardHealthEntry { sender_id: "DAQ".into(), ..Default::default() },
+        crate::types::NetworkBoardHealthEntry {
+            sender_id: crate::types::Board::FlightComputer.sender_id().into(),
+            ..Default::default()
+        },
+    ];
+    project_network_health(&state, &mut rows);
+    assert!(rows[0].health_lines.is_empty(), "only the FC card");
+    let keys: Vec<_> = rows[1].health_lines.iter().map(|l| (l.key.as_str(), l.badge.as_str())).collect();
+    assert_eq!(keys, [("sd", "Unknown"), ("kalman", "Unknown")], "no fresh FC report yet");
+    state.fc_estimator.observe(&health_with_status(2, 3, 4, 10_000), Instant::now(), None, PAD);
+    project_network_health(&state, &mut rows);
+    assert_eq!(rows[1].health_lines.len(), 2, "replaced, not appended");
+    assert_eq!(rows[1].health_lines[1].badge, "Running");
+    // Served in the network topology frame's health rows.
+    let json = serde_json::to_value(&rows[1]).unwrap();
+    assert_eq!(json["health_lines"][1]["key"], "kalman");
+    assert!(serde_json::to_value(&rows[0]).unwrap().get("health_lines").is_none());
 }

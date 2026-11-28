@@ -136,7 +136,7 @@ pub(crate) fn blocked_message(state: &AppState) -> Option<String> {
     (unknown != 0).then(|| format!("Fresh actual state required because saved history is missing or was not clean for {}.", board_names(unknown)))
 }
 
-fn index(board: Board) -> Option<usize> {
+pub(crate) fn index(board: Board) -> Option<usize> {
     BOARDS.iter().position(|b| *b == board)
 }
 #[derive(Clone, Copy, Default)]

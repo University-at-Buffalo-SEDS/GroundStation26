@@ -295,7 +295,7 @@ above 15 V (`telemetry_task/derived.rs:4-5`).
 | `ASCENT_STATE` / `DESCENT_STATE` | f32[6] / f32[4] | 5 Hz while the filter runs | generic | trajectory |
 | `GPS_DATA` | f32[3] | event | `normalized_gps_values` | |
 | `FLIGHT_STATE` | u8[1] | every 2,000 ms in flight plus on change (`FC_STATE_REPUBLISH_MS`, `Core/Src/telemetry.c:1481`) | flight-state authority; `flight_state` table | starts and ends the launch capture |
-| `BOARD_HEALTH` | u32[24] | every 5 s | `fc_estimator::observe_health` (estimator phase, cycles, baro reference); `igt::observe_health`; `launch_site::observe_fc_health`; `fc_command_gate::observe` | estimator view (`FcEstimator` WebSocket message) |
+| `BOARD_HEALTH` | u32[24] | every 5 s | `fc_estimator::observe_health` (estimator phase, status, cycles, baro reference; the FC card's Kalman line in network health); `igt::observe_health`; `launch_site::observe_fc_health`; `fc_command_gate::observe` | estimator view (`FcEstimator` WebSocket message) |
 | `SIM_SAMPLE` | f32[8] | during an IGT replay | recorded raw; `igt::sim_rows` | `SIM_IMU_DATA`, `SIM_BAROMETER_DATA`, `SIM_GPS_DATA`, `SIM_ASCENT_STATE`, `SIM_DESCENT_STATE` (`igt::sim_series`) |
 | `MESSAGE_DATA` / `ORDERED_MESSAGE` | string | event | `recovery_events`, `flight_maxima` | messages table |
 | `LAUNCH_SITE` | f32[3] | echo | `launch_site::observe_echo` | |

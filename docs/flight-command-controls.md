@@ -42,6 +42,19 @@ station's state, fill or valves.
 - Kalman: start (HITL only): the FC starts its estimator as an internal
   Launch does.
 
+The FC's card in the network health section shows a Kalman line beside
+Network, State and SD (`fc_estimator::project_network_health`, from FC
+BOARD_HEALTH word 13 bits 12..19): Disabled (not ready, or stopped after a
+Kalman stop, break-up abort or Stop), Armed (Postinit/Armed: starts at
+Launch) or Running, with the FC flight state it runs in and who started it
+(the station Launch, the operator's Kalman start, or the FC itself with no
+station Launch). Without an FC report in the last 12 s it shows Unknown.
+After a Kalman stop the station asks the FC for a fresh readback so its view
+of the FC phase follows; the station's own flight state is not changed (the
+FC publishes no FLIGHT_STATE for a stop, and an FC report of a pad state
+never moves the station back from a flight state: use the station's own
+flight-state controls).
+
 A real flight is never stoppable by accident: the station refuses Stop and
 Reset (`fc_kalman::refusal`, also in the action policy and at dispatch) once
 its own Launch was sent (a Launch attempt on the launch journal, the Launch

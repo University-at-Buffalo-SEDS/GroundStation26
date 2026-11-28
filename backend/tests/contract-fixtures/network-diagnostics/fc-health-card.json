@@ -1,0 +1,26 @@
+{
+  "age_ms": 0,
+  "clock_offset_ms": null,
+  "cpu_temperature_age_ms": 0,
+  "cpu_temperature_centi_c": null,
+  "current_outage_ms": 0,
+  "diagnostics": null,
+  "disconnects": 0,
+  "health_lines": [
+    {
+      "badge": "Running",
+      "key": "kalman",
+      "name": "Kalman",
+      "tone": "healthy",
+      "value": "Launch · started by the station Launch · filter running (converged)"
+    }
+  ],
+  "healthy": true,
+  "last_seen_ms": 0,
+  "longest_outage_ms": 0,
+  "observed_ms": 0,
+  "offline_ms": 0,
+  "reconnects": 0,
+  "rx_observations": 0,
+  "sender_id": "FC"
+}

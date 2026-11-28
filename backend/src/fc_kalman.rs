@@ -71,6 +71,24 @@ pub(crate) fn block_policy(state: &AppState, policy: &mut crate::sequences::Acti
     }
 }
 
+/// After a Kalman stop the FC returns its own flight state to the pad state
+/// without publishing FLIGHT_STATE (the station's state is not its to
+/// change). Ask the FC for a fresh readback (the board-recovery QUERY that
+/// feeds the station's view of the FC phase, `fc_phase`) once it has had
+/// time to stop, so the station stops showing a phase the FC has left. Its
+/// estimator status follows in the FC's next BOARD_HEALTH (sent at once on a
+/// change). This changes no station state.
+pub(crate) fn refresh_fc_after_stop(state: &std::sync::Arc<AppState>) {
+    let Some(index) = crate::board_abort::index(crate::types::Board::FlightComputer) else { return };
+    let state = state.clone();
+    tokio::spawn(async move {
+        for delay_ms in [1_500u64, 4_000] {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            state.board_abort.request_queries(1 << index);
+        }
+    });
+}
+
 /// The confirmation the client shows before sending (layout `confirm`).
 pub(crate) fn confirmation(cmd: &str) -> Option<crate::layout::ActionConfirm> {
     let (title, message, button) = match cmd {

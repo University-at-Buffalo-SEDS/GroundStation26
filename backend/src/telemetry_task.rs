@@ -1782,6 +1782,9 @@ pub async fn telemetry_task(
                                 continue;
                             }
                             send_operator_flight_command(&state, &router, &cmd, _operator_claim.is_some());
+                            if matches!(cmd, TelemetryCommand::KalmanStop) {
+                                crate::fc_kalman::refresh_fc_after_stop(&state);
+                            }
                         }
                         TelemetryCommand::IgtDryRun | TelemetryCommand::IgtExit => {
                             match crate::igt::command_gate(&state, &cmd) {

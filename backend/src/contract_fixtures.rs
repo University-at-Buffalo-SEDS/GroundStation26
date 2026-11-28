@@ -633,11 +633,21 @@ async fn fc_estimator(app: &axum::Router, out: &mut Fixtures) {
     words[0] = 1;
     words[2] = 11_301;
     words[4] = 1000;
-    words[13] = (TAG << 24) | (3 << 20) | 62;
+    // Converged, running in the FC's Launch state, started by the station Launch.
+    words[13] = (TAG << 24) | (3 << 20) | ((2 | (1 << 2) | (3 << 4)) << 12) | 62;
     words[15] = crate::fc_estimator::word15(11_051, (0xFB4 << 2) | 1); // tracking, -0.76 hPa
     tracker.observe_barometer(&[0.0, 100_320.0, 21.5], launch);
     tracker.observe(&words, launch + Duration::from_millis(550), Some(T0 as u64 + 1_250), flight);
     let status = tracker.status(launch + Duration::from_millis(2_550));
+    // The FC's card in the network health section (NetworkTopology health
+    // rows) carries the Kalman line beside the client's own lines.
+    let card = crate::types::NetworkBoardHealthEntry {
+        sender_id: crate::types::Board::FlightComputer.sender_id().into(),
+        healthy: true,
+        health_lines: vec![crate::fc_estimator::health_line(&status)],
+        ..Default::default()
+    };
+    out.add("network-diagnostics/fc-health-card", serde_json::to_value(card).unwrap());
     out.add("websocket/fc-estimator", serde_json::to_value(WsOutMsg::FcEstimator(status)).unwrap());
     let mut value = get_ok(app, "/api/fc_estimator", Some("viewer")).await;
     pin_fields(&mut value, &["report_age_ms", "running_for_ms"]);

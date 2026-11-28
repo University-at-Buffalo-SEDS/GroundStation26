@@ -821,6 +821,24 @@ pub struct NetworkBoardHealthEntry {
     /// value means the board's clock is not synced to the station.
     #[serde(default)]
     pub clock_offset_ms: Option<i64>,
+    /// Further health lines the station describes for this board (the FC's
+    /// SD card and Kalman filter), rendered generically by the client.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub health_lines: Vec<BackendHealthLine>,
+}
+
+/// One "name · badge · value" health line the client renders as given.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, Hash)]
+pub struct BackendHealthLine {
+    /// Stable key ("sd", "kalman").
+    pub key: String,
+    /// Short name ("Kalman").
+    pub name: String,
+    /// Badge text ("Running", "Armed", "Disabled", "Unknown").
+    pub badge: String,
+    /// healthy, warning, unhealthy, neutral or stale.
+    pub tone: String,
+    pub value: String,
 }
 
 /// The station's own time: network-time quality (it normally leads, so this

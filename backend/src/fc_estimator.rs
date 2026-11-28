@@ -7,7 +7,12 @@
 //!
 //! - word 13: bits 24..31 the 'K' tag (0x4B), bits 20..23 the phase (0 idle,
 //!   1 initializing, 2 running, 3 converged, 4 paused, 5 stopped,
-//!   6 diverged), bits 0..19 the completed filter cycles this flight (wraps);
+//!   6 diverged), bits 12..19 the estimator status (bits 12..13 the mode:
+//!   0 disabled, 1 armed, 2 running, 3 stopped; bits 14..15 who started a
+//!   running evaluation: 1 a station Launch, 2 the operator's Kalman start,
+//!   3 the FC itself with no station Launch; bits 16..19 the FC's own flight
+//!   state, Startup 0 .. Recovery 10), bits 0..11 the completed filter
+//!   cycles this flight (wraps);
 //! - word 15: bits 0..17 the FC uptime tick (word 2's low word, word 4 Hz)
 //!   the filter started running at, in 16-tick units modulo 2^18 (70 min at
 //!   1 kHz); 0 before it has run. Bits 18..31 the barometer ground
@@ -48,7 +53,7 @@ const STALL_SPAN: Duration = Duration::from_secs(1);
 const REPORT_FRESH: Duration = Duration::from_secs(12);
 /// Republish ages (time since start, report age) at most this often.
 const PUBLISH_EVERY: Duration = Duration::from_secs(1);
-const CYCLE_MASK: u32 = 0xF_FFFF;
+const CYCLE_MASK: u32 = 0xFFF;
 const START_MASK: u32 = 0x3_FFFF;
 const START_SHIFT: u32 = 4;
 /// FC baro_reference.h BARO_ISA_T0_L, BARO_ISA_EXP and BARO_ISA_P0.
@@ -172,11 +177,45 @@ impl Phase {
     }
 }
 
+/// The FC's estimator mode (word 13 bits 12..13), as the FC reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    /// Not ready: no Postinit yet, or the FC holds its sequence.
+    Disabled,
+    /// Postinit/Armed with nothing running: a Launch starts it.
+    Armed,
+    Running,
+    /// Stopped: a Kalman stop, a break-up abort or the operator's Stop.
+    Stopped,
+}
+
+/// Who started a running evaluation (word 13 bits 14..15).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    /// A station Launch: the FC admitted the flight.
+    StationLaunch,
+    /// The operator's Kalman start (HITL).
+    OperatorStart,
+    /// The FC itself, with no station Launch (a false launch detection).
+    FcItself,
+}
+
+/// The FC's own flight states (FlightComputer26 `fcstructs.h`).
+const FC_STATES: [&str; 11] = [
+    "Startup", "Postinit", "Armed", "Launch", "Ascent", "Coast", "Apogee", "Descent", "Reefing", "Landed", "Recovery",
+];
+
 /// One decoded FC report.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Report {
     pub phase: Phase,
-    /// Completed filter cycles, modulo 2^20.
+    pub mode: Mode,
+    pub origin: Option<Origin>,
+    /// The FC's own flight state (index into its states), if valid.
+    pub fc_state: Option<u8>,
+    /// Completed filter cycles, modulo 2^12.
     pub cycles: u32,
     /// FC uptime tick (low word) at the filter's start, to 16 ticks.
     pub start_tick: Option<u32>,
@@ -214,8 +253,23 @@ pub fn decode(words: &[u32]) -> Option<Report> {
         return None;
     }
     let baro = words[15] >> 18;
+    let status = (words[13] >> 12) & 0xFF;
+    let fc_state = (status >> 4) as u8;
     Some(Report {
         phase: Phase::from_wire((words[13] >> 20) & 0xF)?,
+        mode: match status & 3 {
+            0 => Mode::Disabled,
+            1 => Mode::Armed,
+            2 => Mode::Running,
+            _ => Mode::Stopped,
+        },
+        origin: match (status >> 2) & 3 {
+            1 => Some(Origin::StationLaunch),
+            2 => Some(Origin::OperatorStart),
+            3 => Some(Origin::FcItself),
+            _ => None,
+        },
+        fc_state: (usize::from(fc_state) < FC_STATES.len()).then_some(fc_state),
         cycles: words[13] & CYCLE_MASK,
         start_tick: start_tick(words[15], words[2]),
         baro: BaroMode::from_wire(baro & 3).map(|mode| BaroRef {
@@ -308,6 +362,58 @@ pub struct Status {
     pub baro_mode: Option<BaroMode>,
     /// "Baro ref 1003.2 hPa · drift +1.8 hPa · tracking".
     pub baro_label: Option<String>,
+    /// The FC's estimator mode from a fresh report; `None`: unknown.
+    pub filter: Option<Mode>,
+    /// The FC's own flight state from a fresh report ("Ascent").
+    pub filter_flight_state: Option<&'static str>,
+    /// Who started the running evaluation, from a fresh report.
+    pub filter_origin: Option<Origin>,
+}
+
+/// Adds the FC's SD and Kalman lines to its card in the network health
+/// section (the FC's row of `NetworkTopologyMsg.health`).
+pub(crate) fn project_network_health(state: &crate::state::AppState, rows: &mut [crate::types::NetworkBoardHealthEntry]) {
+    let fc = crate::types::Board::FlightComputer.sender_id();
+    let Some(row) = rows.iter_mut().find(|row| crate::types::canonical_sender_id(&row.sender_id) == fc) else {
+        return;
+    };
+    row.health_lines.retain(|line| line.key != "sd" && line.key != "kalman");
+    row.health_lines.push(crate::igt::fc_sd::health_line(state));
+    row.health_lines.push(health_line(&state.fc_estimator.status(Instant::now())));
+}
+
+/// The Kalman line of the FC's card in the network health section: the
+/// FC's estimator disabled, armed or running (with the state it runs in and
+/// who started it), or unknown without a fresh report.
+pub(crate) fn health_line(status: &Status) -> crate::types::BackendHealthLine {
+    let line = |badge: &str, tone: &str, value: String| crate::types::BackendHealthLine {
+        key: "kalman".into(),
+        name: "Kalman".into(),
+        badge: badge.into(),
+        tone: tone.into(),
+        value,
+    };
+    let state = status.filter_flight_state.unwrap_or("unknown state");
+    match status.filter {
+        None => line("Unknown", "stale", "No recent FC report".into()),
+        Some(Mode::Running) => {
+            let origin = match status.filter_origin {
+                Some(Origin::StationLaunch) => "started by the station Launch",
+                Some(Origin::OperatorStart) => "started by the operator (Kalman: start)",
+                Some(Origin::FcItself) => "started by the FC itself, no station Launch",
+                None => "start unknown",
+            };
+            let phase = status.phase.map_or("", Phase::label);
+            line("Running", "healthy", format!("{state} · {origin} · filter {phase}"))
+        }
+        Some(Mode::Armed) => line("Armed", "healthy", format!("{state}: starts at Launch")),
+        Some(Mode::Stopped) => line(
+            "Disabled",
+            "warning",
+            format!("{state}: stopped (Kalman stop, break-up abort or Stop)"),
+        ),
+        Some(Mode::Disabled) => line("Disabled", "neutral", format!("{state}: not ready (needs Postinit, or held)")),
+    }
 }
 
 impl Status {
@@ -321,6 +427,9 @@ impl Status {
             && self.launch_seen == other.launch_seen
             && self.expected == other.expected
             && self.baro_mode == other.baro_mode
+            && self.filter == other.filter
+            && self.filter_flight_state == other.filter_flight_state
+            && self.filter_origin == other.filter_origin
     }
 }
 
@@ -568,6 +677,13 @@ impl Tracker {
             baro_drift_hpa,
             baro_mode: baro.map(|b| b.mode),
             baro_label,
+            filter: fresh.map(|seen| seen.report.mode),
+            filter_flight_state: fresh
+                .and_then(|seen| seen.report.fc_state)
+                .map(|state| FC_STATES[usize::from(state)]),
+            filter_origin: fresh
+                .filter(|seen| seen.report.mode == Mode::Running)
+                .and_then(|seen| seen.report.origin),
         }
     }
 
