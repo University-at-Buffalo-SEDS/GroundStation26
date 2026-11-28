@@ -531,13 +531,40 @@ impl Store {
 }
 static STORE: OnceLock<Mutex<Result<Store, String>>> = OnceLock::new();
 fn store() -> &'static Mutex<Result<Store, String>> {
-    STORE.get_or_init(|| {
-        Mutex::new(Store::open(
-            std::env::var_os("GS_CHECKLISTS_FILE")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("backend/data/checklists.json")),
-        ))
-    })
+    STORE.get_or_init(|| Mutex::new(Store::open(store_path())))
+}
+/// The checklist document file: `GS_CHECKLISTS_FILE`, else the station default.
+fn store_path() -> PathBuf {
+    std::env::var_os("GS_CHECKLISTS_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_store_path)
+}
+fn default_store_path() -> PathBuf {
+    #[cfg(not(test))]
+    {
+        PathBuf::from("backend/data/checklists.json")
+    }
+    // Every in-process test shares this one process-wide store, and every
+    // action-policy refresh reads it under the store lock. The default path is
+    // inside the source tree, so tests that record or reset sequence
+    // completions fsynced (and carried between runs) a shared file there while
+    // holding that lock; a slow disk stalled every other test's policy refresh
+    // for seconds and aged its freshness windows. Tests never touch operator
+    // data: an unconfigured test process gets its own private file instead.
+    #[cfg(test)]
+    {
+        static PATH: OnceLock<PathBuf> = OnceLock::new();
+        PATH.get_or_init(|| {
+            std::env::temp_dir()
+                .join(format!(
+                    "groundstation-checklists-test-{}-{}",
+                    std::process::id(),
+                    rand::random::<u128>()
+                ))
+                .join("checklists.json")
+        })
+        .clone()
+    }
 }
 fn access<T>(f: impl FnOnce(&mut Store) -> Result<T, String>) -> Result<T, String> {
     let mut guard = store().lock().map_err(|_| "Checklist store unavailable")?;

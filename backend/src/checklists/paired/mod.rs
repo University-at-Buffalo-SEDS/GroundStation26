@@ -704,11 +704,7 @@ impl Service {
         );
         let global_document = next_document.clone();
         let next_generations = prepared.generations.clone();
-        let legacy_path = access(|store| Ok(store.path.clone())).unwrap_or_else(|_| {
-            std::env::var_os("GS_CHECKLISTS_FILE")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("backend/data/checklists.json"))
-        });
+        let legacy_path = access(|store| Ok(store.path.clone())).unwrap_or_else(|_| store_path());
         if self.journal.metadata().await?.revision != snapshot.metadata.revision {
             return Ok(());
         }
@@ -861,9 +857,7 @@ pub(crate) fn start(
         let legacy = match access(|store| Ok((store.path.clone(), store.document.clone()))) {
             Ok(value) => value,
             Err(_) => {
-                let path = std::env::var_os("GS_CHECKLISTS_FILE")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("backend/data/checklists.json"));
+                let path = store_path();
                 match Store::open(path.clone()) {
                     Ok(store) => (path, store.document),
                     Err(error) => {
