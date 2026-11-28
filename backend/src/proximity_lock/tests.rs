@@ -579,3 +579,55 @@ async fn an_rrls_judges_forwarded_names_by_the_mirrored_controls() {
     assert!(rrls_forward_refusal(&state, "StartFill", Some("op")).is_some());
     assert!(rrls_forward_refusal(&state, "Launch", Some("op")).is_some());
 }
+
+#[tokio::test]
+async fn unknown_devices_say_why() {
+    let state = crate::state::tests::test_app_state().await;
+    enable(&state, json!({}));
+    let now = Instant::now();
+    // Field report: an iPhone kept reporting with in_range null and no
+    // accuracy or reference (no rocket fix, no launch site configured).
+    let mut no_reference = report("phone-r", "rylan's iPhone", true, None);
+    no_reference["cannot_tell"] = json!("no_reference");
+    no_reference["accuracy"] = Value::Null;
+    no_reference["reference"] = Value::Null;
+    send(&state, "rylan", &no_reference, now).unwrap();
+    let mut no_fix = report("watch-c", "Cy's phone", true, None);
+    no_fix["cannot_tell"] = json!("no_fix");
+    send(&state, "cy", &no_fix, now).unwrap();
+    send(&state, "bo", &report("pixel-b", "Bo's Pixel", true, Some(false)), now - Duration::from_secs(61)).unwrap();
+    let status = state.proximity.status_at(now, None);
+    assert_eq!(status.counts.unknown, 3, "{status:?}");
+    let warning = status.warning.as_deref().unwrap();
+    assert!(
+        warning.contains("rylan's iPhone: cannot tell: no fresh rocket GPS fix and no launch site configured at the station"),
+        "{warning}"
+    );
+    assert!(warning.contains("Cy's phone: cannot tell: no recent location fix on the device"), "{warning}");
+    assert!(warning.contains("Bo's Pixel: no report for over 60 s"), "{warning}");
+    let by_name = |name: &str| status.devices.iter().find(|d| d.name == name).unwrap().clone();
+    assert_eq!(by_name("rylan's iPhone").cannot_tell, Some(CannotTell::NoReference));
+    assert_eq!(by_name("Cy's phone").cannot_tell, Some(CannotTell::NoFix));
+    assert_eq!(by_name("Bo's Pixel").cannot_tell, None);
+    assert_eq!(by_name("Bo's Pixel").unknown_reason.as_deref(), Some("no report for over 60 s"));
+    let json = serde_json::to_value(by_name("rylan's iPhone")).unwrap();
+    assert_eq!(json["cannot_tell"], "no_reference");
+    // A definite answer clears the reason; a reason with in_range set is ignored.
+    let mut definite = report("phone-r", "rylan's iPhone", true, Some(false));
+    definite["cannot_tell"] = json!("no_fix");
+    send(&state, "rylan", &definite, now).unwrap();
+    let device = state.proximity.status_at(now, None).devices.into_iter().find(|d| d.name == "rylan's iPhone").unwrap();
+    assert_eq!((device.state, device.cannot_tell, device.unknown_reason), (DeviceState::OutOfRange, None, None));
+    // The audit names the reason too.
+    refresh_at(&state, now);
+    assert!(
+        state.proximity.audit().iter().any(|e| e.kind == AuditKind::Unknown
+            && e.text.contains("Cy's phone (cy) position unknown (cannot tell: no recent location fix on the device)")),
+        "{:#?}",
+        state.proximity.audit()
+    );
+    // An unknown reason value is refused like any other bad field.
+    let mut bad = report("phone-r", "rylan's iPhone", true, None);
+    bad["cannot_tell"] = json!("somewhere");
+    assert_eq!(send(&state, "rylan", &bad, now).unwrap_err().0, StatusCode::BAD_REQUEST);
+}

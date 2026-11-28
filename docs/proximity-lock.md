@@ -63,7 +63,8 @@ is a 400 (`deny_unknown_fields`):
 ```json
 {"v": 1, "device_id": "prox-…", "device_name": "Alex's iPhone", "platform": "ios",
  "participating": true, "in_range": true, "accuracy": "high", "reference": "rocket",
- "background": true, "opt_out": null, "seq": 42, "sent_ms": 1763600000000}
+ "background": true, "opt_out": null, "cannot_tell": null, "seq": 42,
+ "sent_ms": 1763600000000}
 ```
 
 - `accuracy` is a class (`high` ≤ 20 m, `medium` ≤ 100 m, `low`), not metres.
@@ -71,6 +72,11 @@ is a 400 (`deny_unknown_fields`):
   receives) or `pad` (the configured FC launch site, when there is no fresh
   rocket fix). With neither, the device sends `in_range: null`.
 - `opt_out` (when not participating): `user`, `permission_denied`, `unsupported`.
+- `cannot_tell` (participating with `in_range: null`, optional): why the
+  device cannot tell: `no_fix` (no recent location fix on the device),
+  `no_reference` (no fresh rocket fix and no launch site configured at the
+  station), `awaiting_permission` (the location prompt is not answered).
+  Ignored when `in_range` is set or the device does not participate.
 - Freshness is the station's receive time; `sent_ms` is informational.
 
 The station keeps, in memory only, per account and device: the name, the
@@ -227,6 +233,17 @@ accounts only; never a place.
  "override": null, "pad": {"lat_deg": 42.0, "lon_deg": -78.0},
  "blocked_commands": ["Postinit", "AdvanceFlightState", …]}
 ```
+
+A device in state `unknown` also carries `unknown_reason` (words: "no
+report for over 60 s", "cannot tell: no recent location fix on the device")
+and, while it still reports, `cannot_tell` (the report's reason).
+
+The unknown warning (and the reason under `block`) names each unknown
+device with its reason, e.g. "Proximity lock: 1 participating device not
+reporting or cannot tell (rylan's iPhone: cannot tell: no fresh rocket GPS
+fix and no launch site configured at the station); unknown devices only
+warn". Set the launch site (FC launch site settings) so devices can measure
+without a rocket fix.
 
 `active` is true while the lock refuses; `condition` is true while someone is
 in range (or unknown under `block`), overridden or not.

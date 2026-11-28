@@ -339,6 +339,29 @@ impl OptOut {
     }
 }
 
+/// Why a participating device cannot tell whether it is in range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CannotTell {
+    /// No recent location fix on the device.
+    NoFix,
+    /// Nothing to measure against: no fresh rocket fix and no launch site
+    /// configured at the station.
+    NoReference,
+    /// The location permission prompt is not answered yet.
+    AwaitingPermission,
+}
+
+impl CannotTell {
+    fn label(self) -> &'static str {
+        match self {
+            CannotTell::NoFix => "no recent location fix on the device",
+            CannotTell::NoReference => "no fresh rocket GPS fix and no launch site configured at the station",
+            CannotTell::AwaitingPermission => "location permission not answered on the device",
+        }
+    }
+}
+
 /// `POST /api/proximity/report`. Exactly these fields: anything else
 /// (a latitude, a distance) is refused.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -363,6 +386,9 @@ pub struct Report {
     pub background: bool,
     #[serde(default)]
     pub opt_out: Option<OptOut>,
+    /// Participating with `in_range` null: why the device cannot tell.
+    #[serde(default)]
+    pub cannot_tell: Option<CannotTell>,
     /// Increments with every report from this device (heartbeat counter).
     pub seq: u64,
     /// The device's clock when it sent the report (informational: freshness
@@ -403,6 +429,7 @@ struct Device {
     reference: Option<Reference>,
     background: bool,
     opt_out: Option<OptOut>,
+    cannot_tell: Option<CannotTell>,
     last_seen: Instant,
     last_seen_ms: i64,
     recent: VecDeque<Instant>,
@@ -423,6 +450,28 @@ impl Device {
             Some(false) => DeviceState::OutOfRange,
             None => DeviceState::Unknown,
         }
+    }
+
+    /// Why the device is unknown, for the operator: silent, or what the
+    /// device said it lacks. None unless the state is unknown.
+    fn unknown_detail(&self, now: Instant, timeout: Duration) -> Option<String> {
+        if self.state(now, timeout) != DeviceState::Unknown {
+            return None;
+        }
+        if now.saturating_duration_since(self.last_seen) > timeout {
+            return Some(format!("no report for over {} s", timeout.as_secs()));
+        }
+        Some(match self.cannot_tell {
+            Some(reason) => format!("cannot tell: {}", reason.label()),
+            None => "cannot tell".to_owned(),
+        })
+    }
+
+    /// The fresh report's reason, shown only while the device is unknown and
+    /// still reporting.
+    fn cannot_tell_now(&self, now: Instant, timeout: Duration) -> Option<CannotTell> {
+        let fresh = now.saturating_duration_since(self.last_seen) <= timeout;
+        (fresh && self.state(now, timeout) == DeviceState::Unknown).then_some(self.cannot_tell).flatten()
     }
 }
 
@@ -509,6 +558,13 @@ pub struct DeviceView {
     pub background: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub opt_out: Option<OptOut>,
+    /// Unknown but still reporting: why the device cannot tell.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cannot_tell: Option<CannotTell>,
+    /// Unknown: the reason in words ("no report for over 60 s", "cannot
+    /// tell: no recent location fix on the device").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unknown_reason: Option<String>,
     pub last_report_ms: i64,
 }
 
@@ -562,6 +618,18 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 /// The device's name, with a disambiguating account when two devices share it.
 fn names(list: &[&Device]) -> String {
     list.iter().map(|d| d.name.as_str()).collect::<Vec<_>>().join(", ")
+}
+
+/// Unknown devices with the reason for each: "Bo's Pixel: no report for
+/// over 60 s; Cy's phone: cannot tell: no recent location fix on the device".
+fn unknown_names(list: &[&Device], now: Instant, timeout: Duration) -> String {
+    list.iter()
+        .map(|d| match d.unknown_detail(now, timeout) {
+            Some(detail) => format!("{}: {detail}", d.name),
+            None => d.name.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 #[derive(Default)]
@@ -631,6 +699,8 @@ fn status_of(inner: &Inner, now: Instant, pad: Option<Pad>) -> Status {
             reference: device.reference.filter(|_| device.participating),
             background: device.background,
             opt_out: device.opt_out.filter(|_| !device.participating),
+            cannot_tell: device.cannot_tell_now(now, timeout),
+            unknown_reason: device.unknown_detail(now, timeout),
             last_report_ms: device.last_seen_ms,
         });
     }
@@ -649,7 +719,7 @@ fn status_of(inner: &Inner, now: Instant, pad: Option<Pad>) -> Status {
         let text = format!(
             "{} not reporting or cannot tell ({})",
             plural(unknown.len(), "participating device", "participating devices"),
-            names(&unknown)
+            unknown_names(&unknown, now, timeout)
         );
         match settings.stale_policy {
             StalePolicy::Block => reasons.push(format!("Proximity lock: {text}; unknown devices block")),
@@ -926,9 +996,10 @@ pub(crate) fn refresh_at(state: &AppState, now: Instant) {
                 continue;
             }
             let previous = device.announced.replace(current);
-            transitions.push((device.name.clone(), device.username.clone(), previous, current, device.opt_out));
+            let detail = device.unknown_detail(now, timeout);
+            transitions.push((device.name.clone(), device.username.clone(), previous, current, device.opt_out, detail));
         }
-        for (name, user, previous, current, opt_out) in transitions {
+        for (name, user, previous, current, opt_out, detail) in transitions {
             let (kind, text) = match current {
                 DeviceState::InRange => (AuditKind::EnteredRange, format!("{name} ({user}) entered the {radius} m lockout radius")),
                 DeviceState::OutOfRange if previous.is_none() => {
@@ -937,7 +1008,10 @@ pub(crate) fn refresh_at(state: &AppState, now: Instant) {
                 DeviceState::OutOfRange => (AuditKind::LeftRange, format!("{name} ({user}) left the {radius} m lockout radius")),
                 DeviceState::Unknown => (
                     AuditKind::Unknown,
-                    format!("{name} ({user}) position unknown (no report for {} s, or it cannot tell)", settings.heartbeat_timeout_s),
+                    format!(
+                        "{name} ({user}) position unknown ({})",
+                        detail.unwrap_or_else(|| format!("no report for {} s, or it cannot tell", settings.heartbeat_timeout_s))
+                    ),
                 ),
                 DeviceState::OptedOut => (
                     AuditKind::OptedOut,
@@ -1090,6 +1164,7 @@ pub(crate) fn accept_report(
                 reference: None,
                 background: false,
                 opt_out: None,
+                cannot_tell: None,
                 last_seen: now,
                 last_seen_ms: now_ms(),
                 recent: VecDeque::new(),
@@ -1114,6 +1189,7 @@ pub(crate) fn accept_report(
             device.reference = report.reference.filter(|_| report.participating);
             device.background = report.background;
             device.opt_out = if report.participating { None } else { Some(report.opt_out.unwrap_or(OptOut::User)) };
+            device.cannot_tell = report.cannot_tell.filter(|_| report.participating && report.in_range.is_none());
             device.last_seen = now;
             device.last_seen_ms = now_ms();
         }
