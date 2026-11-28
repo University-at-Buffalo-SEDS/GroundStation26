@@ -2924,5 +2924,51 @@
         }
       ]
     }
+  ],
+  "live_summary": [
+    {
+      "label": "Ox tank",
+      "unit": "psi",
+      "decimals": 0,
+      "channels": [
+        {
+          "data_type": "OX_TANK_PRESSURE",
+          "index": 0
+        }
+      ]
+    },
+    {
+      "label": "Chamber",
+      "unit": "psig",
+      "decimals": 0,
+      "channels": [
+        {
+          "data_type": "COMBUSTION_CHAMBER_PRESSURE",
+          "index": 0
+        }
+      ]
+    },
+    {
+      "label": "Load cell",
+      "unit": "kg",
+      "decimals": 1,
+      "channels": [
+        {
+          "data_type": "LOADCELL_WEIGHT_KG",
+          "index": 0
+        }
+      ]
+    },
+    {
+      "label": "Fill",
+      "unit": "%",
+      "decimals": 0,
+      "channels": [
+        {
+          "data_type": "LOADCELL_FILL_PERCENT",
+          "index": 0
+        }
+      ]
+    }
   ]
 }

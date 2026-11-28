@@ -303,6 +303,13 @@ Critical expectations:
   - `gps: {data_types[], lat_index, lon_index, alt_index}`: the rows that are GPS fixes.
   - `watch_items: [{id, channels:[{data_type, sender_id?, index}]}]`: watch item channels by id;
     `/api/watch/status` reads the same list.
+  - `live_summary: [{label, unit, decimals, channels:[{data_type, sender_id?, index}]}]`: the
+    readings (at most 4, in order) the phone app shows on its lock-screen live status (iOS Live
+    Activity, Android ongoing notification) beside the flight state, T-clock and abort state. Each
+    shows the newest finite value of its channels as `label value unit` with `decimals` (default 1;
+    no unit conversion). The station chooses them; the UI has no built-in list, so a layout
+    without it shows no readings there. Loading trims labels and units, drops entries without a
+    label or a named channel, keeps the first 4 and caps `decimals` at 6.
   - `actions_tab.controls: [{cmd, label}]`: names of controls that are not layout buttons (the
     HITL interlock toggles, named in `layout_hitl.json` only, since only HITL has those commands).
   - `actions_tab.fill_target_fluids: [{id, label}]`: the `/api/fill_targets` fluids the UI edits,

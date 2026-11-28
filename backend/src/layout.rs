@@ -50,6 +50,33 @@ pub struct LayoutConfig {
     /// channels. The watch status (`/api/watch/status`) reads the same list.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub watch_items: Vec<WatchItemBinding>,
+    /// The few readings the phone app shows on its lock-screen live status
+    /// (iOS Live Activity, Android ongoing notification), in order, at most
+    /// [`MAX_LIVE_SUMMARY_ITEMS`]. The station chooses them, with their labels
+    /// and units, so the app names no vehicle channel itself. Omitted: the
+    /// live status shows state, T-clock and abort only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub live_summary: Vec<LiveSummaryItem>,
+}
+
+/// Readings a lock-screen live status has room for.
+pub const MAX_LIVE_SUMMARY_ITEMS: usize = 4;
+
+/// One reading on the phone's lock-screen live status: the newest finite
+/// value of `channels`, shown as `label` `value` `unit` with `decimals`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LiveSummaryItem {
+    pub label: String,
+    /// Display unit of the channel values as stored (no conversion).
+    #[serde(default)]
+    pub unit: String,
+    #[serde(default = "default_live_summary_decimals")]
+    pub decimals: u8,
+    pub channels: Vec<WatchChannel>,
+}
+
+fn default_live_summary_decimals() -> u8 {
+    1
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -813,9 +840,23 @@ fn load_layout_file(path: &std::path::Path, mode: crate::station_mode::Mode) -> 
     let mut layout: LayoutConfig =
         serde_json::from_value(value).map_err(|e| format!("Invalid layout JSON: {e}"))?;
     normalize_flight_phases(&mut layout)?;
+    normalize_live_summary(&mut layout.live_summary);
     apply_runtime_layout_overrides(&mut layout, mode);
     assign_control_sections(&mut layout);
     Ok(layout)
+}
+
+/// Keeps the live-status readings a phone can show: a label and at least one
+/// named channel each, at most [`MAX_LIVE_SUMMARY_ITEMS`], up to 6 decimals.
+fn normalize_live_summary(items: &mut Vec<LiveSummaryItem>) {
+    for item in items.iter_mut() {
+        item.label = item.label.trim().to_string();
+        item.unit = item.unit.trim().to_string();
+        item.decimals = item.decimals.min(6);
+        item.channels.retain(|c| !c.data_type.trim().is_empty());
+    }
+    items.retain(|item| !item.label.is_empty() && !item.channels.is_empty());
+    items.truncate(MAX_LIVE_SUMMARY_ITEMS);
 }
 
 /// Renames legacy telemetry type names (and the matching human label) in a
@@ -1533,16 +1574,70 @@ mod vehicle_binding_tests {
         let root = value.as_object_mut().unwrap();
         root.remove("gps");
         root.remove("watch_items");
+        root.remove("live_summary");
         let actions = root["actions_tab"].as_object_mut().unwrap();
         actions.remove("controls");
         actions.remove("fill_target_fluids");
         let layout: LayoutConfig = serde_json::from_value(value).unwrap();
         let served = serde_json::to_value(&layout).unwrap();
-        for key in ["gps", "watch_items"] {
+        for key in ["gps", "watch_items", "live_summary"] {
             assert!(served.get(key).is_none(), "{key}");
         }
         for key in ["controls", "fill_target_fluids"] {
             assert!(served["actions_tab"].get(key).is_none(), "{key}");
         }
+    }
+
+    /// Every shipped layout names its lock-screen readings, with labels and
+    /// units, from channels it already binds for the watch.
+    #[test]
+    fn shipped_layouts_name_their_live_summary_readings() {
+        for file in [DEFAULT_LAYOUT_PATH, DEFAULT_HITL_LAYOUT_PATH, DEFAULT_TEST_FIRE_LAYOUT_PATH] {
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(file);
+            let layout: LayoutConfig = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            let items = &layout.live_summary;
+            assert!(!items.is_empty() && items.len() <= MAX_LIVE_SUMMARY_ITEMS, "{file}: {}", items.len());
+            let watched: Vec<&WatchChannel> = layout.watch_items.iter().flat_map(|w| &w.channels).collect();
+            for item in items {
+                assert!(!item.label.trim().is_empty() && !item.unit.trim().is_empty(), "{file}: {item:?}");
+                assert!(item.decimals <= 6, "{file}: {item:?}");
+                assert!(!item.channels.is_empty(), "{file}: {}", item.label);
+                for channel in &item.channels {
+                    assert!(watched.contains(&channel), "{file}: {} reads {channel:?}, which no watch item binds", item.label);
+                }
+            }
+            let mut normalized = items.clone();
+            normalize_live_summary(&mut normalized);
+            assert_eq!(&normalized, items, "{file} is already normal");
+        }
+    }
+
+    #[test]
+    fn live_summary_drops_unusable_readings_and_keeps_four() {
+        let channel = |dt: &str| WatchChannel { data_type: dt.into(), sender_id: None, index: 0 };
+        let item = |label: &str, channels: Vec<WatchChannel>| LiveSummaryItem {
+            label: label.into(),
+            unit: " psi ".into(),
+            decimals: 9,
+            channels,
+        };
+        let mut items = vec![
+            item("  ", vec![channel("A")]),
+            item("No channel", vec![channel(" ")]),
+            item(" One ", vec![channel("A"), channel("")]),
+            item("Two", vec![channel("B")]),
+            item("Three", vec![channel("C")]),
+            item("Four", vec![channel("D")]),
+            item("Five", vec![channel("E")]),
+        ];
+        normalize_live_summary(&mut items);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["One", "Two", "Three", "Four"]);
+        assert_eq!(items[0].channels, vec![channel("A")]);
+        assert_eq!((items[0].unit.as_str(), items[0].decimals), ("psi", 6));
+        // Decimals default to one when a layout leaves them out.
+        let parsed: LiveSummaryItem =
+            serde_json::from_value(serde_json::json!({"label": "Tank", "channels": [{"data_type": "A"}]})).unwrap();
+        assert_eq!((parsed.unit.as_str(), parsed.decimals, parsed.channels[0].index), ("", 1, 0));
     }
 }

@@ -342,6 +342,15 @@ async fn vehicle_geometry(app: &axum::Router, out: &mut Fixtures) {
     out.add("vehicle/geometry", get_ok(app, crate::vehicle_geometry::PATH, Some("viewer")).await);
 }
 
+/// `GET /api/layout`'s `live_summary`: the readings the phone's lock-screen
+/// live status shows (labels, units, channels), chosen by the station.
+async fn live_summary(app: &axum::Router, out: &mut Fixtures) {
+    let layout = get_ok(app, "/api/layout", Some("viewer")).await;
+    let items = layout["live_summary"].clone();
+    assert!(items.as_array().is_some_and(|items| !items.is_empty()), "{layout}");
+    out.add("layout/live-summary", items);
+}
+
 /// `GET /api/station_mode` (operating mode metadata).
 async fn operating_mode(app: &axum::Router, out: &mut Fixtures) {
     out.add("station-mode/status", get_ok(app, "/api/station_mode", Some("viewer")).await);
@@ -1380,6 +1389,7 @@ async fn contract_fixtures_match_the_backend() {
     auth(&app, &mut out).await;
     fc_estimator(&app, &mut out).await;
     vehicle_geometry(&app, &mut out).await;
+    live_summary(&app, &mut out).await;
     replay_export(&app, &mut out).await;
     replay_bundle(&root.0, &state, &app, &mut out).await;
     flight_plans(&state, &app, &mut out).await;

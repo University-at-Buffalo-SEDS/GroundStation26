@@ -16,7 +16,8 @@ receipt, snapshot after a switch and the `StationModeChanged` frame;
 `/api/alerts`, `/api/alerts/ack`, the `AlertAckState` frame (with
 `history_cleared_through_ms`) and `/api/alerts/history/clear`;
 `/api/network_diagnostics` `radio_tx_budget`; `/api/radio/modem`;
-`/api/rrls/status`; `/api/vehicle/geometry` (the built-in design); `/api/auth/session` (signed in and anonymous) and
+`/api/rrls/status`; `/api/vehicle/geometry` (the built-in design); `layout/live-summary` (the
+`live_summary` readings of `/api/layout`, which the phone's lock-screen live status shows); `/api/auth/session` (signed in and anonymous) and
 `/api/auth/challenge`; `/api/board_abort` in HITL with every board aborted
 (each error `dismissible`, keyed by board and `timestamp_ms`); and one
 request, `requests/gse-self-test-confirmation`: the isolation checkbox's

@@ -3923,5 +3923,63 @@
         }
       ]
     }
+  ],
+  "live_summary": [
+    {
+      "label": "Altitude",
+      "unit": "m",
+      "decimals": 0,
+      "channels": [
+        {
+          "data_type": "ASCENT_STATE",
+          "index": 4
+        },
+        {
+          "data_type": "DESCENT_STATE",
+          "index": 2
+        },
+        {
+          "data_type": "BAROMETER_DATA",
+          "index": 0
+        }
+      ]
+    },
+    {
+      "label": "Velocity",
+      "unit": "m/s",
+      "decimals": 1,
+      "channels": [
+        {
+          "data_type": "ASCENT_STATE",
+          "index": 5
+        },
+        {
+          "data_type": "DESCENT_STATE",
+          "index": 3
+        }
+      ]
+    },
+    {
+      "label": "Ox tank",
+      "unit": "psi",
+      "decimals": 0,
+      "channels": [
+        {
+          "data_type": "OX_TANK_PRESSURE",
+          "index": 0
+        }
+      ]
+    },
+    {
+      "label": "Load cell",
+      "unit": "kg",
+      "decimals": 1,
+      "channels": [
+        {
+          "data_type": "LOADCELL_WEIGHT_KG",
+          "index": 0
+        }
+      ]
+    }
   ]
 }
