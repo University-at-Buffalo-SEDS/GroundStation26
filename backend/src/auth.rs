@@ -1664,8 +1664,9 @@ const WATCH_ROW_PREFIX: &str = "gsw1h:";
 /// `watch|<device id>|<parent session fingerprint>`
 const WATCH_SESSION_PREFIX: &str = "watch|";
 pub const WATCH_SESSION_TYPE: &str = "watch";
-/// Most commands one watch token may carry (pages × 2 actions).
-pub const MAX_WATCH_COMMANDS: usize = 16;
+/// Most commands one watch token may carry: the watch Actions page offers
+/// every watch-eligible command of the mode (plus the per-page buttons).
+pub const MAX_WATCH_COMMANDS: usize = 64;
 /// Upper bound on a watch token's life, even with a longer session TTL.
 const WATCH_TOKEN_MAX_TTL_SECONDS: u64 = 60 * 60 * 24 * 30;
 const NO_WATCH_COMMANDS: &str = "__no_watch_commands__";

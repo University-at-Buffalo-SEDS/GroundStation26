@@ -15,7 +15,8 @@ with a signed-in phone session returns
 
 * Issued only to a named, non-anonymous session; never to a watch token.
 * `commands` is narrowed to the commands the account may send now **and**
-  that are watch-eligible (below), deduplicated, at most 16. A viewer gets a
+  that are watch-eligible (below), deduplicated, at most 64 (the watch Actions page offers every
+  watch-eligible command of the mode). A viewer gets a
   read-only token.
 * `voice` (optional, default false) asks for crew voice. It is granted only
   when the account may transmit on crew voice now (`voice_transmit`, or the
@@ -56,15 +57,26 @@ time, a missing tile not again for a minute).
 
 ## Watch-eligible actions
 
-Watch pages may carry at most two action buttons each, chosen on the phone
-from `GET /api/watch/actions` (signed-in phone session):
+The watch's Actions page shows every entry of `GET /api/watch/actions`
+(signed-in phone session); the watch dashboard highlights some of them and
+items pages may carry at most two buttons each:
 
 ```json
-{"actions":[{"cmd":"Abort","label":"Abort","section":"safety","abort":true,"enabled":true},
-            {"cmd":"Dump","label":"Dump","section":"fill_system","abort":false,"enabled":false,"reason":"…"}],
+{"actions":[{"cmd":"Dump","label":"Dump","section":"fill_system","abort":false,"enabled":false,"reason":"…",
+             "confirm":{"title":"Dump?","message":"Opens the dump valve.","button":"Dump"}},
+            {"cmd":"Abort","label":"Abort","section":"safety","abort":true,"enabled":true}],
  "excluded":[{"cmd":"Launch","reason":"Launch-class actions are not offered on the watch."}],
- "max_per_page":2}
+ "max_per_page":2,
+ "dashboard":{"items":["altitude","velocity","tank_pressure","loadcell_mass"],"actions":["Abort"]}}
 ```
+
+* `actions` are in the served layout's Actions-tab order (commands the
+  layout does not list follow in catalog order) with the layout's `label`
+  and, when the layout has one, its `confirm` text; the phone groups them by
+  `section` the way its Actions tab does.
+* `dashboard` is the watch dashboard a user gets until they arrange their
+  own: watch item ids (propulsion only in test-fire mode) and the default
+  highlighted actions (`Abort`, when the account may send it).
 
 The list holds the current mode's Actions-tab commands the account may send,
 minus the excluded ones:
@@ -72,6 +84,7 @@ minus the excluded ones:
 * Launch class: `Launch`, `GroundStationLaunch`, `ResetLaunchLatch`,
   `TogglePhysicalLaunchMode`, `ToggleLaunchInterlock`;
 * pyro: `Igniter`, `IgniterSequence`, `DeployParachute`, `ExpandParachute`;
+* `IgtEnter` and `IgtLivePyro` (ticketed, typed confirmation in the full app);
 * `RecoverStation` (an HTTP action with its own flow) and the HITL bench
   (Testing section) controls.
 

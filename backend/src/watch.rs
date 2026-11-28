@@ -6,7 +6,8 @@
 //! * `GET  /api/watch/status`  compact, read-only status for the watch (the
 //!   same item/target content the phone publishes to it);
 //! * `GET  /api/watch/actions` the commands the signed-in account may put on
-//!   watch pages (watch-eligible and permitted);
+//!   the watch (watch-eligible and permitted), in Actions-tab order with
+//!   their confirmation text, and the default watch dashboard;
 //! * `POST /api/auth/watch-token` and `/api/auth/watch-token/revoke` issue and
 //!   revoke the watch token (phone session only).
 //!
@@ -57,6 +58,8 @@ pub fn excluded_reason(cmd: &str) -> Option<&'static str> {
         }
         // An HTTP action with its own confirmation flow, not /api/command.
         "RecoverStation" => return Some("Recover station needs the full app."),
+        // Ticketed, typed confirmation in the full app (POST /api/igt/...).
+        "IgtEnter" | "IgtLivePyro" => return Some("Ground-test entry and live pyro need the full app."),
         "RadioRejectTest" => return Some("The radio test needs the full app."),
         _ => {}
     }
@@ -256,6 +259,10 @@ pub struct CatalogAction {
     pub enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The layout's confirmation for this command (`actions_tab.actions[].confirm`),
+    /// shown by the watch in its confirm step.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confirm: Option<crate::layout::ActionConfirm>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -269,23 +276,52 @@ pub struct ActionCatalog {
     pub actions: Vec<CatalogAction>,
     pub excluded: Vec<ExcludedAction>,
     pub max_per_page: usize,
+    /// The watch dashboard a user gets until they arrange their own.
+    pub dashboard: DashboardDefault,
 }
 
-fn label_for(cmd: &str, labels: &BTreeMap<String, String>) -> String {
-    labels.get(cmd).cloned().unwrap_or_else(|| cmd.to_string())
+/// Default highlights of the watch dashboard: watch item ids (the registry
+/// below) and commands from `actions`.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct DashboardDefault {
+    pub items: Vec<&'static str>,
+    pub actions: Vec<String>,
 }
 
-/// The commands of this station mode that may go on a watch page for an
-/// account allowed to send `allowed`, with the current policy state.
+/// Dashboard data highlighted by default: propulsion for a test fire (no
+/// flight), flight and propulsion otherwise.
+pub fn dashboard_items(test_fire: bool) -> Vec<&'static str> {
+    if test_fire {
+        vec!["tank_pressure", "chamber_pressure", "loadcell_mass", "fill_percent"]
+    } else {
+        vec!["altitude", "velocity", "tank_pressure", "loadcell_mass"]
+    }
+}
+
+/// Dashboard actions highlighted by default (when the account may send them).
+pub const DASHBOARD_ACTIONS: &[&str] = &["Abort"];
+
+/// One Actions-tab entry of the served layout: command, label, confirmation.
+pub type LayoutAction = (String, String, Option<crate::layout::ActionConfirm>);
+
+/// The commands of this station mode that may go on the watch for an
+/// account allowed to send `allowed`, with the current policy state, in the
+/// layout's Actions-tab order (commands the layout does not list follow in
+/// catalog order) with the layout's labels and confirmations.
 pub fn action_catalog(
     commands: &[&str],
     allowed: impl Fn(&str) -> bool,
     policy: &crate::sequences::ActionPolicyMsg,
-    labels: &BTreeMap<String, String>,
+    layout: &[LayoutAction],
+    dashboard_items: Vec<&'static str>,
 ) -> ActionCatalog {
+    let position = |cmd: &str| layout.iter().position(|(c, _, _)| c == cmd).unwrap_or(usize::MAX);
+    let mut ordered: Vec<&str> = commands.to_vec();
+    // Stable: same-position (unlisted) commands keep catalog order.
+    ordered.sort_by_key(|cmd| position(cmd));
     let mut actions = Vec::new();
     let mut excluded = Vec::new();
-    for &cmd in commands {
+    for cmd in ordered {
         if !command_watch_eligible(cmd) {
             if let Some(reason) = excluded_reason(cmd) {
                 excluded.push(ExcludedAction {
@@ -299,20 +335,31 @@ pub fn action_catalog(
             continue;
         }
         let state = action_state(cmd, policy);
+        let entry = layout.iter().find(|(c, _, _)| c == cmd);
         actions.push(CatalogAction {
             cmd: cmd.to_string(),
-            label: label_for(cmd, labels),
+            label: entry.map(|(_, label, _)| label.clone()).filter(|l| !l.trim().is_empty()).unwrap_or_else(|| cmd.to_string()),
             section: crate::sequences::control_section(cmd),
             abort: cmd == "Abort",
             watch_safe: WATCH_SAFE_OVERRIDES.contains(&cmd),
             enabled: state.enabled,
             reason: state.reason,
+            confirm: entry.and_then(|(_, _, confirm)| confirm.clone()),
         });
     }
+    let dashboard = DashboardDefault {
+        items: dashboard_items,
+        actions: DASHBOARD_ACTIONS
+            .iter()
+            .filter(|cmd| actions.iter().any(|a| a.cmd == **cmd))
+            .map(|cmd| cmd.to_string())
+            .collect(),
+    };
     ActionCatalog {
         actions,
         excluded,
         max_per_page: MAX_ACTIONS_PER_PAGE,
+        dashboard,
     }
 }
 
@@ -323,13 +370,13 @@ async fn get_actions(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
     };
     crate::sequences::refresh_action_policy_now(&state);
     let policy = state.action_policy_snapshot();
-    let labels: BTreeMap<String, String> = crate::layout::load_layout()
+    let layout: Vec<LayoutAction> = crate::layout::load_layout()
         .map(|layout| {
             layout
                 .actions_tab
                 .actions
                 .into_iter()
-                .map(|a| (a.cmd, a.label))
+                .map(|a| (a.cmd, a.label, a.confirm))
                 .collect()
         })
         .unwrap_or_default();
@@ -338,7 +385,8 @@ async fn get_actions(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
         &commands,
         |cmd| principal.allows_command_name(cmd),
         &policy,
-        &labels,
+        &layout,
+        dashboard_items(crate::runtime_mode::is_test_fire()),
     ))
     .into_response()
 }
@@ -1140,6 +1188,8 @@ mod tests {
             "TogglePhysicalLaunchMode",
             "RecoverStation",
             "RadioRejectTest",
+            "IgtEnter",
+            "IgtLivePyro",
             "ToggleButtonInterlock",
             "NotACommand",
         ] {
@@ -1162,19 +1212,40 @@ mod tests {
                 control.disabled_reason = Some("Fill in progress.".into());
             }
         }
-        let labels = BTreeMap::from([("Dump".to_string(), "Dump valve".to_string())]);
+        let confirm = crate::layout::ActionConfirm {
+            title: "Dump?".into(),
+            message: "Opens the dump valve.".into(),
+            button: "Dump".into(),
+        };
+        let layout: Vec<LayoutAction> = vec![("Dump".into(), "Dump valve".into(), Some(confirm.clone()))];
         let commands = ["Abort", "Dump", "Launch", "Nitrogen", "Igniter"];
-        let catalog = action_catalog(&commands, |cmd| cmd != "Nitrogen", &policy, &labels);
+        let catalog = action_catalog(&commands, |cmd| cmd != "Nitrogen", &policy, &layout, dashboard_items(false));
         let cmds: Vec<_> = catalog.actions.iter().map(|a| a.cmd.as_str()).collect();
-        assert_eq!(cmds, vec!["Abort", "Dump"]);
-        let dump = &catalog.actions[1];
+        // Layout order first (Dump), then the rest in catalog order.
+        assert_eq!(cmds, vec!["Dump", "Abort"]);
+        let dump = &catalog.actions[0];
         assert_eq!(dump.label, "Dump valve");
+        assert_eq!(dump.confirm.as_ref(), Some(&confirm));
         assert!(!dump.enabled);
         assert_eq!(dump.reason.as_deref(), Some("Fill in progress."));
-        assert!(catalog.actions[0].abort && catalog.actions[0].enabled);
+        assert!(catalog.actions[1].abort && catalog.actions[1].enabled && catalog.actions[1].confirm.is_none());
         let excluded: Vec<_> = catalog.excluded.iter().map(|a| a.cmd.as_str()).collect();
         assert_eq!(excluded, vec!["Launch", "Igniter"]);
         assert_eq!(catalog.max_per_page, 2);
+        assert_eq!(catalog.dashboard.actions, vec!["Abort"]);
+        assert_eq!(catalog.dashboard.items, dashboard_items(false));
+        // Abort not permitted: no default dashboard action.
+        let none = action_catalog(&commands, |cmd| cmd != "Abort", &policy, &[], dashboard_items(true));
+        assert!(none.dashboard.actions.is_empty());
+    }
+
+    #[test]
+    fn dashboard_default_items_are_watch_items() {
+        for test_fire in [false, true] {
+            for id in dashboard_items(test_fire) {
+                assert!(ITEMS.iter().any(|def| def.id == id), "{id}");
+            }
+        }
     }
 
     #[test]
