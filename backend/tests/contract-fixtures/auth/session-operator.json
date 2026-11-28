@@ -1,0 +1,51 @@
+{
+  "allowed_commands": [
+    "Abort",
+    "StationMode"
+  ],
+  "anonymous": false,
+  "authenticated": true,
+  "can_edit_calibration": false,
+  "can_view_calibration": false,
+  "command_proxy": {
+    "available": false,
+    "connected": false,
+    "last": null,
+    "paired": false,
+    "pending": null,
+    "primary_mode": null,
+    "reason": "Paired primary control has not initialized; standalone hardware authority is unavailable.",
+    "supported": true,
+    "supported_commands": [],
+    "takeover": false,
+    "takeover_commands": []
+  },
+  "expires_at_ms": 1,
+  "operating_mode": {
+    "authority": "local_primary",
+    "effective_mode": "normal",
+    "error": null,
+    "execution_mode": "compiled_mode",
+    "local_build_mode": "normal",
+    "local_capabilities_match": true,
+    "output_domain": "build_defined",
+    "persisted": false,
+    "primary_station": null,
+    "retained_configuration": null,
+    "synchronized": true
+  },
+  "permissions": {
+    "camera_publish": false,
+    "send_commands": true,
+    "set_system_time": false,
+    "sign_checklists": false,
+    "view_data": true,
+    "voice_transmit": false
+  },
+  "roles": [],
+  "session_type": "session",
+  "station_name": "GroundStation",
+  "station_pairing": null,
+  "station_role": "primary",
+  "username": "operator"
+}

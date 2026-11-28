@@ -9,7 +9,22 @@ const DEFAULT_TEST_FIRE_LAYOUT_PATH: &str = "layout/layout_test_fire.json";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LayoutConfig {
     #[serde(default)]
+    pub flight_phase_version: u8,
+    #[serde(default)]
     pub test_fire_mode: bool,
+    /// Integrated ground test (served layout only; omitted when false).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub igt_mode: bool,
+    /// Live-diagram view per station mode (`normal`, `hitl`, `test_fire`,
+    /// `testing`, `integrated_ground_test`): a topology id from
+    /// `backend/layout/diagrams/`. A mode not listed gets
+    /// [`crate::diagrams::default_view`]. docs/live-diagrams.md.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub live_diagrams: std::collections::BTreeMap<String, String>,
+    /// The view for the mode this layout is served in (resolved from
+    /// `live_diagrams`); the dashboard's Live diagrams tab opens it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_diagram: Option<String>,
     pub version: u32,
     #[serde(default)]
     pub branding: BrandingConfig,
@@ -25,6 +40,53 @@ pub struct LayoutConfig {
     pub state_tab: StateTabLayout,
     #[serde(default)]
     pub battery: BatteryLayoutConfig,
+    /// Which telemetry rows are GPS fixes and where latitude, longitude and
+    /// altitude sit in them (map tracking, vehicle view, replay track).
+    /// Omitted: the UI's built-in GPS types.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gps: Option<GpsLayout>,
+    /// Telemetry bindings of the watch companion's items, by item id
+    /// (`docs/backend/watch-direct.md`); an item not listed keeps its built-in
+    /// channels. The watch status (`/api/watch/status`) reads the same list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub watch_items: Vec<WatchItemBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GpsLayout {
+    /// Data types carrying a fix, in preference order.
+    pub data_types: Vec<String>,
+    #[serde(default)]
+    pub lat_index: usize,
+    #[serde(default = "default_gps_lon_index")]
+    pub lon_index: usize,
+    #[serde(default = "default_gps_alt_index")]
+    pub alt_index: usize,
+}
+
+fn default_gps_lon_index() -> usize {
+    1
+}
+
+fn default_gps_alt_index() -> usize {
+    2
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WatchItemBinding {
+    pub id: String,
+    /// The newest finite value of these channels is shown.
+    pub channels: Vec<WatchChannel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WatchChannel {
+    pub data_type: String,
+    /// Only rows from this board; omitted: any sender.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_id: Option<String>,
+    #[serde(default)]
+    pub index: usize,
 }
 
 fn default_main_tabs() -> Vec<String> {
@@ -472,6 +534,27 @@ pub struct ActionsTabLayout {
     #[serde(default = "default_fill_targets_require_actions_enabled")]
     pub fill_targets_require_actions_enabled: bool,
     pub actions: Vec<ActionSpec>,
+    /// Display names of controls that are not buttons in `actions` (the
+    /// HITL interlock toggles), by command name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub controls: Vec<ControlLabel>,
+    /// The fluids of `/api/fill_targets` the fill-target editors show, in
+    /// order, with their names. Omitted: the UI's built-in list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fill_target_fluids: Vec<FillTargetFluid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FillTargetFluid {
+    /// The fluid's key in the fill-targets document (`nitrogen`, `nitrous`).
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ControlLabel {
+    pub cmd: String,
+    pub label: String,
 }
 
 fn default_show_flight_setup() -> bool {
@@ -509,6 +592,10 @@ pub struct ActionSpec {
     pub spacer_row_before: bool,
     #[serde(default)]
     pub spacer_row_after: bool,
+    /// Actions-tab section, assigned at load from
+    /// [`crate::sequences::control_section`]; a layout file cannot override it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section: Option<crate::sequences::ControlSection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -690,18 +777,176 @@ mod observer_mode_layout_tests {
 }
 
 pub fn load_layout() -> Result<LayoutConfig, String> {
-    let path = layout_path();
-    let raw = std::fs::read_to_string(&path)
+    load_layout_file(&layout_path(), presentation_mode())
+}
+
+/// The layout a station in `mode` presents, for a saved-data replay of a
+/// recording made in that mode. The station's own (possibly custom) layout is
+/// used when `mode` is the mode it presents now; otherwise the shipped
+/// default for `mode`. Never changes the station mode or its live layout.
+pub(crate) fn load_layout_for_mode(mode: crate::station_mode::Mode) -> Result<LayoutConfig, String> {
+    if mode == presentation_mode() {
+        return load_layout();
+    }
+    load_layout_file(&default_layout_path(mode), mode)
+}
+
+fn load_layout_file(path: &std::path::Path, mode: crate::station_mode::Mode) -> Result<LayoutConfig, String> {
+    let raw = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read layout file {path:?}: {e}"))?;
-    let mut layout: LayoutConfig =
+    let mut value: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("Invalid layout JSON: {e}"))?;
-    apply_runtime_layout_overrides(&mut layout);
+    canonicalize_legacy_type_names(&mut value);
+    let mut layout: LayoutConfig =
+        serde_json::from_value(value).map_err(|e| format!("Invalid layout JSON: {e}"))?;
+    normalize_flight_phases(&mut layout)?;
+    apply_runtime_layout_overrides(&mut layout, mode);
+    assign_control_sections(&mut layout);
     Ok(layout)
 }
 
-fn apply_runtime_layout_overrides(layout: &mut LayoutConfig) {
-    let mode = presentation_mode();
+/// Renames legacy telemetry type names (and the matching human label) in a
+/// layout, diagram or saved view: a custom layout, SD import manifest or
+/// portable replay saved before the ox tank PT rename names
+/// FUEL_TANK_PRESSURE, which the station now publishes as OX_TANK_PRESSURE.
+/// Only whole strings are replaced. Returns whether anything changed.
+pub(crate) fn canonicalize_legacy_type_names(value: &mut serde_json::Value) -> bool {
+    fn renamed(text: &str) -> Option<&'static str> {
+        match text {
+            crate::telemetry_schema::LEGACY_FUEL_TANK_PRESSURE => Some(crate::telemetry_schema::OX_TANK_PRESSURE),
+            "Fuel Tank Pressure" => Some("Ox Tank Pressure"),
+            "Fuel tank pressure" => Some("Ox tank pressure"),
+            "FUEL TANK PRESSURE" => Some("OX TANK PRESSURE"),
+            _ => None,
+        }
+    }
+    fn walk(v: &mut serde_json::Value, changed: &mut bool) {
+        match v {
+            serde_json::Value::String(text) => {
+                if let Some(new) = renamed(text) {
+                    *text = new.to_string();
+                    *changed = true;
+                }
+            }
+            serde_json::Value::Object(map) => {
+                // Keys too: maps keyed by data type (e.g. per-type settings).
+                let legacy: Vec<String> = map.keys().filter(|k| renamed(k).is_some()).cloned().collect();
+                for key in legacy {
+                    let new = renamed(&key).unwrap().to_string();
+                    if let Some(item) = map.remove(&key) {
+                        map.entry(new).or_insert(item);
+                        *changed = true;
+                    }
+                }
+                map.values_mut().for_each(|v| walk(v, changed));
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(|v| walk(v, changed)),
+            _ => {}
+        }
+    }
+    let mut changed = false;
+    walk(value, &mut changed);
+    changed
+}
+
+/// BAROMETER_DATA is (altitude, pressure, temperature) in every recording:
+/// the FC always sent that order, and only the station's labels were wrong
+/// before the fix. A layout saved before it (inside an SD import manifest or
+/// a portable replay) labels the channels (pressure, temperature, altitude);
+/// this puts every BAROMETER_DATA label back on the value it names. Returns
+/// whether anything changed.
+pub(crate) fn relabel_legacy_barometer(layout: &mut serde_json::Value) -> bool {
+    fn index_for(label: &str) -> Option<u64> {
+        let l = label.to_ascii_lowercase();
+        if l.contains("alt") || l == "barometer" {
+            Some(0)
+        } else if l.contains("press") || l.contains("prs") {
+            Some(1)
+        } else if l.contains("temp") || l.contains("tmp") {
+            Some(2)
+        } else {
+            None
+        }
+    }
+    fn walk(v: &mut serde_json::Value, changed: &mut bool) {
+        match v {
+            serde_json::Value::Object(map) => {
+                let baro = |map: &serde_json::Map<String, serde_json::Value>, key: &str| {
+                    map.get(key).and_then(|v| v.as_str()) == Some("BAROMETER_DATA")
+                };
+                if baro(map, "id")
+                    && let Some(channels) = map.get_mut("channels").and_then(|c| c.as_array_mut())
+                    && channels.len() == 3
+                {
+                    let labels: Vec<String> = channels.iter().filter_map(|c| c.as_str().map(str::to_owned)).collect();
+                    let mut ordered: Vec<Option<String>> = vec![None, None, None];
+                    for label in &labels {
+                        if let Some(i) = index_for(label) {
+                            ordered[i as usize] = Some(label.clone());
+                        }
+                    }
+                    if ordered.iter().all(Option::is_some) && ordered.iter().flatten().ne(labels.iter()) {
+                        *channels = ordered.into_iter().flatten().map(serde_json::Value::from).collect();
+                        *changed = true;
+                    }
+                }
+                if baro(map, "data_type") {
+                    if let Some(items) = map.get_mut("items").and_then(|c| c.as_array_mut()) {
+                        for item in items {
+                            let want = item["label"].as_str().and_then(index_for);
+                            if let Some(want) = want
+                                && item["index"].as_u64() != Some(want)
+                            {
+                                item["index"] = want.into();
+                                *changed = true;
+                            }
+                        }
+                    }
+                    let want = map.get("label").and_then(|l| l.as_str()).and_then(index_for);
+                    if let Some(want) = want
+                        && map.get("index").and_then(|i| i.as_u64()).is_some_and(|i| i != want)
+                    {
+                        map.insert("index".into(), want.into());
+                        *changed = true;
+                    }
+                }
+                map.values_mut().for_each(|v| walk(v, changed));
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(|v| walk(v, changed)),
+            _ => {}
+        }
+    }
+    let mut changed = false;
+    walk(layout, &mut changed);
+    changed
+}
+
+/// Every action carries the section its command belongs to, from the one
+/// backend table beside the per-mode command catalogs.
+fn assign_control_sections(layout: &mut LayoutConfig) {
+    for action in &mut layout.actions_tab.actions {
+        action.section = crate::sequences::control_section(&action.cmd);
+    }
+}
+
+fn normalize_flight_phases(layout: &mut LayoutConfig) -> Result<(), String> {
+    let version = layout.flight_phase_version;
+    if version > crate::types::FLIGHT_PHASE_VERSION {
+        return Err("Unsupported flight phase version".into());
+    }
+    for group in &mut layout.state_tab.states {
+        for phase in &mut group.states {
+            *phase = crate::types::canonical_phase_key(phase, version).to_owned();
+        }
+    }
+    layout.flight_phase_version = crate::types::FLIGHT_PHASE_VERSION;
+    Ok(())
+}
+
+fn apply_runtime_layout_overrides(layout: &mut LayoutConfig, mode: crate::station_mode::Mode) {
     layout.test_fire_mode = mode == crate::station_mode::Mode::TestFire;
+    layout.igt_mode = mode == crate::station_mode::Mode::IntegratedGroundTest;
+    layout.live_diagram = Some(live_diagram_for(layout, mode));
     if crate::rrls::is_rrls() {
         layout.branding.app_name = Some("RRLS".into());
         layout.branding.dashboard_title = Some("RRLS".into());
@@ -712,6 +957,7 @@ fn apply_runtime_layout_overrides(layout: &mut LayoutConfig) {
         ("ToggleFlightBuzzer", "Flight Buzzer"),
         ("ResetTClock", "Reset T-clock"),
         ("ResetFlightState", "Reset flight state to Idle"),
+        ("RecoverStation", "Recover station"),
     ] {
         if cmd == "ResetFlightState" && mode != crate::station_mode::Mode::Hitl {
             continue;
@@ -730,6 +976,32 @@ fn apply_runtime_layout_overrides(layout: &mut LayoutConfig) {
                 .expect("valid operator recovery action"),
             );
         }
+    }
+    // HITL lists the Ground test controls too; they are refused (and the
+    // client hides them) unless the HITL replay is on (IgtStatus.igt_active).
+    if matches!(mode, crate::station_mode::Mode::IntegratedGroundTest | crate::station_mode::Mode::Hitl) {
+        ensure_igt_actions(layout);
+    }
+    // Retry FC SD wherever the FC is present (every mode but test fire).
+    if mode != crate::station_mode::Mode::TestFire {
+        ensure_fc_sd_retry_action(layout);
+    }
+    // Radio test mode (radio_reject_test): an HTTP action on the primary,
+    // listed under Testing in every mode.
+    if !crate::rrls::is_rrls()
+        && !layout
+            .actions_tab
+            .actions
+            .iter()
+            .any(|action| action.cmd == crate::radio_reject_test::COMMAND)
+    {
+        layout.actions_tab.actions.push(
+            serde_json::from_value(serde_json::json!({
+                "cmd": crate::radio_reject_test::COMMAND, "label": "Radio test: reject AV-bay link",
+                "group": "Radio test", "border": "#ef4444", "bg": "#450a0a", "fg": "#fee2e2"
+            }))
+            .expect("valid radio test action"),
+        );
     }
     if mode != crate::station_mode::Mode::Testing {
         return;
@@ -758,15 +1030,81 @@ fn apply_runtime_layout_overrides(layout: &mut LayoutConfig) {
             new_row_after: true,
             spacer_row_before: false,
             spacer_row_after: true,
+            section: None,
         },
     );
 }
 
-const GSE_SEQUENCE_ACTIONS: [(&str, &str); 5] = [
+/// The live-diagram view a layout names for `mode`, else the built-in one.
+pub(crate) fn live_diagram_for(layout: &LayoutConfig, mode: crate::station_mode::Mode) -> String {
+    let key = serde_json::to_value(mode).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default();
+    layout
+        .live_diagrams
+        .get(&key)
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map_or_else(|| crate::diagrams::default_view(mode).to_string(), str::to_owned)
+}
+
+/// The integrated ground test uses the flight layout (AV bay, FC, recovery
+/// and fill content) with the Ground test controls added first.
+fn ensure_igt_actions(layout: &mut LayoutConfig) {
+    for (index, (cmd, label)) in IGT_ACTIONS.into_iter().enumerate() {
+        if layout.actions_tab.actions.iter().any(|action| action.cmd == cmd) {
+            continue;
+        }
+        let (border, bg, fg) = if cmd == "IgtLivePyro" {
+            ("#ef4444", "#450a0a", "#fee2e2")
+        } else {
+            ("#f97316", "#431407", "#ffedd5")
+        };
+        layout.actions_tab.actions.insert(
+            index,
+            serde_json::from_value(serde_json::json!({
+                "cmd": cmd, "label": label, "group": "Ground test",
+                "border": border, "bg": bg, "fg": fg, "illuminated": true
+            }))
+            .expect("valid ground test action"),
+        );
+    }
+}
+
+/// `FcSdRetry` after the last Flight computer action, in its group.
+fn ensure_fc_sd_retry_action(layout: &mut LayoutConfig) {
+    let actions = &mut layout.actions_tab.actions;
+    if actions.iter().any(|action| action.cmd == "FcSdRetry") {
+        return;
+    }
+    let last_fc = actions.iter().rposition(|action| {
+        crate::sequences::control_section(&action.cmd) == Some(crate::sequences::ControlSection::FlightComputer)
+    });
+    let (index, group) = match last_fc {
+        Some(index) => (index + 1, actions[index].group.clone()),
+        None => (actions.len(), "Flight controls".to_string()),
+    };
+    actions.insert(
+        index,
+        serde_json::from_value(serde_json::json!({
+            "cmd": "FcSdRetry", "label": "Retry FC SD", "group": group,
+            "border": "#38bdf8", "bg": "#082f49", "fg": "#e0f2fe"
+        }))
+        .expect("valid FC SD retry action"),
+    );
+}
+
+const IGT_ACTIONS: [(&str, &str); 4] = [
+    ("IgtEnter", "Enter ground test"),
+    ("IgtLivePyro", "LIVE PYRO"),
+    ("IgtDryRun", "Dry-run"),
+    ("IgtExit", "Exit ground test"),
+];
+
+const GSE_SEQUENCE_ACTIONS: [(&str, &str); 6] = [
     ("StartFill", "Start fill"),
     ("PauseFill", "Pause fill"),
     ("CancelFill", "Cancel fill"),
     ("NitrogenTest", "Nitrogen test"),
+    ("Turbocharge", "Turbocharge"),
     ("ValveSelfTest", "Valve self-test"),
 ];
 
@@ -860,6 +1198,63 @@ fn ensure_gse_sequence_actions(layout: &mut LayoutConfig) {
 mod tests {
     use super::*;
 
+    /// A custom layout saved before the ox tank PT rename names
+    /// FUEL_TANK_PRESSURE; it loads with OX_TANK_PRESSURE and the new label,
+    /// and the shipped layouts no longer name the legacy type.
+    #[test]
+    fn legacy_fuel_tank_pressure_layout_loads_as_ox_tank_pressure() {
+        let shipped = [
+            include_str!("../layout/layout.json"),
+            include_str!("../layout/layout_hitl.json"),
+            include_str!("../layout/layout_test_fire.json"),
+        ];
+        for source in shipped {
+            assert!(!source.contains("FUEL_TANK_PRESSURE") && !source.contains("Fuel Tank"));
+            assert!(source.contains("\"OX_TANK_PRESSURE\""));
+        }
+        let legacy = shipped[0]
+            .replace("OX_TANK_PRESSURE", "FUEL_TANK_PRESSURE")
+            .replace("\"Ox Tank Pressure\"", "\"Fuel Tank Pressure\"");
+        let path = std::env::temp_dir().join(format!("gs-legacy-ox-layout-{}.json", std::process::id()));
+        std::fs::write(&path, &legacy).unwrap();
+        let loaded = load_layout_file(&path, crate::station_mode::Mode::Normal);
+        let _ = std::fs::remove_file(&path);
+        let loaded = loaded.unwrap();
+        let expected = load_layout_file(
+            &default_layout_path(crate::station_mode::Mode::Normal),
+            crate::station_mode::Mode::Normal,
+        )
+        .unwrap();
+        assert_eq!(serde_json::to_value(&loaded).unwrap(), serde_json::to_value(&expected).unwrap());
+        let tab = loaded.data_tab.tabs.iter().find(|t| t.id == "OX_TANK_PRESSURE").unwrap();
+        assert_eq!(tab.label, "Ox Tank Pressure");
+
+        let mut view = serde_json::json!({"FUEL_TANK_PRESSURE": {"index": 0},
+            "items": [{"data_type": "FUEL_TANK_PRESSURE", "label": "Fuel tank pressure"}],
+            "note": "FUEL_TANK_PRESSURE is not renamed inside longer text"});
+        assert!(canonicalize_legacy_type_names(&mut view));
+        assert_eq!(view["OX_TANK_PRESSURE"]["index"], 0);
+        assert_eq!(view["items"][0]["data_type"], "OX_TANK_PRESSURE");
+        assert_eq!(view["items"][0]["label"], "Ox tank pressure");
+        assert_eq!(view["note"], "FUEL_TANK_PRESSURE is not renamed inside longer text");
+        assert!(!canonicalize_legacy_type_names(&mut view));
+    }
+
+    #[test]
+    fn legacy_layout_phase_groups_keep_their_wire_meaning() {
+        let mut value: serde_json::Value = serde_json::from_str(include_str!("../layout/layout.json")).unwrap();
+        value.as_object_mut().unwrap().remove("flight_phase_version");
+        value["state_tab"]["states"][0]["states"] = serde_json::json!(["ParachuteDeploy", "Descent"]);
+        let mut layout: LayoutConfig = serde_json::from_value(value).unwrap();
+        let original_data = serde_json::to_value(&layout.data_tab).unwrap();
+        normalize_flight_phases(&mut layout).unwrap();
+        assert_eq!(layout.state_tab.states[0].states, ["Descent", "Reefing"]);
+        assert_eq!(layout.flight_phase_version, 1);
+        assert_eq!(serde_json::to_value(&layout.data_tab).unwrap(), original_data);
+        normalize_flight_phases(&mut layout).unwrap();
+        assert_eq!(layout.state_tab.states[0].states, ["Descent", "Reefing"]);
+    }
+
     #[test]
     fn gse_commands_are_available_in_all_layouts_and_prelaunch_valve_widgets() {
         for source in [
@@ -900,18 +1295,44 @@ mod tests {
                     continue;
                 }
                 for widget in state.sections.iter().flat_map(|s| &s.widgets) {
-                    if let Some(actions) = &widget.actions {
-                        if actions.iter().any(|s| s == "Nitrous") {
+                    if let Some(actions) = &widget.actions
+                        && actions.iter().any(|s| s == "Nitrous") {
                             checked += 1;
                             for (cmd, _) in GSE_SEQUENCE_ACTIONS {
                                 assert!(actions.iter().any(|s| s == cmd));
                             }
                         }
-                    }
                 }
             }
             assert!(checked > 0);
         }
+    }
+
+    #[test]
+    fn each_mode_serves_its_live_diagram_view() {
+        use crate::station_mode::Mode;
+        let shipped = crate::diagrams::load(&crate::diagrams::diagrams_dir());
+        let ids: Vec<&str> = shipped.diagrams.iter().filter_map(|d| d["id"].as_str()).collect();
+        for (mode, view) in [
+            (Mode::Normal, "flight"),
+            (Mode::Hitl, "flight"),
+            (Mode::Testing, "flight"),
+            (Mode::TestFire, "test_fire"),
+            (Mode::IntegratedGroundTest, "ground_test"),
+        ] {
+            let layout = load_layout_file(&default_layout_path(mode), mode).unwrap();
+            assert_eq!(layout.live_diagram.as_deref(), Some(view), "{mode:?}");
+            assert_eq!(crate::diagrams::default_view(mode), view, "{mode:?}: the files agree with the built-in default");
+            assert!(ids.contains(&view), "{view} is served");
+            let served = serde_json::to_value(&layout).unwrap();
+            assert_eq!(served["live_diagram"], view);
+        }
+        // A layout without the map (a custom or older file) still gets one.
+        let mut layout: LayoutConfig = serde_json::from_str(include_str!("../layout/layout_test_fire.json")).unwrap();
+        layout.live_diagrams.clear();
+        assert_eq!(live_diagram_for(&layout, Mode::TestFire), "test_fire");
+        layout.live_diagrams.insert("test_fire".into(), "network".into());
+        assert_eq!(live_diagram_for(&layout, Mode::TestFire), "network", "the layout chooses");
     }
 
     #[test]
@@ -924,9 +1345,42 @@ mod tests {
         assert!(!layout.state_tab.states.is_empty());
     }
 
-    #[cfg(feature = "testing")]
+    #[test]
+    fn every_control_in_every_mode_has_exactly_one_section() {
+        use crate::sequences::{ControlSection, control_section};
+        use crate::station_mode::Mode;
+        let mut names: Vec<&str> = crate::sequences::every_mode_catalog().concat();
+        for mode in [Mode::Normal, Mode::Hitl, Mode::TestFire, Mode::Testing, Mode::IntegratedGroundTest] {
+            names.extend(crate::types::client_command_names(mode));
+        }
+        names.extend(GSE_SEQUENCE_ACTIONS.iter().map(|(cmd, _)| *cmd));
+        names.extend(["ResetSim", "AutoColdFlow", "ResetFlightState", "ResetTClock", "RecoverStation", "RadioRejectTest"]);
+        for name in &names {
+            assert!(control_section(name).is_some(), "{name} has no Actions-tab section");
+        }
+        assert_eq!(control_section("Abort"), Some(ControlSection::Safety));
+        assert_eq!(control_section("NotACommand"), None);
+        // Only Abort is a Safety control.
+        assert_eq!(
+            names.iter().filter(|n| control_section(n) == Some(ControlSection::Safety)).count(),
+            names.iter().filter(|n| **n == "Abort").count()
+        );
+        // The served layout of every mode assigns each action its section.
+        for mode in [Mode::Normal, Mode::Hitl, Mode::TestFire, Mode::Testing, Mode::IntegratedGroundTest] {
+            let _mode = crate::runtime_mode::test_support::thread_mode(mode);
+            let layout = load_layout().expect("layout should parse");
+            for action in &layout.actions_tab.actions {
+                assert_eq!(action.section, control_section(&action.cmd), "{mode:?} {}", action.cmd);
+                assert!(action.section.is_some(), "{mode:?} {} has no section", action.cmd);
+            }
+            let wire = serde_json::to_value(&layout.actions_tab).unwrap();
+            assert!(wire["actions"].as_array().unwrap().iter().all(|a| a["section"].is_string()));
+        }
+    }
+
     #[test]
     fn testing_layout_includes_reset_sim_action() {
+        crate::mode_suite!(Testing);
         let layout = load_layout().expect("layout should parse");
         assert!(
             layout
@@ -935,5 +1389,78 @@ mod tests {
                 .iter()
                 .any(|action| action.cmd == "ResetSim")
         );
+    }
+}
+
+#[cfg(test)]
+mod vehicle_binding_tests {
+    use super::*;
+
+    /// The SEDS layouts name what the UI used to hard-code: the HITL
+    /// interlock labels, the GPS types and the fill-target fluids.
+    #[test]
+    fn shipped_layouts_name_the_seds_bindings() {
+        for file in [DEFAULT_LAYOUT_PATH, DEFAULT_HITL_LAYOUT_PATH, DEFAULT_TEST_FIRE_LAYOUT_PATH] {
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(file);
+            let layout: LayoutConfig = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            let labels: Vec<(&str, &str)> =
+                layout.actions_tab.controls.iter().map(|c| (c.cmd.as_str(), c.label.as_str())).collect();
+            // The interlock toggles exist only in HITL (only that build has the
+            // commands), so only the HITL layout names them.
+            if file == DEFAULT_HITL_LAYOUT_PATH {
+                assert_eq!(
+                    labels,
+                    [
+                        ("TogglePlumbingDelayInterlock", "Retraction minimum 25 seconds"),
+                        ("ToggleChecklistInterlock", "Checklist enforcement"),
+                        ("ToggleSupplyInterlock", "Nitrogen/nitrous one at a time"),
+                        ("ToggleBoardStateProofInterlock", "Board state checks"),
+                    ],
+                );
+            } else {
+                assert!(labels.is_empty(), "{file}");
+            }
+            assert_eq!(
+                layout.gps,
+                Some(GpsLayout {
+                    data_types: vec!["GPS_DATA".into(), "GPS".into(), "ROCKET_GPS".into()],
+                    lat_index: 0,
+                    lon_index: 1,
+                    alt_index: 2,
+                }),
+                "{file}"
+            );
+            let fluids: Vec<(&str, &str)> = layout
+                .actions_tab
+                .fill_target_fluids
+                .iter()
+                .map(|f| (f.id.as_str(), f.label.as_str()))
+                .collect();
+            assert_eq!(fluids, [("nitrogen", "Nitrogen"), ("nitrous", "Nitrous")], "{file}");
+        }
+    }
+
+    /// A layout without the optional bindings still loads and serves none of
+    /// them, so the UI keeps its built-in values.
+    #[test]
+    fn optional_bindings_are_omitted_when_absent() {
+        let mut value: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(DEFAULT_LAYOUT_PATH)).unwrap(),
+        )
+        .unwrap();
+        let root = value.as_object_mut().unwrap();
+        root.remove("gps");
+        root.remove("watch_items");
+        let actions = root["actions_tab"].as_object_mut().unwrap();
+        actions.remove("controls");
+        actions.remove("fill_target_fluids");
+        let layout: LayoutConfig = serde_json::from_value(value).unwrap();
+        let served = serde_json::to_value(&layout).unwrap();
+        for key in ["gps", "watch_items"] {
+            assert!(served.get(key).is_none(), "{key}");
+        }
+        for key in ["controls", "fill_target_fluids"] {
+            assert!(served["actions_tab"].get(key).is_none(), "{key}");
+        }
     }
 }

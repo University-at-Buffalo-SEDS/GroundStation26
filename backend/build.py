@@ -127,6 +127,12 @@ def refresh_sedsnet_dependency(repo_root: Path) -> None:
         print(result.stdout, end="")
 
 
+def _remote_build():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import remote_build
+    return remote_build
+
+
 def build_backend(
         backend_dir: Path,
         force_pi: bool,
@@ -156,27 +162,18 @@ def build_backend(
         else:
             print("Not running on Raspberry Pi → building without `raspberry_pi` feature.")
 
-    if testing_mode:
-        print("Testing mode enabled → adding `testing` feature.")
-        if "--features" in cmd:
-            cmd[cmd.index("--features") + 1] += ",testing"
-        else:
-            cmd.extend(["--features", "testing"])
-    if hitl_mode:
-        print("HITL mode enabled → adding `hitl_mode` feature.")
-        if "--features" in cmd:
-            cmd[cmd.index("--features") + 1] += ",hitl_mode"
-        else:
-            cmd.extend(["--features", "hitl_mode"])
-    if test_fire_mode:
-        print("Test-fire mode enabled → adding `test_fire_mode` feature.")
-        if "--features" in cmd:
-            cmd[cmd.index("--features") + 1] += ",test_fire_mode"
-        else:
-            cmd.extend(["--features", "test_fire_mode"])
+    if testing_mode or hitl_mode or test_fire_mode:
+        # One binary holds every station mode; the mode is chosen at run time.
+        print("Note: station modes are chosen at run time (GS_STATION_MODE=testing|hitl|test_fire, "
+              "run_groundstation.py, or the UI); building the one backend binary.")
 
     try:
         refresh_sedsnet_dependency(backend_dir.parent)
+        remote = _remote_build()
+        if remote.requested():
+            features = [cmd[i + 1] for i, part in enumerate(cmd) if part == "--features"]
+            remote.build_backend(backend_dir.parent, features, debug_mode)
+            return
         run(cmd, cwd=backend_dir)
     except FileNotFoundError as e:
         _print_missing_tool("Backend build", e, backend_dir)
@@ -190,21 +187,20 @@ def print_usage(exit_code: int = 1) -> None:
     print("Backend build script")
     print("")
     print("Usage:")
-    print("  ./backend/build.py [pi_build|no_pi] [testing|hitl-mode|test-fire-mode] [debug] [log=<path>]")
+    print("  ./backend/build.py [pi_build|no_pi] [testing|hitl-mode|test-fire-mode] [debug] [log=<path>] [--remote HOST]")
     print("")
     print("What this script owns:")
     print("  - backend cargo builds")
     print("  - Raspberry Pi feature selection")
-    print("  - testing, hitl_mode, and test_fire_mode feature toggles")
+    print("  - (station modes are chosen at run time, not at build time)")
     print("")
     print("Options:")
     print("  pi_build                          # force raspberry_pi feature on")
     print("  no_pi                             # force raspberry_pi feature off")
-    print("  testing                           # enable backend testing feature")
-    print("  hitl-mode                         # enable backend hitl_mode feature")
-    print("  test-fire-mode                    # enable backend test_fire_mode feature")
+    print("  testing|hitl-mode|test-fire-mode  # accepted; same binary (set GS_STATION_MODE at run time)")
     print("  debug                             # build without --release")
     print("  log=<path>                        # tee command output into a log file")
+    print("  --remote HOST                     # compile on HOST (user:password@host, user@host or host) and copy the binary back")
     sys.exit(exit_code)
 
 
@@ -212,6 +208,10 @@ def main() -> None:
     raw_args = [a.strip() for a in sys.argv[1:]]
     if any(a in {"-h", "--help", "help"} for a in raw_args):
         print_usage(0)
+    raw_args, remote = _remote_build().take_argument(raw_args)
+    if remote:
+        os.environ[_remote_build().ENV] = remote
+        _remote_build().connect()
 
     force_pi = False
     force_no_pi = False

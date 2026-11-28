@@ -1,0 +1,88 @@
+{
+  "created_ms": 1767225600000,
+  "entries": [
+    {
+      "bytes": 328030,
+      "media_type": "application/json",
+      "path": "replay.json",
+      "sha256": "acd40edb8cbf4a07d3e3f313fbf624918891587b859e7fbd7667712ad78ab61a"
+    },
+    {
+      "bytes": 100198,
+      "media_type": "text/csv",
+      "path": "data/telemetry.csv",
+      "sha256": "53454c549dd857bd3944ddcef0c3f2858cecec31433d6569d868f8570647c7e6"
+    },
+    {
+      "bytes": 97462,
+      "media_type": "application/json",
+      "path": "config/layout.json",
+      "route": "/api/layout",
+      "sha256": "3e267fad62a76392e269b4c3498a4f6bfa7bce127a2adf90d720d21e5352c812"
+    },
+    {
+      "bytes": 1083,
+      "media_type": "application/json",
+      "path": "config/boards.json",
+      "route": "/api/boards",
+      "sha256": "9e23a9e6826fc78b06fbb36609283a3b3c05a6dfe1d81d5ea601103a48eef890"
+    },
+    {
+      "bytes": 10109,
+      "media_type": "application/json",
+      "path": "models/vehicle_geometry.json",
+      "route": "/api/vehicle/geometry",
+      "sha256": "895cf7b7a317d99f8578150007eff67bfcd5b1d384e619a254c11e17c8b46930"
+    },
+    {
+      "bytes": 37549,
+      "media_type": "application/json",
+      "path": "config/diagrams.json",
+      "route": "/api/diagrams",
+      "sha256": "8e4ce2a76136635844734efc5e6f3c9dc181db8c5feea87c975fc318fde35c73"
+    },
+    {
+      "bytes": 172,
+      "media_type": "application/json",
+      "path": "config/map_config.json",
+      "route": "/api/map_config",
+      "sha256": "71051be2ba3c2ccb620420a74af7132752f9d0b4c4bf6b559506fb2935928abb"
+    },
+    {
+      "bytes": 115245,
+      "media_type": "application/json",
+      "path": "derived/trajectory.json",
+      "sha256": "8e148ce21b90b5e2b139cd3d2cc7d4f63b44622fbc504f2843083d8e84e614d5"
+    },
+    {
+      "bytes": 445083,
+      "media_type": "application/json",
+      "path": "derived/flight_plan.json",
+      "sha256": "e2920e3697a597b0a2479efca34dc29c3e3acfae017dfb8821f9e1a4a22e845d"
+    }
+  ],
+  "format": "gsreplay",
+  "generator": "groundstation_backend 0.1.0",
+  "label": "Predicted: 8.5 kg nominal",
+  "missing": [],
+  "mode": "flight",
+  "predicted": true,
+  "recorded_mode": "normal",
+  "rows": 1364,
+  "source": {
+    "flight_plan": "fp-1767225600000-c3564843",
+    "recording": "Predicted: 8.5 kg nominal",
+    "station_name": "Ground Station"
+  },
+  "tiles": {
+    "budget_bytes": 8388608,
+    "bytes": 0,
+    "complete": true,
+    "included": 0
+  },
+  "time_range": {
+    "end_ms": 1767225824626,
+    "start_ms": 1767225600000
+  },
+  "version": 1
+}

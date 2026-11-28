@@ -28,12 +28,14 @@ from pathlib import Path
 CHANNELS = {
     "KG1000": ("Loadcell raw", "Raw"),
     "LOADCELL_WEIGHT_KG": ("Loadcell kg", "kg"),
-    "FUEL_TANK_PRESSURE": ("PT raw", "Raw"),
+    "OX_TANK_PRESSURE": ("Ox tank PT raw", "Raw"),
     "IADC": ("PT raw IADC", "Raw"),
     "PRESSURE_TRANSDUCER_CALIBRATED": ("PT calibrated", "psi"),
     "RECALCULATED_KG": ("Loadcell recalculated kg", "kg"),
     "ABSOLUTE_KG": ("Loadcell absolute kg", "kg"),
 }
+# Recordings exported before the ox tank PT rename name it FUEL_TANK_PRESSURE.
+LEGACY_TYPE_NAMES = {"FUEL_TANK_PRESSURE": "OX_TANK_PRESSURE"}
 
 
 @dataclass(frozen=True)
@@ -59,7 +61,7 @@ def read_recording(path):
         if missing:
             raise ValueError(f"CSV missing columns: {', '.join(sorted(missing))}")
         for line, row in enumerate(reader, 2):
-            kind = row["data_type"]
+            kind = LEGACY_TYPE_NAMES.get(row["data_type"], row["data_type"])
             if kind not in streams:
                 continue
             try:
@@ -67,6 +69,9 @@ def read_recording(path):
                 if not isinstance(values, list) or len(values) != 1:
                     raise ValueError("expected one value in values_json")
                 value = values[0]
+                if value in ("OVR", "-OVR"):
+                    # ADC over range (the station's CSV export marker): no value.
+                    value = None
                 if value is not None:
                     if isinstance(value, bool) or not isinstance(value, (int, float)):
                         raise ValueError("expected a numeric value or null")
@@ -183,7 +188,7 @@ def write_calibration(workbook, fits):
     summary.append(("Mapping", "signed kg = slope * raw + intercept; absolute kg = abs(signed kg)"))
     summary.append(("Scope", "Fit uses full recording, independent of the selected export window"))
     summary.append(("Interpretation", "Reconstructs the conversion applied during recording; not independent physical calibration"))
-    summary.append(("Input units", "Recorded KG1000 raw units; do not assume these are actual ADC-input volts"))
+    summary.append(("Input units", "Recorded KG1000 values as stored: ADC-pin volts from stations with a loadcell_units table (rows from its first_volts_id); the DAQ legacy raw scale (volts / 17.3724) before that"))
     summary.append(("Diagnostics", "Residual = recorded kg minus mapped kg; R²/RMSE compare against recorded kg"))
     summary.append(("Sender", "Method", "Slope (kg/raw)", "Intercept (kg)", "Matched pairs",
                     "R squared", "RMSE (kg)", "Max abs residual (kg)", "Raw minimum", "Raw maximum", "Zero raw"))
@@ -209,7 +214,7 @@ def write_calibration(workbook, fits):
             sheet.cell(number, 7, m * x + b)
         chart = ScatterChart()
         chart.title = f"{fit['sender']}: kg = {m:.9g} × raw + ({b:.9g})"
-        chart.x_axis.title = "Recorded raw units"
+        chart.x_axis.title = "Recorded KG1000 input (V, or legacy raw)"
         chart.y_axis.title = "Signed kg"
         chart.width, chart.height = 28, 13
         observed = Series(Reference(sheet, min_col=2, min_row=2, max_row=len(points) + 1),
@@ -497,7 +502,7 @@ def main():
     for kind in ("KG1000", "LOADCELL_WEIGHT_KG", "PRESSURE_TRANSDUCER_CALIBRATED"):
         if kind not in streams:
             print(f"Warning: {kind} is absent from the recording.", file=sys.stderr)
-    if not any(kind in streams for kind in ("FUEL_TANK_PRESSURE", "IADC")):
+    if not any(kind in streams for kind in ("OX_TANK_PRESSURE", "IADC")):
         print("Warning: no raw PT channel in the recording.", file=sys.stderr)
     if args.all or args.start is not None:
         start = min(rows[0].received_ms for rows in streams.values()) if args.all else args.start

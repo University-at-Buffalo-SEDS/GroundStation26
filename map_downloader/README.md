@@ -55,6 +55,23 @@ around the [official URRG field map](https://www.urrg.us/content.aspx) at
 tiles, and retain the existing bundle on resume. `--test` includes one URRG tile
 at the configured high zoom and remains a small read-only connection probe.
 
+## Terrain (DEM)
+
+`./download_map.py` downloads the imagery and then, with `map_downloader
+--terrain`, the open AWS Terrain Tiles DEM in Terrarium PNG encoding
+(`https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png`,
+keyless; attribution: Mapzen/Tilezen terrain sources, SRTM, USGS 3DEP,
+GMTED2010, ETOPO1 and others, see
+<https://github.com/tilezen/joerd/blob/master/docs/attribution.md>). It covers
+North America at zooms 0–6 and the selected high-detail regions (`MAP_REGIONS`)
+from zoom 7 to `MAP_TERRAIN_MAX_ZOOM` (default 12, at most 15), about 5,000
+tiles for the default regions. Tiles go to their own bundle,
+`terrain.sqlite3` beside `tiles.sqlite3` (`MAP_TERRAIN_BUNDLE_PATH`
+overrides), direct-to-DB only, with the same resume, validation, body cap,
+reserve and bandwidth rules. `--no-terrain` skips it, `--terrain-only` runs
+only it, and `--test` probes one terrain tile per region as well.
+The station serves it offline (`docs/backend/terrain.md`).
+
 ## Compact RRLS dataset
 
 ```sh

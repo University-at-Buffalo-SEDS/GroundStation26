@@ -13,7 +13,12 @@ pub(super) async fn upgrade(
 async fn connection(state: Arc<VoiceState>, mut socket: WebSocket) {
     let token = match tokio::time::timeout(Duration::from_secs(5), socket.recv()).await {
         Ok(Some(Ok(Message::Text(raw)))) => match serde_json::from_str::<Control>(&raw) {
-            Ok(Control::Auth { token }) if !token.is_empty() => token,
+            // Watch tokens never reach the audience program.
+            Ok(Control::Auth { token, .. })
+                if !token.is_empty() && !crate::auth::is_watch_token(&token) =>
+            {
+                token
+            }
             _ => {
                 reject(&mut socket, "Sign in before enabling commentary").await;
                 return;
@@ -125,7 +130,9 @@ mod tests {
             hub: hub.clone(),
             peers: Mutex::new(BTreeMap::new()),
             next: AtomicU32::new(1),
+            claims: AtomicU64::new(1),
             program_slots: Arc::new(tokio::sync::Semaphore::new(4)),
+            limits: super::floor::Limits::default(),
         });
         let routes = axum::Router::new()
             .route("/commentary", get(upgrade))
@@ -175,7 +182,7 @@ mod tests {
                 .lock()
                 .await
                 .values()
-                .any(|p| p.name == "producer" && p.transmitting),
+                .any(|p| p.name == "producer" && p.wants_since.is_some()),
             "stream-only listener cannot acquire VC transmit"
         );
         assert_eq!(hub.history.lock().await.frames.len(), 1);

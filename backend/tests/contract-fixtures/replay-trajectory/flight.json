@@ -1,0 +1,1024 @@
+{
+  "events": [
+    {
+      "altitude_m": 886.1,
+      "kind": "liftoff",
+      "latitude": 31.757985,
+      "longitude": -102.0460261,
+      "t_ms": 1767225610000
+    },
+    {
+      "altitude_m": 2926.1,
+      "kind": "burnout",
+      "latitude": 31.7597222,
+      "longitude": -102.0451949,
+      "t_ms": 1767225617300
+    },
+    {
+      "altitude_m": 3931.1,
+      "kind": "apogee",
+      "latitude": 31.761900349999998,
+      "longitude": -102.04418971999999,
+      "t_ms": 1767225636600
+    },
+    {
+      "altitude_m": 3931.1,
+      "kind": "drogue",
+      "latitude": 31.761900349999998,
+      "longitude": -102.04418971999999,
+      "t_ms": 1767225636600
+    },
+    {
+      "altitude_m": 910.1,
+      "kind": "landing",
+      "latitude": 31.7579627,
+      "longitude": -102.0356683,
+      "t_ms": 1767225804000
+    }
+  ],
+  "phases": [
+    {
+      "end_ms": 1767225610000,
+      "phase": "pad",
+      "start_ms": 1767225600000
+    },
+    {
+      "end_ms": 1767225617300,
+      "phase": "boost",
+      "start_ms": 1767225610000
+    },
+    {
+      "end_ms": 1767225636600,
+      "phase": "coast",
+      "start_ms": 1767225617300
+    },
+    {
+      "end_ms": 1767225804000,
+      "phase": "drogue",
+      "start_ms": 1767225636600
+    },
+    {
+      "end_ms": 1767225836000,
+      "phase": "landed",
+      "start_ms": 1767225804000
+    }
+  ],
+  "points": [
+    {
+      "altitude_m": 889.76,
+      "break_before": true,
+      "latitude": 31.7579977,
+      "longitude": -102.0460268,
+      "phase": "pad",
+      "timestamp_ms": 1767225600000
+    },
+    {
+      "altitude_m": 889.97,
+      "break_before": false,
+      "latitude": 31.7579889,
+      "longitude": -102.0460293,
+      "phase": "pad",
+      "timestamp_ms": 1767225602000
+    },
+    {
+      "altitude_m": 888.31,
+      "break_before": false,
+      "latitude": 31.7579863,
+      "longitude": -102.0460328,
+      "phase": "pad",
+      "timestamp_ms": 1767225604000
+    },
+    {
+      "altitude_m": 889.68,
+      "break_before": false,
+      "latitude": 31.7579947,
+      "longitude": -102.0460194,
+      "phase": "pad",
+      "timestamp_ms": 1767225606000
+    },
+    {
+      "altitude_m": 887.69,
+      "break_before": false,
+      "latitude": 31.7579913,
+      "longitude": -102.0460255,
+      "phase": "pad",
+      "timestamp_ms": 1767225608000
+    },
+    {
+      "altitude_m": 886.12,
+      "break_before": false,
+      "latitude": 31.757985,
+      "longitude": -102.0460261,
+      "phase": "boost",
+      "timestamp_ms": 1767225610000
+    },
+    {
+      "altitude_m": 2926.06,
+      "break_before": false,
+      "latitude": 31.7597222,
+      "longitude": -102.0451949,
+      "phase": "boost",
+      "timestamp_ms": 1767225612000
+    },
+    {
+      "altitude_m": 2926.06,
+      "break_before": false,
+      "latitude": 31.7597222,
+      "longitude": -102.0451949,
+      "phase": "boost",
+      "timestamp_ms": 1767225614000
+    },
+    {
+      "altitude_m": 2926.06,
+      "break_before": false,
+      "latitude": 31.7597222,
+      "longitude": -102.0451949,
+      "phase": "boost",
+      "timestamp_ms": 1767225616000
+    },
+    {
+      "altitude_m": 2926.06,
+      "break_before": false,
+      "latitude": 31.7597222,
+      "longitude": -102.0451949,
+      "phase": "coast",
+      "timestamp_ms": 1767225618000
+    },
+    {
+      "altitude_m": 2926.06,
+      "break_before": false,
+      "latitude": 31.7597222,
+      "longitude": -102.0451949,
+      "phase": "coast",
+      "timestamp_ms": 1767225620000
+    },
+    {
+      "altitude_m": 2926.06,
+      "break_before": false,
+      "latitude": 31.7597222,
+      "longitude": -102.0451949,
+      "phase": "coast",
+      "timestamp_ms": 1767225622000
+    },
+    {
+      "altitude_m": 3145.62,
+      "break_before": false,
+      "latitude": 31.759991,
+      "longitude": -102.0450698,
+      "phase": "coast",
+      "timestamp_ms": 1767225624000
+    },
+    {
+      "altitude_m": 3381.59,
+      "break_before": false,
+      "latitude": 31.7603163,
+      "longitude": -102.0449245,
+      "phase": "coast",
+      "timestamp_ms": 1767225626000
+    },
+    {
+      "altitude_m": 3574.44,
+      "break_before": false,
+      "latitude": 31.7606282,
+      "longitude": -102.044794,
+      "phase": "coast",
+      "timestamp_ms": 1767225628000
+    },
+    {
+      "altitude_m": 3724.59,
+      "break_before": false,
+      "latitude": 31.7609361,
+      "longitude": -102.0446576,
+      "phase": "coast",
+      "timestamp_ms": 1767225630000
+    },
+    {
+      "altitude_m": 3836.01,
+      "break_before": false,
+      "latitude": 31.7612362,
+      "longitude": -102.0445184,
+      "phase": "coast",
+      "timestamp_ms": 1767225632000
+    },
+    {
+      "altitude_m": 3903.72,
+      "break_before": false,
+      "latitude": 31.7615378,
+      "longitude": -102.0443676,
+      "phase": "coast",
+      "timestamp_ms": 1767225634000
+    },
+    {
+      "altitude_m": 3933.35,
+      "break_before": false,
+      "latitude": 31.7618147,
+      "longitude": -102.0442286,
+      "phase": "coast",
+      "timestamp_ms": 1767225636000
+    },
+    {
+      "altitude_m": 3925.81,
+      "break_before": false,
+      "latitude": 31.7621002,
+      "longitude": -102.044099,
+      "phase": "drogue",
+      "timestamp_ms": 1767225638000
+    },
+    {
+      "altitude_m": 3884.75,
+      "break_before": false,
+      "latitude": 31.762293,
+      "longitude": -102.0439682,
+      "phase": "drogue",
+      "timestamp_ms": 1767225640000
+    },
+    {
+      "altitude_m": 3837.68,
+      "break_before": false,
+      "latitude": 31.7623573,
+      "longitude": -102.0438491,
+      "phase": "drogue",
+      "timestamp_ms": 1767225642000
+    },
+    {
+      "altitude_m": 3785.85,
+      "break_before": false,
+      "latitude": 31.7623664,
+      "longitude": -102.0437344,
+      "phase": "drogue",
+      "timestamp_ms": 1767225644000
+    },
+    {
+      "altitude_m": 3732.1,
+      "break_before": false,
+      "latitude": 31.7623411,
+      "longitude": -102.0436194,
+      "phase": "drogue",
+      "timestamp_ms": 1767225646000
+    },
+    {
+      "altitude_m": 3682.15,
+      "break_before": false,
+      "latitude": 31.7623011,
+      "longitude": -102.0434949,
+      "phase": "drogue",
+      "timestamp_ms": 1767225648000
+    },
+    {
+      "altitude_m": 3630.02,
+      "break_before": false,
+      "latitude": 31.7622446,
+      "longitude": -102.0433826,
+      "phase": "drogue",
+      "timestamp_ms": 1767225650000
+    },
+    {
+      "altitude_m": 3578.7,
+      "break_before": false,
+      "latitude": 31.7622022,
+      "longitude": -102.0432865,
+      "phase": "drogue",
+      "timestamp_ms": 1767225652000
+    },
+    {
+      "altitude_m": 3528.06,
+      "break_before": false,
+      "latitude": 31.7621629,
+      "longitude": -102.0431947,
+      "phase": "drogue",
+      "timestamp_ms": 1767225654000
+    },
+    {
+      "altitude_m": 3474.81,
+      "break_before": false,
+      "latitude": 31.7621118,
+      "longitude": -102.0430914,
+      "phase": "drogue",
+      "timestamp_ms": 1767225656000
+    },
+    {
+      "altitude_m": 3422.32,
+      "break_before": false,
+      "latitude": 31.7620527,
+      "longitude": -102.0429924,
+      "phase": "drogue",
+      "timestamp_ms": 1767225658000
+    },
+    {
+      "altitude_m": 3369.77,
+      "break_before": false,
+      "latitude": 31.7619939,
+      "longitude": -102.0429074,
+      "phase": "drogue",
+      "timestamp_ms": 1767225660000
+    },
+    {
+      "altitude_m": 3318.65,
+      "break_before": false,
+      "latitude": 31.7619308,
+      "longitude": -102.0428008,
+      "phase": "drogue",
+      "timestamp_ms": 1767225662000
+    },
+    {
+      "altitude_m": 3266.75,
+      "break_before": false,
+      "latitude": 31.7618681,
+      "longitude": -102.042707,
+      "phase": "drogue",
+      "timestamp_ms": 1767225664000
+    },
+    {
+      "altitude_m": 3213.69,
+      "break_before": false,
+      "latitude": 31.761814,
+      "longitude": -102.042585,
+      "phase": "drogue",
+      "timestamp_ms": 1767225666000
+    },
+    {
+      "altitude_m": 3161.38,
+      "break_before": false,
+      "latitude": 31.76176,
+      "longitude": -102.0424803,
+      "phase": "drogue",
+      "timestamp_ms": 1767225668000
+    },
+    {
+      "altitude_m": 3110.01,
+      "break_before": false,
+      "latitude": 31.7617015,
+      "longitude": -102.0423704,
+      "phase": "drogue",
+      "timestamp_ms": 1767225670000
+    },
+    {
+      "altitude_m": 3060.22,
+      "break_before": false,
+      "latitude": 31.7616388,
+      "longitude": -102.0422765,
+      "phase": "drogue",
+      "timestamp_ms": 1767225672000
+    },
+    {
+      "altitude_m": 3005.78,
+      "break_before": false,
+      "latitude": 31.7615633,
+      "longitude": -102.042177,
+      "phase": "drogue",
+      "timestamp_ms": 1767225674000
+    },
+    {
+      "altitude_m": 2954.65,
+      "break_before": false,
+      "latitude": 31.7614891,
+      "longitude": -102.0420721,
+      "phase": "drogue",
+      "timestamp_ms": 1767225676000
+    },
+    {
+      "altitude_m": 2901.07,
+      "break_before": false,
+      "latitude": 31.7614121,
+      "longitude": -102.0419565,
+      "phase": "drogue",
+      "timestamp_ms": 1767225678000
+    },
+    {
+      "altitude_m": 2851.86,
+      "break_before": false,
+      "latitude": 31.7613317,
+      "longitude": -102.041839,
+      "phase": "drogue",
+      "timestamp_ms": 1767225680000
+    },
+    {
+      "altitude_m": 2800.72,
+      "break_before": false,
+      "latitude": 31.7612494,
+      "longitude": -102.0416995,
+      "phase": "drogue",
+      "timestamp_ms": 1767225682000
+    },
+    {
+      "altitude_m": 2749.46,
+      "break_before": false,
+      "latitude": 31.7611869,
+      "longitude": -102.0415721,
+      "phase": "drogue",
+      "timestamp_ms": 1767225684000
+    },
+    {
+      "altitude_m": 2696.36,
+      "break_before": false,
+      "latitude": 31.7611303,
+      "longitude": -102.0414677,
+      "phase": "drogue",
+      "timestamp_ms": 1767225686000
+    },
+    {
+      "altitude_m": 2648.98,
+      "break_before": false,
+      "latitude": 31.761084,
+      "longitude": -102.0413274,
+      "phase": "drogue",
+      "timestamp_ms": 1767225688000
+    },
+    {
+      "altitude_m": 2598.56,
+      "break_before": false,
+      "latitude": 31.7610313,
+      "longitude": -102.0412152,
+      "phase": "drogue",
+      "timestamp_ms": 1767225690000
+    },
+    {
+      "altitude_m": 2545.03,
+      "break_before": false,
+      "latitude": 31.760965,
+      "longitude": -102.0411083,
+      "phase": "drogue",
+      "timestamp_ms": 1767225692000
+    },
+    {
+      "altitude_m": 2491.67,
+      "break_before": false,
+      "latitude": 31.7609117,
+      "longitude": -102.0409808,
+      "phase": "drogue",
+      "timestamp_ms": 1767225694000
+    },
+    {
+      "altitude_m": 2441.03,
+      "break_before": false,
+      "latitude": 31.7608522,
+      "longitude": -102.0408788,
+      "phase": "drogue",
+      "timestamp_ms": 1767225696000
+    },
+    {
+      "altitude_m": 2387.77,
+      "break_before": false,
+      "latitude": 31.7607984,
+      "longitude": -102.0407761,
+      "phase": "drogue",
+      "timestamp_ms": 1767225698000
+    },
+    {
+      "altitude_m": 2340.49,
+      "break_before": false,
+      "latitude": 31.7607323,
+      "longitude": -102.0406773,
+      "phase": "drogue",
+      "timestamp_ms": 1767225700000
+    },
+    {
+      "altitude_m": 2289.96,
+      "break_before": false,
+      "latitude": 31.7606778,
+      "longitude": -102.0405793,
+      "phase": "drogue",
+      "timestamp_ms": 1767225702000
+    },
+    {
+      "altitude_m": 2238.0,
+      "break_before": false,
+      "latitude": 31.7606181,
+      "longitude": -102.0404825,
+      "phase": "drogue",
+      "timestamp_ms": 1767225704000
+    },
+    {
+      "altitude_m": 2189.14,
+      "break_before": false,
+      "latitude": 31.7605564,
+      "longitude": -102.0404066,
+      "phase": "drogue",
+      "timestamp_ms": 1767225706000
+    },
+    {
+      "altitude_m": 2140.14,
+      "break_before": false,
+      "latitude": 31.7605001,
+      "longitude": -102.0403304,
+      "phase": "drogue",
+      "timestamp_ms": 1767225708000
+    },
+    {
+      "altitude_m": 2090.37,
+      "break_before": false,
+      "latitude": 31.7604216,
+      "longitude": -102.0402496,
+      "phase": "drogue",
+      "timestamp_ms": 1767225710000
+    },
+    {
+      "altitude_m": 2036.7,
+      "break_before": false,
+      "latitude": 31.7603567,
+      "longitude": -102.040141,
+      "phase": "drogue",
+      "timestamp_ms": 1767225712000
+    },
+    {
+      "altitude_m": 1990.66,
+      "break_before": false,
+      "latitude": 31.7602959,
+      "longitude": -102.0400257,
+      "phase": "drogue",
+      "timestamp_ms": 1767225714000
+    },
+    {
+      "altitude_m": 1939.48,
+      "break_before": false,
+      "latitude": 31.7602248,
+      "longitude": -102.0399208,
+      "phase": "drogue",
+      "timestamp_ms": 1767225716000
+    },
+    {
+      "altitude_m": 1889.5,
+      "break_before": false,
+      "latitude": 31.7601564,
+      "longitude": -102.0398172,
+      "phase": "drogue",
+      "timestamp_ms": 1767225718000
+    },
+    {
+      "altitude_m": 1841.54,
+      "break_before": false,
+      "latitude": 31.7600923,
+      "longitude": -102.039719,
+      "phase": "drogue",
+      "timestamp_ms": 1767225720000
+    },
+    {
+      "altitude_m": 1791.9,
+      "break_before": false,
+      "latitude": 31.7600216,
+      "longitude": -102.0396178,
+      "phase": "drogue",
+      "timestamp_ms": 1767225722000
+    },
+    {
+      "altitude_m": 1743.13,
+      "break_before": false,
+      "latitude": 31.759964,
+      "longitude": -102.0395324,
+      "phase": "drogue",
+      "timestamp_ms": 1767225724000
+    },
+    {
+      "altitude_m": 1694.98,
+      "break_before": false,
+      "latitude": 31.7599113,
+      "longitude": -102.0394379,
+      "phase": "drogue",
+      "timestamp_ms": 1767225726000
+    },
+    {
+      "altitude_m": 1649.31,
+      "break_before": false,
+      "latitude": 31.7598582,
+      "longitude": -102.0393481,
+      "phase": "drogue",
+      "timestamp_ms": 1767225728000
+    },
+    {
+      "altitude_m": 1601.65,
+      "break_before": false,
+      "latitude": 31.759786,
+      "longitude": -102.0392362,
+      "phase": "drogue",
+      "timestamp_ms": 1767225730000
+    },
+    {
+      "altitude_m": 1552.94,
+      "break_before": false,
+      "latitude": 31.7597235,
+      "longitude": -102.0391269,
+      "phase": "drogue",
+      "timestamp_ms": 1767225732000
+    },
+    {
+      "altitude_m": 1505.58,
+      "break_before": false,
+      "latitude": 31.7596533,
+      "longitude": -102.0390186,
+      "phase": "drogue",
+      "timestamp_ms": 1767225734000
+    },
+    {
+      "altitude_m": 1458.31,
+      "break_before": false,
+      "latitude": 31.7595899,
+      "longitude": -102.0389061,
+      "phase": "drogue",
+      "timestamp_ms": 1767225736000
+    },
+    {
+      "altitude_m": 1414.32,
+      "break_before": false,
+      "latitude": 31.7595219,
+      "longitude": -102.0388156,
+      "phase": "drogue",
+      "timestamp_ms": 1767225738000
+    },
+    {
+      "altitude_m": 1366.47,
+      "break_before": false,
+      "latitude": 31.759457,
+      "longitude": -102.0386993,
+      "phase": "drogue",
+      "timestamp_ms": 1767225740000
+    },
+    {
+      "altitude_m": 1318.16,
+      "break_before": false,
+      "latitude": 31.759402,
+      "longitude": -102.0385902,
+      "phase": "drogue",
+      "timestamp_ms": 1767225742000
+    },
+    {
+      "altitude_m": 1290.7,
+      "break_before": false,
+      "latitude": 31.7593643,
+      "longitude": -102.0384755,
+      "phase": "drogue",
+      "timestamp_ms": 1767225744000
+    },
+    {
+      "altitude_m": 1278.84,
+      "break_before": false,
+      "latitude": 31.7593238,
+      "longitude": -102.0383824,
+      "phase": "drogue",
+      "timestamp_ms": 1767225746000
+    },
+    {
+      "altitude_m": 1263.8,
+      "break_before": false,
+      "latitude": 31.759267,
+      "longitude": -102.0382544,
+      "phase": "drogue",
+      "timestamp_ms": 1767225748000
+    },
+    {
+      "altitude_m": 1250.62,
+      "break_before": false,
+      "latitude": 31.759215,
+      "longitude": -102.0381227,
+      "phase": "drogue",
+      "timestamp_ms": 1767225750000
+    },
+    {
+      "altitude_m": 1239.01,
+      "break_before": false,
+      "latitude": 31.7591576,
+      "longitude": -102.038008,
+      "phase": "drogue",
+      "timestamp_ms": 1767225752000
+    },
+    {
+      "altitude_m": 1226.51,
+      "break_before": false,
+      "latitude": 31.7590972,
+      "longitude": -102.0379218,
+      "phase": "drogue",
+      "timestamp_ms": 1767225754000
+    },
+    {
+      "altitude_m": 1213.83,
+      "break_before": false,
+      "latitude": 31.7590523,
+      "longitude": -102.03783,
+      "phase": "drogue",
+      "timestamp_ms": 1767225756000
+    },
+    {
+      "altitude_m": 1199.15,
+      "break_before": false,
+      "latitude": 31.7590138,
+      "longitude": -102.0377549,
+      "phase": "drogue",
+      "timestamp_ms": 1767225758000
+    },
+    {
+      "altitude_m": 1187.25,
+      "break_before": false,
+      "latitude": 31.7589635,
+      "longitude": -102.0376749,
+      "phase": "drogue",
+      "timestamp_ms": 1767225760000
+    },
+    {
+      "altitude_m": 1172.43,
+      "break_before": false,
+      "latitude": 31.7589309,
+      "longitude": -102.0376018,
+      "phase": "drogue",
+      "timestamp_ms": 1767225762000
+    },
+    {
+      "altitude_m": 1159.36,
+      "break_before": false,
+      "latitude": 31.758886,
+      "longitude": -102.0375129,
+      "phase": "drogue",
+      "timestamp_ms": 1767225764000
+    },
+    {
+      "altitude_m": 1148.26,
+      "break_before": false,
+      "latitude": 31.7588285,
+      "longitude": -102.0374194,
+      "phase": "drogue",
+      "timestamp_ms": 1767225766000
+    },
+    {
+      "altitude_m": 1137.66,
+      "break_before": false,
+      "latitude": 31.7587956,
+      "longitude": -102.0373485,
+      "phase": "drogue",
+      "timestamp_ms": 1767225768000
+    },
+    {
+      "altitude_m": 1123.67,
+      "break_before": false,
+      "latitude": 31.7587482,
+      "longitude": -102.0372435,
+      "phase": "drogue",
+      "timestamp_ms": 1767225770000
+    },
+    {
+      "altitude_m": 1111.74,
+      "break_before": false,
+      "latitude": 31.7586644,
+      "longitude": -102.0371108,
+      "phase": "drogue",
+      "timestamp_ms": 1767225772000
+    },
+    {
+      "altitude_m": 1100.28,
+      "break_before": false,
+      "latitude": 31.7585902,
+      "longitude": -102.0370208,
+      "phase": "drogue",
+      "timestamp_ms": 1767225774000
+    },
+    {
+      "altitude_m": 1087.38,
+      "break_before": false,
+      "latitude": 31.7585156,
+      "longitude": -102.0369395,
+      "phase": "drogue",
+      "timestamp_ms": 1767225776000
+    },
+    {
+      "altitude_m": 1075.05,
+      "break_before": false,
+      "latitude": 31.7584712,
+      "longitude": -102.0368811,
+      "phase": "drogue",
+      "timestamp_ms": 1767225778000
+    },
+    {
+      "altitude_m": 1062.93,
+      "break_before": false,
+      "latitude": 31.7584275,
+      "longitude": -102.036823,
+      "phase": "drogue",
+      "timestamp_ms": 1767225780000
+    },
+    {
+      "altitude_m": 1050.62,
+      "break_before": false,
+      "latitude": 31.758398,
+      "longitude": -102.0367533,
+      "phase": "drogue",
+      "timestamp_ms": 1767225782000
+    },
+    {
+      "altitude_m": 1040.27,
+      "break_before": false,
+      "latitude": 31.7583671,
+      "longitude": -102.0366529,
+      "phase": "drogue",
+      "timestamp_ms": 1767225784000
+    },
+    {
+      "altitude_m": 1026.65,
+      "break_before": false,
+      "latitude": 31.7583255,
+      "longitude": -102.0365645,
+      "phase": "drogue",
+      "timestamp_ms": 1767225786000
+    },
+    {
+      "altitude_m": 1012.93,
+      "break_before": false,
+      "latitude": 31.7582949,
+      "longitude": -102.0364589,
+      "phase": "drogue",
+      "timestamp_ms": 1767225788000
+    },
+    {
+      "altitude_m": 1000.17,
+      "break_before": false,
+      "latitude": 31.7582656,
+      "longitude": -102.0363392,
+      "phase": "drogue",
+      "timestamp_ms": 1767225790000
+    },
+    {
+      "altitude_m": 989.24,
+      "break_before": false,
+      "latitude": 31.7582352,
+      "longitude": -102.036232,
+      "phase": "drogue",
+      "timestamp_ms": 1767225792000
+    },
+    {
+      "altitude_m": 977.91,
+      "break_before": false,
+      "latitude": 31.758189,
+      "longitude": -102.0361496,
+      "phase": "drogue",
+      "timestamp_ms": 1767225794000
+    },
+    {
+      "altitude_m": 965.58,
+      "break_before": false,
+      "latitude": 31.7581584,
+      "longitude": -102.0360603,
+      "phase": "drogue",
+      "timestamp_ms": 1767225796000
+    },
+    {
+      "altitude_m": 950.27,
+      "break_before": false,
+      "latitude": 31.758122,
+      "longitude": -102.0359859,
+      "phase": "drogue",
+      "timestamp_ms": 1767225798000
+    },
+    {
+      "altitude_m": 934.28,
+      "break_before": false,
+      "latitude": 31.7580774,
+      "longitude": -102.0358997,
+      "phase": "drogue",
+      "timestamp_ms": 1767225800000
+    },
+    {
+      "altitude_m": 924.44,
+      "break_before": false,
+      "latitude": 31.7580143,
+      "longitude": -102.0357834,
+      "phase": "drogue",
+      "timestamp_ms": 1767225802000
+    },
+    {
+      "altitude_m": 910.1,
+      "break_before": false,
+      "latitude": 31.7579627,
+      "longitude": -102.0356683,
+      "phase": "landed",
+      "timestamp_ms": 1767225804000
+    },
+    {
+      "altitude_m": 899.94,
+      "break_before": false,
+      "latitude": 31.7579317,
+      "longitude": -102.0355737,
+      "phase": "landed",
+      "timestamp_ms": 1767225806000
+    },
+    {
+      "altitude_m": 888.02,
+      "break_before": false,
+      "latitude": 31.7578986,
+      "longitude": -102.0354967,
+      "phase": "landed",
+      "timestamp_ms": 1767225808000
+    },
+    {
+      "altitude_m": 888.59,
+      "break_before": false,
+      "latitude": 31.7578921,
+      "longitude": -102.0354827,
+      "phase": "landed",
+      "timestamp_ms": 1767225810000
+    },
+    {
+      "altitude_m": 887.97,
+      "break_before": false,
+      "latitude": 31.7578989,
+      "longitude": -102.0354843,
+      "phase": "landed",
+      "timestamp_ms": 1767225812000
+    },
+    {
+      "altitude_m": 887.27,
+      "break_before": false,
+      "latitude": 31.7578882,
+      "longitude": -102.0354819,
+      "phase": "landed",
+      "timestamp_ms": 1767225814000
+    },
+    {
+      "altitude_m": 887.73,
+      "break_before": false,
+      "latitude": 31.7578949,
+      "longitude": -102.035475,
+      "phase": "landed",
+      "timestamp_ms": 1767225816000
+    },
+    {
+      "altitude_m": 889.12,
+      "break_before": false,
+      "latitude": 31.7578949,
+      "longitude": -102.0354756,
+      "phase": "landed",
+      "timestamp_ms": 1767225818000
+    },
+    {
+      "altitude_m": 887.13,
+      "break_before": false,
+      "latitude": 31.7579013,
+      "longitude": -102.0354762,
+      "phase": "landed",
+      "timestamp_ms": 1767225820000
+    },
+    {
+      "altitude_m": 886.4,
+      "break_before": false,
+      "latitude": 31.7579016,
+      "longitude": -102.0354979,
+      "phase": "landed",
+      "timestamp_ms": 1767225822000
+    },
+    {
+      "altitude_m": 887.25,
+      "break_before": false,
+      "latitude": 31.7578974,
+      "longitude": -102.0354791,
+      "phase": "landed",
+      "timestamp_ms": 1767225824000
+    },
+    {
+      "altitude_m": 888.6,
+      "break_before": false,
+      "latitude": 31.7579064,
+      "longitude": -102.0354847,
+      "phase": "landed",
+      "timestamp_ms": 1767225826000
+    },
+    {
+      "altitude_m": 889.08,
+      "break_before": false,
+      "latitude": 31.7579028,
+      "longitude": -102.0354786,
+      "phase": "landed",
+      "timestamp_ms": 1767225828000
+    },
+    {
+      "altitude_m": 889.43,
+      "break_before": false,
+      "latitude": 31.7579052,
+      "longitude": -102.0354832,
+      "phase": "landed",
+      "timestamp_ms": 1767225830000
+    },
+    {
+      "altitude_m": 889.18,
+      "break_before": false,
+      "latitude": 31.7578966,
+      "longitude": -102.0354919,
+      "phase": "landed",
+      "timestamp_ms": 1767225832000
+    },
+    {
+      "altitude_m": 891.9,
+      "break_before": false,
+      "latitude": 31.7578958,
+      "longitude": -102.0354965,
+      "phase": "landed",
+      "timestamp_ms": 1767225834000
+    },
+    {
+      "altitude_m": 890.87,
+      "break_before": false,
+      "latitude": 31.7578887,
+      "longitude": -102.0355027,
+      "phase": "landed",
+      "timestamp_ms": 1767225836000
+    }
+  ],
+  "sampled": false,
+  "source_sender_id": "FC",
+  "truncated": false,
+  "upper_id": 601
+}

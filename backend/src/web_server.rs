@@ -1,7 +1,11 @@
 //! Shared native/Docker HTTP + HTTPS listeners for GroundStation and RRLS.
 use anyhow::{Context, Result, bail};
 use axum::Router;
-use axum_server::{Handle, tls_rustls::RustlsConfig};
+use axum_server::{
+    Handle,
+    accept::NoDelayAcceptor,
+    tls_rustls::{RustlsAcceptor, RustlsConfig},
+};
 use serde::{Deserialize, Serialize};
 use std::{
     future::Future,
@@ -129,8 +133,8 @@ fn identity(config: &Config) -> Result<(PathBuf, PathBuf)> {
     let saved = std::fs::read(&manifest)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Identity>(&bytes).ok());
-    if let (Some(saved), Ok(bytes)) = (saved, std::fs::read(&cert)) {
-        if key.is_file()
+    if let (Some(saved), Ok(bytes)) = (saved, std::fs::read(&cert))
+        && key.is_file()
             && saved.names == config.names
             && saved.renew_at > now.unix_timestamp()
             && saved.certificate_hash == hash(&bytes)
@@ -143,7 +147,6 @@ fn identity(config: &Config) -> Result<(PathBuf, PathBuf)> {
             }
             return Ok((cert, key));
         }
-    }
     let mut params = rcgen::CertificateParams::new(config.names.clone())?;
     params.not_before = now - time::Duration::days(1);
     params.not_after = now + time::Duration::days(397);
@@ -222,21 +225,34 @@ pub async fn serve(app: Router, config: Config, shutdown: impl Future<Output = (
             self.0.abort();
         }
     }
-    let _discovery = crate::station_pairing::Pairing::load()?.map(|pairing| {
-        DiscoveryGuard(tokio::spawn(async move {
-            if let Err(error) = crate::station_pairing::serve_discovery(pairing).await {
-                log::warn!("paired station LAN discovery unavailable: {error}");
+    let pairing = crate::station_pairing::Pairing::load_or_unpaired("paired discovery");
+    let (scheme, address) = if let Some(listener) = &https {
+        ("https", listener.local_addr()?)
+    } else {
+        ("http", http.local_addr()?)
+    };
+    let _discovery = if crate::flight_sim_runtime::enabled() {
+        None
+    } else {
+        Some(DiscoveryGuard(tokio::spawn(async move {
+            if let Err(error) = crate::station_pairing::serve_discovery(pairing, scheme, address).await {
+                log::warn!("station LAN discovery unavailable: {error}");
             }
-        }))
-    });
+        })))
+    };
     let http_handle = Handle::new();
     let https_handle = Handle::new();
+    // TCP_NODELAY: crew voice sends a small frame every 20 ms per talker;
+    // Nagle's algorithm would hold each one until the previous is ACKed
+    // (up to a delayed-ACK period, 40 ms on Linux, 200 ms on Windows).
     let http_server = axum_server::from_tcp(http)?
+        .acceptor(NoDelayAcceptor::new())
         .handle(http_handle.clone())
         .serve(app.clone().into_make_service());
     let https_server = async {
         if let (Some(listener), Some(tls)) = (https, tls) {
-            axum_server::from_tcp_rustls(listener, tls)?
+            axum_server::from_tcp(listener)?
+                .acceptor(RustlsAcceptor::new(tls).acceptor(NoDelayAcceptor::new()))
                 .handle(https_handle.clone())
                 .serve(app.into_make_service())
                 .await

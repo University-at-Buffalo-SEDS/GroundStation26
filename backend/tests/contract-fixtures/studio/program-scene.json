@@ -1,0 +1,45 @@
+{
+  "mode": "program",
+  "name": "Pad camera",
+  "program_bar": true,
+  "scene_id": "pad-camera",
+  "slots": [
+    {
+      "height": 100.0,
+      "id": "main",
+      "source": {
+        "id": "camera-auto:1",
+        "kind": "camera",
+        "label": "Auto camera 1",
+        "stream_id": null,
+        "transparent": false,
+        "view": "camera"
+      },
+      "width": 100.0,
+      "x": 0.0,
+      "y": 0.0,
+      "z": 0
+    },
+    {
+      "height": 25.0,
+      "id": "lower",
+      "source": {
+        "id": "overlay:lower-third",
+        "kind": "overlay",
+        "label": "T-clock + altitude lower third",
+        "stream_id": null,
+        "transparent": true,
+        "view": "lower_third"
+      },
+      "width": 100.0,
+      "x": 0.0,
+      "y": 75.0,
+      "z": 2
+    }
+  ],
+  "take_seq": 1,
+  "transition": {
+    "duration_ms": 800,
+    "kind": "fade"
+  }
+}

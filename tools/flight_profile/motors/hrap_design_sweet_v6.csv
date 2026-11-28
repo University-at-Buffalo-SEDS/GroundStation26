@@ -1,0 +1,54 @@
+# UB SEDS N2O hybrid, design motor of the OpenRocket model SWEET_V6
+# (tools/flight_profile/vehicle/SWEET_V6.ork, simulation "IREC_STANDARDREPORT"). The .ork names the
+# motor "Midland" (101 mm x 1.73 m) and the rocket comment
+# says the thrust data is from HRAP; the motor file is not embedded, so this is
+# rebuilt from the stored time series (OpenRocket interpolates linearly; these are
+# the vertices). motor_mass_kg is OpenRocket's propellant mass for that run (the
+# motor entry has no dry mass: the hardware is the EntireMotor_nofuel mass object).
+# tools/flight_profile/ork_sims.py --extract-motor rebuilds this file.
+t_s,thrust_n,motor_mass_kg
+0.000,0.000,9.0000
+0.100,2142.750,8.9120
+0.200,4248.600,8.6500
+0.300,4882.290,8.2750
+0.400,5282.120,7.8580
+0.500,5678.050,7.4080
+0.600,4880.580,6.9750
+0.607,4828.359,6.9470
+0.619,4750.028,6.9050
+0.636,4632.530,6.8420
+0.661,4456.284,6.7480
+0.700,4184.300,6.6030
+0.800,4102.540,6.2620
+0.900,4287.320,5.9180
+1.000,4156.390,5.5720
+1.100,4134.900,5.2310
+1.200,3879.680,4.9020
+1.300,4109.850,4.5740
+1.400,4020.280,4.2410
+1.500,3788.730,3.9200
+1.600,3730.630,3.6120
+1.700,3681.970,3.3070
+1.800,3668.390,3.0060
+1.900,3684.150,2.7040
+2.000,3607.720,2.4050
+2.100,3517.190,2.1120
+2.200,3562.400,1.8220
+2.300,3374.310,1.5370
+2.400,3417.040,1.2580
+2.500,2788.900,1.0040
+2.600,2273.060,0.7960
+2.700,1849.140,0.6270
+2.800,1500.490,0.4890
+2.900,1213.470,0.3780
+3.000,976.890,0.2880
+3.100,781.630,0.2160
+3.200,620.180,0.1580
+3.300,486.430,0.1130
+3.400,375.340,0.0770
+3.500,282.820,0.0500
+3.600,205.490,0.0300
+3.700,140.600,0.0160
+3.800,85.900,0.0070
+3.900,39.530,0.0020
+4.000,0.000,0.0000

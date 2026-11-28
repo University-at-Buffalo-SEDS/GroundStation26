@@ -1,9 +1,14 @@
 # Operational firmware simulator boundary
 
 `firmware_sim` enables only the existing explicit `GS_SIM_CLOCK_FILE` clock
-adapter. It is independent of `hitl_mode`: `test_fire_mode,firmware_sim` retains
-the ordinary GSE operational qualification, persistence, checklist, valve, route,
-pressure and launch gates. It does not turn on `testing` or fabricate telemetry.
+adapter. It is independent of the station mode. Build with
+`cargo build -p groundstation_backend --features firmware_sim` and start the
+backend with `GS_STATION_MODE=test_fire` (formerly
+`--features test_fire_mode,firmware_sim`) or `GS_STATION_MODE=hitl` (formerly
+`--features hitl_mode,firmware_sim`). Test fire keeps the ordinary GSE
+operational qualification, persistence, checklist, valve, route, pressure and
+launch gates. `firmware_sim` does not select testing mode or fabricate
+telemetry.
 Without the explicit clock file, ordinary wall timing remains unchanged.
 
 Operational board liveness in an explicit model uses the monotonic time of

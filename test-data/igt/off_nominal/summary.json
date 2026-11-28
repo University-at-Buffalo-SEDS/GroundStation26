@@ -1,0 +1,107 @@
+{
+  "motor": {
+    "curve": "motors/testfire_20261116.csv",
+    "total_impulse_ns": 14413.5,
+    "scaled": true,
+    "peak_thrust_n": 4125.8,
+    "burn_s_5pct_peak": 7.08,
+    "propellant_kg": 10.51
+  },
+  "mass_kg": {
+    "dry": 40.84,
+    "liftoff": 51.35,
+    "burnout": 41.26
+  },
+  "ignition_s": 10.0,
+  "liftoff_s": 10.152,
+  "rail_exit_s": 10.776,
+  "rail_exit_mps": 34.8,
+  "burnout_s": 19.392,
+  "burnout_5pct_peak_s": 17.263,
+  "max_speed_mps": 220.5,
+  "max_speed_s": 15.82,
+  "max_mach": 0.662,
+  "max_boost_accel_g": 8.78,
+  "max_accel_any_g": 15.65,
+  "max_imu_axis_mps2": 235.35,
+  "drogue_shock_g": 9.62,
+  "main_shock_g": 8.89,
+  "landing_shock_g": 15.65,
+  "apogee_s": 36.542,
+  "apogee_m_agl": 3038.0,
+  "apogee_ft_agl": 9967,
+  "apogee_m_msl": 3928.0,
+  "drogue_s": 37.743,
+  "drogue_alt_m": 3031.1,
+  "drogue_rate_mps": 25.1,
+  "main_trigger_s": 146.899,
+  "main_s": 147.199,
+  "main_alt_m": 292.8,
+  "main_rate_mps": 6.5,
+  "landing_s": 188.772,
+  "landing_mps": 6.5,
+  "tipover_s": 190.99,
+  "data_end_s": 221.09,
+  "landing_drift_m": 973.1,
+  "landing_bearing_deg": 75.8,
+  "rows": {
+    "IMU": 10002,
+    "BARO": 11055,
+    "GPS": 1944
+  },
+  "bytes": {
+    "BARO0.CSV": 308086,
+    "GPS0.CSV": 73733,
+    "IMU0.CSV": 512778
+  },
+  "total_bytes": 894597,
+  "seed": 4,
+  "noise": true,
+  "site": [
+    31.758,
+    -102.046,
+    890.016
+  ],
+  "wind": {
+    "mps": 4.0,
+    "from_deg": 300.0,
+    "gust_sigma_mps": 1.0
+  },
+  "glitches": [
+    {
+      "sensor": "imu",
+      "kind": "spike",
+      "at": "burnout+6",
+      "dur_s": 0.01,
+      "accel_mps2": [
+        400.0,
+        0.0,
+        -400.0
+      ],
+      "gyro_dps": [
+        0.0,
+        2500.0,
+        0.0
+      ]
+    },
+    {
+      "sensor": "baro",
+      "kind": "stuck",
+      "at": "drogue+40",
+      "dur_s": 2.0
+    },
+    {
+      "sensor": "gps",
+      "kind": "dropout",
+      "at": "drogue+30",
+      "dur_s": 15.0
+    },
+    {
+      "sensor": "gps",
+      "kind": "jump",
+      "at": "main-20",
+      "dur_s": 1.0,
+      "east_m": 60.0
+    }
+  ]
+}

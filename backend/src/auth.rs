@@ -8,7 +8,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const USERS_FILE_VERSION: u32 = 1;
@@ -23,30 +24,73 @@ const PBKDF2_OUTPUT_LEN: usize = 32;
 static PENDING_LOGIN_CHALLENGES: LazyLock<Mutex<HashMap<String, PendingLoginChallenge>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct Permissions {
-    #[serde(default)]
-    pub view_data: bool,
-    #[serde(default)]
-    pub send_commands: bool,
-    #[serde(default)]
-    pub set_system_time: bool,
-    #[serde(default)]
-    pub voice_transmit: bool,
-    #[serde(default)]
-    pub camera_publish: bool,
+/// Declares every grantable permission exactly once. The flag struct, the
+/// `Permission` enum, `Permission::ALL` and `Permissions::all()` are all
+/// generated from this one list, so an application administrator (who always
+/// receives `Permissions::all()`) cannot be missing a permission added later.
+macro_rules! permission_set {
+    ($($field:ident => $variant:ident),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+        pub struct Permissions {
+            $(#[serde(default)] pub $field: bool,)+
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum Permission {
+            $($variant,)+
+        }
+
+        impl Permission {
+            /// Every permission, in declaration order.
+            #[allow(dead_code)]
+            pub const ALL: &'static [Permission] = &[$(Permission::$variant,)+];
+
+            /// The stored/serialized flag name for this permission.
+            #[allow(dead_code)]
+            pub const fn field_name(self) -> &'static str {
+                match self {
+                    $(Permission::$variant => stringify!($field),)+
+                }
+            }
+        }
+
+        impl Permissions {
+            /// Every permission granted; the only grant an administrator holds.
+            pub const fn all() -> Self {
+                Self { $($field: true,)+ }
+            }
+
+            /// The raw stored flag, without dependency normalization.
+            #[allow(dead_code)]
+            pub const fn flag(self, permission: Permission) -> bool {
+                match permission {
+                    $(Permission::$variant => self.$field,)+
+                }
+            }
+
+            /// Grants held by both sides (paired sessions, revocation).
+            pub const fn intersect(self, other: Self) -> Self {
+                Self { $($field: self.$field && other.$field,)+ }
+            }
+        }
+    };
+}
+
+permission_set! {
+    view_data => ViewData,
+    send_commands => SendCommands,
+    set_system_time => SetSystemTime,
+    voice_transmit => VoiceTransmit,
+    camera_publish => CameraPublish,
+    sign_checklists => SignChecklists,
 }
 
 impl Permissions {
+    /// Effective permissions for an account. Administrators always hold every
+    /// permission regardless of the stored flags; other roles use their flags.
     pub fn for_roles(self, roles: &[StreamRole]) -> Self {
         if roles.contains(&StreamRole::Admin) {
-            Self {
-                view_data: true,
-                send_commands: true,
-                set_system_time: true,
-                voice_transmit: true,
-                camera_publish: true,
-            }
+            Self::all()
         } else {
             self.normalized()
         }
@@ -66,6 +110,7 @@ impl Permissions {
             Permission::SetSystemTime => normalized.set_system_time,
             Permission::VoiceTransmit => normalized.view_data && normalized.voice_transmit,
             Permission::CameraPublish => normalized.view_data && normalized.camera_publish,
+            Permission::SignChecklists => normalized.view_data && normalized.sign_checklists,
         }
     }
 }
@@ -109,15 +154,6 @@ impl CalibrationAccess {
         }
         self
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Permission {
-    ViewData,
-    SendCommands,
-    SetSystemTime,
-    VoiceTransmit,
-    CameraPublish,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,6 +226,7 @@ pub struct SessionStatus {
     pub station_role: &'static str,
     pub station_pairing: Option<crate::station_pairing::Public>,
     pub operating_mode: crate::station_mode::Snapshot,
+    pub command_proxy: crate::command_proxy::Status,
     pub roles: Vec<StreamRole>,
     pub authenticated: bool,
     pub username: Option<String>,
@@ -215,8 +252,32 @@ pub struct AuthPrincipal {
 }
 
 impl AuthPrincipal {
+    /// A signed-in application administrator.
+    pub fn is_admin(&self) -> bool {
+        !self.anonymous && self.roles.contains(&StreamRole::Admin)
+    }
+
+    /// Every authenticated principal is finished here. An administrator always
+    /// holds every permission, unrestricted commands and full calibration
+    /// access; no stored flag, stale session row or paired claim can narrow it.
+    /// Station/mode/proxy admission rules are enforced separately and still apply.
+    fn with_role_authority(mut self) -> Self {
+        if self.is_admin() {
+            self.permissions = Permissions::all();
+            self.command_access = CommandAccess::default();
+            self.calibration_access = CalibrationAccess {
+                view: true,
+                edit: true,
+            };
+            self.roles.retain(|role| *role != StreamRole::StreamViewer);
+        }
+        self
+    }
+
     pub fn can_publish_camera(&self) -> bool {
-        !self.anonymous && (self.roles.contains(&StreamRole::Admin) || self.permissions.allows(Permission::CameraPublish))
+        !self.anonymous
+            && (self.roles.contains(&StreamRole::Admin)
+                || self.permissions.allows(Permission::CameraPublish))
     }
 
     pub fn can_manage_stream(&self) -> bool {
@@ -250,6 +311,7 @@ impl AuthPrincipal {
             },
             station_pairing: crate::station_pairing::public(),
             operating_mode: crate::station_mode::snapshot(),
+            command_proxy: crate::command_proxy::status(),
             roles: self.roles.clone(),
             authenticated: !self.anonymous,
             username: self.username.clone(),
@@ -305,6 +367,7 @@ mod stream_role_tests {
                 set_system_time: false,
                 voice_transmit: false,
                 camera_publish: false,
+                sign_checklists: false,
             },
             expires_at_ms: None,
             anonymous,
@@ -331,6 +394,212 @@ mod stream_role_tests {
         p.command_access.allowed_commands = vec!["StreamControl".into()];
         assert!(!p.can_manage_stream());
         assert_eq!(p.command_access.allowed_commands, vec!["StreamControl"]);
+    }
+}
+
+#[cfg(test)]
+mod admin_authority_tests {
+    use super::*;
+
+    fn user(name: &str, roles: Vec<StreamRole>, permissions: Permissions) -> UserRecord {
+        UserRecord {
+            roles,
+            username: name.into(),
+            password: PasswordHashRecord {
+                algorithm: default_password_algorithm(),
+                iterations: 1,
+                salt_b64: String::new(),
+                hash_b64: String::new(),
+            },
+            permissions,
+            command_access: CommandAccess {
+                allowed_commands: vec!["Pilot".into()],
+            },
+            calibration_access: CalibrationAccess::default(),
+            disabled: false,
+        }
+    }
+
+    /// Every stored flag combination an admin record might carry, including
+    /// none at all and each single flag on its own.
+    fn stored_variants() -> Vec<Permissions> {
+        let mut variants = vec![Permissions::default(), Permissions::all()];
+        for permission in Permission::ALL {
+            let mut only: serde_json::Value = serde_json::to_value(Permissions::default()).unwrap();
+            only[permission.field_name()] = true.into();
+            variants.push(serde_json::from_value(only).unwrap());
+        }
+        variants
+    }
+
+    fn assert_holds_everything(permissions: Permissions, context: &str) {
+        assert_eq!(permissions, Permissions::all(), "{context}");
+        for permission in Permission::ALL {
+            assert!(permissions.flag(*permission), "{context}: {permission:?} flag");
+            assert!(permissions.allows(*permission), "{context}: {permission:?} allowed");
+        }
+    }
+
+    #[test]
+    fn permission_list_covers_every_serialized_flag() {
+        // Fails if a flag is ever added to `Permissions` without also being
+        // part of `Permission::ALL` (and therefore `Permissions::all()`).
+        let default = serde_json::to_value(Permissions::default()).unwrap();
+        let mut stored: Vec<_> = default.as_object().unwrap().keys().cloned().collect();
+        let mut listed: Vec<_> = Permission::ALL.iter().map(|p| p.field_name().to_string()).collect();
+        stored.sort();
+        listed.sort();
+        assert_eq!(stored, listed);
+        let all = serde_json::to_value(Permissions::all()).unwrap();
+        assert!(all.as_object().unwrap().values().all(|v| v == &serde_json::Value::Bool(true)));
+        assert_eq!(all.as_object().unwrap().len(), Permission::ALL.len());
+    }
+
+    #[test]
+    fn admin_role_grants_every_permission_whatever_is_stored() {
+        for stored in stored_variants() {
+            for roles in [
+                vec![StreamRole::Admin],
+                vec![StreamRole::Admin, StreamRole::StreamViewer],
+                vec![StreamRole::StreamViewer, StreamRole::Admin, StreamRole::StreamMaster],
+            ] {
+                assert_holds_everything(stored.for_roles(&roles), &format!("{stored:?} {roles:?}"));
+            }
+        }
+    }
+
+    #[test]
+    fn non_admin_roles_keep_exactly_their_stored_flags() {
+        for stored in stored_variants() {
+            for roles in [
+                vec![],
+                vec![StreamRole::StreamAdmin],
+                vec![StreamRole::StreamMaster],
+                vec![StreamRole::StreamViewer],
+            ] {
+                assert_eq!(stored.for_roles(&roles), stored.normalized(), "{roles:?}");
+            }
+        }
+        let viewer = Permissions { view_data: true, ..Default::default() };
+        assert!(!viewer.for_roles(&[StreamRole::StreamAdmin]).allows(Permission::VoiceTransmit));
+    }
+
+    fn assert_admin_principal(principal: &AuthPrincipal, context: &str) {
+        assert_holds_everything(principal.permissions, context);
+        assert!(principal.command_access.allowed_commands.is_empty(), "{context}");
+        for command in ["FirmwareUpdate", "StreamControl", "RetractPlumbing", "Abort", "ValveSelfTest"] {
+            assert!(principal.allows_command_name(command), "{context}: {command}");
+        }
+        assert!(principal.calibration_access.view && principal.calibration_access.edit, "{context}");
+        assert!(principal.can_manage_stream() && principal.can_publish_camera(), "{context}");
+        assert!(!principal.roles.contains(&StreamRole::StreamViewer), "{context}");
+        let status = principal.session_status();
+        assert_holds_everything(status.permissions, context);
+        assert!(status.can_view_calibration && status.can_edit_calibration, "{context}");
+    }
+
+    fn claims(roles: Vec<StreamRole>, permissions: Permissions, issuer: &str) -> crate::station_pairing::Claims {
+        crate::station_pairing::Claims {
+            installation_id: "test".into(),
+            issuer: issuer.into(),
+            username: "Chief".into(),
+            issued_at_ms: now_ms(),
+            expires_at_ms: now_ms() + 60_000,
+            nonce: "n".into(),
+            roles,
+            permissions,
+            command_access: CommandAccess { allowed_commands: vec!["Pilot".into()] },
+            calibration_access: CalibrationAccess::default(),
+            remembered: false,
+        }
+    }
+
+    #[test]
+    fn paired_admin_holds_every_permission_even_with_stale_claims() {
+        for stored in stored_variants() {
+            let config = UsersFile {
+                users: vec![user("chief", vec![StreamRole::Admin, StreamRole::StreamViewer], stored)],
+                ..Default::default()
+            };
+            for claimed in stored_variants() {
+                for permission in Permission::ALL {
+                    // Peer-issued portable session: both stations say admin.
+                    let principal = paired_principal(
+                        &config,
+                        &claims(vec![StreamRole::Admin], claimed, "primary"),
+                        "rrls",
+                        *permission,
+                        now_ms(),
+                    )
+                    .unwrap();
+                    assert_admin_principal(&principal, "peer-issued");
+                    // A token this station issued follows the current local role.
+                    let principal = paired_principal(
+                        &config,
+                        &claims(vec![], claimed, "rrls"),
+                        "rrls",
+                        *permission,
+                        now_ms(),
+                    )
+                    .unwrap();
+                    assert_admin_principal(&principal, "self-issued");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn paired_non_admin_and_unconfirmed_admin_stay_intersected() {
+        let operator = Permissions { view_data: true, send_commands: true, ..Default::default() };
+        let config = UsersFile {
+            users: vec![user("chief", vec![StreamRole::Admin], operator)],
+            ..Default::default()
+        };
+        // The peer did not vouch for administrator: no admin authority here.
+        let principal = paired_principal(
+            &config,
+            &claims(vec![], operator, "primary"),
+            "rrls",
+            Permission::ViewData,
+            now_ms(),
+        )
+        .unwrap();
+        assert!(!principal.is_admin());
+        assert!(!principal.permissions.voice_transmit);
+        assert!(paired_principal(&config, &claims(vec![], operator, "primary"), "rrls", Permission::VoiceTransmit, now_ms()).is_err());
+        // Plain operators keep the claim/local intersection and command list.
+        let config = UsersFile {
+            users: vec![user("chief", vec![], operator)],
+            ..Default::default()
+        };
+        let principal = paired_principal(
+            &config,
+            &claims(vec![StreamRole::Admin], Permissions::all(), "primary"),
+            "rrls",
+            Permission::SendCommands,
+            now_ms(),
+        )
+        .unwrap();
+        assert_eq!(principal.permissions, operator);
+        assert!(principal.allows_command_name("Pilot"));
+        assert!(!principal.allows_command_name("FirmwareUpdate"));
+    }
+
+    #[test]
+    fn primary_proxy_actor_admin_holds_every_permission() {
+        let root = crate::recording_export::tests::TestDirectory::new();
+        let manager = AuthManager::new(root.0.join("auth.json"));
+        for stored in stored_variants() {
+            let config = UsersFile {
+                users: vec![user("chief", vec![StreamRole::Admin, StreamRole::StreamViewer], stored)],
+                ..Default::default()
+            };
+            std::fs::write(manager.path(), serde_json::to_vec(&config).unwrap()).unwrap();
+            for permission in Permission::ALL {
+                let principal = manager.paired_proxy_actor("CHIEF", *permission).unwrap();
+                assert_admin_principal(&principal, "proxy actor");
+            }
+        }
     }
 }
 
@@ -390,11 +659,12 @@ struct PendingLoginChallenge {
 #[derive(Debug, Clone)]
 pub struct AuthManager {
     path: PathBuf,
+    last_cleanup_ms: Arc<AtomicI64>,
 }
 
 impl AuthManager {
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self { path, last_cleanup_ms: Arc::default() }
     }
 
     #[allow(dead_code)]
@@ -561,6 +831,26 @@ impl AuthManager {
 
     pub async fn logout(&self, db: &SqlitePool, token: &str) -> Result<(), AuthFailure> {
         let token = token.trim();
+        if is_stream_token(token) {
+            // A stream viewer signing itself out removes only its own row.
+            sqlx::query("DELETE FROM auth_sessions WHERE token = ?")
+                .bind(stream_row_key(token))
+                .execute(db)
+                .await
+                .map_err(|e| AuthFailure::Internal(format!("failed to remove stream token: {e}")))?;
+            return Ok(());
+        }
+        if is_watch_token(token) {
+            // A watch signing itself out removes only its own row.
+            sqlx::query("DELETE FROM auth_sessions WHERE token = ?")
+                .bind(watch_row_key(token))
+                .execute(db)
+                .await
+                .map_err(|e| AuthFailure::Internal(format!("failed to remove watch token: {e}")))?;
+            return Ok(());
+        }
+        // Signing out a phone session also revokes the watch tokens it issued.
+        revoke_watch_children(db, token).await?;
         if token.starts_with("paired1.") {
             let pairing = crate::station_pairing::Pairing::load()
                 .ok()
@@ -606,70 +896,49 @@ impl AuthManager {
         let config = self
             .load_users_file()
             .map_err(|_| AuthFailure::Internal("could not load accounts".into()))?;
+        paired_principal(
+            &config,
+            &claims,
+            &pairing.public.station_id,
+            required,
+            now_ms(),
+        )
+    }
+
+    /// Resolve the primary's CURRENT local grant for one authenticated paired
+    /// proxy assertion. The caller must already verify the narrowly signed
+    /// actor/operation envelope; this method creates no login or session.
+    pub(crate) fn paired_proxy_actor(
+        &self,
+        username: &str,
+        required: Permission,
+    ) -> Result<AuthPrincipal, AuthFailure> {
+        let config = self
+            .load_users_file()
+            .map_err(|_| AuthFailure::Internal("could not load accounts".into()))?;
         let user = config
             .users
             .iter()
-            .find(|u| u.username.eq_ignore_ascii_case(&claims.username) && !u.disabled)
-            .ok_or_else(unauthorized)?;
-        let local = user.permissions.for_roles(&user.roles);
-        let roles: Vec<_> = user
-            .roles
-            .iter()
-            .copied()
-            .filter(|r| claims.roles.contains(r))
-            .collect();
-        let permissions = Permissions {
-            view_data: claims.permissions.view_data && local.view_data,
-            send_commands: claims.permissions.send_commands && local.send_commands,
-            set_system_time: claims.permissions.set_system_time && local.set_system_time,
-            voice_transmit: claims.permissions.voice_transmit && local.voice_transmit,
-            camera_publish: claims.permissions.camera_publish && local.camera_publish,
-        };
+            .find(|user| !user.disabled && user.username.eq_ignore_ascii_case(username))
+            .ok_or_else(|| AuthFailure::Forbidden("paired actor is unavailable".into()))?;
+        let permissions = user.permissions.for_roles(&user.roles);
         if !permissions.allows(required) {
             return Err(AuthFailure::Forbidden(
-                "paired account lacks permission".into(),
+                "paired actor lacks local permission".into(),
             ));
         }
-        let (local_commands, local_calibration) = configured_user_access(&config, &user.username);
-        let mut allowed_commands = intersect_commands(
-            &claims.command_access.allowed_commands,
-            &local_commands.allowed_commands,
-        );
-        // An empty list means unrestricted, so an empty intersection must use a
-        // non-command sentinel rather than accidentally expanding permissions.
-        if !claims.command_access.allowed_commands.is_empty()
-            && !local_commands.allowed_commands.is_empty()
-            && allowed_commands.is_empty()
-        {
-            allowed_commands.push("__no_paired_commands__".into());
-        }
-        let local_expiry = claims.issued_at_ms.saturating_add(
-            (config.session_ttl_seconds.min(i64::MAX as u64 / 1000) as i64).saturating_mul(1000),
-        );
-        let expires = claims.expires_at_ms.min(local_expiry);
-        if expires <= now_ms() {
-            return Err(unauthorized());
-        }
+        let (command_access, calibration_access) = configured_user_access(&config, &user.username);
         Ok(AuthPrincipal {
-            roles,
+            roles: user.roles.clone(),
             username: Some(user.username.clone()),
             permissions,
-            expires_at_ms: Some(expires),
+            expires_at_ms: None,
             anonymous: false,
-            session_type: Some(
-                if claims.remembered {
-                    "remembered"
-                } else {
-                    "session"
-                }
-                .into(),
-            ),
-            command_access: CommandAccess { allowed_commands },
-            calibration_access: CalibrationAccess {
-                view: claims.calibration_access.view && local_calibration.view,
-                edit: claims.calibration_access.edit && local_calibration.edit,
-            },
-        })
+            session_type: Some("paired_command_assertion".into()),
+            command_access,
+            calibration_access,
+        }
+        .with_role_authority())
     }
 
     pub async fn authorize_token(
@@ -678,10 +947,20 @@ impl AuthManager {
         token: Option<&str>,
         required: Permission,
     ) -> Result<AuthPrincipal, AuthFailure> {
-        self.cleanup_expired_sessions(db).await?;
+        // Every token's own expiry is checked below. The cleanup writes to the
+        // session database: no request, an Abort least of all, waits for it.
+        self.cleanup_expired_sessions_in_background(db);
 
         if let Some(token) = token.filter(|token| !token.trim().is_empty()) {
             let token = token.trim();
+            if is_stream_token(token) {
+                // Stream viewer tokens are checked only by the raw stream feed
+                // (`authorize_stream`); every other endpoint refuses them.
+                return Err(AuthFailure::Forbidden(STREAM_TOKEN_SCOPE_MESSAGE.into()));
+            }
+            if is_watch_token(token) {
+                return self.authorize_watch(db, token, required).await;
+            }
             let row = sqlx::query(
                 r#"
                 SELECT username, session_type, can_view_data, can_send_commands, expires_at_ms
@@ -722,6 +1001,7 @@ impl AuthManager {
                 set_system_time: false,
                 voice_transmit: false,
                 camera_publish: false,
+                sign_checklists: false,
             }
             .normalized();
 
@@ -734,26 +1014,18 @@ impl AuthManager {
                 .iter()
                 .find(|u| u.username.eq_ignore_ascii_case(&username) && !u.disabled)
                 .ok_or_else(|| AuthFailure::Unauthorized("Account disabled or removed".into()))?;
-            // Application admins inherit full application access. Removing that
-            // role or disabling the account is checked against the current file.
+            // Application admins inherit full application access through
+            // `with_role_authority`. Removing that role or disabling the
+            // account is checked against the current file.
             let current = user.permissions.for_roles(&user.roles);
-            if user.roles.contains(&StreamRole::Admin) {
-                permissions = current;
-            } else {
-                permissions.view_data &= current.view_data;
-                permissions.send_commands &= current.send_commands;
-                permissions.set_system_time = current.set_system_time;
-                permissions.voice_transmit = current.voice_transmit && current.view_data;
-                permissions.camera_publish = current.camera_publish && current.view_data;
-            }
-            if !permissions.allows(required) {
-                return Err(AuthFailure::Forbidden(
-                    "session does not have the required permission".into(),
-                ));
-            }
+            permissions.view_data &= current.view_data;
+            permissions.send_commands &= current.send_commands;
+            permissions.set_system_time = current.set_system_time;
+            permissions.voice_transmit = current.voice_transmit && current.view_data;
+            permissions.camera_publish = current.camera_publish && current.view_data;
+            permissions.sign_checklists = current.sign_checklists && current.view_data;
             let (command_access, calibration_access) = configured_user_access(&config, &username);
-
-            return Ok(AuthPrincipal {
+            let principal = AuthPrincipal {
                 roles: user.roles.clone(),
                 username: Some(username),
                 permissions,
@@ -762,7 +1034,14 @@ impl AuthManager {
                 session_type: Some(row.get::<String, _>("session_type")),
                 command_access,
                 calibration_access,
-            });
+            }
+            .with_role_authority();
+            if !principal.permissions.allows(required) {
+                return Err(AuthFailure::Forbidden(
+                    "session does not have the required permission".into(),
+                ));
+            }
+            return Ok(principal);
         }
 
         let config = self
@@ -772,6 +1051,7 @@ impl AuthManager {
         permissions.set_system_time = false;
         permissions.voice_transmit = false;
         permissions.camera_publish = false;
+        permissions.sign_checklists = false;
         if !permissions.allows(required) {
             return Err(AuthFailure::Unauthorized(
                 "authentication required".to_string(),
@@ -795,8 +1075,15 @@ impl AuthManager {
         db: &SqlitePool,
         token: Option<&str>,
     ) -> Result<SessionStatus, AuthFailure> {
+        // A token that was sent but no longer resolves must be reported as 401,
+        // exactly as every data endpoint does, so clients drop it and sign in
+        // again instead of looking "anonymous" here while all other requests fail.
+        let presented = token.is_some_and(|token| !token.trim().is_empty());
         match self.authorize_token(db, token, Permission::ViewData).await {
             Ok(principal) => Ok(principal.session_status()),
+            Err(AuthFailure::Unauthorized(message)) if presented => {
+                Err(AuthFailure::Unauthorized(message))
+            }
             Err(AuthFailure::Unauthorized(_)) => {
                 let config = self.load_users_file().map_err(|e| {
                     AuthFailure::Internal(format!("failed to load users.json: {e}"))
@@ -806,7 +1093,8 @@ impl AuthManager {
                     username: None,
                     permissions: Permissions {
                         voice_transmit: false,
-                camera_publish: false,
+                        camera_publish: false,
+                        sign_checklists: false,
                         ..config.anonymous.normalized()
                     },
                     expires_at_ms: None,
@@ -821,14 +1109,329 @@ impl AuthManager {
         }
     }
 
-    pub async fn cleanup_expired_sessions(&self, db: &SqlitePool) -> Result<(), AuthFailure> {
-        sqlx::query("DELETE FROM auth_sessions WHERE expires_at_ms <= ?")
-            .bind(now_ms())
-            .execute(db)
+    /// Issues a watch token for the account behind `parent_token` (a normal
+    /// phone session). The token may read data and send only the granted
+    /// commands: `requested` filtered to watch-eligible commands the account
+    /// may send now. One token per account and `device_id`; issuing again
+    /// replaces it. It never outlives the parent session, and signing the
+    /// parent out revokes it.
+    pub async fn issue_watch_token(
+        &self,
+        db: &SqlitePool,
+        parent_token: &str,
+        principal: &AuthPrincipal,
+        device_id: &str,
+        requested: &[String],
+        want_voice: bool,
+        eligible: impl Fn(&str) -> bool,
+    ) -> Result<WatchTokenGrant, AuthFailure> {
+        let parent_token = parent_token.trim();
+        if principal.anonymous || is_watch_token(parent_token) || parent_token.is_empty() {
+            return Err(AuthFailure::Forbidden(
+                "sign in on the phone to link a watch".into(),
+            ));
+        }
+        let username = principal
+            .username
+            .clone()
+            .ok_or_else(|| AuthFailure::Forbidden("sign in on the phone to link a watch".into()))?;
+        if !valid_watch_device_id(device_id) {
+            return Err(AuthFailure::Forbidden("invalid watch device id".into()));
+        }
+        let commands = grant_watch_commands(requested, |cmd| {
+            eligible(cmd) && principal.allows_command_name(cmd)
+        });
+        // Crew voice only for an account that may talk on the voice channel now.
+        let voice = want_voice && principal.permissions.allows(Permission::VoiceTransmit);
+        let config = self
+            .load_users_file()
+            .map_err(|e| AuthFailure::Internal(format!("failed to load users.json: {e}")))?;
+        let now = now_ms();
+        let ttl_ms = (config.session_ttl_seconds.min(WATCH_TOKEN_MAX_TTL_SECONDS) as i64) * 1000;
+        let expires_at_ms = principal
+            .expires_at_ms
+            .unwrap_or(i64::MAX)
+            .min(now.saturating_add(ttl_ms));
+        if expires_at_ms <= now {
+            return Err(AuthFailure::Unauthorized("session token expired".into()));
+        }
+        let token = format!("{WATCH_TOKEN_PREFIX}{}", generate_token());
+        let session_type = format!(
+            "{WATCH_SESSION_PREFIX}{device_id}|{}",
+            token_fingerprint(parent_token)
+        );
+        let device_prefix = format!("{WATCH_SESSION_PREFIX}{device_id}|");
+        let commands_json = watch_grant_json(&commands, voice)
+            .map_err(|e| AuthFailure::Internal(format!("failed to serialize commands: {e}")))?;
+        let mut tx = db
+            .begin()
             .await
-            .map_err(|e| AuthFailure::Internal(format!("failed to cleanup sessions: {e}")))?;
-        Ok(())
+            .map_err(|e| AuthFailure::Internal(format!("failed to start transaction: {e}")))?;
+        sqlx::query(
+            "DELETE FROM auth_sessions WHERE username = ? COLLATE NOCASE AND substr(session_type, 1, ?) = ?",
+        )
+        .bind(&username)
+        .bind(device_prefix.len() as i64)
+        .bind(&device_prefix)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AuthFailure::Internal(format!("failed to replace watch token: {e}")))?;
+        sqlx::query(
+            r#"
+            INSERT INTO auth_sessions (
+                token, username, session_type, can_view_data, can_send_commands, allowed_commands_json, created_at_ms, expires_at_ms
+            )
+            VALUES (?, ?, ?, 1, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(watch_row_key(&token))
+        .bind(&username)
+        .bind(&session_type)
+        .bind(!commands.is_empty() as i64)
+        .bind(commands_json)
+        .bind(now)
+        .bind(expires_at_ms)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AuthFailure::Internal(format!("failed to store watch token: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| AuthFailure::Internal(format!("failed to store watch token: {e}")))?;
+        Ok(WatchTokenGrant {
+            token,
+            device_id: device_id.to_string(),
+            expires_at_ms,
+            commands,
+            voice,
+        })
     }
+
+    /// Revokes the account's watch tokens: one device, or all of them.
+    /// Returns how many were removed.
+    pub async fn revoke_watch_tokens(
+        &self,
+        db: &SqlitePool,
+        username: &str,
+        device_id: Option<&str>,
+    ) -> Result<u64, AuthFailure> {
+        let prefix = match device_id {
+            Some(id) if valid_watch_device_id(id) => format!("{WATCH_SESSION_PREFIX}{id}|"),
+            Some(_) => return Err(AuthFailure::Forbidden("invalid watch device id".into())),
+            None => WATCH_SESSION_PREFIX.to_string(),
+        };
+        let result = sqlx::query(
+            "DELETE FROM auth_sessions WHERE username = ? COLLATE NOCASE AND substr(session_type, 1, ?) = ?",
+        )
+        .bind(username)
+        .bind(prefix.len() as i64)
+        .bind(&prefix)
+        .execute(db)
+        .await
+        .map_err(|e| AuthFailure::Internal(format!("failed to revoke watch tokens: {e}")))?;
+        Ok(result.rows_affected())
+    }
+
+    /// A watch token resolves to a narrow principal: no roles (so no
+    /// administrator authority), view data, and only the granted commands
+    /// that are still watch-eligible and still allowed for the account. The
+    /// router additionally limits watch tokens to the watch endpoints.
+    async fn authorize_watch(
+        &self,
+        db: &SqlitePool,
+        token: &str,
+        required: Permission,
+    ) -> Result<AuthPrincipal, AuthFailure> {
+        let row = sqlx::query(
+            r#"
+            SELECT username, session_type, can_view_data, can_send_commands, expires_at_ms, allowed_commands_json
+            FROM auth_sessions
+            WHERE token = ?
+            LIMIT 1
+            "#,
+        )
+        .bind(watch_row_key(token))
+        .fetch_optional(db)
+        .await
+        .map_err(|e| AuthFailure::Internal(format!("failed to query session: {e}")))?
+        .ok_or_else(|| AuthFailure::Unauthorized("invalid or revoked watch token".into()))?;
+        if !row
+            .get::<String, _>("session_type")
+            .starts_with(WATCH_SESSION_PREFIX)
+        {
+            return Err(AuthFailure::Unauthorized("invalid or revoked watch token".into()));
+        }
+        let expires_at_ms = row.get::<i64, _>("expires_at_ms");
+        if expires_at_ms <= now_ms() {
+            return Err(AuthFailure::Unauthorized("watch token expired".into()));
+        }
+        let config = self
+            .load_users_file()
+            .map_err(|e| AuthFailure::Internal(format!("failed to load users.json: {e}")))?;
+        let username = row.get::<String, _>("username");
+        let user = config
+            .users
+            .iter()
+            .find(|u| u.username.eq_ignore_ascii_case(&username) && !u.disabled)
+            .ok_or_else(|| AuthFailure::Unauthorized("Account disabled or removed".into()))?;
+        let current = user.permissions.for_roles(&user.roles);
+        let (granted, voice_granted) =
+            parse_watch_grant(&row.get::<String, _>("allowed_commands_json"));
+        let (account_commands, _) = configured_user_access(&config, &username);
+        let allowed = grant_watch_commands(&granted, |cmd| {
+            crate::watch::command_watch_eligible(cmd) && account_commands.allows(cmd)
+        });
+        let send_commands =
+            row.get::<i64, _>("can_send_commands") != 0 && current.send_commands && !allowed.is_empty();
+        // Crew voice: granted at issue and still allowed for the account now.
+        let voice_transmit = voice_granted && current.allows(Permission::VoiceTransmit);
+        let permissions = Permissions {
+            view_data: row.get::<i64, _>("can_view_data") != 0 && current.view_data,
+            send_commands,
+            voice_transmit,
+            ..Permissions::default()
+        }
+        .normalized();
+        let principal = AuthPrincipal {
+            roles: Vec::new(),
+            username: Some(user.username.clone()),
+            permissions,
+            expires_at_ms: Some(expires_at_ms),
+            anonymous: false,
+            session_type: Some(WATCH_SESSION_TYPE.into()),
+            command_access: CommandAccess {
+                // Empty would mean "unrestricted"; a watch never has that.
+                allowed_commands: if allowed.is_empty() {
+                    vec![NO_WATCH_COMMANDS.into()]
+                } else {
+                    allowed
+                },
+            },
+            calibration_access: CalibrationAccess::default(),
+        };
+        if !principal.permissions.allows(required) {
+            return Err(AuthFailure::Forbidden(
+                "watch token does not have the required permission".into(),
+            ));
+        }
+        Ok(principal)
+    }
+
+    /// `cleanup_expired_sessions`, one at a time and at most once a minute.
+    fn cleanup_expired_sessions_in_background(&self, db: &SqlitePool) {
+        const INTERVAL_MS: i64 = 60_000;
+        let (now, last) = (now_ms(), self.last_cleanup_ms.load(Ordering::Acquire));
+        // `i64::MAX`: one is running.
+        if last == i64::MAX || (now - last).abs() < INTERVAL_MS
+            || self.last_cleanup_ms.compare_exchange(last, i64::MAX, Ordering::AcqRel, Ordering::Acquire).is_err()
+        {
+            return;
+        }
+        let (db, finished) = (db.clone(), self.last_cleanup_ms.clone());
+        tokio::spawn(async move {
+            if let Err(error) = delete_expired_sessions(&db).await {
+                log::warn!("failed to clean up expired sessions: {error}");
+            }
+            finished.store(now_ms(), Ordering::Release);
+        });
+    }
+
+    pub async fn cleanup_expired_sessions(&self, db: &SqlitePool) -> Result<(), AuthFailure> {
+        delete_expired_sessions(db)
+            .await
+            .map_err(|e| AuthFailure::Internal(format!("failed to cleanup sessions: {e}")))
+    }
+}
+
+async fn delete_expired_sessions(db: &SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM auth_sessions WHERE expires_at_ms <= ?")
+        .bind(now_ms())
+        .execute(db)
+        .await
+        .map(drop)
+}
+
+/// Resolve a verified paired (portable) session against the CURRENT local
+/// accounts. Non-admin grants are the intersection of the signed claims and
+/// the local account. An administrator holds every permission here; command
+/// admission through the primary's proxy is still enforced separately.
+fn paired_principal(
+    config: &UsersFile,
+    claims: &crate::station_pairing::Claims,
+    own_station_id: &str,
+    required: Permission,
+    now: i64,
+) -> Result<AuthPrincipal, AuthFailure> {
+    let unauthorized = || AuthFailure::Unauthorized("invalid or revoked paired session".into());
+    let user = config
+        .users
+        .iter()
+        .find(|u| u.username.eq_ignore_ascii_case(&claims.username) && !u.disabled)
+        .ok_or_else(unauthorized)?;
+    let local = user.permissions.for_roles(&user.roles);
+    let mut roles: Vec<_> = user
+        .roles
+        .iter()
+        .copied()
+        .filter(|r| claims.roles.contains(r))
+        .collect();
+    // A token this station issued is backed by a local session row, so it
+    // follows the CURRENT local account exactly like an unpaired session:
+    // granting administrator takes effect without signing in again. A
+    // peer-issued token still needs both stations to agree on the role.
+    if claims.issuer == own_station_id
+        && user.roles.contains(&StreamRole::Admin)
+        && !roles.contains(&StreamRole::Admin)
+    {
+        roles.push(StreamRole::Admin);
+    }
+    let permissions = claims.permissions.intersect(local);
+    let (local_commands, local_calibration) = configured_user_access(config, &user.username);
+    let mut allowed_commands = intersect_commands(
+        &claims.command_access.allowed_commands,
+        &local_commands.allowed_commands,
+    );
+    // An empty list means unrestricted, so an empty intersection must use a
+    // non-command sentinel rather than accidentally expanding permissions.
+    if !claims.command_access.allowed_commands.is_empty()
+        && !local_commands.allowed_commands.is_empty()
+        && allowed_commands.is_empty()
+    {
+        allowed_commands.push("__no_paired_commands__".into());
+    }
+    let local_expiry = claims.issued_at_ms.saturating_add(
+        (config.session_ttl_seconds.min(i64::MAX as u64 / 1000) as i64).saturating_mul(1000),
+    );
+    let expires = claims.expires_at_ms.min(local_expiry);
+    if expires <= now {
+        return Err(unauthorized());
+    }
+    let principal = AuthPrincipal {
+        roles,
+        username: Some(user.username.clone()),
+        permissions,
+        expires_at_ms: Some(expires),
+        anonymous: false,
+        session_type: Some(
+            if claims.remembered {
+                "remembered"
+            } else {
+                "session"
+            }
+            .into(),
+        ),
+        command_access: CommandAccess { allowed_commands },
+        calibration_access: CalibrationAccess {
+            view: claims.calibration_access.view && local_calibration.view,
+            edit: claims.calibration_access.edit && local_calibration.edit,
+        },
+    }
+    .with_role_authority();
+    if !principal.permissions.allows(required) {
+        return Err(AuthFailure::Forbidden(
+            "paired account lacks permission".into(),
+        ));
+    }
+    Ok(principal)
 }
 
 async fn create_session_for_user(
@@ -843,9 +1446,8 @@ async fn create_session_for_user(
     let permissions = user.permissions.for_roles(&user.roles);
     let (command_access, calibration_access) = configured_user_access(config, &user.username);
     let session_type = if remember_me { "remembered" } else { "session" };
-    let token = match crate::station_pairing::Pairing::load()
-        .map_err(|_| AuthFailure::Internal("station pairing configuration invalid".into()))?
-    {
+    // A broken pairing falls back to an ordinary local session; login must not fail.
+    let token = match crate::station_pairing::Pairing::load_or_unpaired("login") {
         Some(pairing) => pairing
             .token(&crate::station_pairing::Claims {
                 installation_id: pairing.public.installation_id.clone(),
@@ -898,6 +1500,7 @@ async fn create_session_for_user(
             command_access,
             calibration_access,
         }
+        .with_role_authority()
         .session_status(),
     })
 }
@@ -1051,6 +1654,142 @@ fn intersect_commands(source: &[String], destination: &[String]) -> Vec<String> 
     }
 }
 
+/// Watch tokens: `gsw1.` + 32 random bytes. Only a SHA-256 digest is
+/// stored, so the sessions table never holds a usable watch credential.
+pub const WATCH_TOKEN_PREFIX: &str = "gsw1.";
+const WATCH_ROW_PREFIX: &str = "gsw1h:";
+/// `watch|<device id>|<parent session fingerprint>`
+const WATCH_SESSION_PREFIX: &str = "watch|";
+pub const WATCH_SESSION_TYPE: &str = "watch";
+/// Most commands one watch token may carry (pages × 2 actions).
+pub const MAX_WATCH_COMMANDS: usize = 16;
+/// Upper bound on a watch token's life, even with a longer session TTL.
+const WATCH_TOKEN_MAX_TTL_SECONDS: u64 = 60 * 60 * 24 * 30;
+const NO_WATCH_COMMANDS: &str = "__no_watch_commands__";
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WatchTokenGrant {
+    pub token: String,
+    pub device_id: String,
+    pub expires_at_ms: i64,
+    pub commands: Vec<String>,
+    /// The watch may join crew voice (`/api/voice/ws`). Only for an account
+    /// with the voice transmit permission, rechecked on every use.
+    pub voice: bool,
+}
+
+/// Stored grant: the plain command array (no voice), or
+/// `{"commands":[…],"voice":true}` when crew voice was granted.
+fn watch_grant_json(commands: &[String], voice: bool) -> serde_json::Result<String> {
+    if voice {
+        serde_json::to_string(&serde_json::json!({"commands": commands, "voice": true}))
+    } else {
+        serde_json::to_string(commands)
+    }
+}
+
+fn parse_watch_grant(json: &str) -> (Vec<String>, bool) {
+    #[derive(Deserialize)]
+    struct Grant {
+        #[serde(default)]
+        commands: Vec<String>,
+        #[serde(default)]
+        voice: bool,
+    }
+    if let Ok(commands) = serde_json::from_str::<Vec<String>>(json) {
+        return (commands, false);
+    }
+    serde_json::from_str::<Grant>(json)
+        .map(|g| (g.commands, g.voice))
+        .unwrap_or_default()
+}
+
+/// Groups a voice participant with the other devices of the same person:
+/// a phone session's own fingerprint, or for a watch token the fingerprint of
+/// the phone session that issued it. Crew voice never relays audio between
+/// members of one group (no echo loop between a phone and its watch).
+pub async fn voice_device_group(db: &SqlitePool, token: &str) -> String {
+    if !is_watch_token(token) {
+        return token_fingerprint(token);
+    }
+    let session_type: Option<String> =
+        sqlx::query_scalar("SELECT session_type FROM auth_sessions WHERE token = ? LIMIT 1")
+            .bind(watch_row_key(token))
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+    session_type
+        .as_deref()
+        .and_then(|t| t.strip_prefix(WATCH_SESSION_PREFIX))
+        .and_then(|rest| rest.rsplit_once('|'))
+        .map(|(_, parent)| parent.to_string())
+        // Unknown issuer: a group of its own, so nothing is suppressed.
+        .unwrap_or_else(|| format!("watch:{}", token_fingerprint(token)))
+}
+
+pub fn is_watch_token(token: &str) -> bool {
+    token.trim().starts_with(WATCH_TOKEN_PREFIX)
+}
+
+fn sha256_hex(text: &str) -> String {
+    ring::digest::digest(&ring::digest::SHA256, text.as_bytes())
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn watch_row_key(token: &str) -> String {
+    format!("{WATCH_ROW_PREFIX}{}", sha256_hex(token.trim()))
+}
+
+/// Identifies the phone session that issued a watch token without storing it.
+fn token_fingerprint(token: &str) -> String {
+    sha256_hex(token.trim())[..32].to_string()
+}
+
+fn valid_watch_device_id(id: &str) -> bool {
+    (1..=64).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Deduplicated, order-preserving, at most [`MAX_WATCH_COMMANDS`].
+fn grant_watch_commands(requested: &[String], allowed: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for cmd in requested {
+        let cmd = cmd.trim();
+        if cmd.is_empty() || cmd.len() > 64 || out.iter().any(|c| c == cmd) || !allowed(cmd) {
+            continue;
+        }
+        out.push(cmd.to_string());
+        if out.len() == MAX_WATCH_COMMANDS {
+            break;
+        }
+    }
+    out
+}
+
+async fn revoke_watch_children(db: &SqlitePool, parent_token: &str) -> Result<(), AuthFailure> {
+    if parent_token.trim().is_empty() {
+        return Ok(());
+    }
+    let suffix = format!("|{}", token_fingerprint(parent_token));
+    sqlx::query(
+        "DELETE FROM auth_sessions WHERE substr(session_type, 1, ?) = ? AND substr(session_type, -?) = ?",
+    )
+    .bind(WATCH_SESSION_PREFIX.len() as i64)
+    .bind(WATCH_SESSION_PREFIX)
+    .bind(suffix.len() as i64)
+    .bind(&suffix)
+    .execute(db)
+    .await
+    .map_err(|e| AuthFailure::Internal(format!("failed to revoke watch tokens: {e}")))?;
+    Ok(())
+}
+
 fn generate_token() -> String {
     URL_SAFE_NO_PAD.encode(generate_random_bytes(32))
 }
@@ -1079,4 +1818,275 @@ fn default_session_ttl_seconds() -> u64 {
 
 fn default_password_algorithm() -> String {
     "pbkdf2_sha256".to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Stream viewer tokens (docs/backend/raw-stream-feed.md)
+
+/// Stream viewer tokens: `gss1.` + 32 random bytes. Only a SHA-256 digest is
+/// stored (`gss1h:<hex>`), so the sessions table never holds the credential.
+pub const STREAM_TOKEN_PREFIX: &str = "gss1.";
+const STREAM_ROW_PREFIX: &str = "gss1h:";
+/// `stream|<public id>`
+const STREAM_SESSION_PREFIX: &str = "stream|";
+pub const STREAM_TOKEN_SCOPE_MESSAGE: &str = "stream viewer tokens only read the raw stream feed";
+pub const STREAM_TOKEN_MIN_TTL_HOURS: u64 = 1;
+pub const STREAM_TOKEN_MAX_TTL_HOURS: u64 = 8760;
+pub const STREAM_TOKEN_DEFAULT_TTL_HOURS: u64 = 720;
+const STREAM_LABEL_MAX: usize = 80;
+const STREAM_SCOPE_MAX_ITEMS: usize = 64;
+
+pub fn is_stream_token(token: &str) -> bool {
+    token.trim().starts_with(STREAM_TOKEN_PREFIX)
+}
+
+fn stream_row_key(token: &str) -> String {
+    format!("{STREAM_ROW_PREFIX}{}", sha256_hex(token.trim()))
+}
+
+/// What a stream viewer token may read: filters the feed can only narrow.
+/// Empty lists mean every type / every sender.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct StreamScope {
+    pub label: String,
+    #[serde(default)]
+    pub types: Vec<String>,
+    #[serde(default)]
+    pub senders: Vec<String>,
+    /// Per-stream rate cap (Hz) the token can never exceed.
+    #[serde(default)]
+    pub max_hz: Option<f64>,
+}
+
+impl StreamScope {
+    /// Trims, deduplicates and bounds the scope; refuses malformed entries.
+    pub fn normalized(mut self) -> Result<Self, String> {
+        self.label = self.label.trim().to_string();
+        if self.label.is_empty() || self.label.chars().count() > STREAM_LABEL_MAX {
+            return Err(format!("label must be 1-{STREAM_LABEL_MAX} characters"));
+        }
+        if self.label.chars().any(char::is_control) {
+            return Err("label must not contain control characters".into());
+        }
+        for (name, list) in [("types", &mut self.types), ("senders", &mut self.senders)] {
+            let mut out: Vec<String> = Vec::new();
+            for item in list.iter() {
+                let item = item.trim();
+                if item.is_empty() {
+                    continue;
+                }
+                if !valid_stream_filter_item(item) {
+                    return Err(format!("invalid {name} entry {item:?}"));
+                }
+                if !out.iter().any(|seen| seen == item) {
+                    out.push(item.to_string());
+                }
+            }
+            if out.len() > STREAM_SCOPE_MAX_ITEMS {
+                return Err(format!("at most {STREAM_SCOPE_MAX_ITEMS} {name} entries"));
+            }
+            *list = out;
+        }
+        if let Some(hz) = self.max_hz
+            && !(hz.is_finite() && (0.1..=1000.0).contains(&hz))
+        {
+            return Err("max_hz must be 0.1-1000".into());
+        }
+        Ok(self)
+    }
+}
+
+/// `A-Z a-z 0-9 _ - . @ :` with an optional trailing `*` (prefix match).
+pub fn valid_stream_filter_item(item: &str) -> bool {
+    let body = item.strip_suffix('*').unwrap_or(item);
+    (1..=64).contains(&item.len())
+        && body
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'@' | b':'))
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct StreamTokenGrant {
+    pub id: String,
+    /// Shown once; only its digest is stored.
+    pub token: String,
+    pub label: String,
+    pub issuer: String,
+    pub created_ms: i64,
+    pub expires_at_ms: i64,
+    pub types: Vec<String>,
+    pub senders: Vec<String>,
+    pub max_hz: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct StreamTokenInfo {
+    pub id: String,
+    pub label: String,
+    pub issuer: String,
+    pub created_ms: i64,
+    pub expires_at_ms: i64,
+    pub types: Vec<String>,
+    pub senders: Vec<String>,
+    pub max_hz: Option<f64>,
+}
+
+/// A valid stream viewer token: its public id, scope and expiry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamGrant {
+    pub id: String,
+    pub issuer: String,
+    pub scope: StreamScope,
+    pub expires_at_ms: i64,
+}
+
+fn valid_stream_id(id: &str) -> bool {
+    id.len() == 16 && id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+impl AuthManager {
+    /// Issues a stream viewer token. Only a signed-in application
+    /// administrator (never a watch or stream token) may issue one.
+    pub async fn issue_stream_token(
+        &self,
+        db: &SqlitePool,
+        issuer: &AuthPrincipal,
+        scope: StreamScope,
+        ttl_hours: Option<u64>,
+    ) -> Result<StreamTokenGrant, AuthFailure> {
+        if !issuer.is_admin() {
+            return Err(AuthFailure::Forbidden("Application administrator required".into()));
+        }
+        let username = issuer
+            .username
+            .clone()
+            .ok_or_else(|| AuthFailure::Forbidden("Application administrator required".into()))?;
+        let scope = scope.normalized().map_err(AuthFailure::Forbidden)?;
+        let ttl = ttl_hours.unwrap_or(STREAM_TOKEN_DEFAULT_TTL_HOURS);
+        if !(STREAM_TOKEN_MIN_TTL_HOURS..=STREAM_TOKEN_MAX_TTL_HOURS).contains(&ttl) {
+            return Err(AuthFailure::Forbidden(format!(
+                "ttl_hours must be {STREAM_TOKEN_MIN_TTL_HOURS}-{STREAM_TOKEN_MAX_TTL_HOURS}"
+            )));
+        }
+        let now = now_ms();
+        let expires_at_ms = now.saturating_add(ttl as i64 * 3_600_000);
+        let id: String = generate_random_bytes(8).iter().map(|b| format!("{b:02x}")).collect();
+        let token = format!("{STREAM_TOKEN_PREFIX}{}", generate_token());
+        let scope_json = serde_json::to_string(&scope)
+            .map_err(|e| AuthFailure::Internal(format!("failed to serialize scope: {e}")))?;
+        sqlx::query(
+            r#"
+            INSERT INTO auth_sessions (
+                token, username, session_type, can_view_data, can_send_commands, allowed_commands_json, created_at_ms, expires_at_ms
+            )
+            VALUES (?, ?, ?, 1, 0, ?, ?, ?)
+            "#,
+        )
+        .bind(stream_row_key(&token))
+        .bind(&username)
+        .bind(format!("{STREAM_SESSION_PREFIX}{id}"))
+        .bind(scope_json)
+        .bind(now)
+        .bind(expires_at_ms)
+        .execute(db)
+        .await
+        .map_err(|e| AuthFailure::Internal(format!("failed to store stream token: {e}")))?;
+        Ok(StreamTokenGrant {
+            id,
+            token,
+            label: scope.label,
+            issuer: username,
+            created_ms: now,
+            expires_at_ms,
+            types: scope.types,
+            senders: scope.senders,
+            max_hz: scope.max_hz,
+        })
+    }
+
+    /// Every unexpired stream viewer token (never the token itself).
+    pub async fn list_stream_tokens(&self, db: &SqlitePool) -> Result<Vec<StreamTokenInfo>, AuthFailure> {
+        self.cleanup_expired_sessions(db).await?;
+        let rows = sqlx::query(
+            "SELECT username, session_type, allowed_commands_json, created_at_ms, expires_at_ms FROM auth_sessions WHERE substr(session_type, 1, ?) = ? ORDER BY created_at_ms",
+        )
+        .bind(STREAM_SESSION_PREFIX.len() as i64)
+        .bind(STREAM_SESSION_PREFIX)
+        .fetch_all(db)
+        .await
+        .map_err(|e| AuthFailure::Internal(format!("failed to list stream tokens: {e}")))?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let id = row
+                    .get::<String, _>("session_type")
+                    .strip_prefix(STREAM_SESSION_PREFIX)?
+                    .to_string();
+                let scope: StreamScope =
+                    serde_json::from_str(&row.get::<String, _>("allowed_commands_json")).ok()?;
+                Some(StreamTokenInfo {
+                    id,
+                    label: scope.label,
+                    issuer: row.get("username"),
+                    created_ms: row.get("created_at_ms"),
+                    expires_at_ms: row.get("expires_at_ms"),
+                    types: scope.types,
+                    senders: scope.senders,
+                    max_hz: scope.max_hz,
+                })
+            })
+            .collect())
+    }
+
+    /// Revokes one stream viewer token by its public id.
+    pub async fn revoke_stream_token(&self, db: &SqlitePool, id: &str) -> Result<u64, AuthFailure> {
+        if !valid_stream_id(id) {
+            return Err(AuthFailure::Forbidden("invalid stream token id".into()));
+        }
+        let result = sqlx::query("DELETE FROM auth_sessions WHERE session_type = ?")
+            .bind(format!("{STREAM_SESSION_PREFIX}{id}"))
+            .execute(db)
+            .await
+            .map_err(|e| AuthFailure::Internal(format!("failed to revoke stream token: {e}")))?;
+        Ok(result.rows_affected())
+    }
+
+    /// Resolves a stream viewer token. It is valid while its row exists, it
+    /// has not expired and its issuer is still an enabled administrator.
+    pub async fn authorize_stream(&self, db: &SqlitePool, token: &str) -> Result<StreamGrant, AuthFailure> {
+        let invalid = || AuthFailure::Unauthorized("invalid or revoked stream token".into());
+        if !is_stream_token(token) {
+            return Err(invalid());
+        }
+        let row = sqlx::query(
+            "SELECT username, session_type, allowed_commands_json, expires_at_ms FROM auth_sessions WHERE token = ? LIMIT 1",
+        )
+        .bind(stream_row_key(token))
+        .fetch_optional(db)
+        .await
+        .map_err(|e| AuthFailure::Internal(format!("failed to query session: {e}")))?
+        .ok_or_else(invalid)?;
+        let id = row
+            .get::<String, _>("session_type")
+            .strip_prefix(STREAM_SESSION_PREFIX)
+            .map(str::to_string)
+            .ok_or_else(invalid)?;
+        let expires_at_ms = row.get::<i64, _>("expires_at_ms");
+        if expires_at_ms <= now_ms() {
+            return Err(AuthFailure::Unauthorized("stream token expired".into()));
+        }
+        let config = self
+            .load_users_file()
+            .map_err(|e| AuthFailure::Internal(format!("failed to load users.json: {e}")))?;
+        let username = row.get::<String, _>("username");
+        let issuer = config
+            .users
+            .iter()
+            .find(|u| u.username.eq_ignore_ascii_case(&username) && !u.disabled)
+            .filter(|u| u.roles.contains(&StreamRole::Admin))
+            .ok_or_else(|| AuthFailure::Unauthorized("stream token issuer is no longer an administrator".into()))?;
+        let scope: StreamScope = serde_json::from_str(&row.get::<String, _>("allowed_commands_json"))
+            .map_err(|_| invalid())?;
+        Ok(StreamGrant { id, issuer: issuer.username.clone(), scope, expires_at_ms })
+    }
 }

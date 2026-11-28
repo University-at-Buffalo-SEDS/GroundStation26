@@ -43,7 +43,32 @@ pub(super) fn routes() -> Router<Arc<MediaState>> {
                 )
             }),
         )
+        .route(
+            "/assets/stream-sequence-visuals.js",
+            get(|| async { ([(header::CONTENT_TYPE, "text/javascript")], gs_browser_assets::STREAM_SEQUENCE_VISUALS_JS) }),
+        )
+        .route(
+            "/assets/program-diagram.js",
+            get(|| async {
+                // Optional asset: an older frontend checkout has no diagram script.
+                match gs_browser_assets::asset_bytes("PROGRAM_DIAGRAM_JS") {
+                    Some(bytes) => ([(header::CONTENT_TYPE, "text/javascript")], bytes).into_response(),
+                    None => StatusCode::NOT_FOUND.into_response(),
+                }
+            }),
+        )
+        .route(
+            "/assets/program-studio.js",
+            get(|| async {
+                // Optional asset: an older frontend checkout has no studio script.
+                match gs_browser_assets::asset_bytes("PROGRAM_STUDIO_JS") {
+                    Some(bytes) => ([(header::CONTENT_TYPE, "text/javascript")], bytes).into_response(),
+                    None => StatusCode::NOT_FOUND.into_response(),
+                }
+            }),
+        )
         .route("/api/media-assets/program/state", get(program_state))
+        .route("/api/media-assets/program/vehicle-geometry", get(program_vehicle_geometry))
         .route("/api/media-assets/program/audio", get(program_audio))
         .route(
             "/assets/program-audio.js",
@@ -67,6 +92,7 @@ pub(super) fn routes() -> Router<Arc<MediaState>> {
             }),
         )
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn page(
     State(state): State<Arc<MediaState>>,
     Query(query): Query<MediaQuery>,
@@ -90,15 +116,15 @@ pub(super) fn now_ms() -> u64 {
 }
 fn program_t_clock(clock: &crate::telemetry_db::LaunchClockMsg, now: i64) -> Option<String> {
     use crate::telemetry_db::LaunchClockKind;
-    let (sign, delta) = match clock.kind {
+    let (before_t0, delta) = match clock.kind {
         LaunchClockKind::Idle => (
-            "−",
+            true,
             clock
                 .duration_ms
                 .unwrap_or(crate::state::LAUNCH_COUNTDOWN_DURATION_MS),
         ),
         LaunchClockKind::TMinus => (
-            "−",
+            true,
             match (clock.anchor_timestamp_ms, clock.duration_ms) {
                 (Some(anchor), Some(duration)) => {
                     duration.saturating_sub(now.saturating_sub(anchor))
@@ -108,15 +134,11 @@ fn program_t_clock(clock: &crate::telemetry_db::LaunchClockMsg, now: i64) -> Opt
                 _ => return None,
             },
         ),
-        LaunchClockKind::TPlus => ("+", now.saturating_sub(clock.anchor_timestamp_ms?)),
+        LaunchClockKind::TPlus => (false, now.saturating_sub(clock.anchor_timestamp_ms?)),
     };
-    let centis = delta.max(0).saturating_add(5) / 10;
-    Some(format!(
-        "T{sign} {:02}:{:02}.{:02}",
-        centis / 6000,
-        centis / 100 % 60,
-        centis % 100
-    ))
+    // Nearest hundredth, as the dashboard header shows it.
+    let magnitude = delta.max(0).unsigned_abs().saturating_add(5);
+    Some(crate::tclock::format_tclock(before_t0, magnitude, 2))
 }
 const PROGRAM_HISTORY_MS: u64 = 90_000;
 const PROGRAM_SAMPLE_MS: u64 = 250;
@@ -125,7 +147,7 @@ const MAX_PROGRAM_SNAPSHOTS: usize = 364;
 fn retain_program_snapshot(
     history: &mut std::collections::VecDeque<(u64, serde_json::Value)>,
     now: u64,
-    snapshot: serde_json::Value,
+    mut snapshot: serde_json::Value,
 ) {
     // A UTC correction cannot leave future frames or unbounded retained data.
     if history.back().is_some_and(|(time, _)| *time > now) {
@@ -135,6 +157,8 @@ fn retain_program_snapshot(
         .back()
         .is_none_or(|(time, _)| now.saturating_sub(*time) >= PROGRAM_SAMPLE_MS)
     {
+        let previous=history.back().filter(|(at,_)|now.saturating_sub(*at)<=2000).map(|(_,value)|value);
+        crate::sequence_stream::observe_clock_progress(previous,&mut snapshot);
         history.push_back((now, snapshot));
     }
     while history.len() > MAX_PROGRAM_SNAPSHOTS
@@ -176,6 +200,7 @@ pub(super) async fn capture_history(state: Arc<MediaState>) {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn program_state(
     State(state): State<Arc<MediaState>>,
     Query(query): Query<MediaQuery>,
@@ -183,7 +208,27 @@ async fn program_state(
 ) -> ApiResult<Response> {
     let headers = ticket_headers(&state, &headers, &query, "program").await?;
     authorize(&state, &headers, Permission::ViewData).await?;
-    let presentation = read_presentation(&state).await?;
+    let mut presentation = read_presentation(&state).await?;
+    // The manager's Preview monitor (`scene=`) and a single-source browser
+    // source (`source=`) draw live, whatever the programme is replaying.
+    let studio_override = match (&query.source, &query.scene) {
+        (Some(source), _) => Some(
+            super::super::studio::single_source(source)
+                .ok_or_else(|| error(StatusCode::NOT_FOUND, "Unknown source"))?,
+        ),
+        (None, Some(scene)) => {
+            let studio = &presentation.broadcast.studio;
+            let scene = studio.scene(scene).ok_or_else(|| error(StatusCode::NOT_FOUND, "Unknown scene"))?;
+            let layout = studio.layouts.iter().find(|l| l.id == scene.layout_id).ok_or_else(|| error(StatusCode::NOT_FOUND, "Unknown layout"))?;
+            Some((scene.clone(), layout.clone()))
+        }
+        (None, None) => None,
+    };
+    if studio_override.is_some() {
+        // Unaired scenes and single sources are the stream manager's.
+        authorize_preview(&state, &headers).await?;
+        presentation.broadcast.replay = None;
+    }
     let now = now_ms();
     let history = state.program_history.lock().await;
     let target = presentation
@@ -203,14 +248,33 @@ async fn program_state(
         live_telemetry
     };
     let mut streams = Vec::new();
-    let effective_scene = telemetry
-        .as_ref()
-        .and_then(|v| v.get("scene"))
-        .and_then(serde_json::Value::as_str)
-        .filter(|s| *s != "inherit")
-        .unwrap_or(&presentation.broadcast.layout);
+    // A taken studio scene owns the programme; the rundown's per-phase scene
+    // applies to the classic layouts only.
+    let effective_scene = if studio_override.is_some() || presentation.broadcast.layout == "studio" {
+        "studio"
+    } else {
+        telemetry
+            .as_ref()
+            .and_then(|v| v.get("scene"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| *s != "inherit")
+            .unwrap_or(&presentation.broadcast.layout)
+    };
+    let studio_scene = (effective_scene == "studio")
+        .then(|| {
+            studio_override.clone().or_else(|| {
+                let studio = &presentation.broadcast.studio;
+                let scene = studio.scene(&studio.program_scene_id)?;
+                let layout = studio.layouts.iter().find(|l| l.id == scene.layout_id)?;
+                Some((scene.clone(), layout.clone()))
+            })
+        })
+        .flatten();
     let no_video = presentation.broadcast.replay.is_none()
-        && matches!(effective_scene, "map" | "recorded-replay");
+        && (matches!(effective_scene, "map" | "recorded-replay")
+            || studio_scene.as_ref().is_some_and(|(scene, _)| {
+                !scene.sources.values().any(|id| id.starts_with("camera"))
+            }));
     // Maps, saved flight scenes and cached camera replays must not wait on a
     // disconnected live camera relay before updating telemetry/coordinates.
     let available = if no_video || presentation.broadcast.replay.is_some() {
@@ -218,10 +282,21 @@ async fn program_state(
     } else {
         fetch_streams(&state).await.unwrap_or_default().0
     };
+    let resolved = studio_scene
+        .as_ref()
+        .map(|(scene, layout)| super::super::studio::resolve(scene, layout, &available, &presentation));
     let chosen: Vec<String> = if no_video {
         Vec::new()
     } else if let Some(replay) = &presentation.broadcast.replay {
         replay.cameras.iter().map(|c| c.id.clone()).collect()
+    } else if let Some(resolved) = &resolved {
+        // Exactly the scene's cameras (a hidden camera named in a scene shows).
+        available
+            .iter()
+            .filter(|s| s.live && resolved.cameras.iter().any(|id| id == s.id.strip_prefix("transcoded-").unwrap_or(&s.id)))
+            .take(8)
+            .map(|s| s.id.clone())
+            .collect()
     } else {
         available
             .iter()
@@ -250,7 +325,44 @@ async fn program_state(
         let fallback=available.iter().find(|s|s.id==id).map(|s|s.name.as_str()).unwrap_or(logical);
         streams.push(serde_json::json!({"id":logical,"label":presentation.stream_labels.get(logical).map(String::as_str).unwrap_or(fallback),"url":url}));
     }
-    Ok(([(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"broadcast":presentation.broadcast,"streams":streams,"server_now_ms":now,"telemetry":telemetry}))).into_response())
+    // Live diagram scenes carry their (static) topology; the delayed inputs
+    // ride in the snapshot (`telemetry.diagram`).
+    let diagram_scene = match resolved.as_ref().and_then(|r| r.diagram.as_ref()) {
+        Some(id) => format!("diagram-{id}"),
+        None => effective_scene.to_owned(),
+    };
+    let diagram_topology = crate::diagrams::is_scene(&diagram_scene)
+        .then(|| crate::diagrams::scene_topology(&diagram_scene))
+        .flatten();
+    let studio_mode = match (&query.source, &query.scene) {
+        (Some(_), _) => "source",
+        (None, Some(_)) => "preview",
+        _ => "program",
+    };
+    let studio = resolved.map(|r| {
+        let mut value = r.value;
+        value["mode"] = studio_mode.into();
+        value["take_seq"] = presentation.broadcast.studio.take_seq.into();
+        value["transition"] = serde_json::to_value(&presentation.broadcast.studio.transition).unwrap_or_default();
+        value
+    });
+    // The page fetches the vehicle geometry (program_vehicle_geometry) only when this hash changes.
+    let vehicle_geometry_hash = crate::vehicle_geometry::current(&state.app).source.hash.clone();
+    Ok(([(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"broadcast":presentation.broadcast,"streams":streams,"server_now_ms":now,"telemetry":telemetry,"diagram_topology":diagram_topology,"studio":studio,"vehicle_geometry_hash":vehicle_geometry_hash}))).into_response())
+}
+
+/// The station's vehicle geometry for the programme page (its silhouettes);
+/// the same reply as `GET /api/vehicle/geometry`, under the programme ticket.
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
+async fn program_vehicle_geometry(
+    State(state): State<Arc<MediaState>>,
+    Query(query): Query<MediaQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let headers = ticket_headers(&state, &headers, &query, "program").await?;
+    authorize(&state, &headers, Permission::ViewData).await?;
+    let geometry = crate::vehicle_geometry::current(&state.app);
+    Ok(([(header::CACHE_CONTROL, "no-cache")], Json(geometry.as_ref().clone())).into_response())
 }
 
 #[derive(Deserialize)]
@@ -259,6 +371,7 @@ struct AudioCursor {
     after: u64,
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn program_audio(
     State(state): State<Arc<MediaState>>,
     Query(query): Query<MediaQuery>,
@@ -281,6 +394,7 @@ async fn program_audio(
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(batch)).into_response())
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn dashboard_status(
     State(state): State<Arc<MediaState>>,
     headers: HeaderMap,
@@ -293,7 +407,7 @@ async fn dashboard_status(
     )
         .into_response())
 }
-pub(super) fn telemetry_snapshot(
+pub(in crate::media) fn telemetry_snapshot(
     app: &AppState,
     presentation: &Presentation,
     now: u64,
@@ -302,20 +416,44 @@ pub(super) fn telemetry_snapshot(
     let (profile_id, profile) = presentation
         .broadcast
         .rundown
-        .profile(phase, cfg!(feature = "test_fire_mode"));
+        .profile_with_fc(phase, app.fc_phase.snapshot().map(|seen| seen.phase), crate::runtime_mode::is_test_fire());
     let fill_source = app.fill_targets.lock().unwrap().fill_source;
     let stats: Vec<_> = {
         let rows = app.recent_telemetry_cache.lock().unwrap();
         profile.stats.iter().map(|stat| {
             let (binding, absolute) = stat.binding_for_fill(fill_source);
             let value = rows.iter().rev().find(|r|r.data_type==binding.data_type && binding.sender_id.as_ref().is_none_or(|s|s==&r.sender_id))
-                .filter(|r|r.timestamp_ms>=0 && now.saturating_sub(r.timestamp_ms as u64)<5000)
+                // Keep the existing programme row/now timestamp domain. A future
+                // row must be unknown, never saturating-subtracted to age zero.
+                .filter(|r| u64::try_from(r.timestamp_ms).ok()
+                    .and_then(|at| now.checked_sub(at)).is_some_and(|age| age < 5000))
                 .and_then(|r|r.values.get(binding.index).copied().flatten())
                 .map(|v|if absolute {v.abs()}else{v}).map(|v|v*binding.scale+binding.offset).filter(|v|v.is_finite());
             serde_json::json!({"label":stat.label,"value":value,"unit":stat.unit,"precision":stat.precision,"format":stat.format,"binding":binding})
         }).collect()
     };
-    serde_json::json!({"phase":format!("{phase:?}"),"test_fire_mode":cfg!(feature="test_fire_mode"),"stats":stats,"profile":profile_id,"cycle_seconds":profile.cycle_seconds,"stats_per_page":profile.stats_per_page,"scene":profile.scene,"positions":crate::antenna::snapshot(),"t_clock":program_t_clock(&app.launch_clock_snapshot(),crate::telemetry_task::procedure_clock::for_wall(now).timestamp_ms())})
+    let procedure=crate::telemetry_task::procedure_clock::for_wall(now);
+    let clock=app.launch_clock_snapshot();
+    let sampled=procedure.timestamp_ms();
+    let remaining=if clock.kind==crate::telemetry_db::LaunchClockKind::TMinus {
+        match (clock.anchor_timestamp_ms,clock.duration_ms) {
+            (Some(anchor),Some(duration))=>Some(duration.saturating_sub(sampled.saturating_sub(anchor))),
+            (Some(target),None)=>Some(target.saturating_sub(sampled)),
+            (None,Some(duration))=>Some(duration),_=>None,
+        }
+    }else{None};
+    let stream_clock=crate::sequence_stream::Clock {
+        kind:match clock.kind {crate::telemetry_db::LaunchClockKind::Idle=>"idle",crate::telemetry_db::LaunchClockKind::TMinus=>"t_minus",crate::telemetry_db::LaunchClockKind::TPlus=>"t_plus"}.into(),
+        source_kind:if procedure.model_monotonic_ms().is_some(){"model_procedure"}else{"host_wall"}.into(),
+        sampled_timestamp_ms:sampled,anchor_timestamp_ms:clock.anchor_timestamp_ms,duration_ms:clock.duration_ms,remaining_ms:remaining,advancing:false,
+    };
+    let sequence_visuals=crate::sequence_stream::project(stream_clock,Some(crate::gse::progress::stream_observation(app)),app.umbilical_stream_outputs(),app.umbilical_stream_commands());
+    // Diagram inputs only while a diagram scene can be shown (no cost otherwise).
+    let diagram_wanted = crate::diagrams::is_scene(&presentation.broadcast.layout)
+        || presentation.broadcast.rundown.profiles.values().any(|p| crate::diagrams::is_scene(&p.scene))
+        || presentation.broadcast.studio.wants_diagram();
+    let diagram = diagram_wanted.then(|| crate::diagrams::program_inputs(app, now));
+    serde_json::json!({"phase":format!("{phase:?}"),"test_fire_mode":crate::runtime_mode::is_test_fire(),"stats":stats,"profile":profile_id,"cycle_seconds":profile.cycle_seconds,"stats_per_page":profile.stats_per_page,"scene":profile.scene,"positions":crate::antenna::snapshot(),"t_clock":program_t_clock(&clock,sampled),"sequence_visuals":sequence_visuals,"diagram":diagram})
 }
 
 fn valid_hls_file(name: &str) -> bool {
@@ -480,12 +618,15 @@ pub(super) fn delayed_playlist(
     }
     Ok((result.join("\n") + "\n", segments))
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn hls(State(state):State<Arc<MediaState>>,Path((id,file)):Path<(String,String)>,Query(query):Query<MediaQuery>,headers:HeaderMap)->ApiResult<Response>{
     hls_impl(state,id,file,query,headers,false).await
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 pub(crate) async fn raw_hls(State(state):State<Arc<MediaState>>,Path((id,file)):Path<(String,String)>,Query(query):Query<MediaQuery>,headers:HeaderMap)->ApiResult<Response>{
     hls_impl(state,id,file,query,headers,true).await
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn hls_impl(state:Arc<MediaState>,id:String,file:String,query:MediaQuery,headers:HeaderMap,raw:bool)->ApiResult<Response>{
     check_id(&id)?;
     if !valid_hls_file(&file) {
@@ -588,6 +729,7 @@ async fn hls_impl(state:Arc<MediaState>,id:String,file:String,query:MediaQuery,h
         .into_response())
 }
 
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn roles(State(state): State<Arc<MediaState>>, headers: HeaderMap) -> ApiResult<Response> {
     let p = crate::web::authorize_headers(&state.app, &headers, Permission::ViewData).await?;
     if p.anonymous
@@ -613,6 +755,7 @@ struct RoleChange {
     username: String,
     stream_master: bool,
 }
+#[expect(clippy::result_large_err, reason = "Axum HTTP helpers retain the explicit Response rejection API without boxing or changing endpoint behavior")]
 async fn set_role(
     State(state): State<Arc<MediaState>>,
     headers: HeaderMap,
@@ -646,7 +789,9 @@ async fn set_role(
             if change.stream_master {
                 user.roles.push(StreamRole::StreamMaster);
                 user.permissions.view_data = true;
-            } else {
+            } else if !user.roles.contains(&StreamRole::Admin) {
+                // Administrators keep every capability; never store a
+                // viewer restriction on them.
                 user.roles.push(StreamRole::StreamViewer);
             }
             Ok(!change.stream_master
@@ -725,7 +870,7 @@ mod tests {
                 timestamp_ms: 100_000,
                 data_type: "GPS_DATA".into(),
                 sender_id: "RF".into(),
-                values: vec![Some(42.0), Some(-78.0), Some(125.0)],
+                values: vec![Some(42.0), Some(-78.0), Some(125.0)], over_range: 0, over_range_low: 0,
             });
         let fresh = telemetry_snapshot(&app, &profile, 100_500);
         assert_eq!(fresh["stats"][0]["binding"]["data_type"], "GPS_DATA");
@@ -744,7 +889,7 @@ mod tests {
                     timestamp_ms: now as i64,
                     data_type: "GPS_DATA".into(),
                     sender_id: "RF".into(),
-                    values: vec![Some(42.0), Some(-78.0), Some(sample as f32)],
+                    values: vec![Some(42.0), Some(-78.0), Some(sample as f32)], over_range: 0, over_range_low: 0,
                 });
             assert_eq!(
                 telemetry_snapshot(&app, &profile, now)["stats"][0]["value"].as_f64(),
@@ -752,6 +897,45 @@ mod tests {
             );
         }
     }
+    #[tokio::test]
+    async fn programme_row_timestamp_boundaries_preserve_unknown_instead_of_future_age_zero() {
+        let app = crate::state::tests::test_app_state().await;
+        let mut presentation = Presentation::default();
+        for page in presentation.broadcast.rundown.profiles.values_mut() {
+            page.stats = default_stats().into_iter().map(Into::into).collect();
+        }
+        for (at, now, expected) in [
+            (10_000, 10_000, Some(125.0)),
+            (5_001, 10_000, Some(125.0)),
+            (5_000, 10_000, None),
+            (10_001, 10_000, None),
+            (-1, 0, None),
+            (i64::MAX, i64::MAX as u64, Some(125.0)),
+            (i64::MAX, u64::MAX, None),
+        ] {
+            let mut rows = app.recent_telemetry_cache.lock().unwrap();
+            rows.clear();
+            rows.push_back(crate::types::TelemetryRow {
+                timestamp_ms: at, data_type: "GPS_DATA".into(), sender_id: "RF".into(),
+                values: vec![Some(42.0), Some(-78.0), Some(125.0)], over_range: 0, over_range_low: 0,
+            });
+            drop(rows);
+            assert_eq!(telemetry_snapshot(&app, &presentation, now)["stats"][0]["value"].as_f64(), expected, "row={at}, now={now}");
+        }
+        // A newer invalid matching row stays unknown; do not silently revive
+        // an older matching row behind it or mint a replacement timestamp.
+        let mut rows = app.recent_telemetry_cache.lock().unwrap();
+        rows.clear();
+        for at in [9_999, 10_001] {
+            rows.push_back(crate::types::TelemetryRow {
+                timestamp_ms: at, data_type: "GPS_DATA".into(), sender_id: "RF".into(),
+                values: vec![Some(42.0), Some(-78.0), Some(125.0)], over_range: 0, over_range_low: 0,
+            });
+        }
+        drop(rows);
+        assert!(telemetry_snapshot(&app, &presentation, 10_000)["stats"][0]["value"].is_null());
+    }
+
     #[test]
     fn delayed_clock_is_available_to_the_first_viewer_without_live_time_fallback() {
         use crate::telemetry_db::{LaunchClockKind, LaunchClockMsg};
@@ -770,7 +954,7 @@ mod tests {
             );
         }
         let delayed = delayed_program_snapshot(&history, 102_500).unwrap();
-        assert_eq!(delayed["t_clock"], "T− 00:17.50");
+        assert_eq!(delayed["t_clock"], "T- 00:17.50");
         assert_ne!(
             delayed["t_clock"],
             program_t_clock(&clock, 115_000).unwrap()
@@ -803,11 +987,11 @@ mod tests {
         let minus = crate::state::launch_countdown_clock(epoch + 100_000);
         assert_eq!(
             program_t_clock(&minus, epoch + 100_833).as_deref(),
-            Some("T− 00:09.17")
+            Some("T- 00:09.17")
         );
         assert_eq!(
             program_t_clock(&minus, epoch + 100_833).as_deref(),
-            Some("T− 00:09.17")
+            Some("T- 00:09.17")
         );
         let plus = LaunchClockMsg {
             kind: LaunchClockKind::TPlus,
@@ -834,11 +1018,11 @@ mod tests {
         };
         assert_eq!(
             program_t_clock(&clock, 104_250).as_deref(),
-            Some("T− 00:05.75")
+            Some("T- 00:05.75")
         );
         assert_eq!(
             program_t_clock(&clock, 115_000).as_deref(),
-            Some("T− 00:00.00")
+            Some("T- 00:00.00")
         );
         clock.kind = LaunchClockKind::TPlus;
         clock.anchor_timestamp_ms = Some(110_000);
@@ -856,12 +1040,23 @@ mod tests {
         clock.kind = LaunchClockKind::TMinus;
         assert_eq!(
             program_t_clock(&clock, 125_250).as_deref(),
-            Some("T− 00:10.00")
+            Some("T- 00:10.00")
         );
         assert_eq!(
             program_t_clock(&LaunchClockMsg::idle(), 125_250).as_deref(),
-            Some("T− 00:10.00")
+            Some("T- 00:10.00")
         );
+        // Hours and days extend the lead field instead of wrapping minutes.
+        clock.kind = LaunchClockKind::TPlus;
+        clock.anchor_timestamp_ms = Some(0);
+        assert_eq!(program_t_clock(&clock, 3_723_456).as_deref(), Some("T+ 1:02:03.46"));
+        assert_eq!(program_t_clock(&clock, 93_784_000).as_deref(), Some("T+ 1:02:03:04.00"));
+        assert_eq!(
+            program_t_clock(&clock, i64::MAX).as_deref(),
+            Some("T+ 106751991167:07:12:55.81")
+        );
+        clock.anchor_timestamp_ms = Some(i64::MAX);
+        assert_eq!(program_t_clock(&clock, i64::MIN).as_deref(), Some("T+ 00:00.00"));
     }
     #[test]
     fn playlist_uris_are_scoped() {

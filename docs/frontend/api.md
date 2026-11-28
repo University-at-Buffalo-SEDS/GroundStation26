@@ -1,5 +1,12 @@
 # Frontend API Contract
 
+The UI repository's `docs/backend-contract.md` is the complete list of what
+the frontend calls and expects: every route and WebSocket message, the minimum
+backend, degradation rules, the hard-coding audit, the offline replay file
+format and the on-device demo station. Its `tests/test_backend_contract_docs.py`
+fails when the UI requests an undocumented route. This page adds
+backend-side detail.
+
 ## Camera archives and crew voice
 
 Mission links to `/media#recordings-heading` for original camera recordings and
@@ -11,8 +18,9 @@ navigation. No radio hardware commands are involved.
 with scoped download/playback URLs; it requires live-preview access. See
 [recordings](../backend/video-recordings.md). `/api/voice/ws` authenticates a signed-in
 session with explicit `permissions.voice_transmit` and view access in its first
-message, relays bounded PCM frames, and provides
-a participant roster. See [voice protocol and controls](../backend/crew-voice.md).
+message, relays bounded PCM/Opus frames from the talkers on air (at most
+`GS_VOICE_MAX_TALKERS`, default 4, of up to `GS_VOICE_MAX_PARTICIPANTS`, default 32),
+and provides a participant roster and `floor` state. See [voice protocol and controls](../backend/crew-voice.md).
 
 Broadcast settings now include `comms_audio_enabled` (default false). Stream
 managers can include delayed crew audio in the audience program; viewers get only
@@ -20,6 +28,15 @@ playback/mute/volume controls. `/api/media-assets/program/audio` accepts a progr
 ticket and an `after` cursor and releases audio only after the server's broadcast
 delay. It cannot be used to transmit. `/api/voice/status` reports current transmit
 permission and whether the crew audio is included in the broadcast.
+
+## Stream manager
+
+`/api/studio` and `/api/studio/{layouts,scenes,take}` hold the stream
+manager's layouts, scenes and Program scene, and list the sources (cameras,
+live diagrams, telemetry views, overlays, graphics). The programme page draws
+a studio scene in the browser; `scene=` and `source=` on its state route draw
+an unaired scene or one source for stream managers. See
+[stream manager](../media/stream-manager.md).
 
 ## Live dashboard cadence
 
@@ -145,7 +162,11 @@ Purpose:
 
 Expected response:
 
-- Default/fallback: JSON array of `TelemetryRow`.
+- UI bootstrap: `/api/recent?display=true&max_rows=12000` returns a JSON array
+  bounded to 12,000 rows (requested limits clamp to 512–20,000). Each sender/type
+  retains its first/latest samples and bucket extrema; sparse pressure streams
+  are not displaced by dense load-cell history. This is display sampling only.
+- Default/fallback without `display=true`: JSON array of `TelemetryRow`.
 - Preferred when the client sends `Accept: application/x-ndjson`: NDJSON stream with one `TelemetryRow` JSON object per line.
 
 Shape:
@@ -277,6 +298,15 @@ Critical expectations:
 - Frontend-specific action highlighting should not be hardcoded for particular commands; it should follow backend layout plus live `ActionPolicyMsg` updates.
 - Data tab channel labels and boolean label sets must line up with actual telemetry value ordering.
 - State widgets must reference valid data types and valid per-value indexes.
+- Optional vehicle bindings (`backend/src/layout.rs`; each is omitted when empty and the UI then
+  keeps its built-in SEDS value, which the shipped layouts name exactly):
+  - `gps: {data_types[], lat_index, lon_index, alt_index}`: the rows that are GPS fixes.
+  - `watch_items: [{id, channels:[{data_type, sender_id?, index}]}]`: watch item channels by id;
+    `/api/watch/status` reads the same list.
+  - `actions_tab.controls: [{cmd, label}]`: names of controls that are not layout buttons (the
+    HITL interlock toggles, named in `layout_hitl.json` only, since only HITL has those commands).
+  - `actions_tab.fill_target_fluids: [{id, label}]`: the `/api/fill_targets` fluids the UI edits,
+    in order, with their names.
 
 Failure impact:
 
@@ -296,7 +326,10 @@ Expected response:
 - The response includes `capture_target_samples`, top-level backend-supported `fit_modes`, and
   `sensors`.
 - Each sensor provides `id`, `label`, `data_type`, `channel`, `fit_color`, `raw_label`,
-  `expected_label`, optional `formatter`, and optional per-sensor `fit_modes`.
+  `expected_label`, optional `formatter`, optional per-sensor `fit_modes`, and optional
+  `sender_id`: the board the calibration tab reads the sensor from (only fresh rows from it).
+  The shipped config names `DAQ` for `KG1000` and `KG50` and none for the ox tank PT; without it
+  the UI reads a load cell from `DAQ` and any other sensor from any sender.
 - The frontend must render calibration channels, labels, colors, and regression choices from this
   response. These values are intentionally not hard-coded in the frontend so future sensors can be
   added by backend config.
@@ -336,6 +369,23 @@ Expected response:
 Failure impact:
 
 - The map still renders, but zoom behavior may be wrong or conservative.
+
+### `GET /api/flight_phases`, `GET /api/terrain/heightmap`, `GET /api/terrain/status`
+
+Purpose:
+
+- The map tab's rocket track coloured by flight phase (2D and 3D), and the 3D
+  view's offline terrain and coverage line.
+
+Shapes, sources, attribution and fallbacks: `docs/backend/terrain.md` (and the
+UI's `docs/backend-contract.md` section 12). The recorded equivalent of the
+phases is `GET /api/recordings/{id}/replay/trajectory` (`phases`, `events`,
+per-point `phase`).
+
+Failure impact:
+
+- No phase-coloured track; the 3D view falls back to flat ground with imagery,
+  then to the plain reference ground. 2D stays available.
 
 ### `GET /flightstate`
 
@@ -491,7 +541,7 @@ reboot; boot confirmation happens on the board after restart.
 
 Purpose:
 
-- Seed the current operator-notification set.
+- Seed the latest 200 in-memory operator events into Notification Center. Never show these snapshot entries as popups.
 
 Expected response:
 
@@ -549,6 +599,20 @@ Frontend expectations:
 
 - The frontend uses this to disable or allow action buttons, not merely to decorate the UI.
 
+### `GET /api/vehicle/geometry`
+
+ViewData. The station's vehicle generated from its OpenRocket design (apogee
+planner import, `GS_VEHICLE_ORK`, else the built-in `SWEET_V6.ork`):
+`{"schema":"gs26.vehicle_geometry","version":1,"source":{…},"length_m","diameter_m",
+"span_m","profile":[[x,r]…],"sections","nose","fins","internals","tanks","recovery",
+"separations","rail_guides","motor","nozzle","parts","svg","warnings"}`, metres from the
+nose tip. `ETag` is the source hash (304 on `If-None-Match`). Clients refuse other
+schema/version values and draw a generic rocket; they cache the last good reply per
+station. Full schema and the named parts: [vehicle geometry](../vehicle-geometry.md).
+Fixture: `backend/tests/contract-fixtures/vehicle/geometry.json`. The programme reads it
+from `/api/media-assets/program/vehicle-geometry?ticket=` when the state's
+`vehicle_geometry_hash` changes; the saved-replay state carries `vehicle_geometry`.
+
 ## Optional or Feature-Specific HTTP Endpoints
 
 Telemetry rates are compile-time board settings, not managed network variables.
@@ -581,11 +645,76 @@ Calibration documents keep legacy fields for `ch1` and `iadc`. Additional channe
 `extra_channels[channel_id]` with generic `linear`, `zero_raw`, `points`, and `fit` fields. Generic
 points use `{ "expected": number, "raw": number }`.
 
+#### Calibration revisions and reference provenance
+
+The calibration file carries `revision` (u64). `GET /api/calibration` and every
+write's reply return it. Every write of the file adds one: an editor save,
+`capture_zero`, `capture_span`, `capture_thermal_zero`, `long_zero/apply`, a
+50 kg input change (`POST /api/calibration/kg50_input`) and its periodic
+re-stamp by the input sync, the MCP3564R reference (`/mcp_vref`), the chamber
+PT setting, the automatic zero and a calibration document applied from the
+paired station. A request that changes nothing (the same input or reference
+again) and `POST /api/calibration/refit` (a stub that returns the current file)
+write nothing and leave it. A file saved before the field existed loads as
+revision 0; loading or migrating it on start-up is not a write.
+
+`POST /api/calibration` names what it was edited from:
+
+```json
+{"channel": "ch1", "calibration": { ... }, "revision": 41, "fitted_mcp_vref_v": 2.2}
+```
+
+- `revision`: the revision the editor loaded. Missing: `428 Precondition
+  Required` (a client from before revisions; it must reload). Not the
+  station's: `409` "Calibration changed on the station since it was loaded
+  (loaded revision 41, station revision 42). Nothing was saved: reload the
+  calibration and re-apply your changes."
+- `fitted_mcp_vref_v`: the MCP3564R reference (V) the points, zero, fit and
+  thermal correction were captured and fitted at, i.e. the `mcp_vref_v` of the
+  document loaded. Required for `ch1` and `kg50` (`422` when missing), ignored
+  for `iadc`. Not the station's current reference: `409` naming both values.
+  The station stamps the saved channel and thermal entry with this value; it
+  never converts the save or substitutes the current setting. A per-channel
+  `fitted_mcp_vref_v` inside `calibration` is ignored.
+- A changed reference is itself a write, so an editor that loaded before the
+  change is refused by its revision first.
+- `kg50` saves are also refused (`409`) when the 50 kg input changed.
+
+`capture_zero` and `capture_span` take the same `revision` and `mcp_vref_v`
+(the reference of the document the reading was taken against; required for
+KG1000/KG50) with the same statuses, and are refused (`409`) when their
+samples, from `capture_started_ms` or the default look-back window, began
+before the reference last changed (`mcp_vref_changed_ms`, station ms).
+`capture_thermal_zero` is refused the same way when the reference changed
+inside its settling window, and `long_zero/apply` when the capture was taken
+under another reference than the current one.
+
+Not covered: the station cannot tell whether the DAQ has applied a new
+reference yet. Its health report raises a warning while the DAQ's applied
+reference differs from the setting; do not capture while it is shown.
+
+Load-cell units (calibration `version` 2): for KG1000 (`ch1`) and the AMP2 KG50
+input, KG1000/KG50 telemetry and every calibration input value (`zero_raw`,
+`points[].raw`, `temperature_captures[].raw`, thermal `raw_per_c` and points,
+noise `sigma_raw`) are ADC-pin volts, and fits are kg = f(volts): the linear
+slope `m` is kg/V. The P6 KG50 input was already in volts; `iadc` is
+unchanged. The field names are kept for compatibility. Capture requests accept
+`volts` as an alias of `raw`. Version-1 files (DAQ legacy raw scale) are
+migrated on load with the exact factor k = 16000/921 (volts = raw x k): inputs
+are multiplied by k, slopes divided by k (an x^n term by k^n), intercepts kept,
+so every ADC code gives the same kg. A save carrying `version` < 2 is refused
+with a request to reload. Recordings without a `loadcell_units` table (and rows
+before its `first_volts_id`) hold legacy raw values; replay, recent history and
+the test-fire CSV convert them to volts. An SD-resolved recording converts its
+legacy network rows and legacy-firmware SD load-cell rows when it is resolved
+(provenance `converted_from`) and marks the view with `sd_replay_loadcell_units`;
+the original `telemetry` table is never rewritten.
+
 ### `POST /api/notifications/{id}/dismiss`
 
 Purpose:
 
-- Dismiss a persistent notification for all connected clients.
+- Explicitly remove a Notification Center history entry on the server. Closing or auto-expiring a popup must not call this endpoint.
 
 Expected behavior:
 
@@ -674,9 +803,11 @@ The backend sends tagged JSON objects:
 { "ty": "BoardStatus", "data": { ... } }
 { "ty": "NetworkTopology", "data": { ... } }
 { "ty": "Notifications", "data": [ ... ] }
+{ "ty": "Notification", "data": { ... } }
 { "ty": "Messages", "data": [ ... ] }
 { "ty": "ActionPolicy", "data": { ... } }
 { "ty": "NetworkTime", "data": { ... } }
+{ "ty": "StationModeChanged", "data": { ... } }
 ```
 
 Notes:
@@ -690,7 +821,12 @@ Notes:
 ### Live message semantics
 
 - `TelemetryBatch`
-  High-rate telemetry rows. This is the hot path for charts and latest-value caches.
+  High-rate live display rows. A slow client retains each `(sender_id, data_type)`
+  stream's newest unsent row in one bounded frame (up to 1024 streams), separate from
+  ordered warnings, confirmations and state changes. Unsent frames older than 250 ms
+  are skipped; socket writes stalled for two seconds close the session for reconnect.
+  This display coalescing does not change acquisition, database recording, exports or
+  `/api/recent` history. Use recorded/history data for complete analysis.
 - `Warning` and `Error`
   Append to the respective alert lists.
 - `FlightState`
@@ -702,8 +838,13 @@ Notes:
 - `NetworkTopology`
   Replaces the current topology snapshot.
 - `Notifications`
-  Replaces the current active operator-notification set. This is for backend/operator workflow
-  notifications such as fill completion or action-required notices.
+  Restores Notification Center history. Initial connection, reconnect, HTTP bootstrap and
+  lag recovery never create popups; this holds even for legacy `persistent: true` entries.
+- `Notification`
+  A single event received live after this connection began. Deduplicate by `(id, timestamp_ms)`
+  and show a popup for five seconds. Keep it in Notification Center afterward. Closing or
+  expiring the popup is client-local. A hidden/disconnected client sees missed notices only
+  in Notification Center when it returns. Warnings/errors keep their own persistent semantics.
 - `Messages`
   Replaces the current telemetry/backend message set. This is for telemetry-network text
   messages such as flight-computer or router status strings.
@@ -711,6 +852,18 @@ Notes:
   Replaces current command enable/disable policy.
 - `NetworkTime`
   Updates backend clock reference.
+- `StationModeChanged`
+  `{"mode", "label", "policy_epoch", "layout_revision"}`: the backend switched station mode in
+  process. A fresh `ActionPolicy` follows. Refetch `/api/layout` (it follows the mode in force) and
+  the station mode status; keep the session and connection.
+
+### Station mode API
+
+`GET /api/station-modes`, `POST /api/station-modes/prepare` and `POST /api/station-modes/confirm`
+(wire V2). Every option has `transition_kind: "restart"` (server-fenced) and `in_process: true` when
+the switch keeps the Simulation flag and happens inside the running backend; Simulation changes
+restart the backend. The status carries `policy_epoch` (`<boot>:epoch-<n>`, grows on every switch)
+and `layout_revision`. See `docs/backend/station-modes.md`.
 
 ## Frontend Data Model Assumptions
 
@@ -750,6 +903,11 @@ ordered pilot, vent, dump, nitrogen, nitrous. Poll every 500 ms while visible.
 `GET /api/gse/config` and authenticated `POST`/`PUT` expose `nitrogen_target_psi`,
 nullable `pressure_ceiling_psi`, nullable `maximum_zero_offset_psi`, `grouped_panel`,
 and runtime-only `dry_self_test_confirmed`. Edits are rejected during sequencing.
+`launch_mass_min_kg` / `launch_mass_max_kg` (default 4.0 / 9.0) are the inclusive nitrous
+mass window for Launch, retraction and the first Turbocharge, in the target's sign; a save
+that omits them keeps the station's values. When the mass blocks them, the `Launch`,
+`GroundStationLaunch` and `RetractPlumbing` controls carry a `disabled_reason` naming the
+window and the mass.
 New command names are `StartFill`, `PauseFill`, `CancelFill`, `ValveSelfTest`, and
 `NitrogenTest`; use existing action policy and command permissions, never direct
 browser valve sequencing. Action layout entries accept an optional `group` string.

@@ -46,6 +46,9 @@ def main() -> None:
             "sender_id" if "sender_id" in table_cols else "NULL AS sender_id",
             "values_json" if "values_json" in table_cols else "NULL AS values_json",
             "payload_json" if "payload_json" in table_cols else "NULL AS payload_json",
+            # Packed ADC over-range masks: bit i (low 32 bits) = values[i] over
+            # range (null in values_json), bit 32+i = below -full scale.
+            "over_range" if "over_range" in table_cols else "NULL AS over_range",
         ]
         query = (
             "SELECT "

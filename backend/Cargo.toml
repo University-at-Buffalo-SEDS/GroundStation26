@@ -2,17 +2,15 @@
 name = "groundstation_backend"
 version = "0.1.0"
 edition = "2024"
+authors.workspace = true
 description.workspace = true
 license-file.workspace = true
 repository.workspace = true
 
 [features]
 raspberry_pi = ["rppal"]
-testing = []
-hitl_mode = []
 # Explicit MCU simulator clocks without changing operational/HITL policy.
 firmware_sim = []
-test_fire_mode = []
 
 [dependencies]
 gs-browser-assets = { path = "../shared/browser_assets" }
@@ -26,16 +24,20 @@ rcgen = "0.14.10"
 tokio.workspace = true
 serde_json.workspace = true
 rppal = { git = "https://gitlab.rylanswebsite.com/rylan-meilutis/rppal.git", branch = "main", optional = true }
-SEDSnet = { version = "4" }
+SEDSnet = { version = "8.0.0" }
 
 sqlx = { version = "0.9.0", features = ["runtime-tokio", "tls-rustls-ring", "sqlite"] }
 
 anyhow = "1.0.104"
+tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.7.1", features = ["fs", "compression-full"] }
 rand = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serialport = "4.10.1"
 crc32fast = "1"
+flate2 = "1"
+# RRLS outbox only: zstd-compressed SD transfer blocks (sd_download/relay.rs).
+zstd = { version = "0.14", default-features = false }
 futures = "0.3.34"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 libc = "0.2"
@@ -48,10 +50,12 @@ flexi_logger = "0.31.10"
 log = "0.4.34"
 time = { version = "0.3.55", features = ["formatting", "macros", "parsing"] }
 opus = "0.4.0"
+codec2 = "0.3.1"
 
 [dev-dependencies]
-tower = { version = "0.5.3", features = ["util"] }
+# Paused/advanced clocks for deterministic timing tests (test builds only).
+tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake"] }
 
 [build-dependencies]
-SEDSnet = { version = "4", default-features = false, features = ["std"] }
+SEDSnet = { version = "8.0.0", default-features = false, features = ["std"] }

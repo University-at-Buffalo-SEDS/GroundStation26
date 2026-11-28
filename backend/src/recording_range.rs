@@ -1,4 +1,11 @@
+//! `GET /api/recordings/csv?start_ms&end_ms`: every primary recording's
+//! receipt rows in a time range.
+//!
 //! Scan local recording contents, not filename dates (the Pi may boot without RTC).
+//! The row cells are those of the recording CSV (`recording_export`), with
+//! over-range values as `OVR`/`-OVR`, behind a leading `recording` column.
+//! SD-resolved recordings contribute their receipt rows (`telemetry`), not
+//! the resolved `sd_replay_telemetry` timeline.
 use crate::{
     auth::Permission,
     recording_export::{directory, recording_path, text_cell, valid_id},
@@ -47,24 +54,30 @@ async fn open(path: &Path) -> Result<SqlitePool, sqlx::Error> {
         .await
 }
 async fn snapshots(root: &Path, range: Range) -> anyhow::Result<Vec<Snapshot>> {
-    let mut entries = match tokio::fs::read_dir(root).await {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e.into()),
-    };
+    // The ring and legacy files; captures are copies of ring data and would
+    // duplicate rows in a date-range export.
+    let root_owned = root.to_path_buf();
+    let sources = tokio::task::spawn_blocking(move || crate::recording_store::primary_sources(&root_owned)).await?;
     let mut result = Vec::new();
-    while let Some(entry) = entries.next_entry().await? {
-        let id = entry.file_name().to_string_lossy().into_owned();
+    for source in sources {
+        let id = source.id;
         if !valid_id(&id) {
             continue;
         }
-        let meta = entry.file_type().await?;
-        if !meta.is_file() || meta.is_symlink() {
+        if let Some(end) = source.end_ms
+            && end < range.start_ms.saturating_sub(60_000)
+        {
             continue;
         }
-        let path = recording_path(root, &id)
-            .await
-            .map_err(|e| anyhow::anyhow!("Recording changed during export: {id}: {e}"))?;
+        if source.start_ms.is_some_and(|start| start > range.end_ms.saturating_add(60_000)) {
+            continue;
+        }
+        let path = match recording_path(root, &id).await {
+            Ok(path) => path,
+            // A rolling segment may be removed by the ring between listing and opening.
+            Err(_) if source.kind == crate::recording_store::ListedKind::Rolling => continue,
+            Err(e) => return Err(anyhow::anyhow!("Recording changed during export: {id}: {e}")),
+        };
         let db = open(&path).await?;
         let upper: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id),0) FROM telemetry WHERE timestamp_ms >= ? AND timestamp_ms < ?")
             .bind(range.start_ms).bind(range.end_ms).fetch_one(&db).await?;
@@ -82,7 +95,9 @@ async fn page(
     range: Range,
     last: i64,
 ) -> Result<(String, i64), sqlx::Error> {
-    let rows = sqlx::query("SELECT id,timestamp_ms,source_timestamp_ms,sender_id,data_type,values_json,payload_json FROM telemetry WHERE id > ? AND id <= ? AND timestamp_ms >= ? AND timestamp_ms < ? ORDER BY id LIMIT 512")
+    // Over-range values are exported as "OVR"/"-OVR", as in the recording CSV.
+    let over = if crate::over_range::table_has_column(db, "telemetry").await { "over_range" } else { "NULL AS over_range" };
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!("SELECT id,timestamp_ms,source_timestamp_ms,sender_id,data_type,values_json,payload_json,{over} FROM telemetry WHERE id > ? AND id <= ? AND timestamp_ms >= ? AND timestamp_ms < ? ORDER BY id LIMIT 512")))
         .bind(last).bind(snapshot.upper).bind(range.start_ms).bind(range.end_ms).fetch_all(db).await?;
     let mut csv = String::new();
     let mut next = last;
@@ -92,7 +107,10 @@ async fn page(
         let source: Option<i64> = row.try_get("source_timestamp_ms")?;
         let sender: Option<String> = row.try_get("sender_id")?;
         let ty: String = row.try_get("data_type")?;
-        let values: Option<String> = row.try_get("values_json")?;
+        let ty = crate::telemetry_schema::canonical_type_name(&ty).to_string();
+        let values: Option<String> = row
+            .try_get::<Option<String>, _>("values_json")?
+            .map(|v| crate::over_range::export_values_json(&v, row.try_get::<Option<i64>, _>("over_range").ok().flatten()));
         let payload: Option<String> = row.try_get("payload_json")?;
         csv.push_str(&format!(
             "{},{next},{received},{},{},{},{},{}\r\n",
@@ -316,5 +334,20 @@ mod tests {
             .0
             .is_empty()
         );
+    }
+    #[tokio::test]
+    async fn over_range_values_are_marked_as_in_the_recording_csv() {
+        let db = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        crate::telemetry_db::ensure_telemetry_schema(&db).await.unwrap();
+        sqlx::query("INSERT INTO telemetry(timestamp_ms,sender_id,data_type,values_json,payload_json,over_range) VALUES(100,'DAQ','KG1000','[null,1.5,null]','[]',?)")
+            .bind(crate::over_range::pack(0b101, 0b100))
+            .execute(&db)
+            .await
+            .unwrap();
+        let s = Snapshot { path: PathBuf::new(), id: "recording".into(), upper: 1 };
+        let (csv, _) = page(&db, &s, Range { start_ms: 0, end_ms: 200 }, 0).await.unwrap();
+        assert_eq!(csv, "\"recording\",1,100,,\"DAQ\",\"KG1000\",\"[\"\"OVR\"\",1.5,\"\"-OVR\"\"]\",\"[]\"\r\n");
+        let page_csv = crate::recording_export::test_csv_page(&db, 1).await;
+        assert!(csv.ends_with(&page_csv[page_csv.find(",\"DAQ\"").unwrap()..]), "same cells as the recording CSV");
     }
 }

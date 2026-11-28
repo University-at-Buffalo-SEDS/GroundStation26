@@ -16,7 +16,7 @@ pub(crate) fn in_controlled_round<T>(round: usize, run: impl FnOnce() -> T) -> T
 /// The audit covers every managed publication, not unrelated typed commands.
 /// IDs come from this process's actual loaded application schema.
 pub(crate) fn trace_scope() {
-    if !cfg!(any(feature = "hitl_mode", feature = "firmware_sim"))
+    if !(crate::runtime_mode::is_hitl() || cfg!(feature = "firmware_sim"))
         || std::env::var("GS_SIM_TRACE_API_REQUESTS").as_deref() != Ok("1")
     {
         return;
@@ -24,7 +24,7 @@ pub(crate) fn trace_scope() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let types=|names: &[&str]| names.iter().map(|name|serde_json::json!({"name":name,"id":crate::telemetry_schema::data_type(name).as_u32()})).collect::<Vec<_>>();
-        let covered=types(&["FLIGHT_STATE","AV_BAY_UNDERGLOW","FLIGHT_BUZZER","DAQ_LOADCELL_CALIBRATION","DAQ_KG50_CALIBRATION","DAQ_LOG_CLOCK","DAQ_THERMAL_CALIBRATION","DAQ_FILTER_CALIBRATION","DAQ_KG50_INPUT"]);
+        let covered=types(&["FLIGHT_STATE","AV_BAY_UNDERGLOW","FLIGHT_BUZZER","DAQ_LOADCELL_CALIBRATION","DAQ_KG50_CALIBRATION","DAQ_LOG_CLOCK","DAQ_THERMAL_CALIBRATION","DAQ_FILTER_CALIBRATION","DAQ_KG50_INPUT","DAQ_MCP_REFERENCE"]);
         let excluded=types(&["FLIGHT_COMMAND","VALVE_COMMAND","ACTUATOR_COMMAND"]);
         eprintln!("[gs-qualification-scope] {}",serde_json::json!({"version":1,"process_id":std::process::id(),"process_started_ms":crate::simulation_clock_ms(),"covered":covered,"excluded":excluded,"managed_limit_ms":500,"excluded_existing_gates":"Valve startup and Valve/Actuator soak physical status default 2500 ms; FC startup execution-counter assertion and existing RF-soak reliable 500 ms (FC+underglow). Original runner gates remain unchanged; excluded typed commands have no new per-packet 500 ms claim."}));
     });
@@ -32,7 +32,7 @@ pub(crate) fn trace_scope() {
 
 thread_local! { static BOOTSTRAP_PHASE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) }; }
 const BOOTSTRAP_SOURCE: &str = "main.initial_publish_current.before_workers";
-const MANAGED_NAMES: [&str; 9] = [
+const MANAGED_NAMES: [&str; 10] = [
     "FLIGHT_STATE",
     "AV_BAY_UNDERGLOW",
     "FLIGHT_BUZZER",
@@ -42,6 +42,7 @@ const MANAGED_NAMES: [&str; 9] = [
     "DAQ_THERMAL_CALIBRATION",
     "DAQ_FILTER_CALIBRATION",
     "DAQ_KG50_INPUT",
+    "DAQ_MCP_REFERENCE",
 ];
 
 fn bootstrap_observation(router: &Router) -> (usize, usize, usize) {
@@ -67,7 +68,7 @@ pub(crate) fn prime_initial_cache(
     router: &Router,
     run: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    if !cfg!(any(feature = "hitl_mode", feature = "firmware_sim"))
+    if !(crate::runtime_mode::is_hitl() || cfg!(feature = "firmware_sim"))
         || std::env::var("GS_SIM_TRACE_API_REQUESTS").as_deref() != Ok("1")
         || std::env::var("GS_SIM_POLICY_CORRECT_CONTROLS").as_deref() != Ok("1")
     {
@@ -131,7 +132,7 @@ pub(crate) struct Request {
 impl Request {
     pub(crate) fn begin(publisher: &'static str) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
-        let token = (cfg!(any(feature = "hitl_mode", feature = "firmware_sim"))
+        let token = ((crate::runtime_mode::is_hitl() || cfg!(feature = "firmware_sim"))
             && std::env::var("GS_SIM_TRACE_API_REQUESTS").as_deref() == Ok("1"))
         .then(|| NEXT.fetch_add(1, Ordering::Relaxed));
         if let Some(token) = token {
@@ -145,9 +146,30 @@ impl Request {
             submissions: std::cell::Cell::new(0),
         }
     }
+    pub(crate) fn bind_prepared(&self, packet: &Packet) -> u64 {
+        let id = packet.packet_id();
+        if let Some(token) = self.token {
+            emit(serde_json::json!({"event":"bind","token":token,"packet_id":id,"submit_ms":crate::simulation_clock_ms(),"data_type":packet.data_type().as_u32()}));
+            self.submissions.set(self.submissions.get() + 1);
+        }
+        id
+    }
+    pub(crate) fn prepared_result(&self, id: u64, accepted: bool) {
+        if let Some(token) = self.token {
+            emit(serde_json::json!({"event":"submit_result","token":token,"packet_id":id,"ok":accepted,"at_ms":crate::simulation_clock_ms()}));
+        }
+    }
     pub(crate) fn submit(&self, router: &Router, packet: Packet) -> anyhow::Result<()> {
+        self.submit_with(router, packet, Router::set_network_variable)
+    }
+    pub(crate) fn submit_with(
+        &self,
+        router: &Router,
+        packet: Packet,
+        send: impl FnOnce(&Router, Packet) -> sedsnet::TelemetryResult<()>,
+    ) -> anyhow::Result<()> {
         if self.token.is_none() {
-            return router.set_network_variable(packet).map_err(Into::into);
+            return send(router, packet).map_err(Into::into);
         }
         let id = packet.packet_id();
         if let Some(token) = self.token {
@@ -156,7 +178,7 @@ impl Request {
             );
             self.submissions.set(self.submissions.get() + 1);
         }
-        let result = router.set_network_variable(packet);
+        let result = send(router, packet);
         if let Some(token) = self.token {
             emit(
                 serde_json::json!({"event":"submit_result","token":token,"packet_id":id,"ok":result.is_ok(),"at_ms":crate::simulation_clock_ms()}),

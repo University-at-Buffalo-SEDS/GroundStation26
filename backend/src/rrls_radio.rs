@@ -8,7 +8,10 @@ use sedsnet::{
 };
 use std::{
     error::Error,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 type Device = Arc<Mutex<Box<dyn CommsDevice>>>;
@@ -21,11 +24,16 @@ struct Connection {
     rx: Option<Device>,
     tx: Option<Device>,
     failures: u64,
+    retry_tracker: Option<sedsnet::router::RetryTracker>,
+    capacity_enabled: bool,
+    /// AV-bay radio: an operator modem check may hold the port closed.
+    av_bay: bool,
 }
 pub struct RecoveryRadio {
     shared: Arc<Mutex<Connection>>,
     tx: bool,
     side: Option<RouterSideId>,
+    ready_generation: Arc<AtomicU64>,
 }
 impl RecoveryRadio {
     pub fn new(config: CommsLinkConfig) -> Self {
@@ -38,26 +46,98 @@ impl RecoveryRadio {
                 rx: None,
                 tx: None,
                 failures: 0,
+                retry_tracker: None,
+                capacity_enabled: true,
+                av_bay: false,
             })),
             tx: false,
             side: None,
+            ready_generation: Arc::new(AtomicU64::new(0)),
         }
+    }
+    /// The AV-bay radio. Its opener runs the RFD modem startup check once per
+    /// process, and an operator modem check can hold the port closed.
+    pub fn new_av_bay(config: CommsLinkConfig) -> Self {
+        let radio = Self::new(config);
+        {
+            let mut state = radio.shared.lock().unwrap();
+            state.opener = Box::new(open_av_bay_link);
+            state.av_bay = true;
+        }
+        radio
+    }
+    pub(crate) fn from_open_av_bay(
+        config: CommsLinkConfig,
+        rx: Box<dyn CommsDevice>,
+    ) -> anyhow::Result<Self> {
+        let radio = Self::from_open(config, rx)?;
+        {
+            let mut state = radio.shared.lock().unwrap();
+            state.opener = Box::new(open_av_bay_link);
+            state.av_bay = true;
+        }
+        Ok(radio)
+    }
+    /// Preserve the already opened primary handle and its configuration.
+    /// Capacity control remains off until the existing worker enables it.
+    pub(crate) fn from_open(
+        config: CommsLinkConfig,
+        rx: Box<dyn CommsDevice>,
+    ) -> anyhow::Result<Self> {
+        let tx = rx
+            .try_clone_tx()?
+            .ok_or_else(|| anyhow::anyhow!("Serial recovery requires independent transmit"))?;
+        let radio = Self::new(config);
+        {
+            let mut state = radio.shared.lock().unwrap();
+            state.generation = 1;
+            state.capacity_enabled = false;
+            state.rx = Some(Arc::new(Mutex::new(rx)));
+            state.tx = Some(Arc::new(Mutex::new(tx)));
+        }
+        radio.ready_generation.store(1, Ordering::Release);
+        Ok(radio)
     }
     fn connect(&self) -> Option<(u64, Device)> {
         let mut state = self.shared.lock().unwrap();
+        if state.av_bay && crate::comms::rfd_modem::hold_requested() {
+            if state.rx.is_some() {
+                self.ready_generation.store(0, Ordering::Release);
+                if let Some(tracker) = &state.retry_tracker
+                    && let Err(error) = tracker.invalidate_generation()
+                {
+                    log::warn!("radio retry fence unavailable: {error}");
+                }
+                state.rx = None;
+                state.tx = None;
+                log::info!("AV-bay radio released for an operator modem check");
+            }
+            state.retry_at = Instant::now();
+            crate::comms::rfd_modem::acknowledge_release();
+            return None;
+        }
         if state.rx.is_none() && Instant::now() >= state.retry_at {
             state.retry_at = Instant::now() + Duration::from_secs(1);
             match (state.opener)(&state.config).and_then(|mut rx| {
-                rx.enable_radio_capacity_control();
+                if state.capacity_enabled {
+                    rx.enable_radio_capacity_control();
+                }
+                if let Some(tracker) = &state.retry_tracker {
+                    // A new UART instance invalidates both old and new write evidence.
+                    tracker.invalidate_generation()?;
+                    rx.bind_retry_tracker(tracker.clone())?;
+                }
                 let tx = rx
                     .try_clone_tx()?
                     .ok_or_else(|| anyhow::anyhow!("RRLS requires independent UART transmit"))?;
                 Ok((rx, tx))
             }) {
                 Ok((rx, tx)) => {
-                    state.generation += 1;
+                    state.generation = state.generation.checked_add(1)?;
                     state.rx = Some(Arc::new(Mutex::new(rx)));
                     state.tx = Some(Arc::new(Mutex::new(tx)));
+                    self.ready_generation
+                        .store(state.generation, Ordering::Release);
                     log::info!(
                         "RRLS radio connected: {}",
                         crate::comms::link_description(&state.config)
@@ -65,7 +145,7 @@ impl RecoveryRadio {
                 }
                 Err(error) => {
                     state.failures += 1;
-                    if state.failures == 1 || state.failures % 30 == 0 {
+                    if state.failures == 1 || state.failures.is_multiple_of(30) {
                         log::warn!(
                             "RRLS radio {} unavailable; retrying once per second: {error:#}",
                             crate::comms::link_description(&state.config)
@@ -79,11 +159,27 @@ impl RecoveryRadio {
     }
     fn disconnected(&self, generation: u64) {
         let mut state = self.shared.lock().unwrap();
-        if state.generation == generation {
+        if state.generation == generation && state.rx.is_some() {
+            self.ready_generation.store(0, Ordering::Release);
+            if let Some(tracker) = &state.retry_tracker
+                && let Err(error) = tracker.invalidate_generation()
+            {
+                log::warn!("RRLS retry fence unavailable: {error}");
+            }
             // Endpoints do not retain idle clones of failed UART handles.
             state.rx = None;
             state.tx = None;
             state.retry_at = Instant::now() + Duration::from_secs(1);
+        }
+    }
+    /// This endpoint's connected device (TX or RX handle), without opening
+    /// one; the state lock is released before the device is locked.
+    fn current_device(&self) -> Option<Device> {
+        let state = self.shared.lock().unwrap();
+        if self.tx {
+            state.tx.clone()
+        } else {
+            state.rx.clone()
         }
     }
     fn with_device<T, E>(
@@ -110,13 +206,195 @@ impl RecoveryRadio {
         result
     }
 }
+/// Opens the AV-bay radio after the once-per-process RFD modem check.
+pub(crate) fn open_av_bay_link(config: &CommsLinkConfig) -> anyhow::Result<Box<dyn CommsDevice>> {
+    crate::comms::rfd_modem::before_av_bay_open(config);
+    open_link(config)
+}
 fn io_failure(error: &TelemetryError) -> bool {
-    matches!(
-        error,
-        TelemetryError::Io(_) | TelemetryError::GenericError(_)
-    )
+    // SDK Io values describe logical queue/routing ownership, not OS socket
+    // health. Actual receive/read IO errors use std::io -> GenericError.
+    matches!(error, TelemetryError::GenericError(_))
+}
+pub(crate) fn boxed_io_failure(error: &(dyn Error + Send + Sync + 'static)) -> bool {
+    error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::NotFound
+        ) || (error.kind() == std::io::ErrorKind::Other && error.raw_os_error().is_some())
+    })
 }
 impl CommsDevice for RecoveryRadio {
+    fn connection_generation(&self) -> Option<Arc<AtomicU64>> {
+        Some(self.ready_generation.clone())
+    }
+    fn enable_radio_capacity_control(&mut self) {
+        let mut state = self.shared.lock().unwrap();
+        state.capacity_enabled = true;
+        if let Some(device) = &state.rx {
+            device.lock().unwrap().enable_radio_capacity_control();
+        }
+    }
+
+    fn bind_retry_tracker(
+        &mut self,
+        tracker: sedsnet::router::RetryTracker,
+    ) -> TelemetryResult<()> {
+        let mut state = self.shared.lock().unwrap();
+        if state.retry_tracker.as_ref() == Some(&tracker) {
+            return Ok(());
+        }
+        if let Some(old) = &state.retry_tracker {
+            old.invalidate_generation()?;
+        }
+        tracker.invalidate_generation()?;
+        if let Some(device) = &state.rx {
+            device.lock().unwrap().bind_retry_tracker(tracker.clone())?;
+        }
+        state.retry_tracker = Some(tracker);
+        Ok(())
+    }
+    fn command_batch_frame_len(&self, priority: u8, payload: &[u8]) -> Option<usize> {
+        let state = self.shared.lock().unwrap();
+        let device = if self.tx { &state.tx } else { &state.rx };
+        device.as_ref().and_then(|device| {
+            device
+                .lock()
+                .unwrap()
+                .command_batch_frame_len(priority, payload)
+        })
+    }
+    // Every CommsDevice method that has a default is forwarded here: the
+    // primary's and the RRLS's AV-bay radios are this wrapper, so a default
+    // silently switched the UART's behaviour off on hardware (the owed
+    // settings turn, the Abort pair and compact bundles all were).
+    // `every_comms_device_method_is_forwarded` keeps the list complete.
+    /// The ABORT and its FLIGHT_STATE=15 leave in one write (the UART takes
+    /// the pair in `send_tracked_counted`, which is forwarded below).
+    /// Disconnected: false, so the ABORT is not held for a pair.
+    fn supports_abort_pair(&self) -> bool {
+        self.current_device()
+            .is_some_and(|device| device.lock().unwrap().supports_abort_pair())
+    }
+    /// Compact-bundle followers, as the UART sizes them.
+    fn bundle_frame_len(
+        &self,
+        priority: u8,
+        payload: &[u8],
+        first: Option<(u8, &[u8])>,
+    ) -> Option<usize> {
+        self.current_device()
+            .and_then(|device| device.lock().unwrap().bundle_frame_len(priority, payload, first))
+    }
+    fn testing_model_link(&self) -> bool {
+        self.current_device()
+            .is_some_and(|device| device.lock().unwrap().testing_model_link())
+    }
+    fn send_tracked(
+        &mut self,
+        frames: &[(u8, &[u8])],
+        leases: &[sedsnet::router::PackedWriteLease],
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.with_device(
+            "RRLS radio disconnected".into(),
+            |error| boxed_io_failure(error.as_ref()),
+            |device| device.send_tracked(frames, leases),
+        )
+    }
+
+    fn send_tracked_counted(
+        &mut self,
+        frames: &[(u8, &[u8])],
+        leases: &[sedsnet::router::PackedWriteLease],
+    ) -> Result<Option<usize>, Box<dyn Error + Send + Sync>> {
+        self.with_device(
+            "RRLS radio disconnected".into(),
+            |error| boxed_io_failure(error.as_ref()),
+            |device| device.send_tracked_counted(frames, leases),
+        )
+    }
+    fn send_command_batch(
+        &mut self,
+        frames: &[(u8, &[u8])],
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.with_device(
+            "RRLS radio disconnected".into(),
+            |error| boxed_io_failure(error.as_ref()),
+            |device| device.send_command_batch(frames),
+        )
+    }
+    fn ordinary_background_state(&self) -> Option<crate::comms::OrdinaryLaneState> {
+        let device = {
+            let state = self.shared.lock().unwrap();
+            if self.tx {
+                state.tx.clone()
+            } else {
+                state.rx.clone()
+            }
+        };
+        device.and_then(|device| device.lock().unwrap().ordinary_background_state())
+    }
+    fn recovery_budget_configured(&self) -> bool {
+        let device = {
+            let state = self.shared.lock().unwrap();
+            if self.tx {
+                state.tx.clone()
+            } else {
+                state.rx.clone()
+            }
+        };
+        device.is_some_and(|device| device.lock().unwrap().recovery_budget_configured())
+    }
+    fn service_background_mode(&mut self) -> TelemetryResult<()> {
+        self.with_device(
+            TelemetryError::Io("RRLS radio disconnected"),
+            io_failure,
+            |device| device.service_background_mode(),
+        )
+    }
+    fn service_background_transmit(&mut self) -> TelemetryResult<()> {
+        self.with_device(
+            TelemetryError::Io("RRLS radio disconnected"),
+            io_failure,
+            |device| device.service_background_transmit(),
+        )
+    }
+    fn service_background_transmit_counted(
+        &mut self,
+        allow_ordinary: bool,
+    ) -> TelemetryResult<Option<crate::comms::BackgroundProgress>> {
+        self.with_device(
+            TelemetryError::Io("RRLS radio disconnected"),
+            io_failure,
+            |device| device.service_background_transmit_counted(allow_ordinary),
+        )
+    }
+    fn service_paid_budget_transmit_counted(
+        &mut self,
+    ) -> TelemetryResult<Option<crate::comms::BackgroundProgress>> {
+        self.with_device(
+            TelemetryError::Io("RRLS radio disconnected"),
+            io_failure,
+            |device| device.service_paid_budget_transmit_counted(),
+        )
+    }
+    /// The primary's AV-bay radio is this wrapper, so the owed settings turn
+    /// (framing offer, mode reply, HOST_CONTROL reply, station-state copy)
+    /// must reach the UART. With the trait default it never ran, and the
+    /// station state then waited for background admission, which a busy
+    /// control stream (a launch) held shut for 10 s or more.
+    fn service_owed_settings_turn(&mut self) -> TelemetryResult<bool> {
+        self.with_device(
+            TelemetryError::Io("RRLS radio disconnected"),
+            io_failure,
+            |device| device.service_owed_settings_turn(),
+        )
+    }
     fn service_transmit(&mut self) -> TelemetryResult<()> {
         self.with_device(
             TelemetryError::Io("RRLS radio disconnected"),
@@ -144,6 +422,7 @@ impl CommsDevice for RecoveryRadio {
             shared: self.shared.clone(),
             tx: true,
             side: self.side,
+            ready_generation: self.ready_generation.clone(),
         })))
     }
     fn set_side_id(&mut self, side: RouterSideId) {
@@ -196,14 +475,7 @@ impl CommsDevice for RecoveryRadio {
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.with_device(
             "RRLS radio disconnected".into(),
-            |error| {
-                !error.downcast_ref::<std::io::Error>().is_some_and(|error| {
-                    matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-                    )
-                })
-            },
+            |error| boxed_io_failure(error.as_ref()),
             |device| device.send_data_with_priority(payload, priority),
         )
     }
@@ -241,18 +513,89 @@ impl CommsDevice for RecoveryRadio {
 }
 #[cfg(test)]
 mod tests {
+    include!("rrls_radio/connection_generation_tests.rs");
     use super::*;
     use crate::comms_config::{SerialLinkConfig, SerialProtocol};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     fn missing() -> RecoveryRadio {
         RecoveryRadio::new(CommsLinkConfig::Serial {
             serial: SerialLinkConfig {
+                hardware_flow_control: false,
+                rfd_profile: None,
                 port: "/missing-rrls-radio-for-test".into(),
                 baud_rate: 115200,
                 protocol: SerialProtocol::RawUart,
             },
         })
     }
+    #[test]
+    fn retry_reconnect_invalidates_but_idempotent_bind_and_stale_failure_do_not() {
+        use crate::comms::retry_tracker_tests::Fixture;
+        use sedsnet::router::WriteStart;
+        for disconnect in [false, true] {
+            let fixture = Fixture::new(true);
+            let mut radio = missing();
+            radio.shared.lock().unwrap().opener = Box::new(|_| {
+                Ok(Box::new(TestRadio {
+                    online: Arc::new(AtomicBool::new(true)),
+                    ready: Arc::new(AtomicBool::new(true)),
+                    sent: Arc::new(Mutex::new(Vec::new())),
+                    alive: Arc::new(AtomicUsize::new(1)),
+                }))
+            });
+            radio.bind_retry_tracker(fixture.tracker.clone()).unwrap();
+            let (generation, _) = radio.connect().unwrap();
+            let first = fixture.publish(1);
+            assert_eq!(first.try_start(), WriteStart::Ready);
+            first.report_drained().unwrap();
+            let retry = fixture.retry();
+            fixture.finish(first.bytes());
+            radio.bind_retry_tracker(fixture.tracker.clone()).unwrap();
+            radio.disconnected(if disconnect {
+                generation
+            } else {
+                generation - 1
+            });
+            assert_eq!(retry.discard_if_retired(), !disconnect);
+        }
+    }
+
+    #[test]
+    fn operator_modem_check_holds_only_the_av_bay_radio_closed() {
+        let opened = Arc::new(AtomicUsize::new(0));
+        let make = |av_bay: bool| {
+            let radio = missing();
+            let counter = opened.clone();
+            {
+                let mut state = radio.shared.lock().unwrap();
+                state.av_bay = av_bay;
+                state.opener = Box::new(move |_| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(Box::new(TestRadio {
+                        online: Arc::new(AtomicBool::new(true)),
+                        ready: Arc::new(AtomicBool::new(true)),
+                        sent: Arc::new(Mutex::new(Vec::new())),
+                        alive: Arc::new(AtomicUsize::new(1)),
+                    }))
+                });
+            }
+            radio
+        };
+        let av_bay = make(true);
+        let other = make(false);
+        assert!(av_bay.connect().is_some());
+        assert!(other.connect().is_some());
+        let releases = crate::comms::rfd_modem::test_releases();
+        crate::comms::rfd_modem::test_set_hold(true);
+        assert!(av_bay.connect().is_none(), "held radio stays closed");
+        assert!(av_bay.shared.lock().unwrap().rx.is_none());
+        assert!(crate::comms::rfd_modem::test_releases() > releases);
+        assert!(other.connect().is_some(), "only the AV-bay radio is held");
+        crate::comms::rfd_modem::test_set_hold(false);
+        assert!(av_bay.connect().is_some(), "reopens once the check is done");
+        assert_eq!(opened.load(Ordering::SeqCst), 3);
+    }
+
     #[test]
     fn absent_radio_is_bounded_and_does_not_panic_or_fake_success() {
         let mut radio = missing();
@@ -387,7 +730,8 @@ mod tests {
     }
     #[test]
     fn reconnecting_writer_preserves_trusted_priority_metadata() {
-        struct PrioritySpy(Arc<Mutex<Vec<(u8, Vec<u8>)>>>);
+        type PriorityPackets = Arc<Mutex<Vec<(u8, Vec<u8>)>>>;
+        struct PrioritySpy(PriorityPackets);
         impl CommsDevice for PrioritySpy {
             fn try_clone_tx(&self) -> std::io::Result<Option<Box<dyn CommsDevice>>> {
                 Ok(Some(Box::new(Self(self.0.clone()))))
@@ -420,6 +764,154 @@ mod tests {
         let mut writer = radio.try_clone_tx().unwrap().unwrap();
         writer.send_data_with_priority(&[1, 2, 3], 200).unwrap();
         assert_eq!(*observed.lock().unwrap(), vec![(200, vec![1, 2, 3])]);
+    }
+    /// The primary's AV-bay radio is a RecoveryRadio: its TX worker's owed
+    /// settings turn (radio_io SETTINGS_TURN_MS) must reach the UART device.
+    /// It used to stop at the trait default, so the station-state broadcast
+    /// waited for background admission and an RRLS showed a launch 10 s late.
+    #[test]
+    fn the_owed_settings_turn_reaches_the_radio_device() {
+        struct OwedSpy(Arc<AtomicUsize>);
+        impl CommsDevice for OwedSpy {
+            fn try_clone_tx(&self) -> std::io::Result<Option<Box<dyn CommsDevice>>> {
+                Ok(Some(Box::new(Self(self.0.clone()))))
+            }
+            fn set_side_id(&mut self, _: RouterSideId) {}
+            fn recv_packet(
+                &mut self,
+                _: &Router,
+                _: &mut dyn FnMut(&Packet),
+            ) -> TelemetryResult<()> {
+                Ok(())
+            }
+            fn send_data(&mut self, _: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+                Ok(())
+            }
+            fn service_owed_settings_turn(&mut self) -> TelemetryResult<bool> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(true)
+            }
+        }
+        let radio = missing();
+        let turns = Arc::new(AtomicUsize::new(0));
+        let seen = turns.clone();
+        radio.shared.lock().unwrap().opener =
+            Box::new(move |_| Ok(Box::new(OwedSpy(seen.clone()))));
+        let mut writer = radio.try_clone_tx().unwrap().unwrap();
+        assert!(
+            writer.service_owed_settings_turn().unwrap(),
+            "the device's written frame is reported"
+        );
+        assert_eq!(turns.load(Ordering::Relaxed), 1);
+    }
+    /// The method names declared in the first `header { ... }` block of `src`.
+    fn block_methods(src: &str, header: &str) -> Vec<String> {
+        let start = src.find(header).unwrap_or_else(|| panic!("{header} not found"));
+        let mut depth = 0usize;
+        let mut end = start;
+        for (offset, ch) in src[start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = start + offset;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Only the block's own methods (four-space indent), not nested items.
+        src[start..end]
+            .lines()
+            .filter_map(|line| line.strip_prefix("    fn "))
+            .map(|rest| rest.split(|c: char| c == '(' || c == '<').next().unwrap().trim().to_string())
+            .collect()
+    }
+    /// A RecoveryRadio that falls back to a CommsDevice default instead of
+    /// asking its device silently switches the UART's behaviour off on
+    /// hardware: the primary's owed settings turn, the Abort pair (ABORT and
+    /// FLIGHT_STATE=15 in one write) and compact bundles were all off this way.
+    /// Every trait method, a new one included, must be implemented here.
+    #[test]
+    fn every_comms_device_method_is_forwarded() {
+        let trait_methods = block_methods(include_str!("comms.rs"), "pub trait CommsDevice: Send {");
+        assert!(trait_methods.len() > 20, "parsed the trait: {trait_methods:?}");
+        let wrapper = block_methods(include_str!("rrls_radio.rs"), "impl CommsDevice for RecoveryRadio {");
+        let missing: Vec<_> = trait_methods.iter().filter(|name| !wrapper.contains(name)).collect();
+        assert!(missing.is_empty(), "RecoveryRadio inherits the default of {missing:?}");
+    }
+    /// Each forwarded query answers as the device does, on the RX handle and
+    /// on a TX clone, and a disconnected radio does not claim the pair.
+    #[test]
+    fn forwarded_queries_answer_as_the_device_does() {
+        struct Answers;
+        impl CommsDevice for Answers {
+            fn try_clone_tx(&self) -> std::io::Result<Option<Box<dyn CommsDevice>>> {
+                Ok(Some(Box::new(Answers)))
+            }
+            fn set_side_id(&mut self, _: RouterSideId) {}
+            fn recv_packet(
+                &mut self,
+                _: &Router,
+                _: &mut dyn FnMut(&Packet),
+            ) -> TelemetryResult<()> {
+                Ok(())
+            }
+            fn send_data(&mut self, _: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+                Ok(())
+            }
+            fn testing_model_link(&self) -> bool {
+                true
+            }
+            fn supports_abort_pair(&self) -> bool {
+                true
+            }
+            fn ordinary_background_state(&self) -> Option<crate::comms::OrdinaryLaneState> {
+                Some(crate::comms::OrdinaryLaneState::Blocked)
+            }
+            fn transmit_ready_for(&self, priority: u8, _: &[u8]) -> bool {
+                priority == 7
+            }
+            fn command_batch_frame_len(&self, priority: u8, payload: &[u8]) -> Option<usize> {
+                Some(usize::from(priority) + payload.len())
+            }
+            fn bundle_frame_len(
+                &self,
+                priority: u8,
+                payload: &[u8],
+                first: Option<(u8, &[u8])>,
+            ) -> Option<usize> {
+                (first.is_none_or(|(p, _)| p == priority)).then_some(payload.len() + 100)
+            }
+            fn recovery_budget_configured(&self) -> bool {
+                true
+            }
+            fn receive_budget_exhausted(&self) -> bool {
+                true
+            }
+        }
+        let radio = missing();
+        assert!(!radio.supports_abort_pair(), "disconnected: no pair");
+        assert_eq!(radio.bundle_frame_len(1, &[0; 3], None), None);
+        radio.shared.lock().unwrap().opener = Box::new(|_| Ok(Box::new(Answers)));
+        assert!(radio.connect().is_some());
+        let writer = radio.try_clone_tx().unwrap().unwrap();
+        for endpoint in [&radio as &dyn CommsDevice, &*writer] {
+            assert!(endpoint.supports_abort_pair());
+            assert!(endpoint.testing_model_link());
+            assert_eq!(endpoint.bundle_frame_len(1, &[0; 3], None), Some(103));
+            assert_eq!(endpoint.bundle_frame_len(1, &[0; 3], Some((2, &[0]))), None);
+            assert_eq!(endpoint.command_batch_frame_len(4, &[0; 5]), Some(9));
+            assert_eq!(
+                endpoint.ordinary_background_state(),
+                Some(crate::comms::OrdinaryLaneState::Blocked)
+            );
+            assert!(endpoint.transmit_ready_for(7, &[]) && !endpoint.transmit_ready_for(6, &[]));
+            assert!(endpoint.recovery_budget_configured());
+            assert!(endpoint.receive_budget_exhausted());
+        }
     }
     #[test]
     fn uart_backpressure_keeps_recovery_radio_connected_and_can_resume() {

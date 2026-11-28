@@ -1,0 +1,204 @@
+{
+  "channels": [
+    {
+      "count": 5,
+      "data_type": "DAQ_POWER_MONITOR",
+      "finite_count": 5,
+      "index": 2,
+      "key": "[\"DAQ\",\"DAQ_POWER_MONITOR\",2]",
+      "label": "DAQ / DAQ_POWER_MONITOR / 2",
+      "points": [
+        [
+          1767312001000,
+          12.25
+        ],
+        [
+          1767312002000,
+          12.5
+        ],
+        [
+          1767312003000,
+          12.75
+        ],
+        [
+          1767312004000,
+          13
+        ],
+        [
+          1767312005000,
+          13.25
+        ]
+      ],
+      "regression": {
+        "status": "not_applicable"
+      },
+      "sender": "DAQ",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_unclassified"
+    },
+    {
+      "count": 5,
+      "data_type": "LOADCELL_FILL_PERCENT",
+      "finite_count": 5,
+      "index": 0,
+      "key": "[\"DAQ\",\"LOADCELL_FILL_PERCENT\",0]",
+      "label": "DAQ / LOADCELL_FILL_PERCENT / 0",
+      "points": [
+        [
+          1767312001000,
+          12.5
+        ],
+        [
+          1767312002000,
+          25
+        ],
+        [
+          1767312003000,
+          37.5
+        ],
+        [
+          1767312004000,
+          50
+        ],
+        [
+          1767312005000,
+          62.5
+        ]
+      ],
+      "regression": {
+        "epochs": [
+          {
+            "channel": {
+              "fit": null,
+              "linear": {
+                "b": 1.0,
+                "m": 2.0
+              },
+              "points": [
+                {
+                  "kg": 2.0,
+                  "raw": 0.5
+                }
+              ],
+              "zero_raw": 0.25
+            },
+            "equation": "y = f(raw) - f(zero_raw) if tare exists, else f(raw); linear: f(x)=m*x+b; polyN: descending a..e coefficients evaluated at (x-x0)",
+            "fill_source": "KG1000",
+            "fill_targets": {
+              "fill_source": "kg1000_absolute",
+              "target_kg": 8.0
+            },
+            "first_sample_ms": 1767312001000,
+            "flight_state": "NitrousFill",
+            "last_sample_ms": 1767312004000,
+            "postprocess": "clamp(100 * abs(calibrated_kg) / active_target_kg, 0, 100)",
+            "recording": "groundstation_recording_2026-01-02_00-00-00_000.db",
+            "samples": 4
+          },
+          {
+            "channel": {
+              "fit": null,
+              "linear": {
+                "b": 1.0000001,
+                "m": 2.0
+              },
+              "points": [
+                {
+                  "kg": 2.0,
+                  "raw": 0.5
+                }
+              ],
+              "zero_raw": 0.25
+            },
+            "equation": "y = f(raw) - f(zero_raw) if tare exists, else f(raw); linear: f(x)=m*x+b; polyN: descending a..e coefficients evaluated at (x-x0)",
+            "fill_source": "KG1000",
+            "fill_targets": {
+              "fill_source": "kg1000_absolute",
+              "target_kg": 9.5
+            },
+            "first_sample_ms": 1767312005000,
+            "flight_state": "Armed",
+            "last_sample_ms": 1767312005000,
+            "postprocess": "clamp(100 * abs(calibrated_kg) / active_target_kg, 0, 100)",
+            "recording": "groundstation_recording_2026-01-02_00-00-00_000.db",
+            "samples": 1
+          }
+        ],
+        "samples_without_metadata": 0,
+        "status": "recorded_calibration"
+      },
+      "sender": "DAQ",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_derived"
+    },
+    {
+      "count": 5,
+      "data_type": "KG50",
+      "finite_count": 4,
+      "index": 0,
+      "key": "[\"DAQ\",\"KG50\",0]",
+      "label": "DAQ / KG50 / 0",
+      "points": [
+        [
+          1767312001000,
+          0.1
+        ],
+        [
+          1767312002000,
+          0.2
+        ],
+        [
+          1767312003000,
+          null
+        ],
+        [
+          1767312004000,
+          0.4
+        ],
+        [
+          1767312005000,
+          0.5
+        ]
+      ],
+      "regression": {
+        "status": "not_applicable"
+      },
+      "sender": "DAQ",
+      "unit": null,
+      "unit_source": "unknown",
+      "value_kind": "recorded_raw_input"
+    },
+    {
+      "channel_label": "MCU die temperature",
+      "count": 1,
+      "data_type": "REC_BOARD_DIE_TEMPERATURE",
+      "finite_count": 1,
+      "index": 0,
+      "key": "[\"DAQ\",\"REC_BOARD_DIE_TEMPERATURE\",0]",
+      "label": "MCU die temperature",
+      "points": [
+        [
+          1767312001500,
+          32.25
+        ]
+      ],
+      "precision": "counter CSV integers exact; graph projections approximate",
+      "regression": {
+        "channel_label": "MCU die temperature",
+        "precision": "counter CSV integers exact; graph projections approximate",
+        "status": "not_applicable",
+        "unit": "°C",
+        "unit_source": "recorded_diagnostic_schema_v1"
+      },
+      "sender": "DAQ",
+      "unit": "°C",
+      "unit_source": "recorded_diagnostic_schema_v1",
+      "value_kind": "recorded_unclassified"
+    }
+  ],
+  "end_ms": 1767312005001,
+  "recorded_rows": 50,
+  "start_ms": 1767312001000
+}

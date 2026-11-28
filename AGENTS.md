@@ -13,11 +13,13 @@
 ## Build, Test, and Development Commands
 
 - `python3 build.py` builds the frontend web bundle and backend in parallel.
-- `python3 build.py testing|hitl-mode|debug|backend_only|frontend_web` enables common local build modes.
+- `python3 build.py debug|backend_only|frontend_web` selects common local builds. One backend binary holds every station
+  mode; `testing|hitl-mode|test-fire-mode` are still accepted and build the same binary.
 - `python3 build.py docker` builds Docker images; add `pi_build` for Raspberry Pi (`python3 build.py docker pi_build`).
 - `python3 build.py ios|ios_sim|macos|windows|android|linux` builds a platform-specific frontend bundle.
-- `python3 run_groundstation.py [testing|hitl-mode]` builds the frontend and runs the backend.
-- `python3 run_groundstation.py --testing|--hitl-mode` is the preferred explicit form.
+- `python3 run_groundstation.py [testing|hitl-mode]` builds the frontend and runs the backend in that station mode.
+- `python3 run_groundstation.py --testing|--hitl-mode|--test-fire-mode` is the preferred explicit form (sets
+  `GS_STATION_MODE`; modes can also be switched from the UI while idle).
 - `python3 download_map.py` downloads map data needed by the UI.
 - `cargo build -p groundstation_backend --release` builds the backend only.
 - `cargo test` runs workspace tests (add `-p <crate>` for a single crate).

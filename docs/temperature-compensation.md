@@ -6,7 +6,9 @@ uses measured unloaded drift, independently for KG1000 and KG50:
 `reference_raw = raw - raw_per_c * (adc_temperature_c - reference_c)`
 
 Mass calibration (including polynomial/tare) is applied to `reference_raw`.
-Network KG1000/KG50 remain unchanged raw values. DAQ corrects SD calibrated
+Network KG1000/KG50 carry uncorrected ADC-pin volts (`raw` names below mean
+that input; it was the DAQ legacy raw scale before calibration version 2, see
+`frontend/api.md`). DAQ corrects SD calibrated
 records; GroundStation corrects live derived values. Missing/stale temperature
 makes compensated values unavailable, rather than silently reporting uncorrected
 mass. A zero coefficient keeps legacy behavior.
@@ -49,7 +51,8 @@ Hardware timing and thermal performance still require bench validation.
   NaN indicates unavailable. CAN route follows the two load-cell streams.
 - ID 141 `DAQ_THERMAL_CALIBRATION`: retained four-float32 variable:
   `[KG1000 reference C, KG1000 raw/C, KG50 reference C, KG50 raw/C]`.
-- Existing IDs and raw load-cell scales are unchanged. Firmware restores old
+- Existing IDs are unchanged; the slopes are V/C since load cells report volts.
+  Firmware restores old
   4-float and 11-float calibration records with thermal compensation disabled.
 - GroundStation matches temperature to the same sender and only preceding
   telemetry within 2 s. New fields default to empty for older calibration JSON.

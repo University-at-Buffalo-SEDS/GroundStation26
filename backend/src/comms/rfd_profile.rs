@@ -1,0 +1,361 @@
+//! Explicit matched application/modem profile. Loading never contacts a modem.
+use crate::comms_config::{CommsLinkConfig, SerialProtocol};
+use serde::Deserialize;
+use std::sync::OnceLock;
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Profile {
+    version: u64,
+    name: String,
+    pub(crate) modem: Modem,
+    pub transport: Transport,
+}
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Modem {
+    pub(crate) serial_baud: u64,
+    pub(crate) air_bps: u64,
+    pub(crate) max_data_bytes: u64,
+    pub(crate) max_retries: u64,
+    pub(crate) broadcast_retries: u64,
+    pub(crate) serial_break_ms: u64,
+    pub(crate) tx_encapsulation: u64,
+    pub(crate) rx_encapsulation: u64,
+}
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Transport {
+    pub usable_air_bps: u64,
+    pub frame_overhead_bytes: u64,
+    pub packet_burst_ms: u64,
+    pub packet_gap_ms: u64,
+    idle_margin_ms: u64,
+    pub rf_share_percent: u64,
+    pub host_default_share_percent: u64,
+    /// Air turn-taking period (0 = off). The AV bay writes one coalesced burst
+    /// per period and the station answers in the gap after it; declared in the
+    /// budget tuple as flags bit 3, so GS, RRLS and RF ship it together.
+    #[serde(default)]
+    pub turn_period_ms: u64,
+}
+static ACTIVE: OnceLock<Option<Profile>> = OnceLock::new();
+
+impl Profile {
+    /// Modem register targets for the startup modem check.
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+    /// True for the embedded profile: the settings the deployed modems run.
+    pub(crate) fn is_embedded_default(&self) -> bool {
+        Self::parse(include_bytes!("../../comms/rfd-profile.json"))
+            .is_ok_and(|d| d.name == self.name && d.modem == self.modem)
+    }
+    pub(crate) fn modem_values(
+        &self,
+        hardware_flow_control: bool,
+        rolled_out_all_nodes: bool,
+    ) -> super::rfd_modem::ProfileValues {
+        let m = &self.modem;
+        super::rfd_modem::ProfileValues {
+            serial_baud: m.serial_baud,
+            air_bps: m.air_bps,
+            max_data_bytes: m.max_data_bytes,
+            max_retries: m.max_retries,
+            broadcast_retries: m.broadcast_retries,
+            serial_break_ms: m.serial_break_ms,
+            tx_encapsulation: m.tx_encapsulation,
+            rx_encapsulation: m.rx_encapsulation,
+            hardware_flow_control,
+            rolled_out_all_nodes,
+        }
+    }
+    pub(crate) fn recovery_budget_tuple(&self) -> Option<crate::rrls::budget_negotiation::Profile> {
+        // Derived only from this validated local application profile. This is
+        // not a claim about live modem AT values; RF must prove its own tuple.
+        Some(crate::rrls::budget_negotiation::Profile {
+            baud: self.modem.serial_baud.try_into().ok()?,
+            usable_bps: self.transport.usable_air_bps.try_into().ok()?,
+            rf_share: self.transport.rf_share_percent.try_into().ok()?,
+            overhead: self.transport.frame_overhead_bytes.try_into().ok()?,
+            burst_ms: self.transport.packet_burst_ms.try_into().ok()?,
+            gap_ms: self.transport.packet_gap_ms.try_into().ok()?,
+            flags: if self.transport.turn_period_ms > 0 {
+                crate::rrls::budget_negotiation::Profile::TURN_CADENCE
+            } else {
+                0
+            },
+        })
+    }
+    pub(crate) fn parse(bytes: &[u8]) -> anyhow::Result<Self> {
+        let profile: Self = serde_json::from_slice(bytes)?;
+        profile.validate()?;
+        Ok(profile)
+    }
+    fn validate(&self) -> anyhow::Result<()> {
+        let m = &self.modem;
+        let t = &self.transport;
+        anyhow::ensure!(
+            self.version == 1 && !self.name.is_empty() && self.name.len() <= 80,
+            "unsupported or unnamed RFD profile"
+        );
+        anyhow::ensure!(m.serial_baud == 115200, "profile UART baud must be 115200");
+        anyhow::ensure!(
+            m.air_bps == 64000,
+            "this raw ASYNC profile supports 64000 air bps"
+        );
+        anyhow::ensure!(
+            (1028..=4068).contains(&m.max_data_bytes),
+            "invalid modem packet capacity"
+        );
+        anyhow::ensure!(
+            (1..=100).contains(&m.max_retries) && m.broadcast_retries <= 100,
+            "invalid modem retry limits"
+        );
+        anyhow::ensure!(
+            (1..=500).contains(&m.serial_break_ms),
+            "raw ASYNC requires a finite serial break"
+        );
+        anyhow::ensure!(
+            m.tx_encapsulation == 0 && m.rx_encapsulation == 0,
+            "this transport implements raw ASYNC encapsulation only"
+        );
+        anyhow::ensure!(
+            (1200..=m.air_bps).contains(&t.usable_air_bps)
+                && t.frame_overhead_bytes <= 256
+                && (1..=500).contains(&t.packet_burst_ms)
+                && t.packet_gap_ms <= 1000
+                && (1..=100).contains(&t.rf_share_percent)
+                && (1..=100).contains(&t.host_default_share_percent),
+            "invalid RFD application capacity"
+        );
+        // The modem arbitrates the air itself (ASYNC with LBT and its own
+        // copies); host pacing only keeps its 4 KiB buffer from overflowing.
+        // Each host may therefore pace up to the whole usable rate; the
+        // shares no longer have to partition the air.
+        // Every broadcast packet (DESTID 32768) holds the air for 1 +
+        // GLOBAL_RETRIES copies. The application pacing (usable_air_bps) is
+        // only honest if the air can carry it with those copies: 10 retries
+        // left 64000/11 = 5818 bit/s for 32000 bit/s of host pacing, so the
+        // modems' 4 KiB buffers overflowed and most frames never arrived
+        // (bench: AV-bay data 2-4 s old, the GS heard about 11 frames/s).
+        anyhow::ensure!(
+            t.usable_air_bps * (1 + m.broadcast_retries) <= m.air_bps,
+            "usable air rate exceeds what the air carries with every broadcast copy"
+        );
+        anyhow::ensure!(
+            (5..=100).contains(&t.idle_margin_ms)
+                && t.packet_gap_ms >= m.serial_break_ms + t.idle_margin_ms,
+            "UART idle gap must exceed modem serial break with a guard margin"
+        );
+        anyhow::ensure!(
+            t.turn_period_ms == 0 || (100..=1000).contains(&t.turn_period_ms),
+            "air turn period must be 0 (off) or 100..=1000 ms"
+        );
+        let largest_burst = (m.serial_baud * t.packet_burst_ms).div_ceil(10_000) + 1028;
+        anyhow::ensure!(
+            largest_burst <= m.max_data_bytes,
+            "application burst could cross MAX_DATA inside an owned UART frame"
+        );
+        Ok(())
+    }
+}
+
+pub(crate) fn active() -> Option<&'static Profile> {
+    ACTIVE.get().and_then(Option::as_ref)
+}
+
+pub(crate) fn capacity(uart_baud: u32) -> super::rfd_capacity::Capacity {
+    if let Some(p) = active() {
+        super::rfd_capacity::Capacity::from_defaults(
+            uart_baud,
+            super::rfd_capacity::Defaults {
+                air_bps: p.transport.usable_air_bps,
+                overhead_bytes: p.transport.frame_overhead_bytes,
+                packet_burst_ms: p.transport.packet_burst_ms,
+                packet_gap_ms: p.transport.packet_gap_ms,
+                host_share_percent: p.transport.host_default_share_percent,
+            },
+        )
+        .with_turn_period(p.transport.turn_period_ms)
+        .with_turn_quiet_from_serial_break(p.modem.serial_break_ms)
+    } else {
+        super::rfd_capacity::Capacity::from_env(uart_baud)
+    }
+}
+
+pub(crate) fn initialize(link: &CommsLinkConfig) -> anyhow::Result<()> {
+    let serial = match link {
+        CommsLinkConfig::Serial { serial }
+        | CommsLinkConfig::CustomSerial { serial }
+        | CommsLinkConfig::RaspberryPiGpioUart { serial } => Some(serial),
+        _ => None,
+    };
+    let selected = std::env::var_os("GS_RADIO_PROFILE")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            serial.and_then(|s| s.rfd_profile.as_ref()).map(|path| {
+                if path.is_absolute() {
+                    path.clone()
+                } else {
+                    crate::comms_config::config_path()
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."))
+                        .join(path)
+                }
+            })
+        });
+    let raw_radio = serial.is_some_and(|s| s.protocol == SerialProtocol::RawUart);
+    let profile = if selected.is_some() || raw_radio {
+        let bytes = if let Some(path) = selected {
+            std::fs::read(path)?
+        } else {
+            include_bytes!("../../comms/rfd-profile.json").to_vec()
+        };
+        let profile = Profile::parse(&bytes)?;
+        let serial =
+            serial.ok_or_else(|| anyhow::anyhow!("RFD profile requires a serial radio link"))?;
+        anyhow::ensure!(
+            serial.baud_rate as u64 == profile.modem.serial_baud
+                && serial.protocol == SerialProtocol::RawUart,
+            "radio link does not match selected RFD profile"
+        );
+        for (key, expected) in [
+            (
+                "GS_RADIO_AIR_BIT_RATE_BPS",
+                profile.transport.usable_air_bps,
+            ),
+            (
+                "GS_RADIO_AIR_FRAME_OVERHEAD_BYTES",
+                profile.transport.frame_overhead_bytes,
+            ),
+            (
+                "GS_RADIO_PACKET_BURST_MS",
+                profile.transport.packet_burst_ms,
+            ),
+            ("GS_RADIO_PACKET_GAP_MS", profile.transport.packet_gap_ms),
+            (
+                "GS_RADIO_AIR_SHARE_PERCENT",
+                profile.transport.host_default_share_percent,
+            ),
+        ] {
+            if let Some(value) = std::env::var_os(key) {
+                anyhow::ensure!(
+                    value.to_str().and_then(|v| v.parse::<u64>().ok()) == Some(expected),
+                    "{key} conflicts with the selected RFD profile"
+                );
+            }
+        }
+        log::info!(
+            "RFD profile selected: {} (the startup modem check applies its modem registers to this station's modem only)",
+            profile.name
+        );
+        Some(profile)
+    } else {
+        None
+    };
+    ACTIVE
+        .set(profile)
+        .map_err(|_| anyhow::anyhow!("RFD profile already initialized"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn example() -> serde_json::Value {
+        serde_json::from_str(include_str!(
+            "../../../config/radio/rfd-async-64k-low-latency.json"
+        ))
+        .unwrap()
+    }
+    #[test]
+    fn the_air_turn_period_is_declared_in_the_budget_tuple() {
+        let mut v: serde_json::Value = serde_json::from_slice(include_bytes!("../../comms/rfd-profile.json")).unwrap();
+        v["transport"]["turn_period_ms"] = serde_json::json!(200);
+        let p = Profile::parse(&serde_json::to_vec(&v).unwrap()).unwrap();
+        assert_eq!(p.recovery_budget_tuple().unwrap().flags, crate::rrls::budget_negotiation::Profile::TURN_CADENCE);
+        v["transport"]["turn_period_ms"] = serde_json::json!(0);
+        assert_eq!(Profile::parse(&serde_json::to_vec(&v).unwrap()).unwrap().recovery_budget_tuple().unwrap().flags, 0);
+        v["transport"]["turn_period_ms"] = serde_json::json!(50);
+        assert!(Profile::parse(&serde_json::to_vec(&v).unwrap()).is_err(), "a turn shorter than 100 ms is refused");
+        v["transport"].as_object_mut().unwrap().remove("turn_period_ms");
+        assert_eq!(Profile::parse(&serde_json::to_vec(&v).unwrap()).unwrap().transport.turn_period_ms, 0, "absent means off");
+    }
+    #[test]
+    fn shared_profile_preserves_raw_frame_boundaries_and_bounded_capacity() {
+        let p = Profile::parse(&serde_json::to_vec(&example()).unwrap()).unwrap();
+        assert_eq!(p.transport.usable_air_bps, 32000);
+        assert_eq!(p.transport.packet_gap_ms, 15);
+    }
+    #[test]
+    fn shipping_profile_is_the_deployed_matched_modem_settings() {
+        // The startup check enforces this by default and the default build of
+        // every node applies its link-wide registers (the modems read S4=10,
+        // S5=10, S6=50 on 10-28). S5=0: on the 2026-11-10 bench pair
+        // (scripts/rfd_link_test.py) S5=1 at 10 frames/s lost 49% with a 1.0 s
+        // median round trip; S5=0 lost 5.5% at 120 ms. SEDSnet's reliable
+        // retries recover single losses.
+        let p = Profile::parse(include_bytes!("../../comms/rfd-profile.json")).unwrap();
+        assert!(p.is_embedded_default());
+        assert_eq!(p.name(), "rfd-async-64k-drain");
+        assert_eq!(p.modem.max_retries, 10);
+        assert_eq!(p.modem.broadcast_retries, 0);
+        assert_eq!(p.modem.serial_break_ms, 10);
+        assert_eq!(p.modem.max_data_bytes, 3968);
+        assert_eq!(p.transport.packet_gap_ms, 15);
+        assert_eq!(p.transport.usable_air_bps, 30000);
+        assert_eq!(p.transport.host_default_share_percent, 100);
+        assert_eq!(p.transport.rf_share_percent, 100);
+    }
+    /// The deployed modems broadcast every packet 1 + 10 times; the host
+    /// pacing assumed 32000 bit/s of the 64000 bit/s air. Faithful
+    /// simulation (7 boards, Normal, Idle): the GS heard 2.9 frames/s from
+    /// the AV bay with S5=10 and 10.3 frames/s with S5=1; RF data age p50
+    /// 2034 ms -> 254 ms, FC 669 ms -> 203 ms.
+    #[test]
+    fn usable_air_rate_fits_the_broadcast_copies() {
+        let mut v: serde_json::Value =
+            serde_json::from_slice(include_bytes!("../../comms/rfd-profile.json")).unwrap();
+        assert!(Profile::parse(&serde_json::to_vec(&v).unwrap()).is_ok());
+        v["modem"]["broadcast_retries"] = 10.into();
+        assert!(
+            Profile::parse(&serde_json::to_vec(&v).unwrap()).is_err(),
+            "32000 bit/s of pacing cannot fit 11 copies of every packet on 64000 bit/s air"
+        );
+    }
+    #[test]
+    fn one_retry_layer_profile_is_opt_in() {
+        let p = Profile::parse(include_bytes!(
+            "../../../config/radio/rfd-async-64k-one-retry-layer.json"
+        ))
+        .unwrap();
+        assert!(!p.is_embedded_default());
+        assert_eq!((p.modem.broadcast_retries, p.modem.serial_break_ms), (0, 20));
+        // It keeps its own transport tuple (55 ms gap, shares); GS and RRLS
+        // that select it negotiate the recovery budget with that tuple.
+        assert_eq!(p.transport.packet_gap_ms, 55);
+    }
+    #[test]
+    fn mismatched_or_unbounded_profiles_are_rejected() {
+        for (section, key, value) in [
+            ("modem", "serial_break_ms", 0),
+            ("modem", "serial_break_ms", 50),
+            ("modem", "max_data_bytes", 1028),
+            ("modem", "max_retries", 0),
+            ("modem", "tx_encapsulation", 2),
+            ("transport", "usable_air_bps", 64001),
+            ("transport", "rf_share_percent", 101),
+            ("transport", "host_default_share_percent", 101),
+            ("transport", "packet_burst_ms", 500),
+            ("transport", "packet_gap_ms", 10),
+            ("transport", "rf_share_percent", 0),
+        ] {
+            let mut v = example();
+            v[section][key] = value.into();
+            assert!(
+                Profile::parse(&serde_json::to_vec(&v).unwrap()).is_err(),
+                "{section}.{key}"
+            );
+        }
+    }
+}

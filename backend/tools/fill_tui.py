@@ -225,10 +225,6 @@ def build_command_groups(include_hitl: bool) -> list[tuple[str, list[CommandSpec
                             "FlightComputerCommands"),
                 CommandSpec("ReinitSensors", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 17,
                             "FlightComputerCommands"),
-                CommandSpec("EvaluationRelax", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 14,
-                            "FlightComputerCommands"),
-                CommandSpec("EvaluationFocus", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 15,
-                            "FlightComputerCommands"),
                 CommandSpec("EvaluationAbort", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 16,
                             "FlightComputerCommands"),
                 CommandSpec("ReinitBarometer", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 18,
@@ -256,23 +252,17 @@ def build_command_groups(include_hitl: bool) -> list[tuple[str, list[CommandSpec
             ]
         )
 
+    # Network FLIGHT_STATE carries only set (a) (state-split contract): fill
+    # sub-phases stay inside the ground station; the FC reports InFlight.
     flight_state = [
         CommandSpec("Startup", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 0, "FlightState"),
         CommandSpec("Idle", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 1, "FlightState"),
-        CommandSpec("PreFill", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 2, "FlightState"),
-        CommandSpec("FillTest", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 3, "FlightState"),
-        CommandSpec("NitrogenFill", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 4, "FlightState"),
-        CommandSpec("NitrousFill", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 5, "FlightState"),
+        CommandSpec("Fill", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 2, "FlightState"),
         CommandSpec("Armed", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 6, "FlightState"),
         CommandSpec("LaunchState", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 7, "FlightState"),
-        CommandSpec("Ascent", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 8, "FlightState"),
-        CommandSpec("Coast", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 9, "FlightState"),
-        CommandSpec("Apogee", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 10, "FlightState"),
-        CommandSpec("ParachuteDeploy", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 11, "FlightState"),
-        CommandSpec("Descent", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 12, "FlightState"),
         CommandSpec("Landed", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 13, "FlightState"),
-        CommandSpec("Recovery", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 14, "FlightState"),
         CommandSpec("Aborted", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 15, "FlightState"),
+        CommandSpec("InFlight", FLIGHT_STATE_TYPE, FLIGHT_STATE_ENDPOINT, 16, "FlightState"),
     ]
 
     valve = [

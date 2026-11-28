@@ -19,6 +19,10 @@ pub struct Saved {
     pub baseline: Option<Baseline>,
     pub fill_target_kg: Option<f32>,
     #[serde(default)]
+    pub turbocharge: Option<gse_sequence::turbocharge::Evidence>,
+    #[serde(default)]
+    pub turbocharge_binding: Option<serde_json::Value>,
+    #[serde(default)]
     pub pending_checklists: Vec<crate::checklists::CompletionEvent>,
     #[serde(default)]
     pub checklist_digest: Option<String>,
@@ -68,24 +72,26 @@ impl Saved {
                 return Err("Invalid pending sequence completion event".into());
             }
         }
-        if let Some(b) = &self.baseline {
-            if b.samples < 3
+        if self.turbocharge.as_ref().is_some_and(|e| !e.valid()) {
+            return Err("Invalid saved Turbocharge evidence".into());
+        }
+        if let Some(b) = &self.baseline
+            && (b.samples < 3
                 || ![b.average_psi, b.min_psi, b.max_psi, b.noise_psi]
                     .into_iter()
                     .all(f32::is_finite)
                 || b.min_psi > b.average_psi
                 || b.average_psi > b.max_psi
-                || b.noise_psi < 0.0
+                || b.noise_psi < 0.0)
             {
                 return Err("Invalid saved pressure baseline".into());
             }
-        }
         if self.qualification.nitrogen_satisfied() && self.baseline.is_none() {
             return Err("Saved nitrogen test has no pressure baseline".into());
         }
         if self
             .fill_target_kg
-            .is_some_and(|v| !v.is_finite() || v <= 0.0)
+            .is_some_and(|v| !v.is_finite() || v == 0.0)
             || (self.qualification.completed(Milestone::FillTarget)
                 && self.fill_target_kg.is_none())
         {
@@ -112,15 +118,32 @@ impl Saved {
         }
     }
     pub fn save(&self, path: &Path) -> Result<(), String> {
+        self.save_via(path, path.with_extension("upload"))
+    }
+    /// `save` through a temporary file of its own, for a write made without
+    /// the GSE lock while a `save` under it may be running.
+    pub(super) fn save_aside(&self, path: &Path) -> Result<(), String> {
+        self.save_via(path, path.with_extension(format!("upload-{:016x}", rand::random::<u64>())))
+    }
+    fn save_via(&self, path: &Path, temporary: PathBuf) -> Result<(), String> {
         self.validate()?;
+        let bytes = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
+        if bytes.len() > 16384 {
+            return Err("Qualification record exceeds its existing16KiB bound".into());
+        }
         let parent = path.parent().ok_or("Missing qualification directory")?;
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        let temporary = path.with_extension("upload");
         let result = (|| -> std::io::Result<()> {
             let mut file = std::fs::File::create(&temporary)?;
-            file.write_all(&serde_json::to_vec_pretty(self)?)?;
+            file.write_all(&bytes)?;
+            #[cfg(test)]
+            persist_diagnostic::before_sync(path)?;
+            #[cfg(test)]
+            crate::disk_stall::wait(crate::disk_stall::Site::Qualification);
             file.sync_all()?;
             std::fs::rename(&temporary, path)?;
+            #[cfg(test)]
+            persist_diagnostic::saved(path, self);
             std::fs::File::open(parent)?.sync_all()
         })();
         if result.is_err() {
@@ -129,9 +152,21 @@ impl Saved {
         result.map_err(|e| e.to_string())
     }
 }
+/// What committing the Fire stage replaced: kept so that a Launch none of
+/// whose packets was taken can be undone exactly (`gse::launch_undo`).
+#[derive(Clone, Debug)]
+pub struct FireRecord {
+    pub(super) prior: Qualification,
+    pub(super) committed: Qualification,
+    /// The pending checklist event that cleared the nitrogen test's items.
+    pub(super) clear_event: String,
+}
 #[derive(Default)]
 pub struct Operational {
     pub saved: Saved,
+    /// Counts writes of `saved` to its file, so a write made outside the GSE
+    /// lock can tell whether another one landed meanwhile.
+    pub(super) writes: u64,
     pub path: Option<PathBuf>,
     pub run_generation: u64,
     pub running: bool,
@@ -143,7 +178,8 @@ pub struct Operational {
     pub topology_healthy: bool,
     pub startup_configured: bool,
     pub qd: QdWait,
-    pub qd_dispatch_utc_ms: Option<u64>,
+    pub qd_dispatch_stamp: Option<crate::network_stamp::Stamp>,
+    pub(super) qd_launch_admission: Option<super::LaunchAdmission>,
     pub persist_error: Option<String>,
 }
 impl Operational {
@@ -162,6 +198,7 @@ impl Operational {
                 .is_some_and(|since| now.saturating_sub(since) >= 2_000);
     }
     pub fn persist(&mut self) -> Result<(), String> {
+        self.writes += 1;
         let result = self
             .path
             .as_ref()
@@ -179,7 +216,10 @@ impl Operational {
         }
         let mut next = self.saved.clone();
         next.automatic_abort_claimed = false;
-        let result = self.path.as_ref()
+        self.writes += 1;
+        let result = self
+            .path
+            .as_ref()
             .ok_or_else(|| "Qualification storage is not initialized".to_string())
             .and_then(|path| next.save(path));
         if let Err(error) = result {
@@ -245,20 +285,27 @@ impl Operational {
         self.persist()?;
         self.flush_checklists()
     }
-    pub fn commit_fire(&mut self) -> Result<(), String> {
+    pub fn commit_fire(&mut self) -> Result<FireRecord, String> {
         self.bind_checklists()?;
         if !self.saved.pending_checklists.is_empty() {
             return Err("Save pending checklist progress first".into());
         }
         let mut next = self.saved.clone();
         next.qualification.commit_fire().map_err(str::to_string)?;
+        let clear_event = crate::checklists::paired::completion_event_id();
         next.pending_checklists
             .push(crate::checklists::CompletionEvent {
-                id: crate::checklists::paired::completion_event_id(),
+                id: clear_event.clone(),
                 sequence: crate::checklists::Sequence::NitrogenTest,
                 at_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
                 action: crate::checklists::CompletionAction::Clear,
             });
+        let record = FireRecord {
+            prior: self.saved.qualification.clone(),
+            committed: next.qualification.clone(),
+            clear_event,
+        };
+        self.writes += 1;
         let result = self
             .path
             .as_ref()
@@ -270,7 +317,49 @@ impl Operational {
         }
         result?;
         self.saved = next;
-        Ok(())
+        Ok(record)
+    }
+    /// The record with `fire` undone, built from the current one: the
+    /// qualification from before Fire, and the nitrogen test's checklist
+    /// progress back (its Clear is dropped if it was never delivered;
+    /// otherwise `restore`, the event that re-completes it, is queued).
+    /// Refused if the qualification changed since Fire was committed.
+    /// Ok(None): it is already undone.
+    pub(super) fn fire_undone(
+        &self,
+        fire: &FireRecord,
+        restore: &crate::checklists::CompletionEvent,
+    ) -> Result<Option<Saved>, String> {
+        if self.saved.qualification == fire.prior
+            && !self.saved.pending_checklists.iter().any(|event| event.id == fire.clear_event)
+        {
+            return Ok(None);
+        }
+        if self.saved.qualification != fire.committed {
+            return Err("the qualification changed after the Launch was recorded".into());
+        }
+        let mut next = self.saved.clone();
+        next.qualification = fire.prior.clone();
+        if let Some(at) = next.pending_checklists.iter().position(|event| event.id == fire.clear_event) {
+            next.pending_checklists.remove(at);
+        } else if !next.pending_checklists.iter().any(|event| event.id == restore.id) {
+            next.pending_checklists.push(restore.clone());
+        }
+        next.validate()?;
+        Ok(Some(next))
+    }
+    /// The checklist event that gives back the nitrogen test progress Fire
+    /// cleared: passed, or the cold-flow override it had.
+    pub(super) fn fire_restore_event(fire: &FireRecord) -> crate::checklists::CompletionEvent {
+        crate::checklists::CompletionEvent {
+            id: crate::checklists::paired::completion_event_id(),
+            sequence: crate::checklists::Sequence::NitrogenTest,
+            at_ms: crate::telemetry_task::get_current_timestamp_ms() as i64,
+            action: match fire.prior.nitrogen_override() {
+                Some(evidence) => crate::checklists::CompletionAction::Override { operator: evidence.operator.clone() },
+                None => crate::checklists::CompletionAction::Passed,
+            },
+        }
     }
     pub fn flush_checklists(&mut self) -> Result<(), String> {
         if crate::checklists::paired::requested() {
@@ -346,6 +435,7 @@ mod tests {
     use super::*;
     #[test]
     fn saved_template_binding_and_local_reset_receipts_survive_restart() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let path = std::env::temp_dir().join(format!(
             "gse-paired-binding-{}.json",
             rand::random::<u128>()
@@ -396,6 +486,7 @@ mod tests {
     }
     #[test]
     fn restart_retains_ordered_tests_but_never_resumes_outputs_or_queued_launch() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let path = std::env::temp_dir().join(format!(
             "gse-qualification-{}-{}.json",
             std::process::id(),
@@ -432,12 +523,14 @@ mod tests {
     }
     #[test]
     fn corrupt_or_missing_baseline_cannot_restore_fill_permission() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let invalid = r#"{"qualification":{"version":1,"generation":0,"self_test":true,"nitrogen_test":true,"fill_target":false,"fault":null},"baseline":null,"fill_target_kg":null}"#;
         let record: Saved = serde_json::from_str(invalid).unwrap();
         assert!(record.validate().is_err());
     }
     #[test]
     fn topology_must_settle_again_after_loss_or_route_change() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let mut op = Operational::default();
         op.topology(0, true, "a".into());
         op.topology(1999, true, "a".into());
@@ -459,6 +552,7 @@ mod checklist_outbox_tests {
     use super::*;
     #[test]
     fn restart_retries_the_same_saved_event_and_storage_failure_never_acks_it() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let path = std::env::temp_dir().join(format!("gse-outbox-{}.json", rand::random::<u128>()));
         let mut op = Operational {
             path: Some(path.clone()),
@@ -493,8 +587,8 @@ mod checklist_outbox_tests {
     }
     #[test]
     fn unfinished_or_stale_runs_cannot_enqueue_a_success() {
-        let mut op = Operational::default();
-        op.run_generation = 1;
+        crate::mode_suite!(Normal, TestFire, Testing);
+        let mut op = Operational { run_generation: 1, ..Operational::default() };
         assert!(op.complete(Milestone::SelfTest).is_err());
         assert!(op.saved.pending_checklists.is_empty());
         assert!(!op.saved.qualification.completed(Milestone::SelfTest));
@@ -506,6 +600,7 @@ mod fire_persistence_tests {
     use super::*;
     #[test]
     fn failed_fire_save_never_consumes_the_armed_evidence_in_memory() {
+        crate::mode_suite!(Normal, TestFire, Testing);
         let path =
             std::env::temp_dir().join(format!("gse-fire-blocked-{}", rand::random::<u128>()));
         std::fs::create_dir(&path).unwrap();
@@ -542,5 +637,66 @@ mod fire_persistence_tests {
             Some(Fault::MissingTelemetry)
         );
         std::fs::remove_dir(path).unwrap();
+    }
+}
+
+// Private diagnostic successor only: exact-path, one-shot, bounded test gate.
+#[cfg(test)]
+pub(in crate::gse) mod persist_diagnostic {
+    use std::{
+        io,
+        path::{Path, PathBuf},
+        sync::{Mutex, mpsc},
+        time::{Duration, Instant},
+    };
+    struct Gate {
+        path: PathBuf,
+        entered: mpsc::Sender<Instant>,
+        release: mpsc::Receiver<()>,
+    }
+    static GATE: Mutex<Option<Gate>> = Mutex::new(None);
+    /// What each record on disk said, in order: the automatic-abort claim and
+    /// whether Fire was committed.
+    static SAVED: Mutex<Vec<(PathBuf, bool, bool)>> = Mutex::new(Vec::new());
+    pub(super) fn saved(path: &Path, record: &super::Saved) {
+        let fire = record.qualification.stage() == gse_sequence::qualification::MissionStage::Fire;
+        SAVED.lock().unwrap().push((path.to_path_buf(), record.automatic_abort_claimed, fire));
+    }
+    pub fn take_saved(path: &Path) -> Vec<(bool, bool)> {
+        let mut all = SAVED.lock().unwrap();
+        let (mine, others) = all.drain(..).partition::<Vec<_>, _>(|entry| entry.0 == path);
+        *all = others;
+        mine.into_iter().map(|(_, claimed, fire)| (claimed, fire)).collect()
+    }
+    pub fn arm(path: PathBuf) -> (mpsc::Receiver<Instant>, mpsc::Sender<()>) {
+        let (entry_tx, entry_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut gate = GATE.lock().unwrap();
+        assert!(gate.is_none(), "diagnostic already armed");
+        *gate = Some(Gate {
+            path,
+            entered: entry_tx,
+            release: release_rx,
+        });
+        (entry_rx, release_tx)
+    }
+    pub(super) fn before_sync(path: &Path) -> io::Result<()> {
+        let gate = {
+            let mut slot = GATE.lock().unwrap();
+            if slot.as_ref().is_some_and(|g| g.path == path) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(gate) = gate {
+            gate.entered
+                .send(Instant::now())
+                .map_err(|_| io::Error::other("diagnostic observer disappeared"))?;
+            gate.release
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(|_| io::Error::other("diagnostic bounded persist barrier expired"))?;
+        }
+        Ok(())
     }
 }

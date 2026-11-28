@@ -4,8 +4,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use std::collections::{BTreeMap, VecDeque};
 
-#[path = "../comms/virtual_uart.rs"]
-mod virtual_uart;
+use crate::comms::virtual_uart;
 
 #[derive(Deserialize)]
 struct Fixture {
@@ -44,11 +43,11 @@ fn captured_canonical_unsequenced_controls_preserve_the_interactive_boundary_tag
         .iter()
         .any(|prefix| event.label.starts_with(prefix))
     }) {
-        let bytes = STANDARD.decode(&event.payload).unwrap();
+        let bytes = from_rr_v1_for_test(&STANDARD.decode(&event.payload).unwrap());
         let Some((_, body)) = decode(&bytes) else {
             continue;
         };
-        if body.starts_with(b"SDT") {
+        if sedsnet::side_peek::is_side_transport_frame(body) {
             continue;
         }
         let info = sedsnet::wire_format::peek_frame_info(body).unwrap();
@@ -62,7 +61,7 @@ fn captured_canonical_unsequenced_controls_preserve_the_interactive_boundary_tag
             .events
             .iter()
             .find_map(|event| {
-                let bytes = STANDARD.decode(&event.payload).unwrap();
+                let bytes = from_rr_v1_for_test(&STANDARD.decode(&event.payload).unwrap());
                 decode(&bytes)
                     .filter(|(kind, body)| *kind == HEALTH && body.len() == 9 && body[8] == 0)
                     .map(|_| bytes.clone())
@@ -83,7 +82,7 @@ fn captured_canonical_unsequenced_controls_preserve_the_interactive_boundary_tag
         relay.enqueue(
             Outgoing {
                 command: false,
-                bytes: encode(DOWN_DATA, b"SDT\x03opaque"),
+                bytes: encode(DOWN_DATA, b"\x61opaque"),
             },
             253,
             0,
@@ -127,9 +126,9 @@ fn captured_control_can_borrow_after_184ms_bulk_debt_with_health_pending() {
         .iter()
         .filter(|event| event.label.starts_with("AV_BAY_UNDERGLOW:"))
         .find_map(|event| {
-            let bytes = STANDARD.decode(&event.payload).unwrap();
+            let bytes = from_rr_v1_for_test(&STANDARD.decode(&event.payload).unwrap());
             let (_, body) = decode(&bytes)?;
-            (!body.starts_with(b"SDT")).then(|| body.to_vec())
+            (!sedsnet::side_peek::is_side_transport_frame(body)).then(|| body.to_vec())
         })
         .unwrap();
     assert!(crate::comms::closes_radio_packet_batch(254, &command));
@@ -214,7 +213,7 @@ fn captured_bidirectional_relay_burst_retains_source_and_canonical_deadlines() {
     let bytes: Vec<_> = fixture
         .events
         .iter()
-        .map(|e| STANDARD.decode(&e.payload).unwrap())
+        .map(|e| from_rr_v1_for_test(&STANDARD.decode(&e.payload).unwrap()))
         .collect();
     let mut pending = BTreeMap::<(u8, Vec<u8>), VecDeque<usize>>::new();
     let mut outcomes = BTreeMap::<usize, u64>::new();
@@ -431,13 +430,13 @@ fn ordinary_source_progress_survives_routine_heartbeat_without_metadata() {
         .iter()
         .find(|e| e.label.starts_with("BAROMETER_DATA:"))
         .unwrap();
-    let source = STANDARD.decode(&event.payload).unwrap();
+    let source = from_rr_v1_for_test(&STANDARD.decode(&event.payload).unwrap());
     let heartbeat = fixture
         .events
         .iter()
         .filter(|e| e.routine_uplink_heartbeat)
         .find_map(|e| {
-            let bytes = STANDARD.decode(&e.payload).unwrap();
+            let bytes = from_rr_v1_for_test(&STANDARD.decode(&e.payload).unwrap());
             let (kind, body) = decode(&bytes)?;
             (kind == UP_DATA).then(|| encode(AV_BAY_DATA, body))
         })

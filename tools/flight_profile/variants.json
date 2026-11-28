@@ -1,0 +1,52 @@
+{
+  "_about": "Committed IGT datasets (test-data/igt/<name>/). 'set' overrides vehicle.json keys; 'tune' rescales the motor impulse (measured curve shape) to an apogee; 'motor_from' reuses another variant's tuned impulse; 'glitches' are injected sensor faults (see sensors.py). Order matters: a variant's motor_from must come earlier.",
+  "variants": [
+    {
+      "name": "nominal_10k",
+      "description": "nominal flight to 10,000 ft (measured curve shape, scaled impulse)",
+      "seed": 1,
+      "tune": {"apogee_m": 3048.0}
+    },
+    {
+      "name": "measured_motor",
+      "description": "the 2026-11-16 measured motor, unscaled, on the SWEET_V6 airframe",
+      "seed": 11
+    },
+    {
+      "name": "high_wind",
+      "description": "nominal motor in 9 m/s (20 mph, the SA Cup launch limit) wind with 3 m/s gusts",
+      "seed": 2,
+      "motor_from": "nominal_10k",
+      "set": {"environment.wind_mps": 9.0, "environment.gust_sigma_mps": 3.0, "environment.gust_tau_s": 3.0}
+    },
+    {
+      "name": "early_apogee_noise",
+      "description": "Kalman stress: noisy baro, large Mach/port error, outliers, a false-descent pressure step before apogee, big ejection spikes",
+      "seed": 3,
+      "motor_from": "nominal_10k",
+      "set": {"sensors.baro.noise_pa": 6.0, "sensors.baro.port_cp_subsonic": -0.03,
+              "sensors.baro.port_cp_transonic": -0.12, "sensors.baro.ejection_spike_pa": 1200.0},
+      "notes": "baro raw noise 6 Pa (3x), static-port Cp -0.03 subsonic / -0.12 transonic (reads high during boost), 1200 Pa ejection pulses (about -110 m at the drogue), plus:",
+      "glitches": [
+        {"sensor": "baro", "kind": "outliers", "at": "liftoff", "dur_s": 60.0, "pa": 150.0, "prob": 0.02},
+        {"sensor": "baro", "kind": "spike", "at": "apogee-8", "dur_s": 0.4, "pa": 350.0},
+        {"sensor": "baro", "kind": "noise", "at": "apogee-5", "dur_s": 10.0, "scale": 3.0}
+      ]
+    },
+    {
+      "name": "off_nominal",
+      "description": "FC logic: late/hard main (opens at 300 m), IMU saturation glitch, baro freeze, GPS dropout and jump",
+      "seed": 4,
+      "motor_from": "nominal_10k",
+      "set": {"recovery.main_deploy_alt_agl_m": 300.0, "recovery.main_fill_s": 1.0,
+              "recovery.main_opening_overshoot": 1.6},
+      "notes": "the main physically opens at 300 m instead of 457 m (the FC still commands it at 457 m; the data keeps the drogue rate down to 300 m), with a harder opening, plus:",
+      "glitches": [
+        {"sensor": "imu", "kind": "spike", "at": "burnout+6", "dur_s": 0.01, "accel_mps2": [400.0, 0.0, -400.0], "gyro_dps": [0.0, 2500.0, 0.0]},
+        {"sensor": "baro", "kind": "stuck", "at": "drogue+40", "dur_s": 2.0},
+        {"sensor": "gps", "kind": "dropout", "at": "drogue+30", "dur_s": 15.0},
+        {"sensor": "gps", "kind": "jump", "at": "main-20", "dur_s": 1.0, "east_m": 60.0}
+      ]
+    }
+  ]
+}

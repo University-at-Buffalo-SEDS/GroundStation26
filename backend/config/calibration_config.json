@@ -17,8 +17,9 @@
       "label": "1000kg",
       "data_type": "KG1000",
       "channel": "ch1",
+      "sender_id": "DAQ",
       "fit_color": "#22d3ee",
-      "raw_label": "Raw",
+      "raw_label": "V",
       "expected_label": "kg",
       "formatter": {
         "precision": 7
@@ -40,8 +41,9 @@
       "label": "50kg",
       "data_type": "KG50",
       "channel": "kg50",
+      "sender_id": "DAQ",
       "fit_color": "#f59e0b",
-      "raw_label": "Raw",
+      "raw_label": "V",
       "expected_label": "kg",
       "formatter": {
         "precision": 7
@@ -60,8 +62,8 @@
     },
     {
       "id": "IADC",
-      "label": "Tank Pressure",
-      "data_type": "FUEL_TANK_PRESSURE",
+      "label": "Ox Tank Pressure",
+      "data_type": "OX_TANK_PRESSURE",
       "channel": "iadc",
       "fit_color": "#a78bfa",
       "raw_label": "Raw",

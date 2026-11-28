@@ -20,13 +20,16 @@ pub fn initialize() -> anyhow::Result<()> {
         .get_or_init(|| {
             register_firmware_compatible_schema()?;
             for (name, expected) in [
+                ("ABORT", types::ABORT),
                 ("GPS_DATA", types::GPS_DATA),
                 ("BAROMETER_DATA", types::BAROMETER_DATA),
                 ("FUEL_FLOW", types::FUEL_FLOW),
+                ("OX_TANK_PRESSURE", types::OX_TANK_PRESSURE),
                 ("FUEL_TANK_PRESSURE", types::FUEL_TANK_PRESSURE),
                 ("BATTERY_VOLTAGE", types::BATTERY_VOLTAGE),
                 ("BATTERY_CURRENT", types::BATTERY_CURRENT),
                 ("KG1000", types::KG1000),
+                ("DAQ_LOADCELL_CHAMBER", types::DAQ_LOADCELL_CHAMBER),
                 ("KG50", types::KG50),
                 ("GPS_SATELLITE_NUMBER", types::GPS_SATELLITE_NUMBER),
                 ("ASCENT_STATE", types::ASCENT_STATE),
@@ -66,9 +69,237 @@ pub fn data_type(name: &str) -> DataType {
     DataType::named(name)
 }
 
+/// The valve board's oxidiser tank pressure transducer (psi, f32 x 1).
+pub const OX_TANK_PRESSURE: &str = "OX_TANK_PRESSURE";
+/// The same PT's former, inaccurate name. Older valve-board firmware, board SD
+/// cards, recordings, layouts and saved dashboards still carry it; the
+/// schema keeps the type so those decode, and the station maps it to
+/// [`OX_TANK_PRESSURE`] wherever a type name enters (live ingress, replay,
+/// SD import, layout load, API filters).
+pub const LEGACY_FUEL_TANK_PRESSURE: &str = "FUEL_TANK_PRESSURE";
+
+/// Maps a legacy telemetry type name to its canonical name; every other name
+/// is returned unchanged.
+pub fn canonical_type_name(name: &str) -> &str {
+    if name == LEGACY_FUEL_TANK_PRESSURE {
+        OX_TANK_PRESSURE
+    } else {
+        name
+    }
+}
+
+/// Type names a recorded-data filter must match for the requested canonical
+/// names: each canonical name also matches its legacy rows (and a legacy name
+/// in an old saved filter also matches canonical rows).
+pub fn expand_type_filter(types: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = types.to_vec();
+    for name in types {
+        let alias = if name == OX_TANK_PRESSURE {
+            LEGACY_FUEL_TANK_PRESSURE
+        } else if name == LEGACY_FUEL_TANK_PRESSURE {
+            OX_TANK_PRESSURE
+        } else {
+            continue;
+        };
+        if !out.iter().any(|t| t == alias) {
+            out.push(alias.to_string());
+        }
+    }
+    out
+}
+
+/// True for the ox tank PT under either its current or its legacy wire id.
+pub fn is_ox_tank_pressure(ty: DataType) -> bool {
+    ty == types::OX_TANK_PRESSURE || ty == types::FUEL_TANK_PRESSURE
+}
+
+/// BAROMETER_DATA element order on the wire: the FC sends its
+/// `baro { alt, prs, tmp }` struct whole (schema: "alt, prs, tmp").
+pub mod baro {
+    /// Altitude above the FC's ground reference, metres.
+    pub const ALTITUDE_M: usize = 0;
+    /// Compensated static pressure, pascals.
+    pub const PRESSURE_PA: usize = 1;
+    /// Sensor temperature, degrees Celsius.
+    pub const TEMPERATURE_C: usize = 2;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// OX_TANK_PRESSURE is the ox tank PT's canonical type; FUEL_TANK_PRESSURE
+    /// stays decodable as its legacy alias. Both are name-hash wire ids (no
+    /// explicit "id"), so a board schema naming OX_TANK_PRESSURE gets the
+    /// same id as the station without coordination.
+    #[test]
+    fn ox_tank_pressure_and_its_legacy_alias_share_one_shape() {
+        initialize().unwrap();
+        let config: serde_json::Value = serde_json::from_slice(SCHEMA_JSON).unwrap();
+        let entry = |name: &str| {
+            let mut ty = config["types"].as_array().unwrap().iter()
+                .find(|ty| ty["name"] == name).unwrap().clone();
+            assert!(ty.get("id").is_none(), "{name} must keep its name-derived id");
+            ty.as_object_mut().unwrap().remove("name");
+            ty.as_object_mut().unwrap().remove("doc");
+            ty
+        };
+        assert_eq!(entry("OX_TANK_PRESSURE"), entry("FUEL_TANK_PRESSURE"));
+        assert_ne!(types::OX_TANK_PRESSURE, types::FUEL_TANK_PRESSURE);
+        assert_eq!(data_type("OX_TANK_PRESSURE"), types::OX_TANK_PRESSURE);
+        assert!(is_ox_tank_pressure(types::OX_TANK_PRESSURE));
+        assert!(is_ox_tank_pressure(types::FUEL_TANK_PRESSURE));
+        assert_eq!(canonical_type_name("FUEL_TANK_PRESSURE"), "OX_TANK_PRESSURE");
+        assert_eq!(canonical_type_name("OX_TANK_PRESSURE"), "OX_TANK_PRESSURE");
+        assert_eq!(
+            expand_type_filter(&["OX_TANK_PRESSURE".into(), "KG50".into()]),
+            ["OX_TANK_PRESSURE", "KG50", "FUEL_TANK_PRESSURE"]
+        );
+        println!(
+            "OX_TANK_PRESSURE id {} (legacy FUEL_TANK_PRESSURE id {})",
+            types::OX_TANK_PRESSURE.0,
+            types::FUEL_TANK_PRESSURE.0
+        );
+    }
+
+    #[test]
+    fn daq_storage_types_keep_distinct_canonical_ids_and_shapes() {
+        initialize().unwrap();
+        assert_eq!(data_type("DAQ_SD_HEALTH").as_u32(), 92486907);
+        assert_eq!(data_type("DAQ_SD_RETRY").as_u32(), 24116261);
+        assert_eq!(data_type("DAQ_LAUNCH_LOG_STATUS").as_u32(), 203505696);
+        // DAQ-Board SEDS_DT_DAQ_INPUT_HEALTH.
+        assert_eq!(data_type("DAQ_INPUT_HEALTH").as_u32(), 188337040);
+        for (name, count) in [
+            ("BOARD_HEALTH", 24),
+            ("DAQ_SD_HEALTH", 8),
+            ("DAQ_SD_RETRY", 1),
+            ("DAQ_LAUNCH_LOG_STATUS", 7),
+            ("DAQ_INPUT_HEALTH", 28),
+        ] {
+            let good = vec![0u8; count * 4];
+            assert!(
+                sedsnet::packet::Packet::new(
+                    data_type(name),
+                    &[endpoint("GROUND_STATION")],
+                    "DAQ",
+                    1,
+                    good.into()
+                )
+                .is_ok()
+            );
+            let bad = vec![0u8; (count + 1) * 4];
+            assert!(
+                sedsnet::packet::Packet::new(
+                    data_type(name),
+                    &[endpoint("GROUND_STATION")],
+                    "DAQ",
+                    1,
+                    bad.into()
+                )
+                .is_err()
+            );
+        }
+        let config: serde_json::Value = serde_json::from_slice(SCHEMA_JSON).unwrap();
+        let retry = config["types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|ty| ty["name"] == "DAQ_SD_RETRY")
+            .unwrap();
+        assert_eq!(retry["reliable"], "Unordered");
+        assert_eq!(retry["class"], "Data");
+    }
+
+    #[test]
+    fn daq_mcp_reference_keeps_the_firmware_id_and_shape() {
+        initialize().unwrap();
+        // DAQ-Board SEDS_DT_DAQ_MCP_REFERENCE: one f32, volts.
+        assert_eq!(data_type("DAQ_MCP_REFERENCE").as_u32(), 255135887);
+        let packet = |bytes: usize| {
+            sedsnet::packet::Packet::new(
+                data_type("DAQ_MCP_REFERENCE"),
+                &[endpoint("SD_CARD")],
+                "GS",
+                1,
+                vec![0u8; bytes].into(),
+            )
+        };
+        assert!(packet(4).is_ok());
+        assert!(packet(8).is_err());
+    }
+
+    #[test]
+    fn daq_dac_types_keep_canonical_ids_and_byte_shapes() {
+        initialize().unwrap();
+        assert_eq!(data_type("DAQ_DAC_COMMAND").as_u32(), 206667655);
+        assert_eq!(data_type("DAQ_DAC_STATUS").as_u32(), 160950952);
+        assert_eq!(data_type("DAQ_DAC_TABLE").as_u32(), 6815706);
+        for (name, endpoint_name, bytes) in [
+            ("DAQ_DAC_COMMAND", "SD_CARD", 48usize),
+            ("DAQ_DAC_STATUS", "GROUND_STATION", 136),
+            ("DAQ_DAC_TABLE", "SD_CARD", 76),
+        ] {
+            for (len, ok) in [(bytes, true), (bytes - 1, false), (bytes + 1, false)] {
+                assert_eq!(
+                    sedsnet::packet::Packet::new(
+                        data_type(name),
+                        &[endpoint(endpoint_name)],
+                        "GS",
+                        1,
+                        vec![0u8; len].into()
+                    )
+                    .is_ok(),
+                    ok,
+                    "{name} {len}"
+                );
+            }
+        }
+        let config: serde_json::Value = serde_json::from_slice(SCHEMA_JSON).unwrap();
+        let find = |name: &str| {
+            config["types"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|ty| ty["name"] == name)
+                .unwrap()
+                .clone()
+        };
+        let command = find("DAQ_DAC_COMMAND");
+        assert_eq!(command["reliable"], "Off");
+        assert_eq!(command["priority"], 200);
+        assert_eq!(command["endpoints"], serde_json::json!(["SD_CARD"]));
+        let status = find("DAQ_DAC_STATUS");
+        assert_eq!(status["reliable"], "Off");
+        assert_eq!(status["priority"], 16);
+        assert_eq!(status["endpoints"], serde_json::json!(["GROUND_STATION"]));
+        let table = find("DAQ_DAC_TABLE");
+        assert_eq!(table["reliable"], "Off");
+        assert_eq!(table["priority"], 16);
+        assert_eq!(table["endpoints"], serde_json::json!(["SD_CARD"]));
+    }
+
+    #[test]
+    fn chamber_wire_roundtrip_is_additive_float_triplet() {
+        initialize().unwrap();
+        assert_eq!(data_type("DAQ_LOADCELL_CHAMBER"), DataType(259346466));
+        let payload: Vec<u8> = [4.25_f32, 500.0, 2.5]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let packet = sedsnet::packet::Packet::new(
+            data_type("DAQ_LOADCELL_CHAMBER"),
+            &[endpoint("GROUND_STATION")],
+            "DAQ",
+            123456,
+            std::sync::Arc::from(payload),
+        )
+        .unwrap();
+        let bytes = sedsnet::wire_format::pack_packet(&packet);
+        let decoded = sedsnet::wire_format::unpack_packet(&bytes).unwrap();
+        assert_eq!(decoded.data_as_f32().unwrap(), vec![4.25, 500.0, 2.5]);
+        assert_eq!(decoded.timestamp(), 123456);
+    }
 
     #[test]
     fn runtime_schema_uses_embedded_firmware_wire_ids() {

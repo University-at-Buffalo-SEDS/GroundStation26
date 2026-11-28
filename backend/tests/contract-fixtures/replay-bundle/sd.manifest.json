@@ -1,0 +1,337 @@
+{
+  "created_ms": 1767225600000,
+  "entries": [
+    {
+      "bytes": 178147,
+      "media_type": "application/json",
+      "path": "replay.json",
+      "route": "/api/recordings/groundstation_recording_2026-01-03_00-00-00_000.db/replay/export",
+      "sha256": "8a17d4b0288dd4e487596d8e1f13950d4f739651a6b022749f976dc6821ff954"
+    },
+    {
+      "bytes": 37950,
+      "media_type": "text/csv",
+      "path": "data/telemetry.csv",
+      "route": "/api/recordings/groundstation_recording_2026-01-03_00-00-00_000.db/csv",
+      "sha256": "082feadba4c5b81afb1b129dc729e92846006b47769c2a7a5bec8a004c6c6935"
+    },
+    {
+      "bytes": 1461,
+      "media_type": "application/json",
+      "path": "derived/context.json",
+      "route": "/api/recordings/groundstation_recording_2026-01-03_00-00-00_000.db/replay/context",
+      "sha256": "f852bdb9f10854ef7fba7ccb4abff15046def0864ff314a679b83c60f1d4c589"
+    },
+    {
+      "bytes": 97685,
+      "media_type": "application/json",
+      "path": "config/layout.json",
+      "route": "/api/recordings/groundstation_recording_2026-01-03_00-00-00_000.db/replay/layout?view=normal",
+      "sha256": "6c73ad7c906a61177ecd4f9a28ef8c4beb805f8d2bd263a02d5cf4d950c59075"
+    },
+    {
+      "bytes": 70725,
+      "media_type": "application/json",
+      "path": "config/layout/test_fire.json",
+      "route": "/api/recordings/groundstation_recording_2026-01-03_00-00-00_000.db/replay/layout?view=test_fire",
+      "sha256": "169a4483025c067bed4aaffa100238e554ffbb78e95a7c5dfebf77370947bffd"
+    },
+    {
+      "bytes": 97686,
+      "media_type": "application/json",
+      "path": "config/layout/testing.json",
+      "route": "/api/recordings/groundstation_recording_2026-01-03_00-00-00_000.db/replay/layout?view=testing",
+      "sha256": "dd29fa735d8cd03a5201ad72aa89de23a188a32165be181ad951065213cdfc29"
+    },
+    {
+      "bytes": 81648,
+      "media_type": "application/json",
+      "path": "config/layout/hitl.json",
+      "route": "/api/recordings/groundstation_recording_2026-01-03_00-00-00_000.db/replay/layout?view=hitl",
+      "sha256": "312fb1bc8c042d51ef745d6c1969b6bf3a60e4805731f00e15f5e41d5afeabe4"
+    },
+    {
+      "bytes": 97731,
+      "media_type": "application/json",
+      "path": "config/layout/integrated_ground_test.json",
+      "route": "/api/recordings/groundstation_recording_2026-01-03_00-00-00_000.db/replay/layout?view=integrated_ground_test",
+      "sha256": "659e4e9b310392137539d17e1384a8c53bc18e4f59a36cff4613f1a71e035319"
+    },
+    {
+      "bytes": 97462,
+      "media_type": "application/json",
+      "path": "config/station_layout.json",
+      "route": "/api/layout",
+      "sha256": "3e267fad62a76392e269b4c3498a4f6bfa7bce127a2adf90d720d21e5352c812"
+    },
+    {
+      "bytes": 893,
+      "media_type": "application/json",
+      "path": "config/vehicle_visualization.json",
+      "route": "/api/vehicle_visualization",
+      "sha256": "6ce3a4fb2a73b5a252b811b6e94780d720fc018f561c1a3a5057fe4f245941e5"
+    },
+    {
+      "bytes": 63,
+      "media_type": "application/json",
+      "path": "derived/snapshot.json",
+      "route": "/api/recordings/groundstation_recording_2026-01-03_00-00-00_000.db/replay",
+      "sha256": "e9895240df65a7dd637d0a982c6452a0b33f9d6acb906dd5a1fa96c61ccdc66c"
+    },
+    {
+      "bytes": 87,
+      "media_type": "application/json",
+      "path": "derived/flight_snapshot.json",
+      "route": "/api/recordings/groundstation_recording_2026-01-03_00-00-00_000.db/replay/flight",
+      "sha256": "8be71b99943e6516a6b4038cefd9fbd19cda7544fa1a6f8c61f22df6b2a02766"
+    },
+    {
+      "bytes": 33,
+      "media_type": "application/json",
+      "path": "derived/overlays.json",
+      "route": "/api/recordings/groundstation_recording_2026-01-03_00-00-00_000.db/replay/overlays",
+      "sha256": "d375628e404796b46a88cf0b9755335a342d31be337d95aa643892a121f4800b"
+    },
+    {
+      "bytes": 290,
+      "media_type": "application/json",
+      "path": "derived/sd_sources.json",
+      "route": "/api/recordings/groundstation_recording_2026-01-03_00-00-00_000.db/sd/sources",
+      "sha256": "51b6ac2a816830a0740f7cd0b03f02d1eebfd6bdec47a2c7fbf1d11f12e740cd"
+    },
+    {
+      "bytes": 790,
+      "media_type": "application/json",
+      "path": "derived/firmware.json",
+      "route": "/api/recordings/groundstation_recording_2026-01-03_00-00-00_000.db/firmware",
+      "sha256": "972faac15d943eac4a30affcec76d2e3aeb6ffd0cb67c6b523cc7af2214171df"
+    },
+    {
+      "bytes": 168,
+      "media_type": "application/json",
+      "path": "derived/recordings.json",
+      "route": "/api/recordings",
+      "sha256": "ab240b76084765eb52fcf85d98812e810428c16d04a8e8cbfc19c03cd9f0baf4"
+    },
+    {
+      "bytes": 1083,
+      "media_type": "application/json",
+      "path": "config/boards.json",
+      "route": "/api/boards",
+      "sha256": "9e23a9e6826fc78b06fbb36609283a3b3c05a6dfe1d81d5ea601103a48eef890"
+    },
+    {
+      "bytes": 10109,
+      "media_type": "application/json",
+      "path": "models/vehicle_geometry.json",
+      "route": "/api/vehicle/geometry",
+      "sha256": "895cf7b7a317d99f8578150007eff67bfcd5b1d384e619a254c11e17c8b46930"
+    },
+    {
+      "bytes": 998,
+      "media_type": "application/json",
+      "path": "config/calibration.json",
+      "route": "/api/calibration",
+      "sha256": "47fa7b25520b51ce628eb63889347f199ce9dc6d8701e980f01e45b3667dc594"
+    },
+    {
+      "bytes": 1165,
+      "media_type": "application/json",
+      "path": "config/calibration_config.json",
+      "route": "/api/calibration_config",
+      "sha256": "7908a4af694f7b11eff96d4a097c10b0b0f494ec09f17a6c5b351513196b6032"
+    },
+    {
+      "bytes": 37549,
+      "media_type": "application/json",
+      "path": "config/diagrams.json",
+      "route": "/api/diagrams",
+      "sha256": "8e4ce2a76136635844734efc5e6f3c9dc181db8c5feea87c975fc318fde35c73"
+    },
+    {
+      "bytes": 172,
+      "media_type": "application/json",
+      "path": "config/map_config.json",
+      "route": "/api/map_config",
+      "sha256": "71051be2ba3c2ccb620420a74af7132752f9d0b4c4bf6b559506fb2935928abb"
+    },
+    {
+      "bytes": 31,
+      "media_type": "application/json",
+      "path": "derived/alerts.json",
+      "route": "/api/recordings/groundstation_recording_2026-01-03_00-00-00_000.db/replay/alerts",
+      "sha256": "b56a1d1610a0761dd6f82c38253c241b353faea5a20c2f6f6c3b10527015d577"
+    },
+    {
+      "bytes": 2216,
+      "media_type": "application/json",
+      "path": "derived/flight_review.json",
+      "route": "/api/flight_review/recording/groundstation_recording_2026-01-03_00-00-00_000.db",
+      "sha256": "4bdef248a601080abfc91c80e24605482a86c5bfa40eca049e22500bd197526c"
+    },
+    {
+      "bytes": 2385,
+      "media_type": "application/json",
+      "path": "derived/apogee_planner.json",
+      "route": "/api/apogee_planner",
+      "sha256": "5a95aff7f5620245faa20f5a23a1e5de49dadb3a8712846df33279681eb58e21"
+    },
+    {
+      "bytes": 157,
+      "media_type": "application/json",
+      "path": "config/station/fill_targets.json",
+      "route": "/api/fill_targets",
+      "sha256": "f7a2656485c6dedb72695df1bf5c7c1ea79e72bebb9981bb9f294d02bbcfdf4d"
+    },
+    {
+      "bytes": 1457,
+      "media_type": "application/json",
+      "path": "config/station/flight_setup.json",
+      "route": "/api/flight_setup",
+      "sha256": "2ab81c764fc28f02ab236721c3a2098946b2622ac8abe3478d4ac62041c586b0"
+    },
+    {
+      "bytes": 16,
+      "media_type": "application/json",
+      "path": "config/station/auto_zero.json",
+      "route": "/api/auto_zero",
+      "sha256": "26b3426b2593763c96d0890b4a77a0bbf66d13fc512b0c6b138a23c290f30a2a"
+    },
+    {
+      "bytes": 80,
+      "media_type": "application/json",
+      "path": "config/station/kg50_input.json",
+      "route": "/api/calibration/kg50_input",
+      "sha256": "8ef1555c279c8b5a921d958163bd09578494781166469212646ac984df3d9844"
+    },
+    {
+      "bytes": 528,
+      "media_type": "application/json",
+      "path": "config/station/gse_config.json",
+      "route": "/api/gse/config",
+      "sha256": "404b26856a873a6ed7af1eaf4944241bae6eb7d7fd0b845ba7494e9967c06349"
+    },
+    {
+      "bytes": 149,
+      "media_type": "application/json",
+      "path": "config/station/launch_site.json",
+      "route": "/api/fc/launch-site",
+      "sha256": "b9e73929b676999e847b3b3b9ea2a8b246bc8d4a9f6d723e438d85012aa8455b"
+    },
+    {
+      "bytes": 84738,
+      "media_type": "application/json",
+      "path": "config/station/safety_about.json",
+      "route": "/api/safety/about",
+      "sha256": "3d1b44085f76ffba91afc94dc5bd9089c18178a017d70e319c5246811532323b"
+    },
+    {
+      "bytes": 2268,
+      "media_type": "application/json",
+      "path": "config/station/i18n_catalog_en.json",
+      "route": "/api/i18n/catalog?lang=en",
+      "sha256": "f86083555c0a16c5e33815a1a3f255013aa90c8065aeb1beb84182e4f756c00d"
+    },
+    {
+      "bytes": 109,
+      "media_type": "application/json",
+      "path": "derived/trajectory.json",
+      "route": "/api/recordings/groundstation_recording_2026-01-03_00-00-00_000.db/replay/trajectory?upper_id=40",
+      "sha256": "f95013a24d8e822d609ae1da92de1adf13b78c412e40475161272d078fd5aaec"
+    },
+    {
+      "bytes": 3019,
+      "media_type": "application/json",
+      "path": "config/report_context.json",
+      "sha256": "9496e03ce500a7e0397da357e4300b0cb473d5db40c83adcfc198d25409bdd71"
+    },
+    {
+      "bytes": 351,
+      "media_type": "application/json",
+      "path": "derived/calibration_history.json",
+      "sha256": "2c1301e7ac137c02bb2ded0954b1a2ed9fcf1c3d52cc5c5cee10d8d643556f66"
+    },
+    {
+      "bytes": 10209,
+      "media_type": "application/zip",
+      "path": "exports/motor_export.zip",
+      "sha256": "212ba5a065e4de7f793a31100292f150497a21ed03429ea6f4fcc9f89432189a"
+    },
+    {
+      "bytes": 7230,
+      "media_type": "application/zip",
+      "path": "exports/flight_export.zip",
+      "sha256": "9b7348ef6252c4a7aac19c62157e6ee46620fc23dbe1fd79dd0c38b9fa9d7b62"
+    },
+    {
+      "bytes": 512,
+      "media_type": "application/json",
+      "path": "exports/index.json",
+      "sha256": "f4fab39ed16e16e6309876181b07f5f9f29a8953e0e98923cca128531efed999"
+    },
+    {
+      "bytes": 1579,
+      "media_type": "application/json",
+      "path": "derived/review_inputs.json",
+      "sha256": "060246f7936b637a79c9e443864f32823a5ad4f8cba95bc70fa7658f7e8eaff8"
+    },
+    {
+      "bytes": 2909,
+      "media_type": "text/csv",
+      "path": "data/receipt_telemetry.csv",
+      "sha256": "b1fac083dd4fc02ffbdbb1638ae573ab24a960b18ac090154fe230d41310265c"
+    },
+    {
+      "bytes": 2108,
+      "media_type": "text/csv",
+      "path": "sd/sources/8c109001df5761b35e0373971f8ee2f2520bcdbd71053d83e9a6af986986434f.csv",
+      "route": "/api/recordings/groundstation_recording_2026-01-03_00-00-00_000.db/sd/sources/8c109001df5761b35e0373971f8ee2f2520bcdbd71053d83e9a6af986986434f",
+      "sha256": "8c109001df5761b35e0373971f8ee2f2520bcdbd71053d83e9a6af986986434f"
+    }
+  ],
+  "format": "gsreplay",
+  "generator": "groundstation_backend 0.1.0",
+  "missing": [],
+  "mode": "flight",
+  "recorded_mode": "normal",
+  "rows": 40,
+  "sd": {
+    "files": {
+      "budget_bytes": 1048576,
+      "bytes": 2108,
+      "complete": true,
+      "included": 1,
+      "requested": true
+    },
+    "receipt_csv": {
+      "bytes": 2909,
+      "included": true,
+      "path": "data/receipt_telemetry.csv",
+      "rows": 39
+    },
+    "resolved": true,
+    "resolved_rows": 40,
+    "sources": {
+      "bytes": 2108,
+      "listed": 1
+    }
+  },
+  "source": {
+    "recording": "groundstation_recording_2026-01-03_00-00-00_000.db",
+    "station_name": "Ground Station"
+  },
+  "terrain": {
+    "included": false
+  },
+  "tiles": {
+    "budget_bytes": 0,
+    "bytes": 0,
+    "complete": false,
+    "included": 0
+  },
+  "time_range": {
+    "end_ms": 1767398405008,
+    "start_ms": 1767398400003
+  },
+  "version": 1
+}

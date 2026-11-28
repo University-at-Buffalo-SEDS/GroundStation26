@@ -1,0 +1,785 @@
+[
+ {
+  "recording": "2026-10-30_23-23-48_776",
+  "minutes": 13.143816666666666,
+  "rate_hz": 29.27992757050527,
+  "vmain_min": 14.838619232177734,
+  "vmain_median": 15.40362548828125,
+  "tank_psi_max": 469.86785888671875,
+  "adc_temp_range_c": [
+   19.756567001342773,
+   21.691753387451172
+  ],
+  "kg1000": {
+   "gs_calibration_kg_per_raw": [
+    9481.620343644308,
+    -115.71179478112741
+   ],
+   "median_v": 0.21121674394245127,
+   "top_rail_samples": 0,
+   "floor_rail_samples": 0,
+   "gaps": [
+    111,
+    5.132
+   ],
+   "quiet_fraction": 0.7739378978822918,
+   "quiet_segments": 1,
+   "drift_kg_per_min_median": 0.18632133562480954,
+   "drift_kg_per_min_max": 0.18632133562480954,
+   "noise_kg_sample": 0.05926125836569502,
+   "noise_kg_1s": 0.09021387878206288,
+   "corr_10s_adc_temp": 0.7636851293747439,
+   "corr_10s_vmain": 0.25031608774919883
+  },
+  "kg50": {
+   "gs_calibration_kg_per_v": [
+    12915.097656636433,
+    -34.73128128435102
+   ],
+   "median_v": 0.0027421582490205765,
+   "p6_common_mode_v": 1.1377626955509186,
+   "p6_single_ended_diff_v": 0.0031027793884277344,
+   "kg50_over_single_ended_diff": 0.8837748050176732,
+   "gaps": [
+    111,
+    5.185
+   ],
+   "quiet_fraction": 0.7749702124162866,
+   "quiet_segments": 1,
+   "drift_kg_per_min_median": 0.00014830341705802293,
+   "drift_kg_per_min_max": 0.00014830341705802293,
+   "noise_kg_sample": 0.06366654019814261,
+   "noise_kg_1s": 0.421642055001774,
+   "corr_10s_adc_temp": 0.26248280613117736,
+   "corr_10s_vmain": 0.25176662575119785
+  }
+ },
+ {
+  "recording": "2026-10-31_15-55-56_744",
+  "minutes": 8.210183333333333,
+  "rate_hz": 39.86918684316834,
+  "vmain_min": 14.5018310546875,
+  "vmain_median": 15.042464256286621,
+  "tank_psi_max": 365.4527893066406,
+  "adc_temp_range_c": [
+   27.332775115966797,
+   29.243921279907227
+  ],
+  "kg1000": {
+   "gs_calibration_kg_per_raw": [
+    9481.620476449596,
+    -112.897655952723
+   ],
+   "median_v": 0.20677394089041262,
+   "top_rail_samples": 0,
+   "floor_rail_samples": 0,
+   "gaps": [
+    0,
+    0.093
+   ],
+   "quiet_fraction": 0.4790224032586558,
+   "quiet_segments": 1,
+   "drift_kg_per_min_median": 0.06829989993301204,
+   "drift_kg_per_min_max": 0.06829989993301204,
+   "noise_kg_sample": 0.05559320659798579,
+   "noise_kg_1s": 0.06053178529557987,
+   "corr_10s_adc_temp": 0.16083528262759975,
+   "corr_10s_vmain": -0.04341556415801095
+  },
+  "kg50": {
+   "gs_calibration_kg_per_v": [
+    12915.096548491356,
+    -36.734408958959115
+   ],
+   "median_v": 0.0027619618922472,
+   "p6_common_mode_v": 1.1367471814155579,
+   "p6_single_ended_diff_v": 0.003138244152069092,
+   "kg50_over_single_ended_diff": 0.8800978376479079,
+   "gaps": [
+    0,
+    0.092
+   ],
+   "quiet_fraction": 0.4788890019330552,
+   "quiet_segments": 1,
+   "drift_kg_per_min_median": 0.06688318553113287,
+   "drift_kg_per_min_max": 0.06688318553113287,
+   "noise_kg_sample": 0.08264212208220943,
+   "noise_kg_1s": 0.111538828188095,
+   "corr_10s_adc_temp": -0.1818074312938864,
+   "corr_10s_vmain": 0.4730267557811526
+  }
+ },
+ {
+  "recording": "2026-10-31_18-46-28_413",
+  "minutes": 3.8066,
+  "rate_hz": 39.86497136552304,
+  "vmain_min": 14.348946571350098,
+  "vmain_median": 14.459732055664062,
+  "tank_psi_max": 375.120849609375,
+  "adc_temp_range_c": [
+   32.23090362548828,
+   32.43781280517578
+  ],
+  "kg1000": {
+   "gs_calibration_kg_per_raw": [
+    9481.621113044772,
+    -116.0294432029879
+   ],
+   "median_v": 0.2134494912223112,
+   "top_rail_samples": 0,
+   "floor_rail_samples": 0,
+   "gaps": [
+    9,
+    0.661
+   ],
+   "quiet_fraction": 0.885886875343218,
+   "quiet_segments": 1,
+   "drift_kg_per_min_median": 0.020505374622770658,
+   "drift_kg_per_min_max": 0.020505374622770658,
+   "noise_kg_sample": 0.10807225047176214,
+   "noise_kg_1s": 0.018564078149079056,
+   "corr_10s_adc_temp": 0.7909920014597355,
+   "corr_10s_vmain": -0.7645900942788915
+  },
+  "kg50": {
+   "gs_calibration_kg_per_v": [
+    12915.09968731769,
+    -41.08938848034351
+   ],
+   "median_v": 0.003496549092233181,
+   "p6_common_mode_v": 1.1358879804611206,
+   "p6_single_ended_diff_v": 0.003973126411437988,
+   "kg50_over_single_ended_diff": 0.8800497970986229,
+   "gaps": [
+    9,
+    0.679
+   ],
+   "quiet_fraction": 0.8858522664910548,
+   "quiet_segments": 1,
+   "drift_kg_per_min_median": 0.010327874714590565,
+   "drift_kg_per_min_max": 0.010327874714590565,
+   "noise_kg_sample": 0.008451905041505042,
+   "noise_kg_1s": 0.0029975921573207856,
+   "corr_10s_adc_temp": -0.06637714791281032,
+   "corr_10s_vmain": 0.18524662981531995
+  }
+ },
+ {
+  "recording": "2026-10-31_18-57-24_119",
+  "minutes": 0.8629666666666667,
+  "rate_hz": 39.76592375140021,
+  "vmain_min": 14.249238967895508,
+  "vmain_median": 14.342300415039062,
+  "tank_psi_max": 344.82757568359375,
+  "adc_temp_range_c": [
+   32.22705841064453,
+   32.43781280517578
+  ],
+  "kg1000": {
+   "gs_calibration_kg_per_raw": [
+    9481.618936445706,
+    -116.02941639184017
+   ],
+   "median_v": 0.2134400586740202,
+   "top_rail_samples": 0,
+   "floor_rail_samples": 0,
+   "gaps": [
+    0,
+    0.136
+   ],
+   "quiet_fraction": 0.3224866440019427,
+   "corr_10s_adc_temp": null,
+   "corr_10s_vmain": null
+  },
+  "kg50": {
+   "gs_calibration_kg_per_v": [
+    12915.09569327301,
+    -41.0893745236623
+   ],
+   "median_v": 0.0032327325316146016,
+   "p6_common_mode_v": 1.1358788013458252,
+   "p6_single_ended_diff_v": 0.0036739706993103027,
+   "kg50_over_single_ended_diff": 0.8799015550726813,
+   "gaps": [
+    0,
+    0.13
+   ],
+   "quiet_fraction": 0.3230174081237911,
+   "corr_10s_adc_temp": null,
+   "corr_10s_vmain": null
+  }
+ },
+ {
+  "recording": "2026-11-06_00-18-55_152",
+  "minutes": 18.22361666666667,
+  "rate_hz": 39.980172249013876,
+  "vmain_min": 15.408056259155273,
+  "vmain_median": 15.6384916305542,
+  "tank_psi_max": 0.0,
+  "adc_temp_range_c": [
+   29.16020393371582,
+   29.5172061920166
+  ],
+  "kg1000": {
+   "gs_calibration_kg_per_raw": [
+    9481.619572038355,
+    -116.02942459815239
+   ],
+   "median_v": 0.227640444629226,
+   "top_rail_samples": 0,
+   "floor_rail_samples": 0,
+   "gaps": [
+    9,
+    0.291
+   ],
+   "quiet_fraction": 0.834496168363262,
+   "quiet_segments": 1,
+   "drift_kg_per_min_median": 0.00011727398933198484,
+   "drift_kg_per_min_max": 0.00011727398933198484,
+   "noise_kg_sample": 0.06866622246443875,
+   "noise_kg_1s": 0.00778579569353973,
+   "corr_10s_adc_temp": 0.3128115683262049,
+   "corr_10s_vmain": -0.0005613003170488006
+  },
+  "kg50": {
+   "gs_calibration_kg_per_v": [
+    12915.094924582481,
+    -41.089374465089975
+   ],
+   "median_v": 9.235382458427921e-05,
+   "p6_common_mode_v": 0.17529631406068802,
+   "p6_single_ended_diff_v": 0.0034847259521484375,
+   "kg50_over_single_ended_diff": 0.026502464139924783,
+   "gaps": [
+    9,
+    0.321
+   ],
+   "quiet_fraction": 0.8344007319304666,
+   "quiet_segments": 1,
+   "drift_kg_per_min_median": 0.00160558268475244,
+   "drift_kg_per_min_max": 0.00160558268475244,
+   "noise_kg_sample": 0.0809931929655283,
+   "noise_kg_1s": 0.008161524703161251,
+   "corr_10s_adc_temp": -0.3849065777544711,
+   "corr_10s_vmain": -0.5283923132107281
+  }
+ },
+ {
+  "recording": "2026-11-06_03-12-04_278",
+  "minutes": 1.5039166666666666,
+  "rate_hz": 40.00664930459356,
+  "vmain_min": 15.102288246154785,
+  "vmain_median": 15.195348739624023,
+  "tank_psi_max": 0.0,
+  "adc_temp_range_c": [
+   28.84649085998535,
+   29.021631240844727
+  ],
+  "kg1000": {
+   "gs_calibration_kg_per_raw": [
+    9481.627205504354,
+    -116.02952459706535
+   ],
+   "median_v": 0.22765010368811062,
+   "top_rail_samples": 0,
+   "floor_rail_samples": 0,
+   "gaps": [
+    0,
+    0.09
+   ],
+   "quiet_fraction": 1.0,
+   "corr_10s_adc_temp": 0.6680567363281121,
+   "corr_10s_vmain": 0.05624749137941895
+  },
+  "kg50": {
+   "gs_calibration_kg_per_v": [
+    12915.094789957171,
+    -41.0893744378563
+   ],
+   "median_v": 9.445310570299625e-05,
+   "p6_common_mode_v": 0.17336826771497726,
+   "p6_single_ended_diff_v": 0.00354081392288208,
+   "kg50_over_single_ended_diff": 0.02667553499284572,
+   "gaps": [
+    0,
+    0.072
+   ],
+   "quiet_fraction": 1.0,
+   "corr_10s_adc_temp": 0.2858467455024397,
+   "corr_10s_vmain": 0.2951263844418464
+  }
+ },
+ {
+  "recording": "2026-11-06_05-47-46_027",
+  "minutes": 0.4317666666666667,
+  "rate_hz": 40.02933683316606,
+  "vmain_min": 14.424281120300293,
+  "vmain_median": 14.49296760559082,
+  "tank_psi_max": 0.0,
+  "adc_temp_range_c": [
+   32.45319366455078,
+   32.98053741455078
+  ],
+  "kg1000": {
+   "gs_calibration_kg_per_raw": [
+    9481.608341430901,
+    -116.02927745267358
+   ],
+   "median_v": 0.2276850833954951,
+   "top_rail_samples": 0,
+   "floor_rail_samples": 0,
+   "gaps": [
+    1,
+    0.392
+   ],
+   "quiet_fraction": 0.0,
+   "corr_10s_adc_temp": null,
+   "corr_10s_vmain": null
+  },
+  "kg50": {
+   "gs_calibration_kg_per_v": [
+    12915.092977518389,
+    -41.08937431563632
+   ],
+   "median_v": 9.289771696785465e-05,
+   "p6_common_mode_v": 0.19361988082528114,
+   "p6_single_ended_diff_v": 0.0038610920310020447,
+   "kg50_over_single_ended_diff": 0.024059959260734197,
+   "gaps": [
+    1,
+    0.402
+   ],
+   "quiet_fraction": 0.0,
+   "corr_10s_adc_temp": null,
+   "corr_10s_vmain": null
+  }
+ },
+ {
+  "recording": "2026-11-06_19-50-34_778",
+  "minutes": 0.4215,
+  "rate_hz": 40.055357848952156,
+  "vmain_min": 14.040963172912598,
+  "vmain_median": 14.16061019897461,
+  "tank_psi_max": 21.914276123046875,
+  "adc_temp_range_c": [
+   21.07298469543457,
+   21.2288818359375
+  ],
+  "kg1000": {
+   "gs_calibration_kg_per_raw": [
+    9481.619292023071,
+    -116.02942097315227
+   ],
+   "median_v": 0.22808175198288877,
+   "top_rail_samples": 0,
+   "floor_rail_samples": 0,
+   "gaps": [
+    0,
+    0.088
+   ],
+   "quiet_fraction": 0.09674234945705824,
+   "corr_10s_adc_temp": null,
+   "corr_10s_vmain": null
+  }
+ },
+ {
+  "recording": "2026-11-06_22-50-20_185",
+  "minutes": 0.1972,
+  "rate_hz": 40.06085192697768,
+  "vmain_min": 13.23222827911377,
+  "vmain_median": 13.307561874389648,
+  "tank_psi_max": 6.445375442504883,
+  "adc_temp_range_c": [
+   21.313568115234375,
+   21.49639892578125
+  ],
+  "kg1000": {
+   "gs_calibration_kg_per_raw": [
+    9481.626679464425,
+    -116.02951082690772
+   ],
+   "median_v": 0.21162716495874262,
+   "top_rail_samples": 0,
+   "floor_rail_samples": 0,
+   "gaps": [
+    0,
+    0.075
+   ],
+   "quiet_fraction": 1.0,
+   "corr_10s_adc_temp": null,
+   "corr_10s_vmain": null
+  },
+  "kg50": {
+   "gs_calibration_kg_per_v": [
+    12915.142964596687,
+    -41.089513001678725
+   ],
+   "median_v": 0.0029287433717399836,
+   "p6_common_mode_v": 1.1377075612545013,
+   "p6_single_ended_diff_v": 0.00332719087600708,
+   "kg50_over_single_ended_diff": 0.8802450718591569,
+   "gaps": [
+    0,
+    0.061
+   ],
+   "quiet_fraction": 1.0,
+   "corr_10s_adc_temp": null,
+   "corr_10s_vmain": null
+  }
+ },
+ {
+  "recording": "2026-11-06_22-51-01_544",
+  "minutes": 42.1935,
+  "rate_hz": 6.694554058484521,
+  "vmain_min": 10.311921119689941,
+  "vmain_median": 13.294268608093262,
+  "tank_psi_max": 7.0899128913879395,
+  "adc_temp_range_c": [
+   16.260515213012695,
+   26.85260009765625
+  ],
+  "kg1000": {
+   "gs_calibration_kg_per_raw": [
+    9481.618962332634,
+    -116.0294165246277
+   ],
+   "median_v": 0.2284205713826075,
+   "top_rail_samples": 407,
+   "floor_rail_samples": 0,
+   "gaps": [
+    2,
+    1710.406
+   ],
+   "quiet_fraction": 0.19860750531036112,
+   "corr_10s_adc_temp": -0.8167549654393103,
+   "corr_10s_vmain": 0.7426771453744673
+  },
+  "kg50": {
+   "gs_calibration_kg_per_v": [
+    12915.095541845803,
+    -41.08937406618797
+   ],
+   "median_v": 0.0028904378414154053,
+   "p6_common_mode_v": 1.1380853652954102,
+   "p6_single_ended_diff_v": 0.003282904624938965,
+   "kg50_over_single_ended_diff": 0.8804513598896111,
+   "gaps": [
+    2,
+    1710.403
+   ],
+   "quiet_fraction": 0.19871378842409582,
+   "corr_10s_adc_temp": 0.9178699560604411,
+   "corr_10s_vmain": -0.9330576859086321
+  }
+ },
+ {
+  "recording": "2026-11-09_06-25-13_382",
+  "minutes": 0.6525666666666666,
+  "rate_hz": 40.021453746743624,
+  "vmain_min": 15.219720840454102,
+  "vmain_median": 15.283977508544922,
+  "tank_psi_max": 19.33612632751465,
+  "adc_temp_range_c": [
+   28.197893142700195,
+   28.416337966918945
+  ],
+  "kg1000": {
+   "gs_calibration_kg_per_raw": [
+    9481.619576326493,
+    -116.02942456271406
+   ],
+   "median_v": 0.2276108364587757,
+   "top_rail_samples": 0,
+   "floor_rail_samples": 0,
+   "gaps": [
+    0,
+    0.078
+   ],
+   "quiet_fraction": 0.12188895979578813,
+   "corr_10s_adc_temp": null,
+   "corr_10s_vmain": null
+  },
+  "kg50": {
+   "gs_calibration_kg_per_v": [
+    12915.099643625683,
+    -41.08937484789547
+   ],
+   "median_v": 8.153021553880535e-05,
+   "p6_common_mode_v": 0.1689532846212387,
+   "p6_single_ended_diff_v": 0.002983182668685913,
+   "kg50_over_single_ended_diff": 0.027329944087774977,
+   "gaps": [
+    0,
+    0.076
+   ],
+   "quiet_fraction": 0.12181122448979592,
+   "corr_10s_adc_temp": null,
+   "corr_10s_vmain": null
+  }
+ },
+ {
+  "recording": "2026-11-09_06-26-25_821",
+  "minutes": 78.5186,
+  "rate_hz": 10.323880795972759,
+  "vmain_min": 15.128877639770508,
+  "vmain_median": 15.259603500366211,
+  "tank_psi_max": 219.14276123046875,
+  "adc_temp_range_c": [
+   25.535192489624023,
+   28.656902313232422
+  ],
+  "kg1000": {
+   "gs_calibration_kg_per_raw": [
+    9481.618314375659,
+    -116.02940812029166
+   ],
+   "median_v": 0.2276367395630877,
+   "top_rail_samples": 0,
+   "floor_rail_samples": 0,
+   "gaps": [
+    4,
+    3467.538
+   ],
+   "quiet_fraction": 0.5344079610173325,
+   "quiet_segments": 2,
+   "drift_kg_per_min_median": 0.004810396020112337,
+   "drift_kg_per_min_max": 0.008232890518837273,
+   "noise_kg_sample": 0.19332646632614522,
+   "noise_kg_1s": 0.03185422839734988,
+   "corr_10s_adc_temp": 0.14822346760067628,
+   "corr_10s_vmain": 0.44839196404620724
+  },
+  "kg50": {
+   "gs_calibration_kg_per_v": [
+    12915.095400126795,
+    -41.08937452021257
+   ],
+   "median_v": 8.135319512803108e-05,
+   "p6_common_mode_v": 0.1686672531068325,
+   "p6_single_ended_diff_v": 0.0029175281524658203,
+   "kg50_over_single_ended_diff": 0.027884287957692346,
+   "gaps": [
+    6,
+    3467.542
+   ],
+   "quiet_fraction": 0.5343600921204146,
+   "quiet_segments": 2,
+   "drift_kg_per_min_median": 0.006580369511297752,
+   "drift_kg_per_min_max": 0.009234225353222252,
+   "noise_kg_sample": 0.1596072575799077,
+   "noise_kg_1s": 0.15976731220627413,
+   "corr_10s_adc_temp": 0.3947412104459597,
+   "corr_10s_vmain": -0.09406076784766257
+  }
+ },
+ {
+  "recording": "2026-11-09_13-12-38_375",
+  "minutes": 14.335516666666667,
+  "rate_hz": 39.99274529112426,
+  "vmain_min": 13.436073303222656,
+  "vmain_median": 13.580094337463379,
+  "tank_psi_max": 54.78569030761719,
+  "adc_temp_range_c": [
+   28.18731117248535,
+   28.448089599609375
+  ],
+  "kg1000": {
+   "gs_calibration_kg_per_raw": [
+    9481.619951678862,
+    -116.02942960440396
+   ],
+   "median_v": 0.22776847165259942,
+   "top_rail_samples": 0,
+   "floor_rail_samples": 0,
+   "gaps": [
+    8,
+    5.153
+   ],
+   "quiet_fraction": 0.7969999127881624,
+   "quiet_segments": 2,
+   "drift_kg_per_min_median": 0.004918113794492027,
+   "drift_kg_per_min_max": 0.007960980451961136,
+   "noise_kg_sample": 0.1717262743511146,
+   "noise_kg_1s": 0.018741296186124544,
+   "corr_10s_adc_temp": 0.23158165548977067,
+   "corr_10s_vmain": 0.32729112883622574
+  },
+  "kg50": {
+   "gs_calibration_kg_per_v": [
+    12915.0975204849,
+    -41.08937469958444
+   ],
+   "median_v": 8.030176468309946e-05,
+   "p6_common_mode_v": 0.16873284429311752,
+   "p6_single_ended_diff_v": 0.002872183918952942,
+   "kg50_over_single_ended_diff": 0.02795843405194385,
+   "gaps": [
+    8,
+    5.159
+   ],
+   "quiet_fraction": 0.7970403535294802,
+   "quiet_segments": 2,
+   "drift_kg_per_min_median": 0.0011124751617604656,
+   "drift_kg_per_min_max": 0.0011502007186961457,
+   "noise_kg_sample": 0.062267599855115346,
+   "noise_kg_1s": 0.00759748271400148,
+   "corr_10s_adc_temp": 0.06779339300487679,
+   "corr_10s_vmain": 0.30857447528822546
+  }
+ },
+ {
+  "recording": "2026-11-09_13-37-41_454",
+  "minutes": 10.642966666666666,
+  "rate_hz": 39.99198218541823,
+  "vmain_min": 13.256601333618164,
+  "vmain_median": 13.416131973266602,
+  "tank_psi_max": 6.445375442504883,
+  "adc_temp_range_c": [
+   28.15361976623535,
+   28.487548828125
+  ],
+  "kg1000": {
+   "gs_calibration_kg_per_raw": [
+    9481.619769805871,
+    -116.02942720764187
+   ],
+   "median_v": 0.22776104534099467,
+   "top_rail_samples": 0,
+   "floor_rail_samples": 0,
+   "gaps": [
+    2,
+    0.294
+   ],
+   "quiet_fraction": 0.8334638577805623,
+   "quiet_segments": 2,
+   "drift_kg_per_min_median": 0.001876248446572735,
+   "drift_kg_per_min_max": 0.002389532592804408,
+   "noise_kg_sample": 0.04215958635594372,
+   "noise_kg_1s": 0.00711045847821417,
+   "corr_10s_adc_temp": 0.32678247179721603,
+   "corr_10s_vmain": 0.12697559357405624
+  },
+  "kg50": {
+   "gs_calibration_kg_per_v": [
+    12915.09789597499,
+    -41.0893747209829
+   ],
+   "median_v": 7.950425060698763e-05,
+   "p6_common_mode_v": 0.16876230761408806,
+   "p6_single_ended_diff_v": 0.002869032323360443,
+   "kg50_over_single_ended_diff": 0.0277111728437642,
+   "gaps": [
+    2,
+    0.285
+   ],
+   "quiet_fraction": 0.833470378636595,
+   "quiet_segments": 2,
+   "drift_kg_per_min_median": 0.0026139194391979776,
+   "drift_kg_per_min_max": 0.003996008819909461,
+   "noise_kg_sample": 0.06499500482640352,
+   "noise_kg_1s": 0.007297212608246761,
+   "corr_10s_adc_temp": 0.4733229903164307,
+   "corr_10s_vmain": 0.3498520819820378
+  }
+ },
+ {
+  "recording": "2026-11-16_23-43-03_214",
+  "minutes": 0.3423333333333333,
+  "rate_hz": 42.21032132424538,
+  "vmain_min": 14.583812713623047,
+  "vmain_median": 14.674656867980957,
+  "tank_psi_max": 7.0899128913879395,
+  "adc_temp_range_c": [
+   15.057621955871582,
+   15.305912971496582
+  ],
+  "kg1000": {
+   "gs_calibration_kg_per_raw": [
+    9481.480652179944,
+    -116.02915106032806
+   ],
+   "median_v": 0.03360815135909732,
+   "top_rail_samples": 0,
+   "floor_rail_samples": 867,
+   "gaps": [
+    1,
+    3.93
+   ],
+   "quiet_fraction": 0.0,
+   "corr_10s_adc_temp": null,
+   "corr_10s_vmain": null
+  },
+  "kg50": {
+   "gs_calibration_kg_per_v": [
+    12915.046075761431,
+    -41.08917413203263
+   ],
+   "median_v": 0.004037221893668175,
+   "p6_common_mode_v": 1.1377105712890625,
+   "p6_single_ended_diff_v": 0.0045021772384643555,
+   "kg50_over_single_ended_diff": 0.8967265569147669,
+   "gaps": [
+    1,
+    3.934
+   ],
+   "quiet_fraction": 0.0,
+   "corr_10s_adc_temp": null,
+   "corr_10s_vmain": null
+  }
+ },
+ {
+  "recording": "2026-11-17_00-59-46_065",
+  "minutes": 27.88435,
+  "rate_hz": 27.07611975893288,
+  "vmain_min": 11.00322151184082,
+  "vmain_median": 14.178337097167969,
+  "tank_psi_max": 407.34771728515625,
+  "adc_temp_range_c": [
+   15.289544105529785,
+   28.85899543762207
+  ],
+  "kg1000": {
+   "gs_calibration_kg_per_raw": [
+    9481.61905907303,
+    -116.0294179387637
+   ],
+   "median_v": 0.21002298457614763,
+   "top_rail_samples": 2090,
+   "floor_rail_samples": 2304,
+   "gaps": [
+    13,
+    534.389
+   ],
+   "quiet_fraction": 0.5958278145695364,
+   "quiet_segments": 3,
+   "drift_kg_per_min_median": 1.5694729831966998,
+   "drift_kg_per_min_max": 16.636042869119894,
+   "noise_kg_sample": 0.6254195184747023,
+   "noise_kg_1s": 3.0426347366033175,
+   "corr_10s_adc_temp": 0.42793912973161324,
+   "corr_10s_vmain": -0.04522378886936051
+  },
+  "kg50": {
+   "gs_calibration_kg_per_v": [
+    22799.140533966573,
+    -91.33563198759511
+   ],
+   "median_v": 0.003764766501262784,
+   "p6_common_mode_v": 1.1370964646339417,
+   "p6_single_ended_diff_v": 0.004277229309082031,
+   "kg50_over_single_ended_diff": 0.8801881379772853,
+   "gaps": [
+    12,
+    534.42
+   ],
+   "quiet_fraction": 0.6114704518863551,
+   "quiet_segments": 3,
+   "drift_kg_per_min_median": 0.06759649855245191,
+   "drift_kg_per_min_max": 0.3499500472204328,
+   "noise_kg_sample": 0.029672638764948224,
+   "noise_kg_1s": 0.042728506335625846,
+   "corr_10s_adc_temp": -0.8446688484329061,
+   "corr_10s_vmain": -0.9535650962725778
+  }
+ }
+]

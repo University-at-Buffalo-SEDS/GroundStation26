@@ -1,14 +1,24 @@
 import csv
+import importlib.util
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from openpyxl import load_workbook
-
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # repo root: discovery from any cwd
 from export_loadcell_excel import Sample, export_excel, extrema, parse_time, read_recording, recalculate_kg, select_window
+
+if importlib.util.find_spec("openpyxl") is not None:
+    from openpyxl import load_workbook
+else:
+    load_workbook = None
+
+
+NO_OPENPYXL = "openpyxl is not installed (pip install -r tests/requirements.txt)"
 
 
 class RecordingExportTests(unittest.TestCase):
+    @unittest.skipIf(load_workbook is None, NO_OPENPYXL)
     def test_regression_absolute_values_and_saved_coefficients(self):
         raw = [Sample(1000 + i, i, "DAQ", str(i), value)
                for i, value in enumerate((1.0, 2.0, 3.0, None))]
@@ -59,25 +69,28 @@ class RecordingExportTests(unittest.TestCase):
                     (1, 2000, 10, "DAQ", "KG1000", "[1.5]"),
                     (2, 1000, 9, "DAQ", "KG1000", "[null]"),
                     (3, 2000, 11, "DAQ", "KG1000", "[2.5]"),
-                    (4, 2000, 44, "VB", "FUEL_TANK_PRESSURE", "[3.5]"),
+                    (4, 2000, 44, "VB", "FUEL_TANK_PRESSURE", "[3.5]"),  # pre-rename name
+                    (6, 2000, 45, "VB", "OX_TANK_PRESSURE", "[3.75]"),
                     (5, 2000, 11, "DAQ", "KG50", "[99]"),
                 ])
             streams = read_recording(path)
             self.assertEqual([row.value for row in streams["KG1000"]], [None, 1.5, 2.5])
             self.assertEqual(len(select_window(streams, 2000, 2000)["KG1000"]), 2)
             self.assertNotIn("KG50", streams)
-            self.assertEqual(streams["FUEL_TANK_PRESSURE"][0].source_ms, 44)
+            self.assertNotIn("FUEL_TANK_PRESSURE", streams)
+            self.assertEqual([row.source_ms for row in streams["OX_TANK_PRESSURE"]], [44, 45])
             with self.assertRaises(ValueError):
                 select_window(streams, 3000, 4000)
             with self.assertRaises(ValueError):
                 select_window(streams, 2000, 1000)
 
+    @unittest.skipIf(load_workbook is None, NO_OPENPYXL)
     def test_excel_preserves_times_values_and_numeric_chart_axis(self):
         timestamp = 1789794290932
         streams = {
             "KG1000": [Sample(timestamp, 17744228, "=literal", "3", 0.015170760452747345)],
             "LOADCELL_WEIGHT_KG": [Sample(timestamp, 17744228, "DAQ", "4", 4.047607421875)],
-            "FUEL_TANK_PRESSURE": [Sample(timestamp + 50, 17744480, "VB", "16", 466.6)],
+            "OX_TANK_PRESSURE": [Sample(timestamp + 50, 17744480, "VB", "16", 466.6)],
             "PRESSURE_TRANSDUCER_CALIBRATED": [Sample(timestamp + 50, 17744480, "VB", "17", None)],
         }
         with tempfile.TemporaryDirectory() as directory:

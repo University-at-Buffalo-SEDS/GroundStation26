@@ -1,3 +1,4 @@
+pub mod mcp_reference;
 pub mod mission;
 use crate::fill_targets::FillTargetsConfig;
 use crate::layout::ValueFormatter;
@@ -15,12 +16,20 @@ pub const RAW_PRESSURE_TRANSDUCER_DATA_TYPE: &str = "IADC";
 pub const DERIVED_WEIGHT_DATA_TYPE: &str = "LOADCELL_WEIGHT_KG";
 pub const DERIVED_FILL_PERCENT_DATA_TYPE: &str = "LOADCELL_FILL_PERCENT";
 pub const DERIVED_PRESSURE_TRANSDUCER_CALIBRATED_DATA_TYPE: &str = "PRESSURE_TRANSDUCER_CALIBRATED";
-#[cfg(feature = "testing")]
-const DEFAULT_LOADCELL_CALIBRATION_FILENAME: &str = "loadcell_calibration_testing.json";
-#[cfg(all(not(feature = "testing"), feature = "test_fire_mode"))]
-const DEFAULT_LOADCELL_CALIBRATION_FILENAME: &str = "loadcell_calibration_test_fire.json";
-#[cfg(all(not(feature = "testing"), not(feature = "test_fire_mode")))]
-const DEFAULT_LOADCELL_CALIBRATION_FILENAME: &str = "loadcell_calibration.json";
+fn default_loadcell_calibration_filename() -> &'static str {
+    calibration_filename_for(crate::runtime_mode::current())
+}
+
+/// The calibration file a station mode uses. The integrated ground test
+/// fires on the test stand's load cell, so it shares test fire's file.
+pub(crate) fn calibration_filename_for(mode: crate::station_mode::Mode) -> &'static str {
+    use crate::station_mode::Mode;
+    match mode {
+        Mode::Testing => "loadcell_calibration_testing.json",
+        Mode::TestFire | Mode::IntegratedGroundTest => "loadcell_calibration_test_fire.json",
+        Mode::Normal | Mode::Hitl => "loadcell_calibration.json",
+    }
+}
 
 const ALL_CALIBRATION_FIT_MODES: [&str; 9] = [
     "best",
@@ -109,6 +118,15 @@ pub struct GenericCalibrationChannel {
     pub points: Vec<CalibrationPoint>,
     #[serde(default)]
     pub fit: Option<FitMeta>,
+    /// MCP3564R reference (V) this KG1000/KG50 calibration is expressed in
+    /// (`mcp_reference`). Missing in a file: fitted under the nominal 2.4 V.
+    /// `None` in memory: made under the station's current reference. Other
+    /// channels do not carry it.
+    #[serde(
+        default = "mcp_reference::legacy_fitted",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub fitted_mcp_vref_v: Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,6 +161,9 @@ pub struct Kg50InputProfile {
 pub struct LoadcellCalibrationFile {
     #[serde(default)]
     pub kg50_input: Kg50Input,
+    /// Revision of `kg50_input`; never moves backwards. See `kg50_input_packet`.
+    #[serde(default)]
+    pub kg50_input_stamp_ms: u64,
     #[serde(default)]
     pub kg50_input_profiles: BTreeMap<String, Kg50InputProfile>,
     #[serde(default)]
@@ -176,17 +197,44 @@ pub struct LoadcellCalibrationFile {
     pub weights_kg: Vec<f32>,
     #[serde(default)]
     pub extra_channels: BTreeMap<String, GenericCalibrationChannel>,
+    /// A chamber pressure transducer is connected to the DAQ (P4). Off: the
+    /// chamber reads "not installed" instead of 0 psig and its no-signal
+    /// input fault is not raised. Station-side only; missing means installed.
+    #[serde(default = "default_chamber_pt_installed")]
+    pub chamber_pt_installed: bool,
+    /// The DAQ's MCP3564R reference in volts, sent as DAQ_MCP_REFERENCE. Every
+    /// MCP3564R volt the DAQ publishes is code x this / 2^23; changing it
+    /// converts the load-cell calibrations (`mcp_reference`). Nominal 2.4.
+    #[serde(default = "mcp_reference::nominal")]
+    pub mcp_vref_v: f32,
+    /// Operator note shown with the reference (e.g. how it was measured);
+    /// empty for none.
+    #[serde(default)]
+    pub mcp_vref_note: String,
+    /// Station wall-clock ms when `mcp_vref_v` last changed; 0 when it has not
+    /// changed since this field existed. A capture whose samples start before
+    /// it was read under the previous reference and is refused.
+    #[serde(default)]
+    pub mcp_vref_changed_ms: u64,
+    /// Revision of this document. Every write of the calibration file through
+    /// `save`/`save_guarded` adds one, so a writer that edits what it loaded
+    /// (the calibration editor, API captures) sends the revision it loaded and
+    /// is refused when the station's has moved on (`merge_channel_update`,
+    /// `check_base`). A file saved before revisions existed loads as 0.
+    #[serde(default)]
+    pub revision: u64,
 }
 
 impl Default for LoadcellCalibrationFile {
     fn default() -> Self {
         Self {
             kg50_input: Kg50Input::default(),
+            kg50_input_stamp_ms: 0,
             kg50_input_profiles: BTreeMap::new(),
             noise: BTreeMap::new(),
             temperature_captures: BTreeMap::new(),
             thermal: BTreeMap::new(),
-            version: default_calibration_version(),
+            version: CALIBRATION_VERSION,
             full_mass_kg: Some(DEFAULT_FULL_MASS_KG),
             ch1: ChannelLinear {
                 m: Some(1.0),
@@ -210,12 +258,143 @@ impl Default for LoadcellCalibrationFile {
             }),
             weights_kg: Vec::new(),
             extra_channels: BTreeMap::new(),
+            chamber_pt_installed: true,
+            mcp_vref_v: mcp_reference::NOMINAL_MCP_VREF_V,
+            mcp_vref_note: String::new(),
+            mcp_vref_changed_ms: 0,
+            revision: 0,
         }
     }
 }
 
+/// Version 2: KG1000 (`ch1`) and AMP2 KG50 (`kg50`) values are ADC-pin volts
+/// and fits are kg = f(volts). Version 1 stored the DAQ's legacy raw scale.
+pub const CALIBRATION_VERSION: u32 = 2;
+
+/// A file without a version field predates versioning: legacy raw scale.
 fn default_calibration_version() -> u32 {
     1
+}
+
+fn default_chamber_pt_installed() -> bool {
+    true
+}
+
+/// Exact legacy-raw to ADC-pin-volts factor for the DAQ amplified inputs.
+/// DAQ `mcp3564r_code_to_voltage(code) = code * 2.4 / 2^23` (internal 2.4 V
+/// reference, unity gain) and the historical `mcp3564r_code_to_raw_value(code)
+/// = code * 2.2104 / 2^24 * 2 / 16 = code * 2.2104 / 2^27`, so
+/// volts / raw = (2.4 / 2^23) / (2.2104 / 2^27) = 38.4 / 2.2104 = 16000 / 921.
+pub const LEGACY_RAW_TO_VOLTS: f64 = 16000.0 / 921.0;
+
+/// Volts for a value recorded on the legacy raw scale.
+pub fn legacy_raw_to_volts(raw: f32) -> f32 {
+    (raw as f64 * LEGACY_RAW_TO_VOLTS) as f32
+}
+
+fn scale_x(value: &mut Option<f32>, k: f64) {
+    if let Some(v) = value {
+        *v = (*v as f64 * k) as f32;
+    }
+}
+
+fn divide(value: &mut Option<f32>, divisor: f64) {
+    if let Some(v) = value {
+        *v = (*v as f64 / divisor) as f32;
+    }
+}
+
+/// kg = f(raw) becomes kg = f(volts / k) for every fit type. A polynomial's
+/// x^n coefficient is divided by k^n; x0 is an input value and scales by k.
+fn migrate_fit(linear: &mut ChannelLinear, fit: &mut Option<FitMeta>, k: f64) {
+    divide(&mut linear.m, k);
+    let Some(meta) = fit else { return };
+    scale_x(&mut meta.x0, k);
+    let degree = match meta.fit_type.as_deref() {
+        Some("poly4") => 4,
+        Some("poly3") => 3,
+        Some("poly2") => 2,
+        _ => return,
+    };
+    // Highest power first: a is x^degree, the constant term is untouched.
+    let terms = [&mut meta.a, &mut meta.b, &mut meta.c, &mut meta.d, &mut meta.e];
+    for (i, term) in terms.into_iter().enumerate().take(degree) {
+        divide(term, k.powi((degree - i) as i32));
+    }
+}
+
+fn migrate_channel(channel: &mut GenericCalibrationChannel, k: f64) {
+    migrate_fit(&mut channel.linear, &mut channel.fit, k);
+    scale_x(&mut channel.zero_raw, k);
+    for point in &mut channel.points {
+        point.raw = (point.raw as f64 * k) as f32;
+    }
+}
+
+fn migrate_sensor_extras(
+    thermal: Option<&mut ThermalCalibration>,
+    noise: Option<&mut NoiseCalibration>,
+    captures: &mut [TemperatureCapture],
+    k: f64,
+) {
+    if let Some(t) = thermal {
+        t.raw_per_c = (t.raw_per_c as f64 * k) as f32;
+        for p in &mut t.points {
+            p[1] = (p[1] as f64 * k) as f32;
+        }
+    }
+    if let Some(n) = noise {
+        n.sigma_raw = (n.sigma_raw as f64 * k) as f32;
+        n.residual_sigma_raw = (n.residual_sigma_raw as f64 * k) as f32;
+    }
+    for c in captures {
+        c.raw = (c.raw as f64 * k) as f32;
+    }
+}
+
+/// Convert a version-1 (legacy raw) file to version 2 (volts). Exactly: raw
+/// zero, points and captures are multiplied by k, slopes divided by k (x^n
+/// terms by k^n), intercepts unchanged, so kg for any ADC code is unchanged.
+/// Only the amplified inputs change: KG1000 and the AMP2 KG50 profile. The P6
+/// KG50 profile was already in volts and IADC is not a DAQ load cell.
+pub fn migrate_calibration(cfg: &mut LoadcellCalibrationFile) {
+    if cfg.version >= CALIBRATION_VERSION {
+        return;
+    }
+    let k = LEGACY_RAW_TO_VOLTS;
+    // KG1000: the generic entry and its legacy mirror.
+    if let Some(ch1) = cfg.extra_channels.get_mut("ch1") {
+        migrate_channel(ch1, k);
+    }
+    migrate_fit(&mut cfg.ch1, &mut cfg.ch1_fit, k);
+    scale_x(&mut cfg.ch1_zero_raw, k);
+    for point in &mut cfg.points_ch1 {
+        point.ch1_raw = (point.ch1_raw as f64 * k) as f32;
+    }
+    migrate_sensor_extras(
+        cfg.thermal.get_mut("KG1000"),
+        cfg.noise.get_mut("KG1000"),
+        cfg.temperature_captures.get_mut("KG1000").map(|v| v.as_mut_slice()).unwrap_or_default(),
+        k,
+    );
+    // KG50: the active top-level entries belong to the selected input.
+    if cfg.kg50_input == Kg50Input::Amp2 {
+        if let Some(kg50) = cfg.extra_channels.get_mut("kg50") {
+            migrate_channel(kg50, k);
+        }
+        migrate_sensor_extras(
+            cfg.thermal.get_mut("KG50"),
+            cfg.noise.get_mut("KG50"),
+            cfg.temperature_captures.get_mut("KG50").map(|v| v.as_mut_slice()).unwrap_or_default(),
+            k,
+        );
+    } else if let Some(profile) = cfg.kg50_input_profiles.get_mut(Kg50Input::Amp2.key()) {
+        if let Some(channel) = profile.channel.as_mut() {
+            migrate_channel(channel, k);
+        }
+        migrate_sensor_extras(profile.thermal.as_mut(), profile.noise.as_mut(), &mut profile.captures, k);
+    }
+    cfg.version = CALIBRATION_VERSION;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -230,6 +409,11 @@ pub struct CalibrationSensorSpec {
     pub fit_modes: Vec<String>,
     #[serde(default)]
     pub formatter: Option<ValueFormatter>,
+    /// The board whose rows the calibration tab reads for this sensor
+    /// (captures and Live Raw take only fresh rows from it). Omitted: the
+    /// UI reads any sender, except a load cell, which it reads from `DAQ`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -240,13 +424,15 @@ pub struct CalibrationTabLayout {
 }
 
 pub fn calibration_tab_layout() -> CalibrationTabLayout {
+    load_calibration_tab_layout_from_file().unwrap_or_else(built_in_calibration_tab_layout)
+}
+
+/// The tab layout when no `calibration_config.json` is readable.
+fn built_in_calibration_tab_layout() -> CalibrationTabLayout {
     let fit_modes: Vec<String> = ALL_CALIBRATION_FIT_MODES
         .iter()
         .map(|s| (*s).to_string())
         .collect();
-    if let Some(config) = load_calibration_tab_layout_from_file() {
-        return config;
-    }
     CalibrationTabLayout {
         capture_target_samples: CALIBRATION_CAPTURE_TARGET_SAMPLES,
         fit_modes: fit_modes.clone(),
@@ -257,7 +443,7 @@ pub fn calibration_tab_layout() -> CalibrationTabLayout {
                 data_type: "KG1000".to_string(),
                 channel: "ch1".to_string(),
                 fit_color: "#22d3ee".to_string(),
-                raw_label: "Raw".to_string(),
+                raw_label: "V".to_string(),
                 expected_label: "kg".to_string(),
                 fit_modes: fit_modes.clone(),
                 formatter: Some(ValueFormatter {
@@ -266,6 +452,7 @@ pub fn calibration_tab_layout() -> CalibrationTabLayout {
                     prefix: None,
                     suffix: None,
                 }),
+                sender_id: Some("DAQ".to_string()),
             },
             CalibrationSensorSpec {
                 id: "KG50".to_string(),
@@ -273,7 +460,7 @@ pub fn calibration_tab_layout() -> CalibrationTabLayout {
                 data_type: "KG50".to_string(),
                 channel: "kg50".to_string(),
                 fit_color: "#f59e0b".to_string(),
-                raw_label: "Raw".to_string(),
+                raw_label: "V".to_string(),
                 expected_label: "kg".to_string(),
                 fit_modes: fit_modes.clone(),
                 formatter: Some(ValueFormatter {
@@ -282,11 +469,12 @@ pub fn calibration_tab_layout() -> CalibrationTabLayout {
                     prefix: None,
                     suffix: None,
                 }),
+                sender_id: Some("DAQ".to_string()),
             },
             CalibrationSensorSpec {
                 id: "IADC".to_string(),
-                label: "Tank Pressure".to_string(),
-                data_type: "FUEL_TANK_PRESSURE".to_string(),
+                label: "Ox Tank Pressure".to_string(),
+                data_type: "OX_TANK_PRESSURE".to_string(),
                 channel: "iadc".to_string(),
                 fit_color: "#a78bfa".to_string(),
                 raw_label: "Raw".to_string(),
@@ -298,6 +486,7 @@ pub fn calibration_tab_layout() -> CalibrationTabLayout {
                     prefix: None,
                     suffix: None,
                 }),
+                sender_id: None,
             },
         ],
     }
@@ -315,7 +504,12 @@ fn calibration_config_path() -> PathBuf {
 fn load_calibration_tab_layout_from_file() -> Option<CalibrationTabLayout> {
     let path = calibration_config_path();
     let raw = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str::<CalibrationTabLayout>(&raw).ok()
+    let mut layout = serde_json::from_str::<CalibrationTabLayout>(&raw).ok()?;
+    // A config written before the ox tank PT rename names its legacy type.
+    for sensor in &mut layout.sensors {
+        sensor.data_type = crate::telemetry_schema::canonical_type_name(&sensor.data_type).to_string();
+    }
+    Some(layout)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -336,27 +530,84 @@ struct OldCalibrationFile {
     sensors: Vec<OldSensorCalibration>,
 }
 
+// RUNTIME-MODE-BOOT: the path follows the current mode, but main loads the
+// calibration once into `AppState::loadcell_calibration`; a mode switch must
+// reload it from the new mode's file before anything saves it.
 fn calibration_path() -> PathBuf {
     if let Ok(path) = std::env::var("GS_LOADCELL_CALIBRATION_PATH") {
         return PathBuf::from(path);
     }
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    #[cfg(feature = "testing")]
-    {
+    let path = if crate::runtime_mode::is_testing() {
         manifest_dir
             .join("calibration")
-            .join(DEFAULT_LOADCELL_CALIBRATION_FILENAME)
-    }
-    #[cfg(not(feature = "testing"))]
-    {
+            .join(default_loadcell_calibration_filename())
+    } else {
         manifest_dir
             .join("data")
-            .join(DEFAULT_LOADCELL_CALIBRATION_FILENAME)
+            .join(default_loadcell_calibration_filename())
+    };
+    #[cfg(test)]
+    let path = test_calibration_copy(&manifest_dir, &path);
+    path
+}
+
+/// Unit tests never write the checkout's calibration (tracked fixtures under
+/// `calibration/`, the operator's file under `data/`). Each test process works
+/// on its own copy: tracked files are copied in once, so reads match the
+/// fixture; `data/` starts empty, as in a fresh checkout. Copies left by
+/// earlier test processes that have exited are removed.
+#[cfg(test)]
+fn test_calibration_copy(manifest_dir: &std::path::Path, path: &std::path::Path) -> PathBuf {
+    // One thread copies a fixture in while the others wait for it whole.
+    static COPYING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _copying = COPYING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let relative = path.strip_prefix(manifest_dir).unwrap_or(path);
+    let copy = test_scratch_root().join(relative);
+    if !copy.exists() {
+        std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        if relative.starts_with("calibration") && path.exists() {
+            std::fs::copy(path, &copy).unwrap();
+        }
     }
+    copy
+}
+
+/// This test process's private stand-in for `backend/` station files
+/// (calibration, zero captures). Roots left by exited test processes are
+/// removed when the first one is made.
+#[cfg(test)]
+pub(crate) fn test_scratch_root() -> PathBuf {
+    use std::sync::OnceLock;
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    const PREFIX: &str = "gs-test-calibration-";
+    ROOT.get_or_init(|| {
+        let temp = std::env::temp_dir();
+        if let Ok(entries) = std::fs::read_dir(&temp) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if let Some(pid) = name.strip_prefix(PREFIX)
+                    && std::path::Path::new("/proc/self").exists()
+                    && !std::path::Path::new("/proc").join(pid).exists()
+                {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+        }
+        temp.join(format!("{PREFIX}{}", std::process::id()))
+    })
+    .clone()
+}
+
+#[cfg(test)]
+pub(crate) fn calibration_file_for_test() -> PathBuf {
+    calibration_path()
 }
 
 fn from_old_format(old: OldCalibrationFile) -> LoadcellCalibrationFile {
+    // The pre-versioned format stored legacy raw; load_or_default migrates it.
     let mut cfg = LoadcellCalibrationFile {
+        version: default_calibration_version(),
         full_mass_kg: Some(old.full_mass_kg.max(0.001)),
         ..LoadcellCalibrationFile::default()
     };
@@ -374,7 +625,18 @@ fn from_old_format(old: OldCalibrationFile) -> LoadcellCalibrationFile {
 }
 
 pub fn load_or_default() -> LoadcellCalibrationFile {
-    let path = calibration_path();
+    load_or_default_at(&calibration_path(), loadcell_input_is_simulated())
+}
+
+/// FlightSim, and the testing station's in-process simulator, publish the
+/// load-cell input directly in kg (their calibration is an identity), not
+/// DAQ ADC values, so a legacy file of theirs has nothing to convert.
+fn loadcell_input_is_simulated() -> bool {
+    crate::flight_sim_runtime::enabled()
+        || (crate::runtime_mode::is_testing() && crate::flight_sim::sim_mode_enabled())
+}
+
+fn load_or_default_at(path: &std::path::Path, simulated_input: bool) -> LoadcellCalibrationFile {
     let mut cfg = std::fs::read_to_string(&path)
         .ok()
         .and_then(|raw| serde_json::from_str::<LoadcellCalibrationFile>(&raw).ok())
@@ -385,9 +647,31 @@ pub fn load_or_default() -> LoadcellCalibrationFile {
                 .map(from_old_format)
         })
         .unwrap_or_default();
+    if cfg.version < CALIBRATION_VERSION && simulated_input {
+        cfg.version = CALIBRATION_VERSION;
+    } else if cfg.version < CALIBRATION_VERSION {
+        keep_legacy_raw_copy(path);
+    }
+    migrate_calibration(&mut cfg);
     normalize_calibration(&mut cfg);
-    let _ = save(&cfg);
+    if cfg.kg50_input_stamp_ms == 0 {
+        cfg.kg50_input_stamp_ms = crate::telemetry_task::get_current_timestamp_ms();
+    }
+    let _ = save_at(&cfg, path);
     cfg
+}
+
+/// Before a legacy raw-scale file is replaced by its volts migration, keep the
+/// original next to it (`<file>.v1-raw`), once. Nothing to keep for a default.
+fn keep_legacy_raw_copy(path: &std::path::Path) {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".v1-raw");
+    let copy = PathBuf::from(name);
+    if path.is_file() && !copy.exists() {
+        if let Err(error) = std::fs::copy(path, &copy) {
+            log::warn!("could not keep the legacy calibration at {}: {error}", copy.display());
+        }
+    }
 }
 
 fn sync_legacy_channels_into_extra(cfg: &mut LoadcellCalibrationFile) {
@@ -477,6 +761,7 @@ pub fn normalize_calibration(cfg: &mut LoadcellCalibrationFile) {
             });
     }
     sync_legacy_channels_into_extra(cfg);
+    mcp_reference::rereference(cfg);
     sync_extra_channels_into_legacy(cfg);
     update_weights_kg(cfg);
 }
@@ -521,6 +806,17 @@ pub fn amp2_calibration(cfg: &LoadcellCalibrationFile) -> LoadcellCalibrationFil
     result
 }
 
+/// The input a DAQ loadcell report proves the board was scanning.
+pub fn reported_kg50_input(data_type: &str, values: &[Option<f32>]) -> Option<Kg50Input> {
+    match data_type {
+        "KG50" => Some(Kg50Input::Amp2),
+        "DAQ_KG50_SELECTED" if values.first() == Some(&Some(1.0)) => {
+            Some(Kg50Input::P6Differential)
+        }
+        _ => None,
+    }
+}
+
 pub fn selected_kg50_value(
     input: Kg50Input,
     data_type: &str,
@@ -533,7 +829,125 @@ pub fn selected_kg50_value(
         }
         _ => None,
     }
-    .filter(|v| v.is_finite())
+    // NaN is no data; ±Inf is the DAQ's over-range marker and is kept.
+    .filter(|v| !v.is_nan())
+}
+
+/// Convert a recorded row written on the DAQ legacy raw scale to volts. Only
+/// the amplified inputs used that scale: KG1000 (also the first element of
+/// DAQ_LOADCELL_CHAMBER) and AMP2 KG50. A P6 KG50 selection was always volts;
+/// the station records it as `KG50` with its tagged 8-byte [source, volts]
+/// payload, which distinguishes it from a 4-byte AMP2 sample.
+pub fn legacy_loadcell_row_to_volts(
+    data_type: &str,
+    payload_json: Option<&str>,
+    values: &mut [Option<f32>],
+) {
+    let legacy = match data_type {
+        RAW_LOADCELL_DATA_TYPE_1000KG | "DAQ_LOADCELL_CHAMBER" => true,
+        RAW_LOADCELL_DATA_TYPE_50KG => !payload_json.is_some_and(|payload| {
+            serde_json::from_str::<Vec<u8>>(payload).is_ok_and(|bytes| bytes.len() == 8)
+        }),
+        _ => false,
+    };
+    if let (true, Some(Some(value))) = (legacy, values.first_mut()) {
+        *value = legacy_raw_to_volts(*value);
+    }
+}
+
+/// MCP3564R full scale at unity gain: +/-2^23 codes is +/-VREF, so the
+/// amplified KG1000/AMP2 KG50 inputs clip at the station's MCP3564R reference
+/// (`LoadcellCalibrationFile::mcp_vref_v`, nominal 2.4 V), and the P6
+/// differential input (PGA 16) at VREF / 16.
+/// In the 2026-11-16 test fire the KG1000 input sat at code 0xB40000
+/// (3.375 V nominal, legacy raw 0.19427338, published as 1726 kg), past this.
+/// KG1000 amplifier output floor. This analog limit cannot be derived from the
+/// ADC: the test fire showed the amplifier stuck at legacy raw 0.0012-0.0021
+/// (zero load is about raw 0.0120), which converted to -95 to -105 kg. The
+/// floor was set at legacy raw 0.0025; in ADC-pin volts that is 0.0025 * k
+/// (k = 16000/921), about 0.0434 V.
+const KG1000_LOW_RAIL_V: f32 = (0.0025 * LEGACY_RAW_TO_VOLTS) as f32;
+
+/// ADC-pin volt limits outside of which a DAQ load-cell input is clipped, for
+/// the sensor, the MCP3564R reference `vref` and (for KG50) the selected
+/// input. `None` for other sensors.
+pub fn loadcell_rail_limits_at(vref: f32, kg50_input: Kg50Input, sensor: &str) -> Option<(f32, f32)> {
+    let unity = mcp_reference::unity_full_scale_v(vref);
+    let p6 = mcp_reference::p6_full_scale_v(vref);
+    match (sensor, kg50_input) {
+        ("KG1000" | "ch1", _) => Some((KG1000_LOW_RAIL_V, unity)),
+        ("KG50" | "kg50", Kg50Input::P6Differential) => Some((-p6, p6)),
+        ("KG50" | "kg50", Kg50Input::Amp2) => Some((-unity, unity)),
+        _ => None,
+    }
+}
+
+/// Rail limits under `cfg`'s reference and selected 50 kg input.
+pub fn loadcell_rail_limits_for(cfg: &LoadcellCalibrationFile, sensor: &str) -> Option<(f32, f32)> {
+    loadcell_rail_limits_at(cfg.mcp_vref_v, cfg.kg50_input, sensor)
+}
+
+/// Rail limits at the nominal 2.4 V reference. Prefer `loadcell_rail_limits_for`.
+#[cfg(test)]
+pub fn loadcell_rail_limits(kg50_input: Kg50Input, sensor: &str) -> Option<(f32, f32)> {
+    loadcell_rail_limits_at(mcp_reference::NOMINAL_MCP_VREF_V, kg50_input, sensor)
+}
+
+fn volts_outside(limits: Option<(f32, f32)>, volts: f32) -> bool {
+    limits.is_some_and(|(low, high)| !volts.is_finite() || volts <= low || volts >= high)
+}
+
+/// True when `volts` from a DAQ load cell is at an ADC or amplifier rail under
+/// `cfg`'s reference and input, so a converted weight would be meaningless.
+pub fn loadcell_volts_at_rail_for(cfg: &LoadcellCalibrationFile, sensor: &str, volts: f32) -> bool {
+    volts_outside(loadcell_rail_limits_for(cfg, sensor), volts)
+}
+
+/// `loadcell_volts_at_rail_for` at the nominal 2.4 V reference.
+#[cfg(test)]
+pub fn loadcell_volts_at_rail(kg50_input: Kg50Input, sensor: &str, volts: f32) -> bool {
+    volts_outside(loadcell_rail_limits(kg50_input, sensor), volts)
+}
+
+/// DAQ rails describe the real ADC scale. FlightSim publishes the load-cell
+/// input directly in kg, so rail checks do not apply to it.
+pub fn daq_rails_apply() -> bool {
+    !crate::flight_sim_runtime::enabled()
+}
+
+/// Reject a calibration whose points or zero were captured on a clipped input.
+fn reject_railed_points(cfg: &LoadcellCalibrationFile, channel: &str, sensor: &str) -> Result<(), String> {
+    let Some(entry) = cfg.extra_channels.get(channel).filter(|_| daq_rails_apply()) else {
+        return Ok(());
+    };
+    let railed = |volts: f32| loadcell_volts_at_rail_for(cfg, sensor, volts);
+    if let Some(zero) = entry.zero_raw.filter(|volts| railed(*volts)) {
+        return Err(format!(
+            "{sensor} zero {zero} V is at the ADC/amplifier rail; recapture it with the input in range"
+        ));
+    }
+    if let Some(point) = entry.points.iter().find(|point| railed(point.raw)) {
+        return Err(format!(
+            "{sensor} point {} kg has {} V at the ADC/amplifier rail; recapture it with the input in range",
+            point.expected, point.raw
+        ));
+    }
+    Ok(())
+}
+
+/// Keep only temperature captures that still belong to a saved point or zero.
+fn retain_matching_captures(captures: &mut Vec<TemperatureCapture>, channel: Option<&GenericCalibrationChannel>) {
+    let Some(channel) = channel else {
+        captures.clear();
+        return;
+    };
+    captures.retain(|capture| {
+        (capture.expected.abs() <= 1e-6 && channel.zero_raw.is_some())
+            || channel
+                .points
+                .iter()
+                .any(|point| (point.expected - capture.expected).abs() < 1e-6)
+    });
 }
 
 /// A UI save is explicitly scoped to one calibration channel. Everything else
@@ -542,22 +956,133 @@ pub fn selected_kg50_value(
 pub struct CalibrationUpdate {
     pub channel: String,
     pub calibration: LoadcellCalibrationFile,
+    /// `LoadcellCalibrationFile::revision` of the document the editor loaded
+    /// and edited. Required: a save without it is refused (428), a save whose
+    /// revision is not the station's current one is refused as stale (409).
+    #[serde(default)]
+    pub revision: Option<u64>,
+    /// MCP3564R reference (V) the saved KG1000/KG50 points, zero, fit and
+    /// thermal correction were captured and fitted at: the `mcp_vref_v` of the
+    /// document the editor loaded. Required for `ch1` and `kg50` (422 when
+    /// missing); a value that is not the station's current reference is
+    /// refused (409), never converted or restamped. Per-channel
+    /// `fitted_mcp_vref_v` inside `calibration` is ignored: a missing one
+    /// deserializes as the legacy nominal and cannot be told from a real one.
+    #[serde(default)]
+    pub fitted_mcp_vref_v: Option<f32>,
+}
+
+#[cfg(test)]
+impl CalibrationUpdate {
+    /// An editor save of `channel` made against `base` as loaded.
+    pub(crate) fn based_on(base: &LoadcellCalibrationFile, channel: &str, calibration: LoadcellCalibrationFile) -> Self {
+        Self {
+            channel: channel.into(),
+            calibration,
+            revision: Some(base.revision),
+            fitted_mcp_vref_v: Some(base.mcp_vref_v),
+        }
+    }
+}
+
+/// Why a calibration write was refused; the web layer maps each to a status.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UpdateRefusal {
+    /// 428: the write does not say which revision it was based on.
+    RevisionRequired(String),
+    /// 409: the station's calibration (revision, 50 kg input or reference)
+    /// changed since the client loaded it.
+    Stale(String),
+    /// 422: the write does not say which MCP3564R reference its volts are in.
+    ReferenceRequired(String),
+    /// 409: the update itself is not acceptable (unknown channel, legacy
+    /// scale, railed points, invalid thermal or noise values).
+    Rejected(String),
+}
+
+impl UpdateRefusal {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::RevisionRequired(m) | Self::Stale(m) | Self::ReferenceRequired(m) | Self::Rejected(m) => m,
+        }
+    }
+}
+
+impl std::fmt::Display for UpdateRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+/// Load-cell inputs whose volts are scaled by the MCP3564R reference.
+pub fn uses_mcp_reference(sensor_or_channel: &str) -> bool {
+    matches!(sensor_or_channel, "ch1" | "kg50" | "KG1000" | "KG50")
+}
+
+/// Check that a write was made against the station's current calibration.
+/// `revision` is the revision the client loaded; `vref` the reference its
+/// readings were taken under, required when `needs_reference`. Messages tell
+/// the operator what changed and to reload.
+pub fn check_base(
+    current: &LoadcellCalibrationFile,
+    revision: Option<u64>,
+    vref: Option<f32>,
+    needs_reference: bool,
+) -> Result<(), UpdateRefusal> {
+    let Some(revision) = revision else {
+        return Err(UpdateRefusal::RevisionRequired(
+            "This client did not say which calibration revision it edited. Reload the calibration (update the UI if this repeats) and re-apply your changes.".into(),
+        ));
+    };
+    if revision != current.revision {
+        return Err(UpdateRefusal::Stale(format!(
+            "Calibration changed on the station since it was loaded (loaded revision {revision}, station revision {}). Nothing was saved: reload the calibration and re-apply your changes.",
+            current.revision
+        )));
+    }
+    if needs_reference {
+        let Some(vref) = vref else {
+            return Err(UpdateRefusal::ReferenceRequired(
+                "This save does not say which DAQ MCP3564R reference its readings were taken at, so it cannot be stored. Reload the calibration and re-apply your changes.".into(),
+            ));
+        };
+        if vref != current.mcp_vref_v {
+            return Err(UpdateRefusal::Stale(format!(
+                "These readings were taken at DAQ MCP3564R reference {vref} V but the station reference is now {} V. Nothing was saved: reload the calibration and capture the points again.",
+                current.mcp_vref_v
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub fn merge_channel_update(
     current: &LoadcellCalibrationFile,
     update: &CalibrationUpdate,
-) -> Result<LoadcellCalibrationFile, String> {
+) -> Result<LoadcellCalibrationFile, UpdateRefusal> {
     let channel = update.channel.as_str();
     let sensor = match channel {
         "ch1" => "KG1000",
         "kg50" => "KG50",
         "iadc" => "IADC",
-        _ => return Err("Unknown calibration channel".into()),
+        _ => return Err(UpdateRefusal::Rejected("Unknown calibration channel".into())),
     };
-    if channel == "kg50" && update.calibration.kg50_input != current.kg50_input {
-        return Err("50 kg input changed; reload calibration before saving".into());
+    if update.calibration.version < CALIBRATION_VERSION {
+        return Err(UpdateRefusal::Rejected(format!(
+            "Calibration version {} uses the legacy raw scale; reload calibration (version {CALIBRATION_VERSION}, volts) before saving",
+            update.calibration.version
+        )));
     }
+    check_base(current, update.revision, update.fitted_mcp_vref_v, uses_mcp_reference(channel))?;
+    if channel == "kg50" && update.calibration.kg50_input != current.kg50_input {
+        return Err(UpdateRefusal::Stale(
+            "50 kg input changed; reload calibration before saving".into(),
+        ));
+    }
+    // Provenance: the reference the client says it fitted at (checked equal
+    // to the station's above), never a value filled in here. Other channels
+    // do not carry one.
+    let fitted = if uses_mcp_reference(channel) { update.fitted_mcp_vref_v } else { None };
     let incoming = &update.calibration;
     let mut result = current.clone();
     // An omitted selected channel means an explicit reset. Keep an empty entry
@@ -570,9 +1095,14 @@ pub fn merge_channel_update(
             .cloned()
             .unwrap_or_default(),
     );
+    if let Some(entry) = result.extra_channels.get_mut(channel) {
+        entry.fitted_mcp_vref_v = fitted;
+    }
     result.thermal.remove(sensor);
     if let Some(value) = incoming.thermal.get(sensor) {
-        result.thermal.insert(sensor.into(), value.clone());
+        let mut value = value.clone();
+        value.fitted_mcp_vref_v = fitted;
+        result.thermal.insert(sensor.into(), value);
     }
     result.noise.remove(sensor);
     if let Some(value) = incoming.noise.get(sensor) {
@@ -580,24 +1110,96 @@ pub fn merge_channel_update(
     }
     result.temperature_captures.remove(sensor);
     if let Some(value) = incoming.temperature_captures.get(sensor) {
-        result
-            .temperature_captures
-            .insert(sensor.into(), value.clone());
+        let mut captures = value.clone();
+        retain_matching_captures(&mut captures, result.extra_channels.get(channel));
+        if !captures.is_empty() {
+            result.temperature_captures.insert(sensor.into(), captures);
+        }
     }
+    reject_railed_points(&result, channel, sensor).map_err(UpdateRefusal::Rejected)?;
     // Make the selected authoritative generic channel agree with legacy fields
     // before migration normalization (including explicit zero/fit removal).
     sync_extra_channels_into_legacy(&mut result);
     normalize_calibration(&mut result);
-    validate_thermal(&result)?;
+    validate_thermal(&result).map_err(UpdateRefusal::Rejected)?;
     Ok(result)
 }
 
-pub fn save(cfg: &LoadcellCalibrationFile) -> Result<(), String> {
-    save_at(cfg, &calibration_path())
+/// Persist a change to the station's calibration as a new revision: `cfg`
+/// leaves with its revision advanced past the one it was built from (and
+/// unchanged when the write fails). Every runtime writer goes through this or
+/// `save_guarded`, so every write moves the revision clients edit against.
+pub fn save(cfg: &mut LoadcellCalibrationFile) -> Result<(), String> {
+    let previous = next_revision(cfg);
+    save_at(cfg, &calibration_path()).inspect_err(|_| cfg.revision = previous)
 }
 
+/// Advance `cfg.revision`, returning the previous one.
+fn next_revision(cfg: &mut LoadcellCalibrationFile) -> u64 {
+    let previous = cfg.revision;
+    cfg.revision = previous.wrapping_add(1);
+    previous
+}
+
+#[derive(Debug)]
+pub(crate) enum GuardedSaveOutcome {
+    Durable,
+    /// Rename completed; a failed directory sync makes crash durability unknown.
+    PublishedUncertain(String),
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SaveBoundary { Prepare, Unchanged, Replace }
+
 pub(crate) fn save_at(cfg: &LoadcellCalibrationFile, path: &std::path::Path) -> Result<(), String> {
+    match save_at_checked(cfg, path, false, |_| Ok(()))? {
+        GuardedSaveOutcome::Durable => Ok(()),
+        GuardedSaveOutcome::PublishedUncertain(error) => Err(error),
+    }
+}
+/// Calibration format/backups remain identical. Only this guarded path owns
+/// a unique create_new temporary, so a refusal cannot remove another writer's
+/// historical fixed json.tmp file. No SDK/DISPATCH/Stop/GSE guard is involved.
+/// Like `save`, a new revision; a published but uncertain write keeps it.
+pub(crate) fn save_guarded(
+    cfg: &mut LoadcellCalibrationFile,
+    guard: impl FnMut(SaveBoundary) -> Result<(), String>,
+) -> Result<GuardedSaveOutcome, String> {
+    let previous = next_revision(cfg);
+    save_at_checked(cfg, &calibration_path(), true, guard).inspect_err(|_| cfg.revision = previous)
+}
+#[cfg(test)]
+type GuardedReplaceTestHook = (std::path::PathBuf, Box<dyn FnOnce() + Send>);
+#[cfg(test)]
+static GUARDED_REPLACE_TEST_HOOK: std::sync::Mutex<Option<GuardedReplaceTestHook>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+pub(crate) fn set_guarded_replace_test_hook(path: std::path::PathBuf, hook: impl FnOnce() + Send + 'static) {
+    *GUARDED_REPLACE_TEST_HOOK.lock().unwrap() = Some((path, Box::new(hook)));
+}
+#[cfg(test)]
+fn guarded_replace_test_hook(path: &std::path::Path) {
+    let mut slot = GUARDED_REPLACE_TEST_HOOK.lock().unwrap();
+    let hook = if slot.as_ref().is_some_and(|(owner, _)| owner == path) { slot.take().map(|(_, hook)| hook) } else { None };
+    drop(slot);
+    if let Some(hook) = hook { hook(); }
+}
+
+struct OwnedCalibrationTemporary {
+    path: std::path::PathBuf,
+    remove_on_drop: bool,
+}
+impl Drop for OwnedCalibrationTemporary {
+    fn drop(&mut self) {
+        if self.remove_on_drop { let _ = std::fs::remove_file(&self.path); }
+    }
+}
+fn save_at_checked(
+    cfg: &LoadcellCalibrationFile,
+    path: &std::path::Path,
+    unique_temporary: bool,
+    mut guard: impl FnMut(SaveBoundary) -> Result<(), String>,
+) -> Result<GuardedSaveOutcome, String> {
     use std::io::Write;
+    guard(SaveBoundary::Prepare)?;
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -605,9 +1207,16 @@ pub(crate) fn save_at(cfg: &LoadcellCalibrationFile, path: &std::path::Path) -> 
     std::fs::create_dir_all(parent).map_err(|e| format!("create_dir_all({parent:?}): {e}"))?;
     let raw =
         serde_json::to_string_pretty(cfg).map_err(|e| format!("serialize calibration: {e}"))?;
-    if let Ok(previous) = std::fs::read(&path) {
+    if let Ok(previous) = std::fs::read(path) {
         if previous == raw.as_bytes() {
-            return Ok(());
+            guard(SaveBoundary::Unchanged)?;
+            if unique_temporary {
+                // A previous replaced-but-uncertain write is not made durable
+                // merely by reading identical bytes on this attempt.
+                confirm_existing_calibration_durability(path, parent, raw.as_bytes())?;
+                guard(SaveBoundary::Unchanged)?;
+            }
+            return Ok(GuardedSaveOutcome::Durable);
         }
         let backups = path
             .parent()
@@ -636,22 +1245,67 @@ pub(crate) fn save_at(cfg: &LoadcellCalibrationFile, path: &std::path::Path) -> 
             .and_then(|dir| dir.sync_all())
             .map_err(|e| format!("sync calibration backups: {e}"))?;
     }
-    let temporary = path.with_extension("json.tmp");
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&temporary)
+    let temporary_path = if unique_temporary {
+        path.with_extension(format!("json.tmp.{}.{}", std::process::id(), rand::random::<u128>()))
+    } else {
+        path.with_extension("json.tmp")
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true);
+    if unique_temporary { options.create_new(true); } else { options.create(true).truncate(true); }
+    let mut file = options.open(&temporary_path)
         .map_err(|e| format!("open calibration temporary file: {e}"))?;
-    file.write_all(raw.as_bytes())
+    let mut temporary = OwnedCalibrationTemporary { path: temporary_path, remove_on_drop: unique_temporary };
+    let written = file.write_all(raw.as_bytes())
         .and_then(|()| file.sync_all())
-        .map_err(|e| format!("write calibration {path:?}: {e}"))?;
-    std::fs::rename(&temporary, path).map_err(|e| format!("replace calibration {path:?}: {e}"))?;
+        .map_err(|e| format!("write calibration {path:?}: {e}"));
+    drop(file);
+    written?;
+    // The only publication boundary. An expired original guard drops only
+    // this successfully create_new-owned temporary; prior tare stays intact.
+    #[cfg(test)]
+    guarded_replace_test_hook(path);
+    guard(SaveBoundary::Replace)?;
+    std::fs::rename(&temporary.path, path).map_err(|e| format!("replace calibration {path:?}: {e}"))?;
+    temporary.remove_on_drop = false;
     #[cfg(unix)]
-    std::fs::File::open(parent)
-        .and_then(|dir| dir.sync_all())
-        .map_err(|e| format!("sync calibration directory: {e}"))?;
-    Ok(())
+    if let Err(error) = std::fs::File::open(parent).and_then(|dir| dir.sync_all()) {
+        return Ok(GuardedSaveOutcome::PublishedUncertain(format!("calibration file replaced but directory sync failed; persistence is uncertain: {error}")));
+    }
+    Ok(GuardedSaveOutcome::Durable)
+}
+
+fn confirm_existing_calibration_durability(
+    path: &std::path::Path,
+    parent: &std::path::Path,
+    expected: &[u8],
+) -> Result<(), String> {
+    use std::io::Read;
+    let uncertain = |error| format!("matching calibration durability remains uncertain: {error}");
+    let mut file = std::fs::File::open(path).map_err(uncertain)?;
+    let mut observed = Vec::new();
+    file.read_to_end(&mut observed).map_err(uncertain)?;
+    if observed != expected { return Err("calibration contents changed during durability verification".into()); }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let identity = file.metadata().map_err(uncertain)?;
+        let same_path = |current: &std::fs::Metadata| current.dev() == identity.dev() && current.ino() == identity.ino();
+        if !same_path(&std::fs::metadata(path).map_err(uncertain)?) {
+            return Err("calibration owner changed during durability verification".into());
+        }
+        file.sync_all().map_err(uncertain)?;
+        std::fs::File::open(parent).and_then(|directory| directory.sync_all()).map_err(uncertain)?;
+        if !same_path(&std::fs::metadata(path).map_err(uncertain)?) {
+            return Err("calibration owner changed after durability verification".into());
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+        Err("matching calibration durability remains uncertain: file/path identity verification is unavailable".into())
+    }
 }
 
 fn points_for_channel(
@@ -1532,13 +2186,15 @@ mod tests {
 
     #[test]
     fn reversed_load_readings_are_not_clipped_at_132_kg() {
-        let mut cfg = LoadcellCalibrationFile::default();
-        // Coefficients reconstructed from the recording; mass must remain
+                // Coefficients reconstructed from the recording; mass must remain
         // linear outside its observed -132.95 kg minimum. Only fill percentage
         // is intentionally restricted to 0..100, never the measured mass.
-        cfg.ch1 = ChannelLinear {
+        let cfg = LoadcellCalibrationFile {
+            ch1: ChannelLinear {
             m: Some(9977.795),
             b: Some(-147.32314),
+        },
+            ..LoadcellCalibrationFile::default()
         };
         let floor = calibrated_weight_kg(&cfg, "KG1000", 0.0014401439).unwrap();
         assert!((floor + 132.95367).abs() < 0.001);
@@ -1582,6 +2238,13 @@ pub struct ThermalCalibration {
     pub raw_per_c: f32,
     #[serde(default)]
     pub points: Vec<[f32; 2]>, // [temperature C, unloaded raw]
+    /// MCP3564R reference (V) `raw_per_c` and `points` are expressed in; see
+    /// `GenericCalibrationChannel::fitted_mcp_vref_v`.
+    #[serde(
+        default = "mcp_reference::legacy_fitted",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub fitted_mcp_vref_v: Option<f32>,
 }
 
 fn thermal_key(sensor: &str) -> &str {
@@ -1660,6 +2323,9 @@ pub fn capture_thermal_zero(
         return Err("At most 64 thermal points are supported".into());
     }
     t.points.push([temperature, raw]);
+    // The caller checked the sample was taken under the station's reference
+    // (web::capture_thermal_zero); the points are in it.
+    t.fitted_mcp_vref_v = Some(cfg.mcp_vref_v);
     // Keep the saved correction/reference while accumulating an inconclusive fit.
     if !cfg.thermal.contains_key(sensor) {
         t.reference_c = temperature;
@@ -1708,6 +2374,7 @@ mod thermal_tests {
                 reference_c: 20.,
                 raw_per_c: 0.02,
                 points: vec![],
+                fitted_mcp_vref_v: None,
             },
         );
         for i in 0..5 {
@@ -1763,11 +2430,11 @@ mod thermal_tests {
     }
     #[test]
     fn freshness_and_sender_are_required() {
-        let rows = vec![crate::types::TelemetryRow {
+        let rows = [crate::types::TelemetryRow {
             timestamp_ms: 1000,
             data_type: "DAQ_ADC_TEMPERATURE".into(),
             sender_id: "SD_CARD".into(),
-            values: vec![Some(25.0)],
+            values: vec![Some(25.0)], over_range: 0, over_range_low: 0,
         }];
         assert_eq!(
             recent_adc_temperature(rows.iter(), "SD_CARD", 2000),
@@ -1808,6 +2475,16 @@ pub fn record_capture_temperature(
 #[cfg(test)]
 mod temperature_capture_tests {
     use super::*;
+    #[test]
+    fn only_a_daq_report_stream_proves_the_scanned_input() {
+        assert_eq!(reported_kg50_input("KG50", &[Some(0.1)]), Some(Kg50Input::Amp2));
+        assert_eq!(
+            reported_kg50_input("DAQ_KG50_SELECTED", &[Some(1.0), Some(0.1)]),
+            Some(Kg50Input::P6Differential)
+        );
+        assert_eq!(reported_kg50_input("DAQ_KG50_SELECTED", &[Some(2.0), Some(0.1)]), None);
+        assert_eq!(reported_kg50_input("KG1000", &[Some(0.1)]), None);
+    }
     #[test]
     fn calibration_keeps_temperature_and_legacy_json_loads() {
         let mut cfg = LoadcellCalibrationFile::default();
@@ -1928,19 +2605,13 @@ mod channel_save_tests {
         current
             .thermal
             .insert("KG1000".into(), ThermalCalibration::default());
-        sync_extra_channels_into_legacy(&mut current);
+        // Also stamps each load cell with its MCP3564R reference.
+        normalize_calibration(&mut current);
         let original = json(&current);
         let mut stale = LoadcellCalibrationFile::default();
         normalize_calibration(&mut stale);
         stale.extra_channels.get_mut("kg50").unwrap().linear.m = Some(5678.0);
-        let saved = merge_channel_update(
-            &current,
-            &CalibrationUpdate {
-                channel: "kg50".into(),
-                calibration: stale,
-            },
-        )
-        .unwrap();
+        let saved = merge_channel_update(&current, &CalibrationUpdate::based_on(&current, "kg50", stale)).unwrap();
         assert_eq!(
             json(&saved)["extra_channels"]["ch1"],
             original["extra_channels"]["ch1"]
@@ -1953,10 +2624,7 @@ mod channel_save_tests {
         assert_eq!(saved.extra_channels["kg50"].linear.m, Some(5678.0));
         let reset = merge_channel_update(
             &saved,
-            &CalibrationUpdate {
-                channel: "ch1".into(),
-                calibration: LoadcellCalibrationFile::default(),
-            },
+            &CalibrationUpdate::based_on(&saved, "ch1", LoadcellCalibrationFile::default()),
         )
         .unwrap();
         assert_eq!(
@@ -2011,28 +2679,168 @@ mod channel_save_tests {
         switch_kg50_input(&mut current, Kg50Input::P6Differential);
         let stale = LoadcellCalibrationFile::default();
         assert!(
-            merge_channel_update(
-                &current,
-                &CalibrationUpdate {
-                    channel: "kg50".into(),
-                    calibration: stale.clone()
-                }
-            )
-            .is_err()
+            merge_channel_update(&current, &CalibrationUpdate::based_on(&current, "kg50", stale.clone()))
+                .is_err()
         );
-        let saved = merge_channel_update(
-            &current,
-            &CalibrationUpdate {
-                channel: "ch1".into(),
-                calibration: stale,
-            },
-        )
-        .unwrap();
+        let saved = merge_channel_update(&current, &CalibrationUpdate::based_on(&current, "ch1", stale)).unwrap();
         assert_eq!(saved.kg50_input, Kg50Input::P6Differential);
         assert_eq!(
             json(&saved)["kg50_input_profiles"],
             json(&current)["kg50_input_profiles"]
         );
+    }
+}
+
+#[cfg(test)]
+mod revision_tests {
+    use super::*;
+
+    fn loaded() -> LoadcellCalibrationFile {
+        let mut cfg = LoadcellCalibrationFile::default();
+        normalize_calibration(&mut cfg);
+        cfg.revision = 7;
+        cfg
+    }
+
+    fn edit(base: &LoadcellCalibrationFile, m: f32) -> LoadcellCalibrationFile {
+        let mut cfg = base.clone();
+        let ch1 = cfg.extra_channels.entry("ch1".into()).or_default();
+        ch1.linear = ChannelLinear { m: Some(m), b: Some(0.0) };
+        ch1.fit = None;
+        cfg
+    }
+
+    #[test]
+    fn a_file_saved_before_revisions_loads_as_revision_zero_and_loading_does_not_bump_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "gs-calibration-revision-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("calibration.json");
+        let mut legacy = serde_json::to_value(LoadcellCalibrationFile::default()).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        object.remove("revision");
+        object.remove("mcp_vref_changed_ms");
+        object.insert("kg50_input_stamp_ms".into(), 5.into());
+        std::fs::write(&path, legacy.to_string()).unwrap();
+        let cfg = load_or_default_at(&path, false);
+        assert_eq!((cfg.revision, cfg.mcp_vref_changed_ms), (0, 0));
+        assert_eq!(load_or_default_at(&path, false).revision, 0, "a restart is not a write");
+        let written: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(written["revision"], 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn save_moves_the_revision_and_a_failed_save_does_not() {
+        // Its own process: other tests save the same scratch calibration.
+        if crate::operator_queue::isolated_case(module_path!(), "save_moves_the_revision_and_a_failed_save_does_not") {
+            return;
+        }
+        let mut cfg = load_or_default();
+        let before = cfg.revision;
+        save(&mut cfg).unwrap();
+        assert_eq!(cfg.revision, before + 1);
+        assert_eq!(load_or_default().revision, before + 1, "persisted");
+        let mut guarded = cfg.clone();
+        let outcome = save_guarded(&mut guarded, |_| Err("refused".into()));
+        assert!(outcome.is_err());
+        assert_eq!(guarded.revision, before + 1, "a refused write keeps the revision");
+        save_guarded(&mut guarded, |_| Ok(())).unwrap();
+        assert_eq!(guarded.revision, before + 2);
+    }
+
+    #[test]
+    fn an_editor_save_must_be_based_on_the_current_revision() {
+        let current = loaded();
+        let saved = merge_channel_update(&current, &CalibrationUpdate::based_on(&current, "ch1", edit(&current, 900.0)))
+            .unwrap();
+        assert_eq!(saved.extra_channels["ch1"].linear.m, Some(900.0));
+        assert_eq!(saved.revision, current.revision, "merge does not bump; save does");
+
+        let mut older = current.clone();
+        older.revision = 6;
+        let refusal = merge_channel_update(&current, &CalibrationUpdate::based_on(&older, "ch1", edit(&current, 900.0)))
+            .unwrap_err();
+        assert!(matches!(refusal, UpdateRefusal::Stale(_)), "{refusal:?}");
+        let text = refusal.to_string();
+        assert!(text.contains("changed on the station since it was loaded") && text.contains("reload"), "{text}");
+        assert!(text.contains("revision 6") && text.contains("revision 7"), "{text}");
+
+        let mut missing = CalibrationUpdate::based_on(&current, "ch1", edit(&current, 900.0));
+        missing.revision = None;
+        assert!(matches!(merge_channel_update(&current, &missing), Err(UpdateRefusal::RevisionRequired(_))));
+        // A body from a client that predates revisions.
+        let old_client: CalibrationUpdate = serde_json::from_value(serde_json::json!({
+            "channel": "iadc",
+            "calibration": serde_json::to_value(&current).unwrap(),
+        }))
+        .unwrap();
+        assert!(matches!(merge_channel_update(&current, &old_client), Err(UpdateRefusal::RevisionRequired(_))));
+    }
+
+    #[test]
+    fn a_fit_is_stamped_with_the_reference_it_was_made_at_never_the_current_setting() {
+        // The editor loaded at the nominal reference; the station then moved
+        // to 2.2 V (converting its own copy). The old fit is refused, not
+        // stamped 2.2 V, even if it names the current revision.
+        let loaded_at_nominal = loaded();
+        let mut current = loaded_at_nominal.clone();
+        mcp_reference::set_reference(&mut current, 2.2).unwrap();
+        let mut update = CalibrationUpdate::based_on(&current, "ch1", edit(&loaded_at_nominal, 900.0));
+        update.fitted_mcp_vref_v = Some(2.4);
+        let refusal = merge_channel_update(&current, &update).unwrap_err();
+        assert!(matches!(refusal, UpdateRefusal::Stale(_)), "{refusal:?}");
+        let text = refusal.to_string();
+        assert!(text.contains("2.4 V") && text.contains("2.2 V") && text.contains("reload"), "{text}");
+
+        update.fitted_mcp_vref_v = None;
+        assert!(matches!(merge_channel_update(&current, &update), Err(UpdateRefusal::ReferenceRequired(_))));
+
+        // A nested per-channel stamp cannot stand in for the explicit one.
+        let mut nested = edit(&current, 900.0);
+        nested.extra_channels.get_mut("ch1").unwrap().fitted_mcp_vref_v = Some(2.2);
+        let mut update = CalibrationUpdate::based_on(&current, "ch1", nested);
+        update.fitted_mcp_vref_v = None;
+        assert!(matches!(merge_channel_update(&current, &update), Err(UpdateRefusal::ReferenceRequired(_))));
+
+        let mut thermal = edit(&current, 900.0);
+        thermal.thermal.insert(
+            "KG1000".into(),
+            ThermalCalibration { reference_c: 20.0, raw_per_c: 1e-4, points: vec![], fitted_mcp_vref_v: None },
+        );
+        let saved = merge_channel_update(&current, &CalibrationUpdate::based_on(&current, "ch1", thermal)).unwrap();
+        assert_eq!(saved.extra_channels["ch1"].fitted_mcp_vref_v, Some(2.2));
+        assert_eq!(saved.thermal["KG1000"].fitted_mcp_vref_v, Some(2.2));
+        assert_eq!(saved.extra_channels["ch1"].linear.m, Some(900.0), "not converted");
+
+        // IADC is not an MCP3564R input: no reference needed or stamped.
+        let mut iadc = CalibrationUpdate::based_on(&current, "iadc", current.clone());
+        iadc.fitted_mcp_vref_v = None;
+        let saved = merge_channel_update(&current, &iadc).unwrap();
+        assert_eq!(saved.extra_channels["iadc"].fitted_mcp_vref_v, None);
+    }
+
+    #[test]
+    fn capture_checks_share_the_revision_and_reference_rules() {
+        let current = loaded();
+        assert!(check_base(&current, Some(7), Some(2.4), true).is_ok());
+        assert!(matches!(check_base(&current, None, Some(2.4), true), Err(UpdateRefusal::RevisionRequired(_))));
+        assert!(matches!(check_base(&current, Some(8), Some(2.4), true), Err(UpdateRefusal::Stale(_))));
+        assert!(matches!(check_base(&current, Some(7), None, true), Err(UpdateRefusal::ReferenceRequired(_))));
+        assert!(matches!(check_base(&current, Some(7), Some(2.2), true), Err(UpdateRefusal::Stale(_))));
+        assert!(check_base(&current, Some(7), None, false).is_ok());
+        assert!(uses_mcp_reference("KG1000") && uses_mcp_reference("kg50") && !uses_mcp_reference("iadc"));
+    }
+
+    #[test]
+    fn a_thermal_point_is_stamped_with_the_reference_it_was_taken_under() {
+        let mut cfg = loaded();
+        mcp_reference::set_reference(&mut cfg, 2.2).unwrap();
+        capture_thermal_zero(&mut cfg, "KG1000", 0.2, 21.0).unwrap();
+        assert_eq!(cfg.thermal["KG1000"].fitted_mcp_vref_v, Some(2.2));
     }
 }
 
@@ -2060,6 +2868,12 @@ impl HistoryCalibration {
         }
     }
     pub fn project(&mut self, row: crate::types::TelemetryRow) -> Vec<crate::types::TelemetryRow> {
+        let source=crate::telemetry_provenance::source(&row);
+        let rows=self.project_inner(row);
+        for row in &rows {crate::telemetry_provenance::note(row,source);}
+        rows
+    }
+    fn project_inner(&mut self, row: crate::types::TelemetryRow) -> Vec<crate::types::TelemetryRow> {
         if matches!(
             row.data_type.as_str(),
             DERIVED_WEIGHT_DATA_TYPE
@@ -2086,7 +2900,7 @@ impl HistoryCalibration {
         let sensor = match row.data_type.as_str() {
             "KG1000" => "KG1000",
             "KG50" => "KG50",
-            "IADC" | "FUEL_TANK_PRESSURE" => "IADC",
+            "IADC" | crate::telemetry_schema::OX_TANK_PRESSURE | crate::telemetry_schema::LEGACY_FUEL_TANK_PRESSURE => "IADC",
             _ => return vec![row],
         };
         let kind = match sensor {
@@ -2105,6 +2919,7 @@ impl HistoryCalibration {
             .first()
             .copied()
             .flatten()
+            .filter(|volts| !(daq_rails_apply() && loadcell_volts_at_rail_for(&self.cfg, sensor, *volts)))
             .and_then(|raw| temperature_corrected_raw(&self.cfg, sensor, raw, temp))
             .map(|raw| {
                 self.processing
@@ -2146,17 +2961,21 @@ mod history_calibration_tests {
     use crate::types::TelemetryRow;
     #[test]
     fn history_calibration_uses_current_thermal_fit_and_expires_stale_temperature() {
-        let mut cfg = LoadcellCalibrationFile::default();
-        cfg.ch1 = ChannelLinear {
-            m: Some(2.),
-            b: Some(1.),
+                let mut cfg = LoadcellCalibrationFile {
+            ch1: ChannelLinear {
+            m: Some(128.),
+            b: Some(2.),
+        },
+            ..LoadcellCalibrationFile::default()
         };
+        // Volts stay inside the DAQ ADC range (exact binary fractions).
         cfg.thermal.insert(
             "KG1000".into(),
             ThermalCalibration {
                 reference_c: 20.,
-                raw_per_c: 0.5,
+                raw_per_c: 0.00390625,
                 points: vec![],
+                fitted_mcp_vref_v: None,
             },
         );
         let mut replay =
@@ -2165,15 +2984,15 @@ mod history_calibration_tests {
             timestamp_ms,
             data_type: kind.into(),
             sender_id: "DAQ".into(),
-            values: vec![value],
+            values: vec![value], over_range: 0, over_range_low: 0,
         };
         replay.project(row(100, "DAQ_ADC_TEMPERATURE", Some(22.)));
         assert_eq!(
-            replay.project(row(101, "KG1000", Some(3.)))[1].values,
-            vec![Some(5.)]
+            replay.project(row(101, "KG1000", Some(0.25)))[1].values,
+            vec![Some(33.)]
         );
         assert_eq!(
-            replay.project(row(2101, "KG1000", Some(3.)))[1].values,
+            replay.project(row(2101, "KG1000", Some(0.25)))[1].values,
             vec![None]
         );
         assert_eq!(
@@ -2183,10 +3002,12 @@ mod history_calibration_tests {
     }
     #[test]
     fn history_calibration_replaces_old_weights_from_raw_without_touching_raw() {
-        let mut cfg = LoadcellCalibrationFile::default();
-        cfg.ch1 = ChannelLinear {
-            m: Some(2.),
+                let cfg = LoadcellCalibrationFile {
+            ch1: ChannelLinear {
+            m: Some(192.),
             b: Some(1.),
+        },
+            ..LoadcellCalibrationFile::default()
         };
         let mut replay =
             HistoryCalibration::new(cfg, &FillTargetsConfig::default(), FlightState::Startup);
@@ -2194,14 +3015,513 @@ mod history_calibration_tests {
             timestamp_ms: 100,
             data_type: "KG1000".into(),
             sender_id: "DAQ".into(),
-            values: vec![Some(3.)],
+            values: vec![Some(0.25)], over_range: 0, over_range_low: 0,
         };
         let output = replay.project(raw.clone());
         assert_eq!(output[0].values, raw.values);
-        assert_eq!(output[1].values, vec![Some(7.)]);
+        assert_eq!(output[1].values, vec![Some(49.)]);
         let mut old = raw;
         old.data_type = DERIVED_WEIGHT_DATA_TYPE.into();
         old.values = vec![Some(9000.)];
         assert!(replay.project(old).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod guarded_save_tests {
+    use super::*;
+    struct Directory(std::path::PathBuf);
+    impl Directory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("gs-guarded-calibration-{}", rand::random::<u128>()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Directory {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+    fn owned_temporary_count(directory: &std::path::Path) -> usize {
+        std::fs::read_dir(directory).unwrap().filter(|entry| {
+            entry.as_ref().unwrap().file_name().to_string_lossy().starts_with("loadcell.json.tmp.")
+        }).count()
+    }
+    #[test]
+    fn late_replace_guard_preserves_previous_tare_and_never_removes_unowned_fixed_temporary() {
+        let directory = Directory::new();
+        let path = directory.0.join("loadcell.json");
+        let original = LoadcellCalibrationFile::default();
+        save_at(&original, &path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let fixed = path.with_extension("json.tmp");
+        std::fs::write(&fixed, b"another writer owns this").unwrap();
+        let mut changed = original.clone();
+        changed.ch1_zero_raw = Some(0.123);
+        let mut boundaries = Vec::new();
+        let result = save_at_checked(&changed, &path, true, |boundary| {
+            boundaries.push(boundary);
+            if boundary == SaveBoundary::Replace { Err("original capture expired".into()) } else { Ok(()) }
+        });
+        assert!(result.is_err());
+        assert_eq!(boundaries, [SaveBoundary::Prepare, SaveBoundary::Replace]);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read(&fixed).unwrap(), b"another writer owns this");
+        assert_eq!(owned_temporary_count(&directory.0), 0);
+    }
+    #[test]
+    fn identical_data_shortcut_still_requires_original_current_guard() {
+        let directory = Directory::new();
+        let path = directory.0.join("loadcell.json");
+        let original = LoadcellCalibrationFile::default();
+        save_at(&original, &path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let result = save_at_checked(&original, &path, true, |boundary| {
+            if boundary == SaveBoundary::Unchanged { Err("original capture expired".into()) } else { Ok(()) }
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(owned_temporary_count(&directory.0), 0);
+    }
+    #[test]
+    fn matching_bytes_do_not_claim_durable_when_the_owned_path_disappears_after_read() {
+        let directory = Directory::new();
+        let path = directory.0.join("loadcell.json");
+        let original = LoadcellCalibrationFile::default();
+        save_at(&original, &path).unwrap();
+        let mut removed = false;
+        let result = save_at_checked(&original, &path, true, |boundary| {
+            if boundary == SaveBoundary::Unchanged && !removed {
+                std::fs::remove_file(&path).unwrap();
+                removed = true;
+            }
+            Ok(())
+        });
+        assert!(result.is_err(), "a previous matching read is not current file/directory durability proof");
+        assert!(removed && !path.exists());
+        assert_eq!(owned_temporary_count(&directory.0), 0);
+    }
+    #[test]
+    fn guarded_success_keeps_normal_json_and_backup_format_without_consuming_fixed_temporary() {
+        let directory = Directory::new();
+        let path = directory.0.join("loadcell.json");
+        let original = LoadcellCalibrationFile::default();
+        save_at(&original, &path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let fixed = path.with_extension("json.tmp");
+        std::fs::write(&fixed, b"keep").unwrap();
+        let mut changed = original.clone();
+        changed.ch1_zero_raw = Some(0.123);
+        assert!(matches!(save_at_checked(&changed, &path, true, |_| Ok(())).unwrap(), GuardedSaveOutcome::Durable));
+        assert_eq!(std::fs::read(&path).unwrap(), serde_json::to_string_pretty(&changed).unwrap().as_bytes());
+        assert_eq!(std::fs::read(&fixed).unwrap(), b"keep");
+        let backups = std::fs::read_dir(directory.0.join("calibration_backups")).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read(backups[0].path()).unwrap(), before);
+        assert_eq!(owned_temporary_count(&directory.0), 0);
+    }
+}
+
+#[cfg(test)]
+mod rail_tests {
+    use super::*;
+
+    const K: f32 = LEGACY_RAW_TO_VOLTS as f32;
+    // DAQ code 0xB40000 at 2.4 V / 2^23, test fire 2026-11-16 (legacy raw 0.19427338).
+    const CLIP_V: f32 = 0xB4_0000 as f32 * 2.4 / 8_388_608.0;
+    const ZERO_V: f32 = 0.01205 * K;
+    const LOAD_V: f32 = 0.0226 * K;
+
+    fn kg1000_update(points: &[(f32, f32)], zero_raw: Option<f32>, captures: &[f32]) -> CalibrationUpdate {
+        let mut calibration = LoadcellCalibrationFile::default();
+        calibration.extra_channels.insert(
+            "ch1".into(),
+            GenericCalibrationChannel {
+                linear: ChannelLinear { m: Some(9481.619 / K), b: Some(0.0) },
+                zero_raw,
+                points: points
+                    .iter()
+                    .map(|(expected, raw)| CalibrationPoint { expected: *expected, raw: *raw })
+                    .collect(),
+                fit: None,
+                fitted_mcp_vref_v: None,
+            },
+        );
+        calibration.temperature_captures.insert(
+            "KG1000".into(),
+            captures
+                .iter()
+                .map(|expected| TemperatureCapture { expected: *expected, raw: 0.013 * K, temperature_c: Some(21.0) })
+                .collect(),
+        );
+        CalibrationUpdate::based_on(&LoadcellCalibrationFile::default(), "ch1", calibration)
+    }
+
+    #[test]
+    fn rails_are_volts_and_cover_the_test_fire_clip_and_low_rail_but_not_real_loads() {
+        let amp2 = Kg50Input::Amp2;
+        let (low, high) = loadcell_rail_limits(amp2, "KG1000").unwrap();
+        assert_eq!(high, 2.4, "2^23 codes at the 2.4 V reference");
+        assert!((low - 0.0025 * K).abs() < 1e-7 && (low - 0.043431).abs() < 1e-5, "{low}");
+        assert_eq!(loadcell_rail_limits(amp2, "KG50"), Some((-2.4, 2.4)));
+        assert_eq!(loadcell_rail_limits(Kg50Input::P6Differential, "kg50"), Some((-0.15, 0.15)));
+        assert_eq!(loadcell_rail_limits(amp2, "IADC"), None);
+        assert!(loadcell_volts_at_rail(amp2, "KG1000", CLIP_V));
+        assert!(loadcell_volts_at_rail(amp2, "KG1000", 2.4));
+        // The amplifier floor seen in the test fire (legacy raw 0.0012-0.0021).
+        assert!(loadcell_volts_at_rail(amp2, "KG1000", 0.0012 * K));
+        assert!(loadcell_volts_at_rail(amp2, "KG1000", 0.0021 * K));
+        assert!(loadcell_volts_at_rail(amp2, "KG1000", f32::NAN));
+        // Zero (~0.209 V), and the ~450 kgf thrust spikes, are in range.
+        assert!(!loadcell_volts_at_rail(amp2, "KG1000", ZERO_V));
+        assert!(!loadcell_volts_at_rail(amp2, "KG1000", 0.0595 * K));
+        assert!(!loadcell_volts_at_rail(amp2, "KG1000", 2.39));
+        let p6 = Kg50Input::P6Differential;
+        assert!(!loadcell_volts_at_rail(p6, "KG50", 0.0042533));
+        assert!(!loadcell_volts_at_rail(p6, "KG50", -0.0128));
+        assert!(loadcell_volts_at_rail(p6, "KG50", 0.2109375));
+        assert!(loadcell_volts_at_rail(p6, "KG50", -0.2109375));
+        assert!(loadcell_volts_at_rail(amp2, "KG50", CLIP_V));
+        assert!(!loadcell_volts_at_rail(amp2, "KG50", 1.0));
+        assert!(!loadcell_volts_at_rail(amp2, "IADC", 1000.0));
+    }
+
+    #[test]
+    fn rails_match_the_former_raw_limits_through_k() {
+        // Former limits: high 2^23 codes on the raw scale, KG1000 low raw 0.0025.
+        let old_high = (8_388_608.0 * 2.2104 / 16_777_216.0 * 2.0 / 16.0) as f32;
+        let (low, high) = loadcell_rail_limits(Kg50Input::Amp2, "KG1000").unwrap();
+        assert!((old_high * K - high).abs() < 1e-5, "{old_high} {high}");
+        assert!((0.0025 * K - low).abs() < 1e-7);
+    }
+
+    #[test]
+    fn save_rejects_points_or_zero_captured_at_a_rail() {
+        let current = LoadcellCalibrationFile::default();
+        let err = merge_channel_update(&current, &kg1000_update(&[(100.0, CLIP_V)], Some(ZERO_V), &[]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rail") && err.contains("100") && err.contains(" V "), "{err}");
+        let err = merge_channel_update(&current, &kg1000_update(&[(100.0, LOAD_V)], Some(0.001935 * K), &[]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("zero") && err.contains("rail"), "{err}");
+        let ok = merge_channel_update(&current, &kg1000_update(&[(100.0, LOAD_V)], Some(ZERO_V), &[]))
+            .unwrap();
+        assert_eq!(ok.extra_channels["ch1"].points.len(), 1);
+        // The P6 differential KG50 scale is not mistaken for a clip.
+        let mut p6 = LoadcellCalibrationFile::default();
+        switch_kg50_input(&mut p6, Kg50Input::P6Differential);
+        let mut update = p6.clone();
+        update.extra_channels.insert(
+            "kg50".into(),
+            GenericCalibrationChannel {
+                zero_raw: Some(0.0040061),
+                points: vec![CalibrationPoint { expected: 5.0, raw: 0.0042256 }],
+                ..Default::default()
+            },
+        );
+        assert!(merge_channel_update(&p6, &CalibrationUpdate::based_on(&p6, "kg50", update)).is_ok());
+    }
+
+    #[test]
+    fn save_refuses_a_legacy_raw_scale_calibration() {
+        let current = LoadcellCalibrationFile::default();
+        let mut update = kg1000_update(&[(100.0, LOAD_V)], Some(ZERO_V), &[]);
+        update.calibration.version = 1;
+        let err = merge_channel_update(&current, &update).unwrap_err().to_string();
+        assert!(err.contains("reload"), "{err}");
+        // A save without a version field is a legacy client.
+        let legacy: CalibrationUpdate =
+            serde_json::from_str(r#"{"channel":"ch1","calibration":{}}"#).unwrap();
+        assert!(merge_channel_update(&current, &legacy).is_err());
+    }
+
+    #[test]
+    fn save_drops_temperature_captures_without_a_matching_point() {
+        let current = LoadcellCalibrationFile::default();
+        let saved = merge_channel_update(
+            &current,
+            &kg1000_update(&[(100.0, LOAD_V)], Some(ZERO_V), &[0.0, 50.0, 100.0]),
+        )
+        .unwrap();
+        let kept: Vec<f32> = saved.temperature_captures["KG1000"].iter().map(|c| c.expected).collect();
+        assert_eq!(kept, vec![0.0, 100.0]);
+        let saved = merge_channel_update(&current, &kg1000_update(&[(100.0, LOAD_V)], None, &[0.0, 50.0]))
+            .unwrap();
+        assert!(!saved.temperature_captures.contains_key("KG1000"));
+    }
+
+    #[test]
+    fn history_replay_withholds_weight_for_railed_volts_and_keeps_volts() {
+        let cfg = LoadcellCalibrationFile {
+            ch1: ChannelLinear { m: Some(9481.619 / K), b: Some(-114.0) },
+            ..LoadcellCalibrationFile::default()
+        };
+        let mut replay = HistoryCalibration::new(cfg, &FillTargetsConfig::default(), FlightState::Startup);
+        let row = |timestamp_ms, value| crate::types::TelemetryRow {
+            timestamp_ms,
+            data_type: "KG1000".into(),
+            sender_id: "DAQ".into(),
+            values: vec![Some(value)], over_range: 0, over_range_low: 0,
+        };
+        let out = replay.project(row(100, CLIP_V));
+        assert_eq!(out[0].values, vec![Some(CLIP_V)]);
+        assert_eq!(out[1].data_type, DERIVED_WEIGHT_DATA_TYPE);
+        assert_eq!(out[1].values, vec![None]);
+        let out = replay.project(row(200, 0.0122373 * K));
+        assert!(out[1].values[0].is_some());
+    }
+}
+
+#[cfg(test)]
+mod volts_migration_tests {
+    use super::*;
+
+    const K: f64 = LEGACY_RAW_TO_VOLTS;
+
+    /// DAQ formulas, as firmware computes them (binary32).
+    fn legacy_raw(code: i32) -> f32 {
+        (((code as f32) * 2.2104_f32) / 16_777_216.0) * 2.0 / 16.0
+    }
+    fn volts(code: i32) -> f32 {
+        (code as f32 * 2.4_f32) / 8_388_608.0
+    }
+
+    fn fit(kind: &str, terms: [f32; 5], x0: f32) -> Option<FitMeta> {
+        Some(FitMeta {
+            fit_type: Some(kind.into()),
+            a: Some(terms[0]),
+            b: Some(terms[1]),
+            c: Some(terms[2]),
+            d: Some(terms[3]),
+            e: Some(terms[4]),
+            x0: Some(x0),
+        })
+    }
+
+    fn legacy_file(kg50_input: Kg50Input, kg50_fit: Option<FitMeta>) -> LoadcellCalibrationFile {
+        // The 2026-11-16/17 test-fire KG1000 fit (kg/raw) and a KG50 fit.
+        let kg1000 = GenericCalibrationChannel {
+            linear: ChannelLinear { m: Some(9481.619), b: Some(-115.9939) },
+            zero_raw: Some(0.0122373),
+            points: vec![
+                CalibrationPoint { expected: 20.4, raw: 0.01437773 },
+                CalibrationPoint { expected: 102.0, raw: 0.022947349 },
+            ],
+            fit: fit("linear", [0.0; 5], 0.0),
+            fitted_mcp_vref_v: None,
+        };
+        let kg50 = GenericCalibrationChannel {
+            linear: ChannelLinear { m: Some(22799.14), b: Some(-89.81956) },
+            zero_raw: Some(0.0040061),
+            points: vec![CalibrationPoint { expected: 20.0, raw: 0.004845549 }],
+            fit: kg50_fit,
+            fitted_mcp_vref_v: None,
+        };
+        let mut cfg = LoadcellCalibrationFile {
+            version: 1,
+            kg50_input,
+            ch1: kg1000.linear.clone(),
+            ch1_fit: kg1000.fit.clone(),
+            ch1_zero_raw: kg1000.zero_raw,
+            points_ch1: vec![PointCh1 { kg: 20.4, ch1_raw: 0.01437773 }],
+            ..LoadcellCalibrationFile::default()
+        };
+        cfg.extra_channels.insert("ch1".into(), kg1000);
+        cfg.thermal.insert(
+            "KG1000".into(),
+            ThermalCalibration { reference_c: 25.0, raw_per_c: 1.5e-6, points: vec![[20.0, 0.0122]], fitted_mcp_vref_v: None },
+        );
+        cfg.noise.insert(
+            "KG1000".into(),
+            NoiseCalibration { sigma_raw: 2e-5, residual_sigma_raw: 1e-5, tau_ms: 50.0, session_id: "s".into() },
+        );
+        cfg.temperature_captures.insert(
+            "KG1000".into(),
+            vec![TemperatureCapture { expected: 0.0, raw: 0.0122373, temperature_c: Some(30.3) }],
+        );
+        match kg50_input {
+            Kg50Input::Amp2 => {
+                cfg.extra_channels.insert("kg50".into(), kg50);
+            }
+            Kg50Input::P6Differential => {
+                // P6 is the active (volts) KG50; AMP2 waits in its profile.
+                let mut p6 = kg50.clone();
+                p6.zero_raw = Some(0.0042);
+                cfg.extra_channels.insert("kg50".into(), p6);
+                cfg.kg50_input_profiles.insert(
+                    Kg50Input::Amp2.key().into(),
+                    Kg50InputProfile { channel: Some(kg50), thermal: None, noise: None, captures: vec![] },
+                );
+            }
+        }
+        cfg
+    }
+
+    fn assert_same_kg(before: Option<f32>, after: Option<f32>, what: &str) {
+        let (before, after) = (before.unwrap(), after.unwrap());
+        // binary32 coefficients and inputs: a few ulps of the result.
+        assert!(
+            (before - after).abs() <= 1e-3 + before.abs() * 1e-5,
+            "{what}: {before} kg on the raw scale, {after} kg in volts"
+        );
+    }
+
+    #[test]
+    fn factor_is_exact() {
+        assert_eq!(LEGACY_RAW_TO_VOLTS, 16000.0 / 921.0);
+        assert!((K - (2.4 / 8_388_608.0) / (2.2104 / 134_217_728.0)).abs() < 1e-12);
+        for code in [1, -1, 790_001, 2_097_152, 0xB4_0000, 8_388_607, -8_388_608] {
+            let converted = legacy_raw_to_volts(legacy_raw(code));
+            assert!((converted - volts(code)).abs() <= volts(code).abs() * 4.8e-7, "{code}");
+        }
+    }
+
+    #[test]
+    fn migration_round_trip_gives_the_same_kg_for_the_same_adc_code() {
+        let poly = |kind| fit(kind, [-3.0e7, 4.0e6, -1.5e5, 8.0e3, -2.0], 0.004);
+        for (kg50_input, kg50_fit) in [
+            (Kg50Input::Amp2, fit("linear", [0.0; 5], 0.0)),
+            (Kg50Input::Amp2, poly("poly2")),
+            (Kg50Input::Amp2, poly("poly3")),
+            (Kg50Input::Amp2, poly("poly4")),
+            (Kg50Input::P6Differential, poly("poly3")),
+        ] {
+            let old = legacy_file(kg50_input, kg50_fit);
+            let mut new = old.clone();
+            migrate_calibration(&mut new);
+            assert_eq!(new.version, CALIBRATION_VERSION);
+            // Intercepts unchanged, slopes / k, inputs * k.
+            assert_eq!(new.ch1.b, old.ch1.b);
+            assert_eq!(new.ch1.m, old.ch1.m.map(|m| (m as f64 / K) as f32));
+            assert_eq!(new.ch1_zero_raw, old.ch1_zero_raw.map(legacy_raw_to_volts));
+            assert_eq!(new.points_ch1[0].ch1_raw, legacy_raw_to_volts(old.points_ch1[0].ch1_raw));
+            assert_eq!(new.extra_channels["ch1"].points[1].raw, legacy_raw_to_volts(0.022947349));
+            assert_eq!(new.thermal["KG1000"].reference_c, 25.0);
+            assert_eq!(new.thermal["KG1000"].points[0][0], 20.0);
+            assert_eq!(new.thermal["KG1000"].points[0][1], legacy_raw_to_volts(0.0122));
+            assert_eq!(new.noise["KG1000"].tau_ms, 50.0);
+            assert_eq!(new.temperature_captures["KG1000"][0].raw, legacy_raw_to_volts(0.0122373));
+            for code in [600_000, 700_005, 790_001, 1_000_000, 1_300_000, 1_500_000] {
+                let (raw, v) = (legacy_raw(code), volts(code));
+                assert_same_kg(
+                    calibrated_weight_kg(&old, "KG1000", raw),
+                    calibrated_weight_kg(&new, "KG1000", v),
+                    &format!("KG1000 code {code}"),
+                );
+                let generic_old = calibrated_channel_value(&old, "ch1", raw);
+                let generic_new = calibrated_channel_value(&new, "ch1", v);
+                assert_same_kg(generic_old, generic_new, "ch1 generic");
+                if kg50_input == Kg50Input::Amp2 {
+                    let code = code / 4;
+                    assert_same_kg(
+                        calibrated_weight_kg(&old, "KG50", legacy_raw(code)),
+                        calibrated_weight_kg(&new, "KG50", volts(code)),
+                        &format!("AMP2 KG50 code {code}"),
+                    );
+                }
+            }
+            if kg50_input == Kg50Input::P6Differential {
+                // The active P6 calibration was volts already: untouched.
+                let (old_p6, new_p6) = (&old.extra_channels["kg50"], &new.extra_channels["kg50"]);
+                assert_eq!(serde_json::to_value(old_p6).unwrap(), serde_json::to_value(new_p6).unwrap());
+                // The stored AMP2 profile is converted for when it is selected again.
+                let old_amp2 = old.kg50_input_profiles["amp2"].channel.as_ref().unwrap();
+                let new_amp2 = new.kg50_input_profiles["amp2"].channel.as_ref().unwrap();
+                for code in [200_000, 260_000, 300_000] {
+                    assert_same_kg(
+                        eval_channel_with_zero(&old_amp2.linear, old_amp2.fit.as_ref(), old_amp2.zero_raw, legacy_raw(code)),
+                        eval_channel_with_zero(&new_amp2.linear, new_amp2.fit.as_ref(), new_amp2.zero_raw, volts(code)),
+                        "AMP2 profile",
+                    );
+                }
+            }
+            // The DAQ polynomial the station publishes keeps the on-board kg too.
+            if kg50_input == Kg50Input::Amp2 {
+                let (c_old, c_new) = (kg50_daq_coefficients(&old).unwrap(), kg50_daq_coefficients(&new).unwrap());
+                let daq = |c: [f32; 7], x: f32| {
+                    let x = x - c[5];
+                    c[0] + c[1] * x + c[2] * x * x + c[3] * x * x * x + c[4] * x * x * x * x - c[6]
+                };
+                for code in [150_000, 197_500, 250_000] {
+                    let (before, after) = (daq(c_old, legacy_raw(code)), daq(c_new, volts(code)));
+                    assert!((before - after).abs() <= 1e-3 + before.abs() * 1e-5, "{before} {after}");
+                }
+            }
+            // A migrated file is not converted again.
+            let mut again = new.clone();
+            migrate_calibration(&mut again);
+            assert_eq!(serde_json::to_value(&again).unwrap(), serde_json::to_value(&new).unwrap());
+        }
+    }
+
+    #[test]
+    fn files_without_a_version_are_legacy_and_new_files_are_volts() {
+        let legacy: LoadcellCalibrationFile =
+            serde_json::from_str(r#"{"ch1":{"m":9481.619,"b":-115.9939}}"#).unwrap();
+        assert_eq!(legacy.version, 1);
+        assert_eq!(LoadcellCalibrationFile::default().version, CALIBRATION_VERSION);
+        let saved = serde_json::to_value(LoadcellCalibrationFile::default()).unwrap();
+        assert_eq!(saved["version"], 2);
+    }
+
+    #[test]
+    fn loading_a_legacy_file_migrates_it_and_keeps_the_original() {
+        let dir = std::env::temp_dir().join(format!("gs-volts-migration-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("loadcell_calibration.json");
+        let old = legacy_file(Kg50Input::Amp2, fit("linear", [0.0; 5], 0.0));
+        std::fs::write(&path, serde_json::to_string(&old).unwrap()).unwrap();
+        let loaded = load_or_default_at(&path, false);
+        let reloaded = load_or_default_at(&path, false);
+        assert_eq!(loaded.version, CALIBRATION_VERSION);
+        assert_eq!(loaded.ch1.m, Some((9481.619_f64 / K) as f32));
+        let on_disk: LoadcellCalibrationFile =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(on_disk.version, CALIBRATION_VERSION);
+        assert_eq!(on_disk.ch1.m, loaded.ch1.m, "saved once, in volts");
+        assert_eq!(reloaded.ch1.m, loaded.ch1.m, "not converted twice");
+        let kept: LoadcellCalibrationFile =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("loadcell_calibration.json.v1-raw")).unwrap())
+                .unwrap();
+        assert_eq!((kept.version, kept.ch1.m), (1, Some(9481.619)));
+        // A simulator's identity calibration (input already in kg) is only
+        // relabelled.
+        let sim = dir.join("sim.json");
+        std::fs::write(&sim, r#"{"ch1":{"m":1.0,"b":0.0}}"#).unwrap();
+        let loaded = load_or_default_at(&sim, true);
+        assert_eq!((loaded.version, loaded.ch1.m), (CALIBRATION_VERSION, Some(1.0)));
+        assert!(!dir.join("sim.json.v1-raw").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod calibration_sender_tests {
+    use super::*;
+
+    fn senders(layout: &CalibrationTabLayout) -> Vec<(String, Option<String>)> {
+        layout.sensors.iter().map(|s| (s.id.clone(), s.sender_id.clone())).collect()
+    }
+
+    /// The calibration tab reads each sensor from the board the station names:
+    /// the SEDS load cells from DAQ, the ox tank PT from any sender.
+    #[test]
+    fn shipped_calibration_config_names_the_load_cell_board() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config/calibration_config.json");
+        let raw = std::fs::read_to_string(path).unwrap();
+        let shipped: CalibrationTabLayout = serde_json::from_str(&raw).unwrap();
+        let expected = vec![
+            ("KG1000".to_string(), Some("DAQ".to_string())),
+            ("KG50".to_string(), Some("DAQ".to_string())),
+            ("IADC".to_string(), None),
+        ];
+        assert_eq!(senders(&shipped), expected);
+        // The built-in fallback (no config file) says the same.
+        let built_in = built_in_calibration_tab_layout();
+        assert_eq!(senders(&built_in), expected);
+        let json = serde_json::to_value(&built_in).unwrap();
+        assert_eq!(json["sensors"][0]["sender_id"], "DAQ");
+        assert!(json["sensors"][2].get("sender_id").is_none(), "an unnamed sender is omitted");
     }
 }

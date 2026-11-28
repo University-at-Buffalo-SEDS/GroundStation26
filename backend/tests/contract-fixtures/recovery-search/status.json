@@ -1,0 +1,337 @@
+{
+  "accepting_uploads": true,
+  "active": true,
+  "cleared_by": null,
+  "cleared_ms": null,
+  "format": "gs26.recovery_search",
+  "late_upload_until_ms": null,
+  "limits": {
+    "late_upload_grace_s": 1800,
+    "max_accuracy_m": 100.0,
+    "max_batch_points": 500,
+    "max_devices": 64,
+    "max_points_per_device": 20000,
+    "max_points_total": 200000,
+    "polygon_max_points": 200,
+    "swath_width_m": [
+      2.0,
+      500.0
+    ]
+  },
+  "overlay": {
+    "areas": [
+      {
+        "id": "search_swath-0",
+        "kind": "search_swath",
+        "label": "Searched",
+        "polygon": [
+          [
+            31.7577752,
+            -102.0450216
+          ],
+          [
+            31.7577752,
+            -102.044863
+          ],
+          [
+            31.7578089,
+            -102.044863
+          ],
+          [
+            31.7578427,
+            -102.0447836
+          ],
+          [
+            31.7590567,
+            -102.0447836
+          ],
+          [
+            31.7590567,
+            -102.0448233
+          ],
+          [
+            31.7591242,
+            -102.044863
+          ],
+          [
+            31.7591242,
+            -102.0450216
+          ],
+          [
+            31.7590905,
+            -102.0450216
+          ],
+          [
+            31.7590567,
+            -102.045101
+          ],
+          [
+            31.7578427,
+            -102.045101
+          ],
+          [
+            31.7578427,
+            -102.0450613
+          ]
+        ]
+      },
+      {
+        "id": "uncovered-0",
+        "kind": "uncovered",
+        "label": "Not yet searched",
+        "polygon": [
+          [
+            31.758,
+            -102.046
+          ],
+          [
+            31.758,
+            -102.0450878
+          ],
+          [
+            31.7589106,
+            -102.0450878
+          ],
+          [
+            31.7589106,
+            -102.046
+          ]
+        ]
+      },
+      {
+        "id": "uncovered-1",
+        "kind": "uncovered",
+        "label": "Not yet searched",
+        "polygon": [
+          [
+            31.758,
+            -102.0447705
+          ],
+          [
+            31.758,
+            -102.0438979
+          ],
+          [
+            31.7589106,
+            -102.0438979
+          ],
+          [
+            31.7589106,
+            -102.0447705
+          ]
+        ]
+      }
+    ],
+    "id": "search_coverage:rs-fixture-session",
+    "kind": "search_coverage",
+    "label": "Search coverage 15%",
+    "markers": [],
+    "predicted": false,
+    "tracks": [
+      {
+        "color": "#0ea5e9",
+        "id": "searcher:26de433f44f4",
+        "label": "viewer's iPhone",
+        "phase": null,
+        "points": [
+          [
+            31.7579101,
+            -102.0449423,
+            null
+          ],
+          [
+            31.757955,
+            -102.0449423,
+            null
+          ],
+          [
+            31.758,
+            -102.0449423,
+            null
+          ],
+          [
+            31.758045,
+            -102.0449423,
+            null
+          ],
+          [
+            31.7580899,
+            -102.0449423,
+            null
+          ],
+          [
+            31.7581349,
+            -102.0449423,
+            null
+          ],
+          [
+            31.7581799,
+            -102.0449423,
+            null
+          ],
+          [
+            31.7582248,
+            -102.0449423,
+            null
+          ],
+          [
+            31.7582698,
+            -102.0449423,
+            null
+          ],
+          [
+            31.7583148,
+            -102.0449423,
+            null
+          ],
+          [
+            31.7583597,
+            -102.0449423,
+            null
+          ],
+          [
+            31.7584047,
+            -102.0449423,
+            null
+          ],
+          [
+            31.7584497,
+            -102.0449423,
+            null
+          ],
+          [
+            31.7584946,
+            -102.0449423,
+            null
+          ],
+          [
+            31.7585396,
+            -102.0449423,
+            null
+          ],
+          [
+            31.7585846,
+            -102.0449423,
+            null
+          ],
+          [
+            31.7586295,
+            -102.0449423,
+            null
+          ],
+          [
+            31.7586745,
+            -102.0449423,
+            null
+          ],
+          [
+            31.7587195,
+            -102.0449423,
+            null
+          ],
+          [
+            31.7587644,
+            -102.0449423,
+            null
+          ],
+          [
+            31.7588094,
+            -102.0449423,
+            null
+          ],
+          [
+            31.7588544,
+            -102.0449423,
+            null
+          ],
+          [
+            31.7588993,
+            -102.0449423,
+            null
+          ],
+          [
+            31.7589443,
+            -102.0449423,
+            null
+          ],
+          [
+            31.7589893,
+            -102.0449423,
+            null
+          ]
+        ],
+        "style": "search"
+      }
+    ]
+  },
+  "searchers": [
+    {
+      "color": "#0ea5e9",
+      "distance_m": 120.0,
+      "first_ms": 1,
+      "id": "26de433f44f4",
+      "last_ms": 1,
+      "name": "viewer's iPhone",
+      "opted_in_ms": 1,
+      "opted_out_ms": null,
+      "platform": "ios",
+      "points": 25,
+      "sharing": true,
+      "username": "viewer"
+    }
+  ],
+  "session_id": "rs-fixture-session",
+  "settings": {
+    "swath_width_m": 30.0
+  },
+  "started_by": "operator",
+  "started_ms": 1,
+  "stats": {
+    "cell_m": 3.75,
+    "covered_in_target_m2": 3037.5,
+    "distance_m": 120.0,
+    "percent_covered": 15.09,
+    "points": 25,
+    "searchers": 1,
+    "sharing": 1,
+    "swath_m2": 4331.25,
+    "target_cell_m": 3.75,
+    "target_m2": 20123.44,
+    "uncovered_m2": 17085.94
+  },
+  "stopped_by": null,
+  "stopped_ms": null,
+  "target": {
+    "label": "95% landing area",
+    "polygon": [
+      [
+        31.758,
+        -102.046
+      ],
+      [
+        31.758,
+        -102.0438846
+      ],
+      [
+        31.7588993,
+        -102.0438846
+      ],
+      [
+        31.7588993,
+        -102.046
+      ]
+    ],
+    "set_by": "operator",
+    "set_ms": 1,
+    "source": "los_prediction"
+  },
+  "version": 1,
+  "you": {
+    "device_id": "fixture-phone",
+    "id": "26de433f44f4",
+    "max_seq": 25,
+    "opt_in_id": "fixture-opt-in",
+    "points": 25,
+    "sharing": true
+  }
+}

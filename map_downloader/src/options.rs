@@ -4,6 +4,8 @@ use std::collections::BTreeSet;
 #[derive(Default)]
 pub(crate) struct Options {
     pub test: bool,
+    /// Download the Terrarium DEM (crate::layer) instead of the imagery.
+    pub terrain: bool,
     pub repairs: BTreeSet<(u32, u32, u32)>,
 }
 impl Options {
@@ -13,6 +15,8 @@ impl Options {
         while let Some(arg) = args.next() {
             if arg == "--test" {
                 out.test = true;
+            } else if arg == "--terrain" {
+                out.terrain = true;
             } else if arg == "--repair-tile" {
                 let value = args
                     .next()
@@ -42,6 +46,10 @@ impl Options {
         direct: bool,
         bundle: bool,
     ) -> Result<()> {
+        ensure!(
+            !self.terrain || self.test || (direct && bundle),
+            "--terrain downloads only into its direct-to-DB bundle (terrain.sqlite3); remove --via-tiles/--no-bundle"
+        );
         if self.repairs.is_empty() {
             return Ok(());
         }
@@ -56,7 +64,7 @@ impl Options {
         for &(z, x, y) in &self.repairs {
             ensure!(z <= max_zoom, "repair zoom exceeds MAP_MAX_ZOOM");
             ensure!(
-                profile.bounds(z).iter().any(|bounds| {
+                crate::layer::bounds(profile, z).iter().any(|bounds| {
                     let (a, b, c, d) = crate::tile_range_for_bounds(*bounds, z);
                     x >= a && x <= b && y >= c && y <= d
                 }),
@@ -103,6 +111,15 @@ mod tests {
             assert!(parse(&args).is_err());
         }
         assert!(Options::parse((0..33).map(|x| format!("--repair-tile=6/{x}/0"))).is_err());
+    }
+    #[test]
+    fn terrain_flag_requires_the_direct_bundle() {
+        let p = parse(&["--terrain"]).unwrap();
+        assert!(p.terrain && !p.test);
+        assert!(p.validate(crate::profile::Profile::GroundStation, 12, true, true, true).is_ok());
+        assert!(p.validate(crate::profile::Profile::GroundStation, 12, true, false, false).is_err());
+        let probe = parse(&["--test", "--terrain"]).unwrap();
+        assert!(probe.validate(crate::profile::Profile::GroundStation, 12, true, false, false).is_ok());
     }
     #[test]
     fn repair_keeps_profile_zoom_and_resume_interlocks() {

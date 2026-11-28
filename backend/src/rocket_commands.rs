@@ -14,16 +14,16 @@ pub enum FlightComputerCommands {
     RevokeValidateMeasms = 9,
     DeployParachute = 12,
     ExpandParachute = 13,
-    EvaluationRelax = 14,
-    EvaluationFocus = 15,
+    // Bytes 14 and 15 (EvaluationRelax, EvaluationFocus) are retired: the
+    // FC's estimator guard made them meaningless and the FC refuses them.
+    // Never reuse them for another command.
     EvaluationAbort = 16,
     ReinitSensors = 17,
     ReinitBarometer = 18,
+    // Historical API name: FC byte 19 reinitializes the IMU.
     EnableIMU = 19,
     DisableIMU = 20,
-    #[cfg(feature = "hitl_mode")]
     AdvanceFlightState = 21,
-    #[cfg(feature = "hitl_mode")]
     RewindFlightState = 22,
     AbortAfter40 = 23,
     AbortAfter100 = 24,
@@ -31,6 +31,13 @@ pub enum FlightComputerCommands {
     ReinitAfter15 = 26,
     ReinitAfter30 = 27,
     ReinitAfter50 = 28,
+    // Integrated ground test (FC fc_msg Actionable_Decrees + 17..20).
+    IgtEnter = 29,
+    IgtLivePyro = 30,
+    IgtDryRun = 31,
+    IgtExit = 32,
+    /// Re-attempt the SD mount and log file (FC `SD_Retry`, both images).
+    FcSdRetry = 33,
 }
 
 #[repr(u8)]
@@ -57,4 +64,69 @@ pub enum ActuatorBoardCommands {
     NitrousClose = 13,
     #[allow(unused)]
     IgniterSequence = 14,
+    /// Automatic only (always sent with the 0x80 origin tag): tank
+    /// overpressure before Launch. The Actuator Board enters its Abort safe
+    /// state; it ignores the command after Launch. Sent by the station and by
+    /// the Valve Board at its own relief.
+    OverpressureAbort = 16,
+}
+
+#[cfg(test)]
+mod flight_command_wire_tests {
+    use super::FlightComputerCommands::*;
+
+    #[test]
+    fn existing_command_bytes_match_the_captured_fc_compatibility_table() {
+        let contract: serde_json::Value = serde_json::from_str(include_str!(
+            "test-fixtures/fc-global-state-contract.json"
+        )).unwrap();
+        let mut cases = [
+            (Postinit, "Compat_Postinit_Signal"),
+            (Launch, "Compat_Launch_Signal"),
+            (MonitorAltitude, "Compat_Vigilant_Mode"),
+            (RevokeMonitorAltitude, "Revoke_Vigilant_Mode"),
+            (ConsecutiveSamples, "Compat_Eval_Successive"),
+            (RevokeConsecutiveSamples, "Revoke_Eval_Successive"),
+            (ResetFailures, "Compat_Reset_Failures"),
+            (RevokeResetFailures, "Revoke_Reset_Failures"),
+            (ValidateMeasms, "Compat_Measm_Reports"),
+            (RevokeValidateMeasms, "Revoke_Measm_Reports"),
+            (DeployParachute, "Compat_Deploy_Parachute"),
+            (ExpandParachute, "Compat_Expand_Parachute"),
+            (EvaluationAbort, "Compat_Evaluation_Abort"),
+            (ReinitSensors, "Compat_Reinit_Sensors"),
+            (ReinitBarometer, "Compat_Reinit_Barometer"),
+            (EnableIMU, "Compat_Reinit_IMU"),
+            (DisableIMU, "Compat_Disable_IMU"),
+        ]
+        .to_vec();
+        if crate::runtime_mode::is_hitl() {
+            cases.extend([
+                (AdvanceFlightState, "Compat_Advance_State"),
+                (RewindFlightState, "Compat_Rewind_State"),
+            ]);
+        }
+        cases.extend([
+            (AbortAfter40, "Compat_Abort_After_40"),
+            (AbortAfter100, "Compat_Abort_After_100"),
+            (AbortAfter250, "Compat_Abort_After_250"),
+            (ReinitAfter15, "Compat_Reinit_After_15"),
+            (ReinitAfter30, "Compat_Reinit_After_30"),
+            (ReinitAfter50, "Compat_Reinit_After_50"),
+            (IgtEnter, "Compat_IGT_Enter"),
+            (IgtLivePyro, "Compat_IGT_Live_Pyro"),
+            (IgtDryRun, "Compat_IGT_Dry_Run"),
+            (IgtExit, "Compat_IGT_Exit"),
+            (FcSdRetry, "Compat_SD_Retry"),
+        ]);
+        for (command, expected) in cases {
+            assert_eq!(contract["remote_commands_compat"][command as usize], expected);
+        }
+        // Bytes 10 and 11 are intentionally not reused by another GS command.
+        assert_eq!(contract["remote_commands_compat"][10], "Compat_Velocity_Checks");
+        assert_eq!(contract["remote_commands_compat"][11], "Revoke_Velocity_Checks");
+        // Bytes 14 and 15 are retired (EvaluationRelax/Focus) and stay unused.
+        assert_eq!(contract["remote_commands_compat"][14], "Compat_Retired_Evaluation_Relax");
+        assert_eq!(contract["remote_commands_compat"][15], "Compat_Retired_Evaluation_Focus");
+    }
 }

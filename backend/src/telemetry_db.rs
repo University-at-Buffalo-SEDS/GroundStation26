@@ -1,14 +1,12 @@
 use anyhow::Result;
 use sqlx::sqlite::{SqliteConnection, SqlitePoolOptions};
 use sqlx::{Connection, Row, SqlitePool};
-use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 use time::format_description::FormatItem;
 use tokio::time::Duration;
 
-pub const RECORDING_BUFFER_WINDOW_MS: i64 = 2 * 60 * 1000;
 pub const DEFAULT_TELEMETRY_DB_FILENAME: &str = "groundstation.db";
 
 #[derive(Debug, Clone)]
@@ -42,19 +40,8 @@ pub enum DbWrite {
         timestamp_ms: i64,
         severity: String,
         message: String,
+        condition: Option<crate::alert_conditions::ConditionLink>,
     },
-}
-
-impl DbWrite {
-    pub fn timestamp_ms(&self) -> i64 {
-        match self {
-            Self::FlightState { timestamp_ms, .. }
-            | Self::Calibration { timestamp_ms, .. }
-            | Self::Message { timestamp_ms, .. }
-            | Self::Telemetry { timestamp_ms, .. }
-            | Self::Alert { timestamp_ms, .. } => *timestamp_ms,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,17 +53,28 @@ pub enum RecordingMode {
 
 #[derive(Debug, Clone, Copy)]
 pub enum RecordingCommand {
+    /// Legacy fixture-only session controls. The always-on rolling recorder
+    /// ignores StartNow and refuses Pause/Stop; no operator command reaches
+    /// them.
     StartNow,
-    StartWithRecent,
+    // Constructed only by fixtures (see above); the recorder still handles them.
+    #[cfg_attr(not(test), allow(dead_code))]
     Pause,
+    #[cfg_attr(not(test), allow(dead_code))]
     Stop,
+    /// Clear the live history: the rolling recorder opens a fresh segment
+    /// instead of deleting rows.
     ResetAll,
+    /// Close the current segment cleanly and open the next (power off/reboot).
+    RotateSegment,
 }
 
 #[derive(Debug, Clone)]
 pub enum DbQueueItem {
+    Condition(crate::alert_condition_runtime::Work),
     Write(DbWrite),
     Control(RecordingCommand),
+    EnsureRecording(std::sync::Arc<crate::fill_recording::EnsureRequest>),
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -108,6 +106,18 @@ impl LaunchClockMsg {
 pub struct RecordingStatusMsg {
     pub mode: RecordingModeWire,
     pub db_path: Option<String>,
+    /// True while the always-on rolling recording owns the writer.
+    #[serde(default)]
+    pub always_on: bool,
+    /// Event captures in progress (owned by `recording_store`).
+    #[serde(default)]
+    pub captures: Vec<crate::recording_store::CaptureBrief>,
+}
+
+impl RecordingStatusMsg {
+    pub fn new(mode: RecordingModeWire, db_path: Option<String>) -> Self {
+        Self { mode, db_path, always_on: false, captures: Vec::new() }
+    }
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -258,6 +268,16 @@ pub async fn ensure_telemetry_schema(db: &SqlitePool) -> Result<()> {
             .await?;
     }
 
+    // Packed ADC over-range masks of the row's values (crate::over_range);
+    // NULL when nothing is over range or the row predates over-range support.
+    if !cols.iter().any(|row| row.get::<String, _>("name") == "over_range") {
+        sqlx::query("ALTER TABLE telemetry ADD COLUMN over_range INTEGER")
+            .execute(db)
+            .await?;
+    }
+
+    mark_loadcell_volts(db).await?;
+
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS alerts (
@@ -270,6 +290,11 @@ pub async fn ensure_telemetry_schema(db: &SqlitePool) -> Result<()> {
     )
     .execute(db)
     .await?;
+
+    let alert_cols=sqlx::query("PRAGMA table_info(alerts)").fetch_all(db).await?;
+    if !alert_cols.iter().any(|row|row.get::<String,_>("name")=="condition_json") {
+        sqlx::query("ALTER TABLE alerts ADD COLUMN condition_json TEXT").execute(db).await?;
+    }
 
     sqlx::query(
         r#"
@@ -314,6 +339,18 @@ pub async fn open_telemetry_db(path: &Path) -> Result<(SqlitePool, String)> {
     Ok((db, db_path))
 }
 
+/// The caller already owns a newly create_new-reserved file. On schema
+/// failure close the actual pool before its owner removes that exact file.
+pub(crate) async fn open_reserved_telemetry_db(path: &Path) -> Result<SqlitePool> {
+    let db = open_sqlite_pool(&format!("sqlite://{}", path.display())).await?;
+    apply_sqlite_pragmas(&db).await;
+    if let Err(error) = ensure_telemetry_schema(&db).await {
+        db.close().await;
+        return Err(error);
+    }
+    Ok(db)
+}
+
 pub async fn open_in_memory_telemetry_db() -> Result<SqlitePool> {
     let db = open_sqlite_pool("sqlite::memory:").await?;
     apply_sqlite_pragmas(&db).await;
@@ -336,14 +373,14 @@ pub fn session_db_path(base_dir: &Path, started_at_ms: i64) -> PathBuf {
     ))
 }
 
-fn human_readable_session_stamp(started_at_ms: i64) -> String {
+pub(crate) fn human_readable_session_stamp(started_at_ms: i64) -> String {
     static FORMAT: &[FormatItem<'static>] = time::macros::format_description!(
         "[year]-[month]-[day]_[hour]-[minute]-[second]_[subsecond digits:3]"
     );
 
     let timestamp_ns = started_at_ms
         .checked_mul(1_000_000)
-        .and_then(|value| value.try_into().ok());
+        .map(i128::from);
     let Some(timestamp_ns) = timestamp_ns else {
         return started_at_ms.to_string();
     };
@@ -376,84 +413,98 @@ async fn exec_pragma_with_retry(
     Ok(())
 }
 
+// A successful SQL execution is not proof that SQLite checkpointed its WAL.
+fn checkpoint_complete(row: Option<sqlx::sqlite::SqliteRow>) -> bool {
+    let Some(row) = row else { return false; };
+    match (row.try_get::<i64, _>(0), row.try_get::<i64, _>(1), row.try_get::<i64, _>(2)) {
+        (Ok(0), Ok(-1), Ok(-1)) => true, // SQLite reports no WAL.
+        (Ok(0), Ok(log), Ok(done)) => log >= 0 && log == done,
+        _ => false,
+    }
+}
+
+async fn checkpoint_pool_with_retry(
+    db: &SqlitePool,
+    retries: usize,
+    delay_ms: u64,
+) -> Result<bool, sqlx::Error> {
+    for attempt in 0..retries {
+        match sqlx::query("PRAGMA wal_checkpoint(TRUNCATE);").fetch_optional(db).await {
+            Ok(row) => return Ok(checkpoint_complete(row)),
+            Err(error) => {
+                if attempt + 1 >= retries { return Err(error); }
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+        }
+    }
+    Ok(false)
+}
+
 pub async fn flush_sqlite_journals(db: &SqlitePool) {
     let retries = env_usize("GS_SQLITE_SHUTDOWN_PRAGMA_RETRIES", 8, 1, 60);
     let delay_ms = env_i64("GS_SQLITE_SHUTDOWN_PRAGMA_RETRY_DELAY_MS", 120, 10, 5_000) as u64;
 
-    if let Err(err) =
-        exec_pragma_with_retry(db, "PRAGMA wal_checkpoint(TRUNCATE);", retries, delay_ms).await
-    {
-        log::error!("sqlite wal_checkpoint(TRUNCATE) failed after {retries} attempts: {err}");
+    match checkpoint_pool_with_retry(db, retries, delay_ms).await {
+        Ok(true) => {}
+        Ok(false) => log::warn!("sqlite WAL checkpoint is busy or unverified; journals retained"),
+        Err(err) => log::error!("sqlite wal_checkpoint(TRUNCATE) failed after {retries} attempts: {err}"),
     }
     if let Err(err) = exec_pragma_with_retry(db, "PRAGMA optimize;", retries, delay_ms).await {
         log::error!("sqlite PRAGMA optimize failed after {retries} attempts: {err}");
     }
 }
 
-pub async fn finalize_sqlite_after_pool_close(db_path: &str) {
-    let url = format!("sqlite://{db_path}");
-    let mut conn = match SqliteConnection::connect(&url).await {
+/// SQLite owns journal cleanup. False means finalization was not verified;
+/// it never authorizes a filesystem unlink or claims physical media durability.
+pub async fn finalize_sqlite_after_pool_close(db_path: &str) -> bool {
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(db_path)
+        .create_if_missing(false);
+    let mut conn = match SqliteConnection::connect_with(&options).await {
         Ok(conn) => conn,
-        Err(err) => {
-            log::error!("failed to reopen sqlite db for finalization ({db_path}): {err}");
-            return;
+        Err(error) => {
+            log::error!("failed to reopen sqlite db for finalization ({db_path}); journals retained: {error}");
+            return false;
         }
     };
-
-    for stmt in [
-        "PRAGMA busy_timeout=5000;",
-        "PRAGMA wal_checkpoint(TRUNCATE);",
-        "PRAGMA optimize;",
-    ] {
-        if let Err(err) = sqlx::query(stmt).execute(&mut conn).await {
-            log::error!("sqlite finalization pragma failed ({stmt}): {err}");
-        }
+    let busy_timeout_ok = match sqlx::query("PRAGMA busy_timeout=5000;").execute(&mut conn).await {
+        Ok(_) => true,
+        Err(error) => { log::error!("SQLite finalization busy_timeout failed: {error}"); false }
+    };
+    let checkpoint_ok = match sqlx::query("PRAGMA wal_checkpoint(TRUNCATE);").fetch_optional(&mut conn).await {
+        Ok(row) => checkpoint_complete(row),
+        Err(error) => { log::error!("SQLite finalization checkpoint failed: {error}"); false }
+    };
+    if !checkpoint_ok {
+        log::warn!("SQLite finalization checkpoint busy or unverified ({db_path}); leaving journals to SQLite");
+        if let Err(error) = conn.close().await { log::error!("failed closing SQLite finalization connection: {error}"); }
+        return false;
     }
-
+    let optimize_ok = match sqlx::query("PRAGMA optimize;").execute(&mut conn).await {
+        Ok(_) => true,
+        Err(error) => { log::error!("SQLite finalization optimize failed: {error}"); false }
+    };
     let retries = env_usize("GS_SQLITE_SHUTDOWN_PRAGMA_RETRIES", 8, 1, 60);
-    let retry_delay_ms = env_i64("GS_SQLITE_SHUTDOWN_PRAGMA_RETRY_DELAY_MS", 120, 10, 5_000) as u64;
+    let delay_ms = env_i64("GS_SQLITE_SHUTDOWN_PRAGMA_RETRY_DELAY_MS", 120, 10, 5_000) as u64;
+    let mut delete_mode_verified = false;
     for attempt in 0..retries {
-        match sqlx::query("PRAGMA journal_mode=DELETE;")
-            .execute(&mut conn)
-            .await
-        {
-            Ok(_) => break,
-            Err(err) => {
-                if attempt + 1 >= retries {
-                    log::error!(
-                        "SQLite finalization pragma failed (PRAGMA journal_mode=DELETE;): {err}"
-                    );
-                } else {
-                    tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
-                }
+        match sqlx::query("PRAGMA journal_mode=DELETE;").fetch_optional(&mut conn).await {
+            Ok(row) => {
+                delete_mode_verified = row.and_then(|row| row.try_get::<String, _>(0).ok())
+                    .is_some_and(|mode| mode.eq_ignore_ascii_case("delete"));
+                break;
+            }
+            Err(error) => {
+                if attempt + 1 >= retries { log::error!("SQLite finalization journal_mode failed: {error}"); }
+                else { tokio::time::sleep(Duration::from_millis(delay_ms)).await; }
             }
         }
     }
-
-    if let Err(err) = conn.close().await {
-        log::error!("failed closing sqlite finalization connection: {err}");
-    }
-}
-
-pub async fn remove_sqlite_sidecars(db_path: &str) {
-    let retries = env_usize("GS_SQLITE_SIDECAR_DELETE_RETRIES", 12, 1, 120);
-    let retry_delay_ms = env_i64("GS_SQLITE_SIDECAR_DELETE_DELAY_MS", 100, 10, 2_000) as u64;
-    for suffix in [".wal", ".shm", "-wal", "-shm", "-journal", ".journal"] {
-        let sidecar = format!("{db_path}{suffix}");
-        for attempt in 0..retries {
-            match fs::remove_file(&sidecar) {
-                Ok(()) => break,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
-                Err(err) => {
-                    if attempt + 1 >= retries {
-                        log::error!("failed removing sqlite sidecar {sidecar}: {err}");
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
-                }
-            }
-        }
-    }
+    let close_ok = match conn.close().await {
+        Ok(()) => true,
+        Err(error) => { log::error!("failed closing SQLite finalization connection: {error}"); false }
+    };
+    busy_timeout_ok && checkpoint_ok && optimize_ok && delete_mode_verified && close_ok
 }
 
 pub fn sqlite_sidecars_present(db_path: &str) -> Vec<String> {
@@ -469,8 +520,9 @@ pub async fn close_and_finalize_sqlite(db: SqlitePool, db_path: &str) {
         flush_sqlite_journals(&db).await;
         db.close().await;
     }
-    finalize_sqlite_after_pool_close(db_path).await;
-    remove_sqlite_sidecars(db_path).await;
+    if !finalize_sqlite_after_pool_close(db_path).await {
+        log::warn!("SQLite finalization incomplete; recording and journals preserved: {db_path}");
+    }
     let lingering = sqlite_sidecars_present(db_path);
     if !lingering.is_empty() {
         log::error!(
@@ -480,34 +532,11 @@ pub async fn close_and_finalize_sqlite(db: SqlitePool, db_path: &str) {
     }
 }
 
-pub async fn sqlite_db_has_user_rows(db_path: &str) -> Result<bool> {
-    let url = format!("sqlite://{db_path}");
-    let db = open_sqlite_pool(&url).await?;
-    let total: i64 = sqlx::query_scalar(
-        r#"
-        SELECT
-            COALESCE((SELECT COUNT(*) FROM telemetry), 0) +
-            COALESCE((SELECT COUNT(*) FROM alerts), 0) +
-            COALESCE((SELECT COUNT(*) FROM flight_state), 0) +
-            COALESCE((SELECT COUNT(*) FROM messages), 0)
-        "#,
-    )
-    .fetch_one(&db)
-    .await?;
-    db.close().await;
-    Ok(total > 0)
-}
-
-pub async fn delete_sqlite_if_empty(db_path: &str) -> Result<bool> {
-    if !Path::new(db_path).exists() {
-        return Ok(false);
-    }
-    if sqlite_db_has_user_rows(db_path).await? {
-        return Ok(false);
-    }
-    fs::remove_file(db_path)?;
-    remove_sqlite_sidecars(db_path).await;
-    Ok(true)
+/// A path and an empty snapshot do not establish exclusive file ownership.
+/// Keep even empty recordings until a separately owned deletion protocol exists.
+/// Callers retain their existing async interface and treat false as not deleted.
+pub async fn delete_sqlite_if_empty(_db_path: &str) -> Result<bool> {
+    Ok(false)
 }
 
 pub async fn recover_sqlite_sidecars_in_dir(dir: &Path) -> Result<()> {
@@ -527,19 +556,63 @@ pub async fn recover_sqlite_sidecars_in_dir(dir: &Path) -> Result<()> {
             continue;
         }
         log::info!("recovering sqlite sidecars for {}", path.display());
-        finalize_sqlite_after_pool_close(&db_path).await;
-        remove_sqlite_sidecars(&db_path).await;
+        if !finalize_sqlite_after_pool_close(&db_path).await {
+            log::warn!("SQLite recovery incomplete; original journals preserved: {db_path}");
+        }
     }
     Ok(())
 }
 
-pub fn prune_recent_writes(buffer: &mut VecDeque<DbWrite>, newest_ts_ms: i64) {
-    let cutoff = newest_ts_ms.saturating_sub(RECORDING_BUFFER_WINDOW_MS);
-    while let Some(front) = buffer.front() {
-        if front.timestamp_ms() < cutoff {
-            buffer.pop_front();
-        } else {
-            break;
-        }
+#[cfg(test)]
+#[path = "telemetry_db/durability_tests.rs"]
+mod durability_tests;
+
+/// DAQ load-cell inputs (KG1000, AMP2 KG50) are ADC-pin volts from telemetry
+/// row `first_volts_id` on. Rows before it, and every recording without this
+/// table, were written on the DAQ's legacy raw scale. A database first opened
+/// by this station version marks its next row id once; reopening keeps it.
+pub async fn mark_loadcell_volts(db: &SqlitePool) -> Result<()> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS loadcell_units (id INTEGER PRIMARY KEY CHECK(id=1), first_volts_id INTEGER NOT NULL, unit TEXT NOT NULL)",
+    )
+    .execute(db)
+    .await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO loadcell_units VALUES (1, (SELECT COALESCE(MAX(id), 0) + 1 FROM telemetry), 'adc_volts')",
+    )
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// First telemetry row id whose load-cell values are volts. `i64::MAX` (every
+/// row legacy raw) for a recording made before the change.
+///
+/// An activated SD-resolved view (`recording_sd::activate_resolved`) renumbers
+/// rows, so the recording's mark does not apply to it: the resolver converts
+/// legacy rows itself and marks the view `sd_replay_loadcell_units`. A view
+/// resolved before that mark existed holds only legacy raw rows.
+pub async fn loadcell_volts_from_id(db: &SqlitePool) -> i64 {
+    let table_exists = |schema: &'static str, name: &'static str, kind: &'static str| {
+        sqlx::query_scalar::<_, i64>(match schema {
+            "temp" => "SELECT COUNT(*) FROM temp.sqlite_master WHERE type=? AND name=?",
+            _ => "SELECT COUNT(*) FROM main.sqlite_master WHERE type=? AND name=?",
+        })
+        .bind(kind)
+        .bind(name)
+        .fetch_one(db)
+    };
+    if table_exists("temp", "telemetry", "view").await.unwrap_or(0) > 0 {
+        let marked = table_exists("main", "sd_replay_loadcell_units", "table").await.unwrap_or(0) > 0;
+        return if marked { i64::MIN } else { i64::MAX };
     }
+    if table_exists("main", "loadcell_units", "table").await.unwrap_or(0) == 0 {
+        return i64::MAX;
+    }
+    sqlx::query_scalar::<_, i64>("SELECT first_volts_id FROM main.loadcell_units WHERE id=1")
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(i64::MAX)
 }

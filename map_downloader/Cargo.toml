@@ -1,5 +1,6 @@
 [package]
 name = "map_downloader"
+authors.workspace = true
 description.workspace = true
 license-file.workspace = true
 repository.workspace = true

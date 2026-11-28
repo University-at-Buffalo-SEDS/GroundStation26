@@ -1,0 +1,7 @@
+{
+  "scene_id": "pad-camera",
+  "transition": {
+    "duration_ms": 800,
+    "kind": "fade"
+  }
+}

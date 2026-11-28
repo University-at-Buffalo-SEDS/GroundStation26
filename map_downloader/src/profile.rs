@@ -11,6 +11,39 @@ pub(crate) const UB_BOUNDS: Bounds = (-78.91, 42.87, -78.74, 43.04);
 pub(crate) const MIDLAND_BOUNDS: Bounds = (-102.30, 31.85, -101.95, 32.10);
 pub(crate) const RRLS_BOUNDS: &[Bounds] = &[UB_BOUNDS, URRG_BOUNDS, MIDLAND_BOUNDS];
 pub(crate) const RRLS_REGION: &str = "rrls";
+/// High-detail regions an operator may pick (download_map.py --regions or
+/// its TUI), as MAP_REGIONS=urrg,ub,midland.
+pub(crate) const SELECTABLE_REGIONS: &[(&str, Bounds)] =
+    &[("urrg", URRG_BOUNDS), ("ub", UB_BOUNDS), ("midland", MIDLAND_BOUNDS)];
+/// Parses a MAP_REGIONS value: one or more selectable names, comma separated.
+pub(crate) fn parse_regions(value: &str) -> Result<Vec<Bounds>> {
+    let mut picked = Vec::new();
+    for name in value.split(',').map(str::trim).filter(|name| !name.is_empty()) {
+        let bounds = SELECTABLE_REGIONS
+            .iter()
+            .find(|(known, _)| known.eq_ignore_ascii_case(name))
+            .map(|(_, bounds)| *bounds)
+            .with_context(|| format!("MAP_REGIONS: unknown region {name:?} (choose from urrg, ub, midland)"))?;
+        if !picked.contains(&bounds) {
+            picked.push(bounds);
+        }
+    }
+    ensure!(!picked.is_empty(), "MAP_REGIONS must name at least one of urrg, ub, midland");
+    Ok(picked)
+}
+/// The operator's high-detail selection, or None (unset) for each profile's
+/// default regions. Read once; main validates it before any download.
+pub(crate) fn selected_regions() -> Result<Option<&'static [Bounds]>> {
+    static SELECTED: std::sync::OnceLock<Option<Vec<Bounds>>> = std::sync::OnceLock::new();
+    if let Some(selected) = SELECTED.get() {
+        return Ok(selected.as_deref());
+    }
+    let parsed = match std::env::var("MAP_REGIONS") {
+        Ok(value) => Some(parse_regions(&value)?),
+        Err(_) => None,
+    };
+    Ok(SELECTED.get_or_init(|| parsed).as_deref())
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Profile {
     GroundStation,
@@ -30,7 +63,7 @@ impl Profile {
     pub(crate) fn bounds(self, z: u32) -> &'static [Bounds] {
         match self {
             Self::GroundStation => coverage_bounds(z),
-            Self::Rrls => RRLS_BOUNDS,
+            Self::Rrls => selected_regions().ok().flatten().unwrap_or(RRLS_BOUNDS),
         }
     }
     pub(crate) fn default_region(self) -> &'static str {
@@ -65,7 +98,7 @@ pub(crate) fn planned_bytes(max_zoom: u32) -> Result<u64> {
     let mut count = 0u64;
     for z in 0..=max_zoom {
         let mut coords = HashSet::new();
-        for &b in RRLS_BOUNDS {
+        for &b in Profile::Rrls.bounds(z) {
             let (a, c, d, e) = tile_range_for_bounds(b, z);
             for x in a..=c {
                 for y in d..=e {
@@ -86,6 +119,13 @@ pub(crate) fn planned_bytes(max_zoom: u32) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn map_regions_selects_one_or_more_named_regions() {
+        assert_eq!(parse_regions("urrg").unwrap(), vec![URRG_BOUNDS]);
+        assert_eq!(parse_regions(" UB , midland,ub").unwrap(), vec![UB_BOUNDS, MIDLAND_BOUNDS]);
+        assert!(parse_regions("").is_err());
+        assert!(parse_regions("urrg,texas").is_err());
+    }
     #[test]
     fn rrls_never_selects_bulk_regions_and_contains_all_sites() {
         for z in 0..=17 {

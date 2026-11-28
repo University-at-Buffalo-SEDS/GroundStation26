@@ -106,42 +106,6 @@
   "actions_tab": {
     "actions": [
       {
-        "label": "Start DB Now",
-        "cmd": "StartWritingNow",
-        "border": "#10b981",
-        "bg": "#06261d",
-        "fg": "#d1fae5",
-        "illuminated": true,
-        "group": "Recording"
-      },
-      {
-        "label": "Start DB Last 2 Min",
-        "cmd": "StartWritingLastTwoMinutes",
-        "border": "#14b8a6",
-        "bg": "#042f2e",
-        "fg": "#ccfbf1",
-        "illuminated": true,
-        "group": "Recording"
-      },
-      {
-        "label": "Pause DB",
-        "cmd": "PauseWritingDb",
-        "border": "#f59e0b",
-        "bg": "#3b2203",
-        "fg": "#fef3c7",
-        "illuminated": true,
-        "group": "Recording"
-      },
-      {
-        "label": "Stop DB",
-        "cmd": "StopWritingDb",
-        "border": "#ef4444",
-        "bg": "#3f0b13",
-        "fg": "#fee2e2",
-        "illuminated": true,
-        "group": "Recording"
-      },
-      {
         "label": "Postinit",
         "cmd": "Postinit",
         "border": "#38bdf8",
@@ -174,7 +138,7 @@
         "group": "Flight controls"
       },
       {
-        "label": "Flight State +1",
+        "label": "State +1",
         "cmd": "AdvanceFlightState",
         "border": "#38bdf8",
         "bg": "#0b1220",
@@ -182,7 +146,7 @@
         "group": "Flight controls"
       },
       {
-        "label": "Flight State -1",
+        "label": "State -1",
         "cmd": "RewindFlightState",
         "border": "#38bdf8",
         "bg": "#0b1220",
@@ -233,7 +197,17 @@
     "disable_actions_by_default": true,
     "show_flight_setup": false,
     "show_fill_targets": true,
-    "fill_targets_require_actions_enabled": true
+    "fill_targets_require_actions_enabled": true,
+    "fill_target_fluids": [
+      {
+        "id": "nitrogen",
+        "label": "Nitrogen"
+      },
+      {
+        "id": "nitrous",
+        "label": "Nitrous"
+      }
+    ]
   },
   "data_tab": {
     "sender_split_data_types": [
@@ -242,10 +216,10 @@
     ],
     "tabs": [
       {
-        "id": "FUEL_TANK_PRESSURE",
-        "label": "Fuel Tank Pressure",
+        "id": "OX_TANK_PRESSURE",
+        "label": "Ox Tank Pressure",
         "channels": [
-          "Tank Pressure"
+          "Ox Tank Pressure"
         ],
         "chart": {
           "enabled": true
@@ -255,6 +229,27 @@
           "kind": "low_pass",
           "cutoff_hz": 8.0
         }
+      },
+      {
+        "id": "COMBUSTION_CHAMBER_PRESSURE",
+        "label": "Combustion chamber pressure",
+        "channels": [
+          "Pressure (psig)"
+        ],
+        "chart": {
+          "enabled": true
+        },
+        "display_filter": {
+          "enabled": true,
+          "kind": "low_pass",
+          "cutoff_hz": 8.0
+        },
+        "channel_formatters": [
+          {
+            "precision": 2,
+            "suffix": " psig"
+          }
+        ]
       },
       {
         "id": "BATTERY_VOLTAGE",
@@ -559,10 +554,10 @@
             ],
             "chart_groups": [
               {
-                "title": "Raw",
+                "title": "Raw (V)",
                 "data_type": "KG1000",
                 "labels": [
-                  "Raw"
+                  "Raw (V)"
                 ],
                 "channels": [
                   0
@@ -625,7 +620,7 @@
             ],
             "summary_items": [
               {
-                "label": "Raw",
+                "label": "Raw (V)",
                 "data_type": "KG1000",
                 "index": 0,
                 "formatter": {
@@ -689,10 +684,10 @@
             ],
             "chart_groups": [
               {
-                "title": "Raw",
+                "title": "Raw (V)",
                 "data_type": "KG50",
                 "labels": [
-                  "Raw"
+                  "Raw (V)"
                 ],
                 "channels": [
                   0
@@ -740,7 +735,7 @@
             ],
             "summary_items": [
               {
-                "label": "Raw",
+                "label": "Raw (V)",
                 "data_type": "KG50",
                 "index": 0,
                 "formatter": {
@@ -788,14 +783,14 @@
           {
             "id": "loadcell_pressure_transducer",
             "label": "Pressure Transducer",
-            "data_type": "FUEL_TANK_PRESSURE",
+            "data_type": "OX_TANK_PRESSURE",
             "channels": [
               "Pressure Transducer"
             ],
             "chart_groups": [
               {
                 "title": "Raw",
-                "data_type": "FUEL_TANK_PRESSURE",
+                "data_type": "OX_TANK_PRESSURE",
                 "labels": [
                   "Raw"
                 ],
@@ -822,7 +817,7 @@
             "summary_items": [
               {
                 "label": "Raw",
-                "data_type": "FUEL_TANK_PRESSURE",
+                "data_type": "OX_TANK_PRESSURE",
                 "index": 0,
                 "formatter": {
                   "kind": "number",
@@ -847,6 +842,87 @@
               "enabled": true,
               "kind": "low_pass",
               "cutoff_hz": 8.0
+            }
+          },
+          {
+            "id": "chamber_pressure",
+            "label": "Chamber pressure",
+            "data_type": "COMBUSTION_CHAMBER_PRESSURE",
+            "sender_id": "DAQ",
+            "channels": [
+              "Chamber pressure (psig)"
+            ],
+            "chart_groups": [
+              {
+                "title": "Pressure (psig)",
+                "data_type": "COMBUSTION_CHAMBER_PRESSURE",
+                "sender_id": "DAQ",
+                "labels": [
+                  "Pressure (psig)"
+                ],
+                "channels": [
+                  0
+                ]
+              },
+              {
+                "title": "Connector voltage (V)",
+                "data_type": "COMBUSTION_CHAMBER_VOLTAGE",
+                "sender_id": "DAQ",
+                "labels": [
+                  "Voltage (V)"
+                ],
+                "channels": [
+                  0
+                ]
+              }
+            ],
+            "summary_items": [
+              {
+                "label": "Chamber PT",
+                "data_type": "COMBUSTION_CHAMBER_PT_INSTALLED",
+                "sender_id": "DAQ",
+                "index": 0,
+                "boolean_labels": {
+                  "true_label": "Installed",
+                  "false_label": "Not installed",
+                  "unknown_label": "No reading"
+                }
+              },
+              {
+                "label": "Chamber pressure",
+                "data_type": "COMBUSTION_CHAMBER_PRESSURE",
+                "sender_id": "DAQ",
+                "index": 0,
+                "formatter": {
+                  "kind": "number",
+                  "precision": 2,
+                  "suffix": " psig"
+                }
+              },
+              {
+                "label": "Raw connector voltage",
+                "data_type": "COMBUSTION_CHAMBER_VOLTAGE",
+                "sender_id": "DAQ",
+                "index": 0,
+                "formatter": {
+                  "kind": "number",
+                  "precision": 4,
+                  "suffix": " V"
+                }
+              },
+              {
+                "label": "Outside rated 0\u20131000 psig range (1=yes)",
+                "data_type": "COMBUSTION_CHAMBER_RANGE_STATUS",
+                "sender_id": "DAQ",
+                "index": 0,
+                "formatter": {
+                  "kind": "number",
+                  "precision": 0
+                }
+              }
+            ],
+            "chart": {
+              "enabled": true
             }
           }
         ],
@@ -1413,10 +1489,10 @@
             ],
             "chart_groups": [
               {
-                "title": "Raw",
+                "title": "Raw (V)",
                 "data_type": "KG1000",
                 "labels": [
-                  "Raw"
+                  "Raw (V)"
                 ],
                 "channels": [
                   0
@@ -1479,7 +1555,7 @@
             ],
             "summary_items": [
               {
-                "label": "Raw",
+                "label": "Raw (V)",
                 "data_type": "KG1000",
                 "index": 0,
                 "formatter": {
@@ -1543,10 +1619,10 @@
             ],
             "chart_groups": [
               {
-                "title": "Raw",
+                "title": "Raw (V)",
                 "data_type": "KG50",
                 "labels": [
-                  "Raw"
+                  "Raw (V)"
                 ],
                 "channels": [
                   0
@@ -1594,7 +1670,7 @@
             ],
             "summary_items": [
               {
-                "label": "Raw",
+                "label": "Raw (V)",
                 "data_type": "KG50",
                 "index": 0,
                 "formatter": {
@@ -1643,6 +1719,81 @@
         "chart": {
           "enabled": true
         }
+      },
+      {
+        "id": "IGNITER_SENSE_SIGNAL",
+        "label": "Igniter current sense",
+        "channels": [
+          "ADC counts",
+          "Signal voltage",
+          "Current (estimated)"
+        ],
+        "show_min_max": true,
+        "channel_formatters": [
+          {
+            "kind": "integer"
+          },
+          {
+            "precision": 4,
+            "suffix": " V"
+          },
+          {
+            "precision": 2,
+            "suffix": " A"
+          }
+        ],
+        "chart": {
+          "enabled": true
+        },
+        "chart_groups": [
+          {
+            "title": "Measured current-sense signal",
+            "data_type": "IGNITER_SENSE_SIGNAL",
+            "sender_id": "AB",
+            "labels": [
+              "Signal voltage (V)"
+            ],
+            "channels": [
+              1
+            ]
+          },
+          {
+            "title": "Estimated current (uncalibrated, 3V3 ratiometric assumption)",
+            "data_type": "IGNITER_SENSE_SIGNAL",
+            "sender_id": "AB",
+            "labels": [
+              "Current (A, estimated)"
+            ],
+            "channels": [
+              2
+            ]
+          },
+          {
+            "title": "ADC input",
+            "data_type": "IGNITER_SENSE_SIGNAL",
+            "sender_id": "AB",
+            "labels": [
+              "ADC counts"
+            ],
+            "channels": [
+              0
+            ]
+          }
+        ],
+        "subtabs": [
+          {
+            "id": "actuator_igniter_sense",
+            "label": "Actuator board",
+            "data_type": "IGNITER_SENSE_SIGNAL",
+            "sender_id": "AB",
+            "channels": [
+              "ADC counts",
+              "Signal voltage",
+              "Current (estimated)"
+            ],
+            "show_min_max": true
+          }
+        ]
       }
     ],
     "default_display_filter": {
@@ -1763,10 +1914,10 @@
             "widgets": [
               {
                 "kind": "summary",
-                "data_type": "FUEL_TANK_PRESSURE",
+                "data_type": "OX_TANK_PRESSURE",
                 "items": [
                   {
-                    "label": "Tank Pressure",
+                    "label": "Ox Tank Pressure",
                     "index": 0,
                     "fill_target_fluid": "nitrous",
                     "fill_target_kind": "pressure_psi",
@@ -1810,9 +1961,9 @@
                 "chart_title": "Pressure and Loadcell",
                 "chart_series": [
                   {
-                    "data_type": "FUEL_TANK_PRESSURE",
+                    "data_type": "OX_TANK_PRESSURE",
                     "index": 0,
-                    "label": "Tank Pressure",
+                    "label": "Ox Tank Pressure",
                     "display_filter": {
                       "enabled": true,
                       "kind": "low_pass",
@@ -2036,10 +2187,10 @@
             "widgets": [
               {
                 "kind": "summary",
-                "data_type": "FUEL_TANK_PRESSURE",
+                "data_type": "OX_TANK_PRESSURE",
                 "items": [
                   {
-                    "label": "Tank Pressure",
+                    "label": "Ox Tank Pressure",
                     "index": 0
                   }
                 ]
@@ -2069,9 +2220,9 @@
                 "chart_title": "Pressure and Loadcell",
                 "chart_series": [
                   {
-                    "data_type": "FUEL_TANK_PRESSURE",
+                    "data_type": "OX_TANK_PRESSURE",
                     "index": 0,
-                    "label": "Tank Pressure",
+                    "label": "Ox Tank Pressure",
                     "display_filter": {
                       "enabled": true,
                       "kind": "low_pass",
@@ -2110,18 +2261,18 @@
             "widgets": [
               {
                 "kind": "summary",
-                "data_type": "FUEL_TANK_PRESSURE",
+                "data_type": "OX_TANK_PRESSURE",
                 "items": [
                   {
-                    "label": "Tank Pressure",
+                    "label": "Ox Tank Pressure",
                     "index": 0
                   }
                 ]
               },
               {
                 "kind": "chart",
-                "data_type": "FUEL_TANK_PRESSURE",
-                "chart_title": "Fuel Tank Pressure",
+                "data_type": "OX_TANK_PRESSURE",
+                "chart_title": "Ox Tank Pressure",
                 "width": 1200.0,
                 "height": 260.0
               }
@@ -2210,10 +2361,10 @@
             "widgets": [
               {
                 "kind": "actions",
-                "data_type": "FUEL_TANK_PRESSURE",
+                "data_type": "OX_TANK_PRESSURE",
                 "items": [
                   {
-                    "label": "Tank Pressure",
+                    "label": "Ox Tank Pressure",
                     "index": 0
                   }
                 ],
@@ -2318,8 +2469,8 @@
           "Ascent",
           "Coast",
           "Apogee",
-          "ParachuteDeploy",
-          "Descent"
+          "Descent",
+          "Reefing"
         ],
         "sections": [
           {
@@ -2327,10 +2478,10 @@
             "widgets": [
               {
                 "kind": "summary",
-                "data_type": "FUEL_TANK_PRESSURE",
+                "data_type": "OX_TANK_PRESSURE",
                 "items": [
                   {
-                    "label": "Tank Pressure",
+                    "label": "Ox Tank Pressure",
                     "index": 0
                   }
                 ]
@@ -2360,9 +2511,9 @@
                 "chart_title": "Pressure and Loadcell",
                 "chart_series": [
                   {
-                    "data_type": "FUEL_TANK_PRESSURE",
+                    "data_type": "OX_TANK_PRESSURE",
                     "index": 0,
-                    "label": "Tank Pressure",
+                    "label": "Ox Tank Pressure",
                     "display_filter": {
                       "enabled": true,
                       "kind": "low_pass",
@@ -2504,14 +2655,14 @@
         ],
         "sections": [
           {
-            "title": "FUEL TANK PRESSURE",
+            "title": "OX TANK PRESSURE",
             "widgets": [
               {
                 "kind": "summary",
-                "data_type": "FUEL_TANK_PRESSURE",
+                "data_type": "OX_TANK_PRESSURE",
                 "items": [
                   {
-                    "label": "Tank Pressure",
+                    "label": "Ox Tank Pressure",
                     "index": 0
                   }
                 ]
@@ -2639,7 +2790,7 @@
         "drop_rate_data_type": "VALVE_BOARD_BATTERY_DROP_RATE_V_PER_MIN",
         "remaining_minutes_data_type": "VALVE_BOARD_BATTERY_REMAINING_MINUTES",
         "empty_voltage": 13.6,
-        "full_voltage": 15.2,
+        "full_voltage": 16.85,
         "curve_exponent": 1.0
       },
       {
@@ -2651,9 +2802,127 @@
         "drop_rate_data_type": "FILL_BOX_POWER_DROP_RATE_V_PER_MIN",
         "remaining_minutes_data_type": "FILL_BOX_POWER_REMAINING_MINUTES",
         "empty_voltage": 13.6,
-        "full_voltage": 15.2,
+        "full_voltage": 16.85,
         "curve_exponent": 1.0
       }
     ]
-  }
+  },
+  "live_diagrams": {
+    "test_fire": "test_fire"
+  },
+  "flight_phase_version": 1,
+  "gps": {
+    "data_types": [
+      "GPS_DATA",
+      "GPS",
+      "ROCKET_GPS"
+    ],
+    "lat_index": 0,
+    "lon_index": 1,
+    "alt_index": 2
+  },
+  "watch_items": [
+    {
+      "id": "altitude",
+      "channels": [
+        {
+          "data_type": "ASCENT_STATE",
+          "index": 4
+        },
+        {
+          "data_type": "DESCENT_STATE",
+          "index": 2
+        },
+        {
+          "data_type": "BAROMETER_DATA",
+          "index": 0
+        }
+      ]
+    },
+    {
+      "id": "velocity",
+      "channels": [
+        {
+          "data_type": "ASCENT_STATE",
+          "index": 5
+        },
+        {
+          "data_type": "DESCENT_STATE",
+          "index": 3
+        }
+      ]
+    },
+    {
+      "id": "gps_altitude",
+      "channels": [
+        {
+          "data_type": "GPS_DATA",
+          "index": 2
+        },
+        {
+          "data_type": "GPS",
+          "index": 2
+        },
+        {
+          "data_type": "ROCKET_GPS",
+          "index": 2
+        }
+      ]
+    },
+    {
+      "id": "gps_sats",
+      "channels": [
+        {
+          "data_type": "GPS_SATELLITE_NUMBER",
+          "index": 0
+        }
+      ]
+    },
+    {
+      "id": "tank_pressure",
+      "channels": [
+        {
+          "data_type": "OX_TANK_PRESSURE",
+          "index": 0
+        }
+      ]
+    },
+    {
+      "id": "chamber_pressure",
+      "channels": [
+        {
+          "data_type": "COMBUSTION_CHAMBER_PRESSURE",
+          "index": 0
+        }
+      ]
+    },
+    {
+      "id": "loadcell_mass",
+      "channels": [
+        {
+          "data_type": "LOADCELL_WEIGHT_KG",
+          "index": 0
+        }
+      ]
+    },
+    {
+      "id": "fill_percent",
+      "channels": [
+        {
+          "data_type": "LOADCELL_FILL_PERCENT",
+          "index": 0
+        }
+      ]
+    },
+    {
+      "id": "av_battery",
+      "channels": [
+        {
+          "data_type": "BATTERY_VOLTAGE",
+          "sender_id": "PB",
+          "index": 0
+        }
+      ]
+    }
+  ]
 }

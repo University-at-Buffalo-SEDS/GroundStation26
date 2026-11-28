@@ -1,0 +1,86 @@
+[
+  {
+    "bundle": "flight",
+    "file": "review/flight-launch-flight.zip",
+    "path": "/api/flight_review/recording/groundstation_recording_2026-01-01_00-00-00_000.db/flight_export?from_ms=1767225605000&to_ms=1767225660000",
+    "station_path": "/api/flight_review/recording/groundstation_recording_2026-01-01_00-00-00_000.db/flight_export?from_ms=1767225605000&to_ms=1767225660000&raster=false",
+    "status": 200
+  },
+  {
+    "bundle": "flight",
+    "file": "review/flight-descent-flight.zip",
+    "path": "/api/flight_review/recording/groundstation_recording_2026-01-01_00-00-00_000.db/flight_export?from_ms=1767225630000&to_ms=1767225840000",
+    "station_path": "/api/flight_review/recording/groundstation_recording_2026-01-01_00-00-00_000.db/flight_export?from_ms=1767225630000&to_ms=1767225840000&raster=false",
+    "status": 200
+  },
+  {
+    "bundle": "flight",
+    "file": "review/flight-launch-summary.json",
+    "path": "/api/flight_review/recording/groundstation_recording_2026-01-01_00-00-00_000.db?from_ms=1767225605000&to_ms=1767225660000",
+    "station_path": "/api/flight_review/recording/groundstation_recording_2026-01-01_00-00-00_000.db?from_ms=1767225605000&to_ms=1767225660000",
+    "status": 200
+  },
+  {
+    "body": "No motor data (load cells, chamber or tank PT) in this recording or range.",
+    "bundle": "flight",
+    "path": "/api/flight_review/recording/groundstation_recording_2026-01-01_00-00-00_000.db/motor_export?from_ms=1767225605000&to_ms=1767225660000",
+    "station_path": "/api/flight_review/recording/groundstation_recording_2026-01-01_00-00-00_000.db/motor_export?from_ms=1767225605000&to_ms=1767225660000&raster=false",
+    "status": 404
+  },
+  {
+    "bundle": "flight_capture",
+    "file": "review/capture-ascent-flight.zip",
+    "path": "/api/flight_review/recording/event.launch.2027-01-15_08-00-00_flight.db/flight_export?from_ms=1799999995000&to_ms=1800000060000",
+    "station_path": "/api/flight_review/recording/event.launch.2027-01-15_08-00-00_flight.db/flight_export?from_ms=1799999995000&to_ms=1800000060000&raster=false",
+    "status": 200
+  },
+  {
+    "bundle": "flight_capture",
+    "file": "review/capture-descent-flight.zip",
+    "path": "/api/flight_review/recording/event.launch.2027-01-15_08-00-00_flight.db/flight_export?from_ms=1800000020000&to_ms=1800000200000",
+    "station_path": "/api/flight_review/recording/event.launch.2027-01-15_08-00-00_flight.db/flight_export?from_ms=1800000020000&to_ms=1800000200000&raster=false",
+    "status": 200
+  },
+  {
+    "body": "No motor data (load cells, chamber or tank PT) in this recording or range.",
+    "bundle": "flight_capture",
+    "path": "/api/flight_review/recording/event.launch.2027-01-15_08-00-00_flight.db/motor_export?from_ms=1799999995000&to_ms=1800000060000",
+    "station_path": "/api/flight_review/recording/event.launch.2027-01-15_08-00-00_flight.db/motor_export?from_ms=1799999995000&to_ms=1800000060000&raster=false",
+    "status": 404
+  },
+  {
+    "bundle": "test_fire",
+    "file": "review/fire-burn-motor.zip",
+    "path": "/api/flight_review/recording/event.launch.2027-01-15_09-00-00_fire.db/motor_export?from_ms=1799999990000&to_ms=1800000020000",
+    "station_path": "/api/flight_review/recording/event.launch.2027-01-15_09-00-00_fire.db/motor_export?from_ms=1799999990000&to_ms=1800000020000&raster=false",
+    "status": 200
+  },
+  {
+    "bundle": "test_fire",
+    "file": "review/fire-late-motor.zip",
+    "path": "/api/flight_review/recording/event.launch.2027-01-15_09-00-00_fire.db/motor_export?from_ms=1800000001000&to_ms=1800000020000",
+    "station_path": "/api/flight_review/recording/event.launch.2027-01-15_09-00-00_fire.db/motor_export?from_ms=1800000001000&to_ms=1800000020000&raster=false",
+    "status": 200
+  },
+  {
+    "bundle": "test_fire",
+    "file": "review/fire-before-motor.zip",
+    "path": "/api/flight_review/recording/event.launch.2027-01-15_09-00-00_fire.db/motor_export?from_ms=1799999990000&to_ms=1799999999000",
+    "station_path": "/api/flight_review/recording/event.launch.2027-01-15_09-00-00_fire.db/motor_export?from_ms=1799999990000&to_ms=1799999999000&raster=false",
+    "status": 200
+  },
+  {
+    "bundle": "test_fire",
+    "file": "review/fire-burn-summary.json",
+    "path": "/api/flight_review/recording/event.launch.2027-01-15_09-00-00_fire.db?from_ms=1799999990000&to_ms=1800000020000",
+    "station_path": "/api/flight_review/recording/event.launch.2027-01-15_09-00-00_fire.db?from_ms=1799999990000&to_ms=1800000020000",
+    "status": 200
+  },
+  {
+    "body": "No flight data (FC phases, altitude or velocity) in this recording or range.",
+    "bundle": "test_fire",
+    "path": "/api/flight_review/recording/event.launch.2027-01-15_09-00-00_fire.db/flight_export?from_ms=1799999990000&to_ms=1800000020000",
+    "station_path": "/api/flight_review/recording/event.launch.2027-01-15_09-00-00_fire.db/flight_export?from_ms=1799999990000&to_ms=1800000020000&raster=false",
+    "status": 404
+  }
+]

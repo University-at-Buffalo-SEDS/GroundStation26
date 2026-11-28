@@ -1,0 +1,19 @@
+{
+  "baro_drift_hpa": null,
+  "baro_label": null,
+  "baro_mode": null,
+  "baro_ref_hpa": null,
+  "cycles": null,
+  "expected": true,
+  "label": "FC estimator: no report",
+  "launch_seen": false,
+  "phase": null,
+  "rate_hz": null,
+  "report_age_ms": null,
+  "running_for_ms": null,
+  "stalled": false,
+  "started_network_ms": null,
+  "started_t_plus_ms": null,
+  "state": "unknown",
+  "warning": null
+}

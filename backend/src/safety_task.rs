@@ -1,5 +1,5 @@
 use crate::state::AppState;
-use crate::telemetry_task::{get_current_timestamp_ms, queue_automatic_abort_packet};
+use crate::telemetry_task::get_current_timestamp_ms;
 use crate::types::{Board, FlightState, canonical_sender_id};
 use crate::web::{emit_warning, emit_warning_db_only};
 use sedsnet::router::Router;
@@ -8,13 +8,10 @@ use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
 use tokio::time::{Duration, sleep};
 
-// Acceleration thresholds (m/s²)
-const ACCELERATION_X_MIN_THRESHOLD: f32 = -2.0; // m/s²
-const ACCELERATION_X_MAX_THRESHOLD: f32 = 2.0; // m/s²
-const ACCELERATION_Y_MIN_THRESHOLD: f32 = -2.0; // m/s²
-const ACCELERATION_Y_MAX_THRESHOLD: f32 = 2.0; // m/s²
-const ACCELERATION_Z_MIN_THRESHOLD: f32 = -2.0; // m/s²
-const ACCELERATION_Z_MAX_THRESHOLD: f32 = 100.0; // m/s²
+// In-flight control is the FC's alone: radio telemetry can drop out, so every
+// vehicle check below warns only while the vehicle is on the pad
+// (`vehicle_checks_on_pad`). No accelerometer check: X is vertical and reads
+// 1 g at rest, so a +/-2 m/s^2 window warned on every upright rocket.
 
 // Gyroscope thresholds (deg/s)
 const GYRO_X_MAX_THRESHOLD: f32 = 5.0; // deg/s
@@ -24,51 +21,117 @@ const GYRO_X_MIN_THRESHOLD: f32 = -5.0;
 const GYRO_Y_MIN_THRESHOLD: f32 = -5.0;
 const GYRO_Z_MIN_THRESHOLD: f32 = -360.0;
 
-// Barometric pressure thresholds (Pa)
+// Barometer thresholds, applied to BAROMETER_DATA (alt m, pressure Pa, temp C).
 const BARO_PRESSURE_MIN_THRESHOLD: f32 = 30000.0; // Pa
 const BARO_PRESSURE_MAX_THRESHOLD: f32 = 110000.0; // Pa
-const BARO_TEMPERATURE_MIN_THRESHOLD: f32 = 0.0; // °C
-const BARO_TEMPERATURE_MAX_THRESHOLD: f32 = 85.0; // °
-const BARO_ALTITUDE_MIN_THRESHOLD: f32 = -5.0; // m
+// The BMP390's operating range; a winter pad sits below 0 °C.
+const BARO_TEMPERATURE_MIN_THRESHOLD: f32 = -40.0; // °C
+const BARO_TEMPERATURE_MAX_THRESHOLD: f32 = 85.0; // °C
+// The FC's own MIN_ALT: below it the FC rejects the sample. Pad weather moves
+// the relative altitude a few metres.
+const BARO_ALTITUDE_MIN_THRESHOLD: f32 = -30.0; // m
 const BARO_ALTITUDE_MAX_THRESHOLD: f32 = 11000.0; // m
 
 // GPS thresholds
 // Should be in texas
-#[cfg(not(feature = "hitl_mode"))]
 const GPS_LATITUDE_MIN_THRESHOLD: f32 = 25.0; // degrees
-#[cfg(not(feature = "hitl_mode"))]
 const GPS_LATITUDE_MAX_THRESHOLD: f32 = 36.5; // degrees
-#[cfg(not(feature = "hitl_mode"))]
 const GPS_LONGITUDE_MIN_THRESHOLD: f32 = -106.5; // degrees
-#[cfg(not(feature = "hitl_mode"))]
 const GPS_LONGITUDE_MAX_THRESHOLD: f32 = -93.5; // degrees
 
 // Default battery voltage thresholds (V), used as fallback sender ranges.
 const BATTERY_VOLTAGE_AV_BAY_MIN_THRESHOLD: f32 = 6.3; // V
 const BATTERY_VOLTAGE_AV_BAY_MAX_THRESHOLD: f32 = 8.0; // V
 const BATTERY_VOLTAGE_VALVE_BOARD_MIN_THRESHOLD: f32 = 12.3; // V
-const BATTERY_VOLTAGE_VALVE_BOARD_MAX_THRESHOLD: f32 = 16.5; // V
+const BATTERY_VOLTAGE_VALVE_BOARD_MAX_THRESHOLD: f32 = 16.85; // V
 const BATTERY_VOLTAGE_GROUND_STATION_MIN_THRESHOLD: f32 = 12.3; // V
-const BATTERY_VOLTAGE_GROUND_STATION_MAX_THRESHOLD: f32 = 16.5; // V
+const BATTERY_VOLTAGE_GROUND_STATION_MAX_THRESHOLD: f32 = 16.85; // V
 const BATTERY_LOW_VOLTAGE_ALWAYS_WARN_THRESHOLD: f32 = 13.0; // V
 
-// Battery current thresholds (A)
-const BATTERY_CURRENT_MIN_THRESHOLD: f32 = 0.0; // A
+// Battery current thresholds (A). BATTERY_CURRENT is one float32 (amps) from
+// the LTC2990 boards. Recorded idle draw (Nov 2026, 7,463 samples): GB
+// 0.41-1.54 A, PB 4.05-4.37 A, VB -0.14-0.55 A. The VB sense reads a few tens
+// of mA either side of zero at rest, so the floor allows offset noise and only
+// a real reverse current or a swapped sense trips it.
+const BATTERY_CURRENT_MIN_THRESHOLD: f32 = -1.0; // A
 const BATTERY_CURRENT_MAX_THRESHOLD: f32 = 50.0; // A
 
-// Fuel Tank Pressure thresholds (psi)
-const FUEL_TANK_PRESSURE_MIN_THRESHOLD: f32 = 0.0; // psi
-const FUEL_TANK_PRESSURE_MAX_THRESHOLD: f32 = 3000.0; // psi
+// Ox Tank Pressure thresholds (psi)
+const OX_TANK_PRESSURE_MIN_THRESHOLD: f32 = 0.0; // psi
+const OX_TANK_PRESSURE_MAX_THRESHOLD: f32 = 3000.0; // psi
 
 // Kalman Filter thresholds
 const KALMAN_STATE_MIN_THRESHOLD: f32 = -5000.0; // arbitrary units
 const KALMAN_STATE_MAX_THRESHOLD: f32 = 5000.0; // arbitrary units
 
-#[cfg(not(feature = "testing"))]
+// The testing build used the same thresholds.
 const BOARD_TIMEOUT_MS: u64 = 12000;
-#[cfg(not(feature = "testing"))]
 const BOARD_OFFLINE_ABORT_TRIGGER_MS: u64 = 6000;
 const SAFETY_WARNING_COOLDOWN_MS_DEFAULT: u64 = 5_000;
+
+// This applies only to board-liveness silence. Shared automatic-abort policy
+// still includes Idle for independent faults such as failed ADC zero capture.
+/// Disconnect (board-offline) aborts are armed from the Idle mission phase
+/// onward. Post-Launch and Aborted detailed states stay suppressed by the
+/// caller's existing detailed-state rules (no automatic abort after Launch).
+fn liveness_abort_allowed_in_state(stage: FlightState) -> bool {
+    crate::mission_phase::safety_phase(stage).disconnect_aborts_armed()
+}
+
+// An explicitly configured MCU simulation clock must compare like domains.
+// Physical deployments (no model clock) keep the original wall-age policy.
+// Unknown or future model observations remain unknown, never fresh-by-clamping.
+fn safety_liveness_age_ms(
+    wall_now_ms: u64,
+    last_wall_ms: Option<u64>,
+    model_now_ms: Option<u64>,
+    last_model_ms: Option<u64>,
+) -> Option<u64> {
+    match model_now_ms {
+        Some(now) => last_model_ms.and_then(|last| now.checked_sub(last)),
+        None => last_wall_ms.map(|last| wall_now_ms.saturating_sub(last)),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+enum SafetyAbortReason {
+    BoardOffline {
+        board: &'static str,
+        selected_state: FlightState,
+        selected_wall_ms: u64,
+        last_observation_wall_ms: u64,
+        observation_wall_age_ms: u64,
+        decision_clock_basis: &'static str,
+        decision_age_ms: u64,
+        selected_model_ms: Option<u64>,
+        last_observation_model_ms: Option<u64>,
+        observation_instant_age_ms: Option<u64>,
+        offline_detection_threshold_ms: u64,
+        abort_trigger_threshold_ms: u64,
+    },
+    GenericError {
+        sender: String,
+        packet_id: u64,
+        selected_state: FlightState,
+        selected_wall_ms: u64,
+    },
+}
+
+fn record_first_abort_reason(first: &mut Option<SafetyAbortReason>, reason: SafetyAbortReason) {
+    if first.is_some() {
+        return;
+    }
+    // Record the actual first selected cause before claim or transport work.
+    // last_observation_wall_ms is ANY board packet evidence, not a heartbeat clock.
+    match serde_json::to_string(&reason) {
+        Ok(value) => log::error!("automatic_abort_first_cause={value}"),
+        Err(error) => {
+            log::error!("automatic_abort_first_cause={reason:?} serialization_error={error}")
+        }
+    }
+    *first = Some(reason);
+}
 
 fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name)
@@ -158,24 +221,46 @@ fn battery_voltage_out_of_range(sender_id: &str, voltage: f32) -> bool {
     outside_configured_range || battery_low_voltage_always_warns(sender_id, voltage)
 }
 
-fn check_accel_thresholds(values: &[f32], warnings: &mut HashSet<&'static str>) {
-    if let Some(accel_x) = values.first()
-        && ((ACCELERATION_X_MIN_THRESHOLD > *accel_x) || (*accel_x > ACCELERATION_X_MAX_THRESHOLD))
-    {
-        warnings.insert("Critical: Acceleration X threshold exceeded!");
+/// The out-of-range warning names the pack's board: one pack out of range
+/// (a charged VB pack) must not stand for another (a drained PB pack).
+fn battery_voltage_warning(sender_id: &str) -> &'static str {
+    match canonical_sender_id(sender_id) {
+        "PB" => "Critical: PB battery voltage out of range!",
+        "VB" => "Critical: VB battery voltage out of range!",
+        "GB" => "Critical: GB battery voltage out of range!",
+        _ => "Critical: Battery voltage out of range!",
     }
+}
 
-    if let Some(accel_y) = values.get(1)
-        && ((ACCELERATION_Y_MIN_THRESHOLD > *accel_y) || (*accel_y > ACCELERATION_Y_MAX_THRESHOLD))
-    {
-        warnings.insert("Critical: Acceleration Y threshold exceeded!");
-    }
+const BATTERY_CURRENT_WARNING: &str = "Critical: Battery current out of range!";
 
-    if let Some(accel_z) = values.get(2)
-        && ((ACCELERATION_Z_MIN_THRESHOLD > *accel_z) || (*accel_z > ACCELERATION_Z_MAX_THRESHOLD))
+/// BATTERY_CURRENT carries a single float32 (schema count 1): the current is
+/// element 0. Undecodable payloads warn nothing rather than a fake 0 A.
+fn check_battery_current(values: &[f32], warnings: &mut HashSet<&'static str>) {
+    if let Some(current) = values.first()
+        && current.is_finite()
+        && !(BATTERY_CURRENT_MIN_THRESHOLD..=BATTERY_CURRENT_MAX_THRESHOLD).contains(current)
     {
-        warnings.insert("Critical: Acceleration Z threshold exceeded!");
+        warnings.insert(BATTERY_CURRENT_WARNING);
     }
+}
+
+/// Ox tank PT range check; the packet may carry the current or legacy wire id.
+fn check_ox_tank_pressure(pkt: &sedsnet::packet::Packet, warnings: &mut HashSet<&'static str>) {
+    let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 1]);
+    if let Some(pressure) = values.first()
+        && ((OX_TANK_PRESSURE_MIN_THRESHOLD > *pressure)
+            || (*pressure > OX_TANK_PRESSURE_MAX_THRESHOLD))
+    {
+        warnings.insert("Critical: Ox tank pressure out of range!");
+    }
+}
+
+/// Whether a Launch attempt is on record, without ever waiting: a Launch save
+/// holds this lock across its disk write, and a slow disk must not hold up the
+/// safety loop. While the lock is busy (or poisoned) the last answer stands.
+fn launch_attempted_now(state: &AppState, last: bool) -> bool {
+    state.launch_history.try_lock().map_or(last, |history| history.launch_locked())
 }
 
 fn check_gyro_thresholds(values: &[f32], warnings: &mut HashSet<&'static str>) {
@@ -198,36 +283,402 @@ fn check_gyro_thresholds(values: &[f32], warnings: &mut HashSet<&'static str>) {
     }
 }
 
-#[cfg(feature = "testing")]
-const BOARD_TIMEOUT_MS: u64 = 12000;
-#[cfg(feature = "testing")]
-const BOARD_OFFLINE_ABORT_TRIGGER_MS: u64 = 6000;
+/// One BAROMETER_DATA sample in the FC's order: altitude m, pressure Pa, temperature C.
+pub(crate) fn check_baro_thresholds(values: &[f32], warnings: &mut HashSet<&'static str>) {
+    use crate::telemetry_schema::baro;
+    if let Some(pressure) = values.get(baro::PRESSURE_PA)
+        && ((BARO_PRESSURE_MIN_THRESHOLD > *pressure) || (*pressure > BARO_PRESSURE_MAX_THRESHOLD))
+    {
+        warnings.insert("Critical: Barometer pressure threshold exceeded!");
+    }
 
+    if let Some(temp) = values.get(baro::TEMPERATURE_C)
+        && ((BARO_TEMPERATURE_MIN_THRESHOLD > *temp) || (*temp > BARO_TEMPERATURE_MAX_THRESHOLD))
+    {
+        warnings.insert("Critical: Barometer temperature threshold exceeded!");
+    }
+
+    if let Some(alt) = values.get(baro::ALTITUDE_M)
+        && ((BARO_ALTITUDE_MIN_THRESHOLD > *alt) || (*alt > BARO_ALTITUDE_MAX_THRESHOLD))
+    {
+        warnings.insert("Critical: Barometer altitude threshold exceeded!");
+    }
+}
+
+/// Vehicle health checks (PB/VB battery voltage, battery current, tank
+/// pressure) warn only while the vehicle is on the pad: a pre-Launch state, or
+/// Aborted, with no launch attempt on record. The launch lock is the station's
+/// own persisted record of a Launch, so neither an Abort sent before the FC's
+/// first in-flight report nor a restart in flight turns the checks back on.
+fn vehicle_checks_on_pad(current: FlightState, launch_attempted: bool) -> bool {
+    !launch_attempted
+        && matches!(
+            current,
+            FlightState::Startup
+                | FlightState::Idle
+                | FlightState::PreFill
+                | FlightState::FillTest
+                | FlightState::NitrogenFill
+                | FlightState::NitrousFill
+                | FlightState::Armed
+                | FlightState::Aborted
+        )
+}
+
+/// Testing: publish the station's Startup FLIGHT_STATE once every board is
+/// seen, when this station has written no FLIGHT_STATE yet.
+pub(crate) fn testing_startup_due(testing: bool, current: FlightState, all_boards_seen: bool, own_published: bool) -> bool {
+    testing && current == FlightState::Startup && all_boards_seen && !own_published
+}
+
+/// The station modes whose old builds ran the safety task. HITL and test fire
+/// builds had no safety task at all.
+fn mode_runs_safety_task(mode: crate::station_mode::Mode) -> bool {
+    matches!(
+        mode,
+        crate::station_mode::Mode::Normal
+            | crate::station_mode::Mode::Testing
+            | crate::station_mode::Mode::IntegratedGroundTest
+    )
+}
+
+/// Why one run of the safety loop ended.
+enum SafetyExit {
+    Shutdown,
+    /// An automatic abort was claimed and dispatched; the old task ended here.
+    Claimed,
+    /// The station mode changed; the run's local state belongs to the old mode.
+    ModeChanged,
+}
+
+/// Runs the safety task for the station's lifetime, following the runtime
+/// station mode. In normal and testing modes it runs [`safety_task`]'s loop
+/// exactly as the old builds did. In HITL and test fire it does nothing, as
+/// those builds had no safety task. Every mode switch ends the current run and
+/// starts a fresh one (fresh local state), exactly as a restarted process would.
+/// After a claimed abort the run ends, as before, and nothing restarts it until
+/// the mode changes.
+pub async fn safety_supervisor(
+    state: Arc<AppState>,
+    router: Arc<Router>,
+    mut shutdown_rx: broadcast::Receiver<()>,
+) {
+    let mut modes = crate::runtime_mode::subscribe();
+    loop {
+        let token = crate::runtime_mode::token();
+        modes.borrow_and_update();
+        if mode_runs_safety_task(token.mode) {
+            match safety_loop(&state, &router, &mut shutdown_rx, token).await {
+                SafetyExit::Shutdown => return,
+                SafetyExit::ModeChanged => continue,
+                SafetyExit::Claimed => {}
+            }
+        }
+        if token != crate::runtime_mode::token() {
+            continue;
+        }
+        tokio::select! {
+            changed = modes.changed() => {
+                if changed.is_err() {
+                    // The mode can no longer change; wait for shutdown only.
+                    let _ = shutdown_rx.recv().await;
+                    return;
+                }
+            }
+            _ = shutdown_rx.recv() => return,
+        }
+    }
+}
+
+/// One run of the safety task under the mode in force now (used directly by
+/// tests; the station runs [`safety_supervisor`]).
+#[cfg(test)]
 pub async fn safety_task(
     state: Arc<AppState>,
     router: Arc<Router>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
-    let mut abort = false;
+    let token = crate::runtime_mode::token();
+    if !mode_runs_safety_task(token.mode) {
+        return;
+    }
+    let _ = safety_loop(&state, &router, &mut shutdown_rx, token).await;
+}
+
+/// The abort watch's findings, for the safety loop to report. Reporting may wait
+/// for a disk; the watch never waits for the reporting.
+enum Finding {
+    /// One cycle's board status, before its packets are read.
+    Boards {
+        now_ms: u64,
+        evidence: Vec<crate::alert_condition_producers::Evidence>,
+        warnings: Vec<(String, crate::alert_conditions::Key)>,
+        log_only: Vec<String>,
+    },
+    /// The same cycle's packets.
+    Packets {
+        now_ms: u64,
+        packets: Vec<sedsnet::packet::Packet>,
+        vehicle_on_pad: bool,
+        generic_error: bool,
+    },
+    /// A board reported an error: pause the fill.
+    PauseFill,
+    LivenessCancelled(FlightState),
+    /// An automatic abort was claimed and sent.
+    Aborted(SafetyAbortReason, AbortSent),
+    Ended(SafetyExit),
+}
+enum AbortSent {
+    Accepted,
+    Failed(sedsnet::TelemetryError),
+}
+/// Cycles the reporting may fall behind before the watch drops packets (their
+/// value-range warnings); everything else it keeps.
+const MAX_CYCLES_BEHIND: usize = 120;
+
+/// The boards an abort can be raised for, read from the layout file by the
+/// reporting loop. Empty until it was read once in this mode.
+type RequiredBoards = Arc<std::sync::Mutex<Option<Vec<Board>>>>;
+
+fn required_boards(state: &AppState) -> Vec<Board> {
+    Board::ALL.iter().copied().filter(|board| state.board_required_for_progression(*board)).collect()
+}
+
+/// Ends the abort watch when the safety loop does.
+struct WatchStop(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+impl WatchStop {
+    fn new() -> Self {
+        Self(Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())))
+    }
+}
+impl Drop for WatchStop {
+    fn drop(&mut self) {
+        *self.0.0.lock().unwrap() = true;
+        self.0.1.notify_all();
+    }
+}
+
+/// One run: the abort watch decides and sends on its own thread, this loop
+/// reports, and publishes the automatic flight state.
+async fn safety_loop(
+    state: &Arc<AppState>,
+    router: &Arc<Router>,
+    shutdown_rx: &mut broadcast::Receiver<()>,
+    token: crate::runtime_mode::ModeToken,
+) -> SafetyExit {
     let mut last_no_packet_warning_ms: u64 = 0;
     let warning_cooldown_ms = env_u64(
         "GS_SAFETY_WARNING_COOLDOWN_MS",
         SAFETY_WARNING_COOLDOWN_MS_DEFAULT,
     );
     let mut last_warning_emit_ms: HashMap<&'static str, u64> = HashMap::new();
+    let required: RequiredBoards = Arc::default();
+    let (findings, mut found) = tokio::sync::mpsc::unbounded_channel();
+    let behind = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stop = WatchStop::new();
+    let watch = {
+        let (state, router, required, stop, behind) =
+            (state.clone(), router.clone(), required.clone(), stop.0.clone(), behind.clone());
+        crate::runtime_mode::spawn_thread("safety_abort", move || {
+            abort_watch(&state, &router, token, &required, &stop, &behind, &findings)
+        })
+    };
+    if let Err(error) = watch {
+        // The channel is closed: this run ends, and a new one is started.
+        log::error!("The automatic abort watch could not be started: {error}");
+        sleep(Duration::from_secs(1)).await;
+        return SafetyExit::ModeChanged;
+    }
+    // Reads the layout file, which may wait for a disk.
+    *required.lock().unwrap() = Some(required_boards(state));
     loop {
-        tokio::select! {
-            _ = sleep(Duration::from_millis(500)) => {}
+        let finding = tokio::select! {
+            finding = found.recv() => finding,
             recv = shutdown_rx.recv() => {
                 match recv {
                     Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) | Err(broadcast::error::RecvError::Closed) => {
-                        break;
+                        return SafetyExit::Shutdown;
                     }
                 }
             }
+        };
+        let Some(finding) = finding else {
+            // The watch ended without saying why (a panic): start over.
+            log::error!("The automatic abort watch ended unexpectedly; it is started again");
+            sleep(Duration::from_secs(1)).await;
+            return SafetyExit::ModeChanged;
+        };
+        // Local state (warning cooldowns) belongs to the mode it was built
+        // under; a switch starts a fresh run.
+        if !token.is_current() && !matches!(finding, Finding::Aborted(..) | Finding::Ended(SafetyExit::Claimed)) {
+            return SafetyExit::ModeChanged;
         }
+        match finding {
+            Finding::Ended(exit) => return exit,
+            Finding::Aborted(reason, sent) => report_abort(state, &reason, &sent),
+            Finding::LivenessCancelled(stage) => {
+                log::warn!("automatic_abort_intent_cancelled source=board_offline state={stage:?}");
+            }
+            Finding::PauseFill => {
+                // Hold the mode admission across "still this mode" and the
+                // pause so a switch cannot slip between them.
+                let _admission = crate::runtime_mode::admission();
+                if !token.is_current() {
+                    return SafetyExit::ModeChanged;
+                }
+                crate::gse::pause_fill_for_recoverable_fault(state, "board reported an unclassified error");
+            }
+            Finding::Packets { now_ms, packets, vehicle_on_pad, generic_error } => {
+                behind.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                let mut cycle_warnings: HashSet<&'static str> = HashSet::new();
+                if generic_error {
+                    cycle_warnings.insert("Generic Error received from vehicle!");
+                    gs_debug_println!("Safety: Generic Error packet received");
+                }
+                for pkt in packets {
+                    if pkt.data_type() != crate::telemetry_schema::data_type("GENERIC_ERROR") {
+                        value_range_warnings(state, &pkt, vehicle_on_pad, &mut cycle_warnings);
+                    }
+                }
+                let mut emitted = cycle_warnings.into_iter().collect::<Vec<_>>();
+                emitted.sort_unstable();
+                for msg in emitted {
+                    let last_ms = last_warning_emit_ms.get(msg).copied().unwrap_or(0);
+                    if now_ms.saturating_sub(last_ms) >= warning_cooldown_ms {
+                        emit_warning(state, msg);
+                        last_warning_emit_ms.insert(msg, now_ms);
+                    }
+                }
+            }
+            Finding::Boards { now_ms, evidence, warnings, log_only } => {
+                // This original finite owner precedes every status/layout/provider wait.
+                // Losing eligibility affects only automatic publication, never health
+                // observation or independent manual/automatic emergency supervision.
+                let automatic_observation = crate::automatic_flight_state::Observation::begin(state);
+                #[cfg(all(test, not(feature = "firmware_sim")))]
+                crate::normal_publication_probe::n6_record(state, match automatic_observation.as_ref() { None => 0, Some(o) if o.captured().is_none() => 1, Some(_) => 2 });
+                let current_state = { *state.state.lock().unwrap() };
+                // Decide the required set before taking the status table: in HITL the
+                // requirement itself reads board presence from that table.
+                let boards = required_boards(state);
+                *required.lock().unwrap() = Some(boards.clone());
+                let all_boards_seen = {
+                    let board_status = state.board_status.lock().unwrap();
+                    boards.iter().all(|board| board_status.get(board).and_then(|s| s.last_seen_ms).is_some())
+                };
 
-        let current_state = { *state.state.lock().unwrap() };
+                for evidence in evidence {
+                    crate::alert_condition_runtime::observe(state,evidence.key,evidence.state,evidence.message,now_ms as i64);
+                }
+                for (warning,key) in warnings {
+                    crate::web::emit_warning_linked(state,warning,state.alert_conditions.current_link(key));
+                }
+                for warning in log_only {
+                    emit_warning_db_only(state, warning);
+                }
+
+                let _ = state
+                    .board_status_tx
+                    .send(state.board_status_snapshot(now_ms));
+
+                if current_state == FlightState::Startup
+                    && all_boards_seen
+                    && !crate::runtime_mode::is_hitl()
+                    && !crate::runtime_mode::is_test_fire()
+                    && *state.state.lock().unwrap() == FlightState::Startup {
+                        #[cfg(all(test, not(feature = "firmware_sim")))]
+                        crate::normal_publication_probe::point(state, crate::normal_publication_probe::Site::SafetyReady, current_state as u8).await;
+                        if let Some(original) = automatic_observation.as_ref().and_then(|o| o.captured())
+                            && original.expected == current_state
+                            && let Some(proposal) = original.proposal(FlightState::Idle, crate::automatic_flight_state::Cause::Readiness) {
+                            let _admission = crate::runtime_mode::admission();
+                            if !token.is_current() {
+                                return SafetyExit::ModeChanged;
+                            }
+                            crate::automatic_flight_state::publish(state, proposal);
+                        }
+                    }
+
+                // Testing has no automatic flight-state authority (no Readiness Idle),
+                // and a fresh station has no retained FLIGHT_STATE to publish, so the
+                // boards never learned any state: the DAQ refuses DAC output with no
+                // known state. Declare the station's actual Startup once.
+                if let Some(router) = state.topology_router.get()
+                    && testing_startup_due(
+                        crate::runtime_mode::is_testing(),
+                        current_state,
+                        all_boards_seen,
+                        router.own_network_variable(crate::telemetry_schema::data_type("FLIGHT_STATE")).is_some(),
+                    )
+                {
+                    match crate::network_variables::set_flight_state_control_stamped(router, FlightState::Startup as u8) {
+                        Ok(()) => log::info!("Testing: published the station's Startup FLIGHT_STATE for the boards"),
+                        // retried every pass until the network clock is set (once at boot): log it once
+                        Err(err) => {
+                            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                log::info!("Testing: the Startup FLIGHT_STATE waits for network time: {err}");
+                            }
+                        }
+                    }
+                }
+
+                let last_packet_ms = state.last_packet_received_ms();
+                if current_state == FlightState::Startup {
+                    last_no_packet_warning_ms = 0;
+                } else if last_packet_ms == 0 || now_ms.saturating_sub(last_packet_ms) > 10_000 {
+                    if last_no_packet_warning_ms == 0
+                        || now_ms.saturating_sub(last_no_packet_warning_ms) >= 10_000
+                    {
+                        emit_warning(
+                            state,
+                            "Warning: No telemetry packets received for 10 seconds!",
+                        );
+                        gs_debug_println!("Safety: No telemetry packets received for >=10 seconds!");
+                        last_no_packet_warning_ms = now_ms;
+                    }
+                } else {
+                    last_no_packet_warning_ms = 0;
+                }
+            }
+        }
+    }
+}
+
+/// Decides and sends the automatic aborts of one run. Nothing here waits for a
+/// disk, a log, or a lock that is held across either; every report is handed to
+/// `findings`.
+fn abort_watch(
+    state: &Arc<AppState>,
+    router: &Arc<Router>,
+    token: crate::runtime_mode::ModeToken,
+    required: &RequiredBoards,
+    stop: &(std::sync::Mutex<bool>, std::sync::Condvar),
+    behind: &std::sync::atomic::AtomicUsize,
+    findings: &tokio::sync::mpsc::UnboundedSender<Finding>,
+) {
+    let report = |finding| {
+        let _ = findings.send(finding);
+    };
+    let mut pending_abort = None;
+    let mut first_abort_reason = None;
+    // Off the pad until the record has been read once (a restart in flight).
+    let mut launch_attempted = true;
+    loop {
+        {
+            let stopped = stop.0.lock().unwrap();
+            let (stopped, _) = stop.1.wait_timeout_while(stopped, Duration::from_millis(500), |stopped| !*stopped).unwrap();
+            if *stopped {
+                return;
+            }
+        }
+        // Local state (the pending abort) belongs to the mode it was built
+        // under; a switch starts a fresh run.
+        if !token.is_current() {
+            return report(Finding::Ended(SafetyExit::ModeChanged));
+        }
+        let current_state = state.local_flight_state_snapshot();
         let on_ground = matches!(
             current_state,
             FlightState::Startup
@@ -244,20 +695,30 @@ pub async fn safety_task(
                 | FlightState::Ascent
                 | FlightState::Coast
                 | FlightState::Apogee
-                | FlightState::ParachuteDeploy
                 | FlightState::Descent
+                | FlightState::Reefing
+                | FlightState::InFlight
                 | FlightState::Landed
                 | FlightState::Recovery
                 | FlightState::Aborted
         );
         let now_ms = get_current_timestamp_ms();
+        let model_now_ms = crate::simulation_clock_ms();
         let sim_mode = crate::flight_sim::sim_mode_enabled();
         let mut board_warnings = Vec::new();
+        let mut condition_evidence=Vec::new();
         let mut board_log_only = Vec::new();
-        let all_boards_seen = {
+        let required = required.lock().unwrap().clone();
+        if let Some(required) = required {
             let mut board_status = state.board_status.lock().unwrap();
             for (board, status) in board_status.iter_mut() {
-                if !state.board_required_for_progression(*board) {
+                if !required.contains(board) {
+                    // Disabling a requirement never clears a condition. A real
+                    // fresh observation from this same optional board can.
+                    if !sim_mode && status.last_seen_ms.is_some() && safety_liveness_age_ms(now_ms,status.last_seen_ms,model_now_ms,status.last_seen_model_ms).is_some_and(|age|age<=BOARD_TIMEOUT_MS)
+                        && let Some(key)=crate::alert_conditions::BoardKey::from_sender(board.sender_id())
+                        && let Some(evidence)=crate::alert_condition_producers::board_liveness(key,true,false)
+                    {condition_evidence.push(evidence);}
                     status.warned = false;
                     continue;
                 }
@@ -267,10 +728,17 @@ pub async fn safety_task(
                     continue;
                 }
 
-                let offline = match status.last_seen_ms {
-                    Some(last_seen_ms) => now_ms.saturating_sub(last_seen_ms) > BOARD_TIMEOUT_MS,
-                    None => true,
-                };
+                let liveness_age_ms = safety_liveness_age_ms(
+                    now_ms,
+                    status.last_seen_ms,
+                    model_now_ms,
+                    status.last_seen_model_ms,
+                );
+                let offline = liveness_age_ms.is_none_or(|age| age > BOARD_TIMEOUT_MS);
+                if let Some(key)=crate::alert_conditions::BoardKey::from_sender(board.sender_id()) {
+                    let eligible=offline && !is_av_bay_board(*board) && !suppress_disconnect_warnings && current_state!=FlightState::Startup && on_ground;
+                    if let Some(evidence)=crate::alert_condition_producers::board_liveness(key,!offline && status.last_seen_ms.is_some(),eligible) {condition_evidence.push(evidence);}
+                }
                 let is_ground_board = matches!(
                     board,
                     Board::ValveBoard
@@ -293,7 +761,7 @@ pub async fn safety_task(
                         );
                         if current_state != FlightState::Startup {
                             if on_ground {
-                                board_warnings.push(msg);
+                                if let Some(key)=crate::alert_conditions::BoardKey::from_sender(board.sender_id()) {board_warnings.push((msg,crate::alert_conditions::Key::BoardOffline(key)));}
                             } else {
                                 board_log_only.push(msg);
                             }
@@ -301,273 +769,835 @@ pub async fn safety_task(
                         status.warned = true;
                     }
 
+                    // HITL never aborts on its own: a board that leaves the
+                    // bench is simply absent. Only a board reporting Abort stops it.
                     let abort_eligible = *board != Board::ValveBoard
+                        && !crate::runtime_mode::is_hitl()
                         && !suppress_disconnect_warnings
                         && (on_ground || !is_ground_board);
-                    if current_state != FlightState::Startup
+                    if liveness_abort_allowed_in_state(current_state)
                         && abort_eligible
                         && !in_flight_ignored_board
                         && let Some(last_seen_ms) = status.last_seen_ms
-                    {
-                        let offline_ms = now_ms.saturating_sub(last_seen_ms);
-                        if offline_ms >= BOARD_OFFLINE_ABORT_TRIGGER_MS && !abort {
-                            abort = true;
+                        && let Some(offline_ms) = liveness_age_ms
+                        && offline_ms >= BOARD_OFFLINE_ABORT_TRIGGER_MS && pending_abort.is_none() {
+                            let reason = SafetyAbortReason::BoardOffline {
+                                board: board.sender_id(),
+                                selected_state: current_state,
+                                selected_wall_ms: now_ms,
+                                last_observation_wall_ms: last_seen_ms,
+                                observation_wall_age_ms: now_ms.saturating_sub(last_seen_ms),
+                                decision_clock_basis: if model_now_ms.is_some() {
+                                    "model"
+                                } else {
+                                    "wall"
+                                },
+                                decision_age_ms: offline_ms,
+                                selected_model_ms: model_now_ms,
+                                last_observation_model_ms: status.last_seen_model_ms,
+                                observation_instant_age_ms: status.last_seen_instant.map(|seen| {
+                                    seen.elapsed().as_millis().min(u64::MAX as u128) as u64
+                                }),
+                                offline_detection_threshold_ms: BOARD_TIMEOUT_MS,
+                                abort_trigger_threshold_ms: BOARD_OFFLINE_ABORT_TRIGGER_MS,
+                            };
+                            record_first_abort_reason(&mut first_abort_reason, reason.clone());
+                            pending_abort = Some(reason);
                         }
-                    }
                 } else {
                     status.warned = false;
                 }
             }
-            Board::ALL.iter().all(|board| {
-                if !state.board_required_for_progression(*board) {
-                    return true;
-                }
-                board_status
-                    .get(board)
-                    .and_then(|s| s.last_seen_ms)
-                    .is_some()
-            })
-        };
-
-        for warning in board_warnings {
-            emit_warning(&state, warning);
         }
-        for warning in board_log_only {
-            emit_warning_db_only(&state, warning);
-        }
+        report(Finding::Boards {
+            now_ms,
+            evidence: condition_evidence,
+            warnings: board_warnings,
+            log_only: board_log_only,
+        });
 
-        let _ = state
-            .board_status_tx
-            .send(state.board_status_snapshot(now_ms));
+        // Value-range checks see every packet since the last cycle: those the
+        // ingest already took from the ring (the safety tap) and those still
+        // queued in it. A packet still queued now is seen again next cycle,
+        // once taken; the checks only collect warnings, so that is harmless.
+        let packets = cycle_packets(state);
 
-        if current_state == FlightState::Startup
-            && all_boards_seen
-            && !cfg!(feature = "hitl_mode")
-            && !cfg!(feature = "test_fire_mode")
-        {
-            if *state.state.lock().unwrap() == FlightState::Startup {
-                state.set_local_flight_state(FlightState::Idle);
+        // An empty snapshot only means no packet was ingested this cycle. The
+        // liveness abort selected above must still be dispatched below: a
+        // board that drops off can take every other packet with it (the
+        // Gateway Board carries the whole umbilical).
+        launch_attempted = launch_attempted_now(state, launch_attempted);
+        let vehicle_on_pad = vehicle_checks_on_pad(current_state, launch_attempted);
+        let mut generic_error = false;
+        for pkt in &packets {
+            if pkt.data_type() != crate::telemetry_schema::data_type("GENERIC_ERROR") {
+                continue;
+            }
+            generic_error = true;
+            // The board's own error report is shown in every phase; only
+            // on the pad may it pause the fill (never an action in flight).
+            if vehicle_on_pad && !matches!(pending_abort, Some(SafetyAbortReason::GenericError { .. })) {
+                let reason = SafetyAbortReason::GenericError {
+                    sender: state.canonical_network_sender_id(pkt.sender()),
+                    packet_id: pkt.packet_id(),
+                    selected_state: current_state,
+                    selected_wall_ms: now_ms,
+                };
+                record_first_abort_reason(&mut first_abort_reason, reason.clone());
+                // A real fault supersedes a cancellable liveness intent.
+                pending_abort = Some(reason);
             }
         }
+        let reporting = behind.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < MAX_CYCLES_BEHIND;
+        report(Finding::Packets {
+            now_ms,
+            packets: if reporting { packets } else { Vec::new() },
+            vehicle_on_pad,
+            generic_error,
+        });
 
-        let last_packet_ms = state.last_packet_received_ms();
-        if current_state == FlightState::Startup {
-            last_no_packet_warning_ms = 0;
-        } else if last_packet_ms == 0 || now_ms.saturating_sub(last_packet_ms) > 10_000 {
-            if last_no_packet_warning_ms == 0
-                || now_ms.saturating_sub(last_no_packet_warning_ms) >= 10_000
-            {
-                emit_warning(
-                    &state,
-                    "Warning: No telemetry packets received for 10 seconds!",
-                );
-                gs_debug_println!("Safety: No telemetry packets received for >=10 seconds!");
-                last_no_packet_warning_ms = now_ms;
-            }
-        } else {
-            last_no_packet_warning_ms = 0;
-        }
-
-        // Snapshot current packets from the ring buffer for value-range checks.
-        let packets = {
-            let rb = state.ring_buffer.lock().unwrap();
-            let len = rb.len();
-            rb.recent(len)
-                .into_iter()
-                .map(|received| match received {
-                    crate::ring_buffer::ReceivedPacket::Telemetry(packet)
-                    | crate::ring_buffer::ReceivedPacket::AppliedStatus { packet, .. } => {
-                        packet.clone()
-                    }
-                })
-                .collect::<Vec<_>>()
-        };
-
-        if packets.is_empty() {
-            continue;
-        }
-
-        let mut cycle_warnings: HashSet<&'static str> = HashSet::new();
-        for pkt in packets {
-            match pkt.data_type() {
-                ty if ty == crate::telemetry_schema::data_type("ACCEL_DATA") => {
-                    let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 3]);
-                    check_accel_thresholds(&values, &mut cycle_warnings);
+        if let Some(reason) = pending_abort.as_ref() {
+            match dispatch_safety_abort_reason(state, router, reason, token) {
+                SafetyDispatch::Claimed(sent) => {
+                    report(Finding::Aborted(reason.clone(), sent));
+                    return report(Finding::Ended(SafetyExit::Claimed));
                 }
-
-                ty if ty == crate::telemetry_schema::data_type("GYRO_DATA") => {
-                    let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 3]);
-                    check_gyro_thresholds(&values, &mut cycle_warnings);
+                SafetyDispatch::StartupLivenessCancelled(stage) => {
+                    report(Finding::LivenessCancelled(stage));
+                    pending_abort = None;
+                    first_abort_reason = None;
                 }
-
-                ty if ty == crate::telemetry_schema::data_type("IMU_DATA") => {
-                    let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 6]);
-                    if values.len() >= 6 {
-                        check_accel_thresholds(&values[..3], &mut cycle_warnings);
-                        check_gyro_thresholds(&values[3..6], &mut cycle_warnings);
-                    }
+                SafetyDispatch::RecoverableFault => {
+                    report(Finding::PauseFill);
+                    pending_abort = None;
+                    first_abort_reason = None;
                 }
-
-                ty if ty == crate::telemetry_schema::data_type("BAROMETER_DATA") => {
-                    // [pressure_Pa, temperature_C, altitude_m]
-                    let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 3]);
-
-                    // Pressure
-                    if let Some(pressure) = values.first()
-                        && ((BARO_PRESSURE_MIN_THRESHOLD > *pressure)
-                            || (*pressure > BARO_PRESSURE_MAX_THRESHOLD))
-                    {
-                        cycle_warnings.insert("Critical: Barometer pressure threshold exceeded!");
-                    }
-
-                    // Temperature
-                    if let Some(temp) = values.get(1)
-                        && ((BARO_TEMPERATURE_MIN_THRESHOLD > *temp)
-                            || (*temp > BARO_TEMPERATURE_MAX_THRESHOLD))
-                    {
-                        cycle_warnings
-                            .insert("Critical: Barometer temperature threshold exceeded!");
-                    }
-
-                    // Altitude
-                    if let Some(alt) = values.get(2)
-                        && ((BARO_ALTITUDE_MIN_THRESHOLD > *alt)
-                            || (*alt > BARO_ALTITUDE_MAX_THRESHOLD))
-                    {
-                        cycle_warnings.insert("Critical: Barometer altitude threshold exceeded!");
-                    }
-                }
-
-                // GPS: [lat, lon] in "xy"
-                ty if ty == crate::telemetry_schema::data_type("GPS_DATA") => {
-                    #[cfg(not(feature = "hitl_mode"))]
-                    {
-                        let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 3]);
-
-                        // Latitude (x)
-                        if let Some(lat) = values.first()
-                            && ((GPS_LATITUDE_MIN_THRESHOLD > *lat)
-                                || (*lat > GPS_LATITUDE_MAX_THRESHOLD))
-                        {
-                            cycle_warnings
-                                .insert("Critical: GPS latitude out of bounds (Texas check)!");
-                        }
-
-                        // Longitude (y)
-                        if let Some(lon) = values.get(1)
-                            && ((GPS_LONGITUDE_MIN_THRESHOLD > *lon)
-                                || (*lon > GPS_LONGITUDE_MAX_THRESHOLD))
-                        {
-                            cycle_warnings
-                                .insert("Critical: GPS longitude out of bounds (Texas check)!");
-                        }
-                    }
-                }
-
-                ty if ty == crate::telemetry_schema::data_type("BATTERY_CURRENT") => {
-                    let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 2]);
-
-                    // Current
-                    if let Some(current) = values.get(1)
-                        && ((BATTERY_CURRENT_MIN_THRESHOLD > *current)
-                            || (*current > BATTERY_CURRENT_MAX_THRESHOLD))
-                    {
-                        cycle_warnings.insert("Critical: Battery current out of range!");
-                    }
-                }
-
-                ty if ty == crate::telemetry_schema::data_type("BATTERY_VOLTAGE") => {
-                    let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 2]);
-                    // Voltage
-                    if let Some(voltage) = values.first() {
-                        if is_fill_system_battery_sender(pkt.sender()) {
-                            continue;
-                        } else if battery_voltage_out_of_range(pkt.sender(), *voltage) {
-                            cycle_warnings.insert("Critical: Battery voltage out of range!");
-                        }
-                    }
-                }
-
-                // Fuel tank pressure: [pressure_psi, ...]
-                ty if ty == crate::telemetry_schema::data_type("FUEL_TANK_PRESSURE") => {
-                    let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 1]);
-
-                    if let Some(pressure) = values.first()
-                        && ((FUEL_TANK_PRESSURE_MIN_THRESHOLD > *pressure)
-                            || (*pressure > FUEL_TANK_PRESSURE_MAX_THRESHOLD))
-                    {
-                        cycle_warnings.insert("Critical: Fuel tank pressure out of range!");
-                    }
-                }
-
-                // Ascent/descent Kalman filter state packets.
-                ty if ty == crate::telemetry_schema::data_type("ASCENT_STATE")
-                    || ty == crate::telemetry_schema::data_type("DESCENT_STATE") =>
-                {
-                    let values = pkt.data_as_f32().unwrap_or_default();
-
-                    if values.iter().any(|value| {
-                        !value.is_finite()
-                            || *value < KALMAN_STATE_MIN_THRESHOLD
-                            || *value > KALMAN_STATE_MAX_THRESHOLD
-                    }) {
-                        cycle_warnings.insert("Critical: Kalman filter state out of range!");
-                    }
-                }
-
-                ty if ty == crate::telemetry_schema::data_type("GENERIC_ERROR") => {
-                    abort = true;
-                    cycle_warnings.insert("Generic Error received from vehicle!");
-                    gs_debug_println!("Safety: Generic Error packet received");
-                }
-
-                _ => {}
+                SafetyDispatch::Unavailable => {}
             }
         }
-
-        if !cycle_warnings.is_empty() {
-            let mut emitted = cycle_warnings.into_iter().collect::<Vec<_>>();
-            emitted.sort_unstable();
-            for msg in emitted {
-                let last_ms = last_warning_emit_ms.get(msg).copied().unwrap_or(0);
-                if now_ms.saturating_sub(last_ms) >= warning_cooldown_ms {
-                    emit_warning(&state, msg);
-                    last_warning_emit_ms.insert(msg, now_ms);
-                }
-            }
-        }
-
-        if abort && dispatch_safety_abort(&state, &router) {
-            break;
-        }
+        #[cfg(test)]
+        state.gse.abort.cycles.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
-/// Claims launch exclusion before dispatch, without holding the GSE mutex over
-/// router callbacks. Admission failure keeps the persisted recovery latch.
-pub(crate) fn dispatch_safety_abort(state: &Arc<AppState>, router: &Router) -> bool {
-    let Some(_claim) = crate::gse::claim_automatic_abort(state) else { return false; };
-    state.set_abort_indicator_latched(true);
+/// The value-range checks of one packet. Vehicle sensors and health are checked
+/// on the pad only (in-flight control is the FC's: note at the top); the GB's
+/// battery current in every phase. No accelerometer check.
+fn value_range_warnings(
+    state: &AppState,
+    pkt: &sedsnet::packet::Packet,
+    vehicle_on_pad: bool,
+    warnings: &mut HashSet<&'static str>,
+) {
+    match pkt.data_type() {
+        ty if vehicle_on_pad && ty == crate::telemetry_schema::data_type("GYRO_DATA") => {
+            let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 3]);
+            check_gyro_thresholds(&values, warnings);
+        }
+
+        ty if vehicle_on_pad && ty == crate::telemetry_schema::data_type("IMU_DATA") => {
+            let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 6]);
+            if values.len() >= 6 {
+                check_gyro_thresholds(&values[3..6], warnings);
+            }
+        }
+
+        ty if vehicle_on_pad && ty == crate::telemetry_schema::data_type("BAROMETER_DATA") => {
+            let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 3]);
+            check_baro_thresholds(&values, warnings);
+        }
+
+        // GPS: [lat, lon] in "xy"
+        ty if vehicle_on_pad && ty == crate::telemetry_schema::data_type("GPS_DATA") => {
+            if !crate::runtime_mode::is_hitl() {
+                let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 3]);
+
+                // Latitude (x)
+                if let Some(lat) = values.first()
+                    && ((GPS_LATITUDE_MIN_THRESHOLD > *lat)
+                        || (*lat > GPS_LATITUDE_MAX_THRESHOLD))
+                {
+                    warnings
+                        .insert("Critical: GPS latitude out of bounds (Texas check)!");
+                }
+
+                // Longitude (y)
+                if let Some(lon) = values.get(1)
+                    && ((GPS_LONGITUDE_MIN_THRESHOLD > *lon)
+                        || (*lon > GPS_LONGITUDE_MAX_THRESHOLD))
+                {
+                    warnings
+                        .insert("Critical: GPS longitude out of bounds (Texas check)!");
+                }
+            }
+        }
+
+        // Ascent/descent Kalman filter state packets.
+        ty if vehicle_on_pad
+            && (ty == crate::telemetry_schema::data_type("ASCENT_STATE")
+                || ty == crate::telemetry_schema::data_type("DESCENT_STATE")) =>
+        {
+            let values = pkt.data_as_f32().unwrap_or_default();
+
+            if values.iter().any(|value| {
+                !value.is_finite()
+                    || *value < KALMAN_STATE_MIN_THRESHOLD
+                    || *value > KALMAN_STATE_MAX_THRESHOLD
+            }) {
+                warnings.insert("Critical: Kalman filter state out of range!");
+            }
+        }
+
+        ty if ty == crate::telemetry_schema::data_type("BATTERY_CURRENT") => {
+            let sender = state.canonical_network_sender_id(pkt.sender());
+            if vehicle_on_pad || is_fill_system_battery_sender(&sender) {
+                let values = pkt.data_as_f32().unwrap_or_default();
+                check_battery_current(&values, warnings);
+            }
+        }
+
+        ty if ty == crate::telemetry_schema::data_type("BATTERY_VOLTAGE") => {
+            let values = pkt.data_as_f32().unwrap_or_else(|_| vec![0f32; 2]);
+            // Voltage
+            if let Some(voltage) = values.first() {
+                // SEDSnet 7 boards send a compact @addr: source: resolve it to the board
+                let sender = state.canonical_network_sender_id(pkt.sender());
+                // GB: its own low-voltage alert (telemetry_task). PB/VB
+                // ride the vehicle: checked on the pad only.
+                if !is_fill_system_battery_sender(&sender)
+                    && vehicle_on_pad
+                    && battery_voltage_out_of_range(&sender, *voltage)
+                {
+                    warnings.insert(battery_voltage_warning(&sender));
+                }
+            }
+        }
+
+        // Ox tank pressure: [pressure_psi, ...] (current or legacy wire id).
+        // A fill check: on the pad only (the tank flies with the vehicle).
+        ty if crate::telemetry_schema::is_ox_tank_pressure(ty) => {
+            if vehicle_on_pad {
+                check_ox_tank_pressure(pkt, warnings);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The packets one safety cycle checks: everything the ingest took from the
+/// ring since the last cycle (the safety tap), then whatever is still queued.
+fn cycle_packets(state: &AppState) -> Vec<sedsnet::packet::Packet> {
+    let mut packets = state.safety_tap.lock().unwrap().take();
+    let rb = state.ring_buffer.lock().unwrap();
+    let len = rb.len();
+    packets.extend(rb.recent(len).into_iter().rev().map(|received| match received {
+        crate::ring_buffer::ReceivedPacket::Telemetry { packet, .. }
+        | crate::ring_buffer::ReceivedPacket::AppliedStatus { packet, .. } => packet.clone(),
+    }));
+    packets
+}
+
+/// Claims launch exclusion and sends, without the GSE lock.
+#[cfg(test)]
+pub(crate) fn dispatch_safety_abort(state: &Arc<AppState>, router: &Arc<Router>) -> bool {
+    let Some(claim) = crate::gse::claim_automatic_abort(state) else {
+        return false;
+    };
+    let cause = crate::abort_retirement::AbortCause::Unknown("Safety Task Abort Command Issued".into());
+    let _ = send_safety_abort(state, router, &claim, cause);
+    drop(claim);
+    crate::sequences::refresh_action_policy_now(state);
+    true
+}
+
+enum SafetyDispatch {
+    Claimed(AbortSent),
+    StartupLivenessCancelled(FlightState),
+    RecoverableFault,
+    /// Not now: refused, or a Launch is being saved. Tried again next cycle.
+    Unavailable,
+}
+
+fn dispatch_safety_abort_reason(
+    state: &Arc<AppState>,
+    router: &Arc<Router>,
+    reason: &SafetyAbortReason,
+    token: crate::runtime_mode::ModeToken,
+) -> SafetyDispatch {
+    let SafetyAbortReason::BoardOffline { board, .. } = reason else {
+        // GENERIC_ERROR has no severity contract. It is not evidence of a massive,
+        // unrecoverable hazard; preserve diagnostics and cancel fill, never global Abort.
+        return SafetyDispatch::RecoverableFault;
+    };
+    let claim = match crate::gse::decide_liveness_abort(state, token) {
+        crate::gse::AbortDecision::Claimed(claim) => claim,
+        crate::gse::AbortDecision::Startup(stage) => {
+            return SafetyDispatch::StartupLivenessCancelled(stage);
+        }
+        crate::gse::AbortDecision::LaunchSaving | crate::gse::AbortDecision::Busy | crate::gse::AbortDecision::Unavailable => {
+            return SafetyDispatch::Unavailable;
+        }
+    };
+    // Recorded so a stale abort is retired by age only once its cause cleared.
+    let cause = crate::types::Board::from_sender_id(board).map_or_else(
+        || crate::abort_retirement::AbortCause::Unknown(format!("{board} offline")),
+        crate::abort_retirement::AbortCause::BoardOffline,
+    );
+    // The claim's record starts once the ABORT is on its way.
+    SafetyDispatch::Claimed(send_safety_abort(state, router, &claim, cause))
+}
+
+/// Latch, queue, transmit: nothing else before the ABORT. A queue failure keeps
+/// the claim latched.
+fn send_safety_abort(
+    state: &Arc<AppState>,
+    router: &Arc<Router>,
+    claim: &crate::gse::AutomaticAbortClaim,
+    cause: crate::abort_retirement::AbortCause,
+) -> AbortSent {
+    match crate::gse::send_automatic_abort(state, router, claim, "Safety Task Abort Command Issued", cause) {
+        Ok(()) => AbortSent::Accepted,
+        Err(error) => AbortSent::Failed(error),
+    }
+}
+
+/// What the station logs and shows of a claimed abort.
+fn report_abort(state: &Arc<AppState>, reason: &SafetyAbortReason, sent: &AbortSent) {
+    // This is a claimed cause, distinct from an earlier selected/cancelled one.
+    match serde_json::to_string(reason) {
+        Ok(value) => log::error!("automatic_abort_claimed_cause={value}"),
+        Err(error) => {
+            log::error!("automatic_abort_claimed_cause={reason:?} serialization_error={error}")
+        }
+    }
+    match sent {
+        AbortSent::Accepted => gs_debug_println!("Safety task: Abort command accepted for delivery"),
+        AbortSent::Failed(error) => {
+            log::error!("failed to queue automatic abort; GSE abort remains latched: {error:?}")
+        }
+    }
     crate::sequences::refresh_action_policy_now(state);
     state.broadcast_action_policy_snapshot();
-    match queue_automatic_abort_packet(router, "Safety Task Abort Command Issued") {
-        Ok(()) => {
-            if let Err(error) = router.process_all_queues_with_timeout(3) {
-                log::error!("failed to flush automatic abort: {error:?}");
-            }
-            gs_debug_println!("Safety task: Abort command accepted for delivery");
-        }
-        Err(error) => log::error!("failed to queue automatic abort; GSE abort remains latched: {error:?}"),
-    }
-    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn f32_packet(data_type: &str, sender: &str, values: &[f32]) -> sedsnet::packet::Packet {
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        sedsnet::packet::Packet::new(
+            crate::telemetry_schema::data_type(data_type),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+            sender,
+            get_current_timestamp_ms(),
+            Arc::<[u8]>::from(bytes),
+        )
+        .unwrap()
+    }
+
+    /// In-flight control is the FC's: the vehicle's flight sensors are checked
+    /// on the pad only, and the accelerometer never. The FC's X axis is
+    /// vertical, so 1 g at rest used to trip "Acceleration X exceeded".
+    #[tokio::test]
+    async fn flight_sensors_warn_on_the_pad_only_and_the_accelerometer_never() {
+        let state = crate::state::tests::test_app_state().await;
+        let run = |pkt: sedsnet::packet::Packet, on_pad: bool| {
+            let mut warnings = HashSet::new();
+            value_range_warnings(&state, &pkt, on_pad, &mut warnings);
+            warnings
+        };
+        for on_pad in [true, false] {
+            assert!(run(f32_packet("ACCEL_DATA", "FC", &[9.81, 0.0, 0.0]), on_pad).is_empty());
+            assert!(run(f32_packet("ACCEL_DATA", "FC", &[300.0, -50.0, 500.0]), on_pad).is_empty());
+            assert!(run(f32_packet("IMU_DATA", "FC", &[9.81, 3.0, 3.0, 0.0, 0.0, 0.0]), on_pad).is_empty());
+        }
+        let faults: [(&str, &str, &[f32], &'static str); 6] = [
+            ("GYRO_DATA", "FC", &[90.0, 0.0, 0.0], "Critical: Gyro X threshold exceeded!"),
+            ("IMU_DATA", "FC", &[9.81, 0.0, 0.0, 0.0, 0.0, 900.0], "Critical: Gyro Z threshold exceeded!"),
+            ("BAROMETER_DATA", "FC", &[0.0, 20_000.0, 20.0], "Critical: Barometer pressure threshold exceeded!"),
+            ("GPS_DATA", "RF", &[0.0, -102.0, 0.0], "Critical: GPS latitude out of bounds (Texas check)!"),
+            ("ASCENT_STATE", "FC", &[f32::NAN, 0.0, 0.0, 0.0, 0.0, 0.0], "Critical: Kalman filter state out of range!"),
+            ("DESCENT_STATE", "FC", &[9_000.0, 0.0, 0.0, 0.0], "Critical: Kalman filter state out of range!"),
+        ];
+        for (data_type, sender, values, warning) in faults {
+            // HITL bench positions are not checked against the launch site.
+            if data_type != "GPS_DATA" || !crate::runtime_mode::is_hitl() {
+                assert_eq!(run(f32_packet(data_type, sender, values), true), HashSet::from([warning]));
+            }
+            assert!(run(f32_packet(data_type, sender, values), false).is_empty(), "{data_type}");
+        }
+    }
+
+    /// PB/VB battery, battery current and tank pressure ride the vehicle:
+    /// checked on the pad, silent from Launch on. The GB's current stays.
+    #[tokio::test]
+    async fn vehicle_health_warns_on_the_pad_only() {
+        let state = crate::state::tests::test_app_state().await;
+        let run = |pkt: sedsnet::packet::Packet, on_pad: bool| {
+            let mut warnings = HashSet::new();
+            value_range_warnings(&state, &pkt, on_pad, &mut warnings);
+            warnings
+        };
+        let pb_low = || f32_packet("BATTERY_VOLTAGE", "PB", &[5.6]);
+        assert_eq!(run(pb_low(), true), HashSet::from(["Critical: PB battery voltage out of range!"]));
+        assert!(run(pb_low(), false).is_empty());
+        // A full 4S pack (16.8 V) is in range: the maximum is 16.85 V.
+        assert!(run(f32_packet("BATTERY_VOLTAGE", "VB", &[16.8]), true).is_empty());
+        assert!(!battery_voltage_out_of_range("VB", 16.85));
+        assert!(battery_voltage_out_of_range("VB", 16.9));
+        let vb_amps = || f32_packet("BATTERY_CURRENT", "VB", &[60.0]);
+        assert_eq!(run(vb_amps(), true), HashSet::from([BATTERY_CURRENT_WARNING]));
+        assert!(run(vb_amps(), false).is_empty());
+        assert_eq!(
+            run(f32_packet("BATTERY_CURRENT", "GB", &[60.0]), false),
+            HashSet::from([BATTERY_CURRENT_WARNING])
+        );
+        let tank = || f32_packet("OX_TANK_PRESSURE", "VB", &[3_500.0]);
+        assert_eq!(run(tank(), true), HashSet::from(["Critical: Ox tank pressure out of range!"]));
+        assert!(run(tank(), false).is_empty());
+    }
+
+    #[test]
+    fn vehicle_checks_stop_at_launch() {
+        use FlightState as S;
+        let pad = [S::Startup, S::Idle, S::PreFill, S::FillTest, S::NitrogenFill, S::NitrousFill, S::Armed, S::Aborted];
+        let flight = [
+            S::Launch, S::Ascent, S::Coast, S::Apogee, S::Descent, S::Reefing, S::InFlight, S::Landed, S::Recovery,
+        ];
+        for s in pad {
+            assert!(vehicle_checks_on_pad(s, false), "{s:?}");
+            // An Abort while the station still shows Launch, or a restart in
+            // flight, keeps the checks off until the launch lock is released.
+            assert!(!vehicle_checks_on_pad(s, true), "{s:?}");
+        }
+        for s in flight {
+            assert!(!vehicle_checks_on_pad(s, false), "{s:?}");
+            assert!(!vehicle_checks_on_pad(s, true), "{s:?}");
+        }
+    }
+
+    /// The gate's launch evidence is the recorded Launch attempt, which an
+    /// Abort does not clear.
+    #[tokio::test]
+    async fn a_recorded_launch_attempt_keeps_the_vehicle_checks_off_through_an_abort() {
+        let state = crate::state::tests::test_app_state().await;
+        let attempted = || state.launch_history.lock().unwrap().launch_locked();
+        assert!(vehicle_checks_on_pad(FlightState::Aborted, attempted()));
+        state.launch_history.lock().unwrap().inhibit_automatic_actions().unwrap();
+        assert!(!vehicle_checks_on_pad(FlightState::Aborted, attempted()));
+    }
+
+    /// A Launch save holds the record's lock across its disk write: the safety
+    /// loop keeps its last answer instead of waiting for it.
+    #[tokio::test]
+    async fn the_launch_attempt_check_never_waits_for_a_busy_record() {
+        let state = crate::state::tests::test_app_state().await;
+        assert!(!launch_attempted_now(&state, true));
+        let held = state.launch_history.lock().unwrap();
+        assert!(launch_attempted_now(&state, true));
+        assert!(!launch_attempted_now(&state, false));
+        drop(held);
+        state.launch_history.lock().unwrap().inhibit_automatic_actions().unwrap();
+        assert!(launch_attempted_now(&state, false));
+    }
+
+    /// The ingest drains the ring continuously: a packet it already took (a PB
+    /// pack reading below range) must still reach the next safety cycle, once.
+    #[tokio::test]
+    async fn a_cycle_checks_the_packets_the_ingest_already_took() {
+        let state = crate::state::tests::test_app_state().await;
+        let now = get_current_timestamp_ms();
+        let packet = |sender: &str, volts: f32| crate::ring_buffer::ReceivedPacket::Telemetry {
+            packet: sedsnet::packet::Packet::new(
+                crate::telemetry_schema::data_type("BATTERY_VOLTAGE"),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                sender,
+                now,
+                Arc::<[u8]>::from(volts.to_le_bytes().to_vec()),
+            )
+            .unwrap(),
+            ingress_generation: 0,
+        };
+        state.ring_buffer.lock().unwrap().push(packet("PB", 5.6));
+        state.ring_buffer.lock().unwrap().push(packet("GB", 12.4));
+        // the ingest takes the first one before the safety cycle runs
+        let taken = state.ring_buffer.lock().unwrap().pop_oldest().unwrap();
+        state.safety_tap.lock().unwrap().record(&taken);
+        let senders = |packets: Vec<sedsnet::packet::Packet>| packets.iter().map(|p| p.sender().to_string()).collect::<Vec<_>>();
+        assert_eq!(senders(cycle_packets(&state)), ["PB", "GB"]);
+        let volts = state.safety_tap.lock().unwrap().take();
+        assert!(volts.is_empty(), "the tap is drained by the cycle");
+        assert!(battery_voltage_out_of_range("PB", 5.6));
+        assert_eq!(battery_voltage_warning("PB"), "Critical: PB battery voltage out of range!");
+        assert_eq!(battery_voltage_warning("VB"), "Critical: VB battery voltage out of range!");
+        // the still-queued packet is seen again once the ingest takes it; nothing else repeats
+        let taken = state.ring_buffer.lock().unwrap().pop_oldest().unwrap();
+        state.safety_tap.lock().unwrap().record(&taken);
+        assert_eq!(senders(cycle_packets(&state)), ["GB"]);
+        assert!(cycle_packets(&state).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn actual_safety_task_cancels_unclassified_faults_and_startup_liveness() {
+        crate::mode_suite!(Normal, Testing);
+        const CHILD: &str = "GS_ACTUAL_LIVENESS_POLICY_CHILD";
+        const NAME: &str = "safety_task::tests::actual_safety_task_cancels_unclassified_faults_and_startup_liveness";
+        if std::env::var_os(CHILD).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("GS_SIM_MODE", "0")
+                .env("GS_RRLS_ROLE", "primary")
+                .env_remove("GS_SIM_CLOCK_FILE")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        assert!(!crate::flight_sim::sim_mode_enabled());
+        assert_eq!(crate::simulation_clock_ms(), None);
+        // Disconnect aborts arm from the Idle mission phase; a state that
+        // returns to Startup between selection and claim still cancels.
+        for (stage, generic, transition_startup, expect_abort) in [
+            (FlightState::Idle, false, false, true),
+            (FlightState::PreFill, false, false, true),
+            (FlightState::Idle, true, false, false),
+            (FlightState::PreFill, false, true, false),
+            (FlightState::PreFill, true, true, false),
+        ] {
+            actual_safety_scene(stage, generic, transition_startup, expect_abort, false).await;
+        }
+        // An offline board can take every other packet with it: the Gateway
+        // Board carries the whole umbilical and the radio may be silent too.
+        // With nothing received this cycle the liveness abort must still go out.
+        actual_safety_scene(FlightState::Idle, false, false, true, true).await;
+    }
+
+    async fn actual_safety_scene(
+        stage: FlightState,
+        generic: bool,
+        transition_startup: bool,
+        expect_abort: bool,
+        nothing_received: bool,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let state = crate::state::tests::test_app_state().await;
+        let weak = Arc::downgrade(&state);
+        let seen = Arc::new(AtomicUsize::new(0));
+        let observed = seen.clone();
+        let router = Arc::new(Router::new(sedsnet::router::RouterConfig::new([
+            sedsnet::router::EndpointHandler::new_packet_handler(
+                crate::telemetry_schema::endpoint("ABORT"),
+                move |packet| {
+                    assert!(
+                        crate::gse::lock_free_for_callback(&weak.upgrade().unwrap()),
+                        "I/O callback holds no GSE mutex"
+                    );
+                    if packet.data_type() == crate::telemetry_schema::data_type("ABORT") {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Ok(())
+                },
+            ),
+        ])));
+        let path = crate::gse::armed_fixture_for_test(&state, &router);
+        state.set_local_flight_state(stage);
+        let now = get_current_timestamp_ms();
+        {
+            let mut boards = state.board_status.lock().unwrap();
+            for board in Board::ALL {
+                let status = boards.get_mut(board).unwrap();
+                status.last_seen_ms = Some(now);
+                status.last_seen_model_ms = None;
+                status.last_seen_instant = Some(std::time::Instant::now());
+            }
+            let ab = boards.get_mut(&Board::ActuatorBoard).unwrap();
+            ab.last_seen_ms = Some(now - 13_000);
+            ab.last_seen_instant = Some(std::time::Instant::now() - Duration::from_secs(13));
+        }
+        assert!(state.board_required_for_progression(Board::ActuatorBoard));
+        let packet = |kind: &str| {
+            sedsnet::packet::Packet::new(
+                crate::telemetry_schema::data_type(kind),
+                &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+                "PB",
+                now,
+                Arc::<[u8]>::from(vec![0u8]),
+            )
+            .unwrap()
+        };
+        if !nothing_received {
+            state
+                .ring_buffer
+                .lock()
+                .unwrap()
+                .push(crate::ring_buffer::ReceivedPacket::Telemetry {
+                    packet: packet("FLIGHT_STATE"), ingress_generation: crate::gse::automatic_generation(&state),
+                });
+        }
+        if generic && !transition_startup {
+            state
+                .ring_buffer
+                .lock()
+                .unwrap()
+                .push(crate::ring_buffer::ReceivedPacket::Telemetry {
+                    packet: packet("GENERIC_ERROR"), ingress_generation: crate::gse::automatic_generation(&state),
+                });
+        }
+        let mut statuses = state.board_status_tx.subscribe();
+        let blocker = if transition_startup {
+            let blocked_state = state.clone();
+            let generic_packet = packet("GENERIC_ERROR");
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let worker = tokio::task::spawn_blocking(move || {
+                let ingress_generation = crate::gse::automatic_generation(&blocked_state);
+                let mut ring = blocked_state.ring_buffer.lock().unwrap();
+                let _ = ready_tx.send(());
+                if release_rx
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap_or(false)
+                {
+                    ring.push(crate::ring_buffer::ReceivedPacket::Telemetry { packet: generic_packet, ingress_generation });
+                }
+            });
+            ready_rx.await.unwrap();
+            Some((release_tx, worker))
+        } else {
+            None
+        };
+        let (stop, receiver) = broadcast::channel(1);
+        let task = tokio::spawn(safety_task(state.clone(), router, receiver));
+        tokio::time::timeout(Duration::from_secs(3), statuses.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if let Some((release, worker)) = blocker {
+            // The real task has selected the stale-board intent and broadcast
+            // status, but cannot read its ring/claim yet. No runtime hook/bypass.
+            state.set_local_flight_state(FlightState::Startup);
+            release.send(generic).unwrap();
+            worker.await.unwrap();
+        }
+        if expect_abort {
+            tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                seen.load(Ordering::SeqCst) > 0,
+                "actual Router receives ABORT"
+            );
+            state.gse.abort.settle();
+            assert!(state.abort_indicator_latched());
+            assert!(
+                crate::gse::claim_automatic_abort(&state).is_none(),
+                "claim remains latched after dispatch guard drops"
+            );
+        } else {
+            // A second real iteration proves the first dispatch decision ran.
+            tokio::time::timeout(Duration::from_secs(3), statuses.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let _ = stop.send(());
+            tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(seen.load(Ordering::SeqCst), 0);
+            assert!(!state.abort_indicator_latched());
+        }
+        // The record follows the ABORT on its own thread.
+        state.gse.abort.settle();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved["automatic_abort_claimed"], expect_abort,
+            "persisted latch matches actual dispatch outcome"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn testing_declares_startup_once_to_the_boards() {
+        assert!(testing_startup_due(true, FlightState::Startup, true, false));
+        assert!(!testing_startup_due(true, FlightState::Startup, true, true), "already published");
+        assert!(!testing_startup_due(true, FlightState::Startup, false, false), "boards not all seen");
+        assert!(!testing_startup_due(true, FlightState::Idle, true, false), "only Startup");
+        assert!(!testing_startup_due(false, FlightState::Startup, true, false), "Normal publishes Readiness Idle itself");
+    }
+
+    #[test]
+    fn liveness_startup_exemption_is_only_a_caller_policy() {
+        crate::mode_suite!(Normal, Testing);
+        for wire in 0..16 {
+            let stage = crate::types::u8_to_flight_state(wire).unwrap();
+            // Startup only is exempt; Aborted and post-Launch states are
+            // excluded by the caller's detailed-state suppression.
+            assert_eq!(liveness_abort_allowed_in_state(stage), (1..=6).contains(&wire) || wire == 15);
+        }
+        // Preserve both existing thresholds; actual selection still requires
+        // the outer age >12s gate before the >=6s abort-trigger check.
+        assert_eq!(BOARD_TIMEOUT_MS, 12_000);
+        assert_eq!(BOARD_OFFLINE_ABORT_TRIGGER_MS, 6_000);
+    }
+
+    #[test]
+    fn first_abort_reason_retains_its_actual_source_and_observation_age() {
+        crate::mode_suite!(Normal, Testing);
+        let first = SafetyAbortReason::BoardOffline {
+            board: "AB",
+            selected_state: FlightState::PreFill,
+            selected_wall_ms: 13_001,
+            last_observation_wall_ms: 1_000,
+            observation_wall_age_ms: 12_001,
+            decision_clock_basis: "wall",
+            decision_age_ms: 12_001,
+            selected_model_ms: Some(1_300),
+            last_observation_model_ms: Some(1_000),
+            observation_instant_age_ms: Some(12_001),
+            offline_detection_threshold_ms: 12_000,
+            abort_trigger_threshold_ms: 6_000,
+        };
+        let mut selected = None;
+        record_first_abort_reason(&mut selected, first.clone());
+        record_first_abort_reason(
+            &mut selected,
+            SafetyAbortReason::GenericError {
+                sender: "PB".into(),
+                packet_id: 7,
+                selected_state: FlightState::Idle,
+                selected_wall_ms: 13_002,
+            },
+        );
+        assert_eq!(selected.as_ref(), Some(&first));
+        let value = serde_json::to_value(selected.unwrap()).unwrap();
+        assert_eq!(value["source"], "board_offline");
+        assert_eq!(value["board"], "AB");
+        assert_eq!(value["last_observation_wall_ms"], 1_000);
+        assert_eq!(value["observation_wall_age_ms"], 12_001);
+        assert!(value.get("last_heartbeat_ms").is_none());
+    }
+
+    #[test]
+    fn slowed_model_cadence_does_not_expire_on_host_wall_time() {
+        crate::mode_suite!(Normal, Testing);
+        let age = safety_liveness_age_ms(13_012, Some(1_000), Some(7_364), Some(6_000));
+        assert_eq!(age, Some(1_364));
+        assert!(!age.is_none_or(|age| age > BOARD_TIMEOUT_MS));
+    }
+
+    #[test]
+    fn model_timeout_is_stale_even_when_wall_time_is_fresh() {
+        crate::mode_suite!(Normal, Testing);
+        let age = safety_liveness_age_ms(1_001, Some(1_000), Some(18_001), Some(6_000));
+        assert_eq!(age, Some(12_001));
+        assert!(age.is_none_or(|age| age > BOARD_TIMEOUT_MS));
+        assert!(age.unwrap() >= BOARD_OFFLINE_ABORT_TRIGGER_MS);
+    }
+
+    #[test]
+    fn unknown_or_future_model_observations_never_become_fake_fresh() {
+        crate::mode_suite!(Normal, Testing);
+        for last in [None, Some(1)] {
+            let age = safety_liveness_age_ms(1_000, Some(1_000), Some(0), last);
+            assert_eq!(age, None);
+            assert!(age.is_none_or(|age| age > BOARD_TIMEOUT_MS));
+        }
+    }
+
+    #[test]
+    fn model_zero_and_exact_timeout_boundary_are_valid() {
+        crate::mode_suite!(Normal, Testing);
+        assert_eq!(
+            safety_liveness_age_ms(99_000, Some(0), Some(0), Some(0)),
+            Some(0)
+        );
+        let age = safety_liveness_age_ms(99_000, Some(0), Some(12_000), Some(0));
+        assert_eq!(age, Some(12_000));
+        assert!(!age.is_none_or(|age| age > BOARD_TIMEOUT_MS));
+    }
+
+    #[test]
+    fn absent_model_clock_preserves_exact_wall_fallback() {
+        crate::mode_suite!(Normal, Testing);
+        for (now, last) in [
+            (0u64, None),
+            (0, Some(0)),
+            (1, Some(2)),
+            (13_001, Some(1_000)),
+        ] {
+            let expected = last.map(|last| now.saturating_sub(last));
+            assert_eq!(
+                safety_liveness_age_ms(now, last, None, Some(u64::MAX)),
+                expected
+            );
+        }
+    }
+
+    fn battery_current_packet(sender: &str, amps: f32) -> sedsnet::packet::Packet {
+        sedsnet::packet::Packet::new(
+            crate::telemetry_schema::data_type("BATTERY_CURRENT"),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+            sender,
+            1,
+            Arc::<[u8]>::from(amps.to_le_bytes().to_vec()),
+        )
+        .unwrap()
+    }
+
+    fn battery_current_warns(sender: &str, amps: f32) -> bool {
+        let packet = battery_current_packet(sender, amps);
+        let values = packet.data_as_f32().unwrap();
+        // The wire schema has exactly one element; the old check read [1].
+        assert_eq!(values.len(), 1);
+        let mut warnings = HashSet::new();
+        check_battery_current(&values, &mut warnings);
+        warnings.contains(BATTERY_CURRENT_WARNING)
+    }
+
+    #[test]
+    fn battery_current_alarm_trips_on_the_single_schema_element() {
+        crate::mode_suite!(Normal, Testing);
+        assert!(battery_current_warns("PB", 60.0));
+        assert!(battery_current_warns("GB", 50.5));
+        assert!(battery_current_warns("VB", -5.0));
+        assert!(battery_current_warns("VB", -1.01));
+    }
+
+    #[test]
+    fn battery_current_alarm_ignores_recorded_idle_draw() {
+        crate::mode_suite!(Normal, Testing);
+        // Extremes from the Nov 2026 Pi recordings, per sender.
+        for (sender, amps) in [
+            ("GB", 0.4115),
+            ("GB", 1.5352),
+            ("PB", 4.0518),
+            ("PB", 4.3683),
+            ("VB", -0.1359),
+            ("VB", 0.5485),
+            ("VB", 0.0),
+        ] {
+            assert!(!battery_current_warns(sender, amps), "{sender} {amps} A");
+        }
+        assert!(!battery_current_warns("PB", 50.0));
+        assert!(!battery_current_warns("PB", -1.0));
+        let mut warnings = HashSet::new();
+        check_battery_current(&[], &mut warnings);
+        check_battery_current(&[f32::NAN], &mut warnings);
+        assert!(warnings.is_empty());
+    }
+
     #[test]
     fn low_voltage_floor_always_warns_for_fill_system_battery() {
+        crate::mode_suite!(Normal, Testing);
         assert!(battery_low_voltage_always_warns("GB", 13.0));
         assert!(battery_low_voltage_always_warns("GW", 13.0));
         assert!(battery_low_voltage_always_warns("GB", 12.99));
@@ -575,6 +1605,7 @@ mod tests {
 
     #[test]
     fn low_voltage_floor_does_not_apply_to_non_fill_system_batteries() {
+        crate::mode_suite!(Normal, Testing);
         assert!(!battery_low_voltage_always_warns("PB", 7.4));
         assert!(!battery_low_voltage_always_warns("PB", 13.0));
         assert!(!battery_low_voltage_always_warns("VB", 13.0));
@@ -582,7 +1613,42 @@ mod tests {
 
     #[test]
     fn battery_voltage_range_check_includes_non_configurable_fill_system_floor() {
+        crate::mode_suite!(Normal, Testing);
         assert!(battery_voltage_out_of_range("GB", 13.0));
         assert!(battery_voltage_out_of_range("GW", 13.0));
+    }
+}
+
+#[cfg(test)]
+mod ox_tank_pressure_tests {
+    use super::*;
+
+    fn packet(name: &str, psi: f32) -> sedsnet::packet::Packet {
+        sedsnet::packet::Packet::new(
+            crate::telemetry_schema::data_type(name),
+            &[crate::telemetry_schema::endpoint("GROUND_STATION")],
+            "VB",
+            1,
+            Arc::from(psi.to_le_bytes().to_vec().into_boxed_slice()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ox_tank_pressure_rule_fires_on_current_and_legacy_wire_ids() {
+        for name in ["OX_TANK_PRESSURE", "FUEL_TANK_PRESSURE"] {
+            let high = packet(name, OX_TANK_PRESSURE_MAX_THRESHOLD + 1.0);
+            assert!(crate::telemetry_schema::is_ox_tank_pressure(high.data_type()), "{name}");
+            let mut warnings = HashSet::new();
+            check_ox_tank_pressure(&high, &mut warnings);
+            assert!(warnings.contains("Critical: Ox tank pressure out of range!"), "{name}");
+
+            let mut warnings = HashSet::new();
+            check_ox_tank_pressure(&packet(name, 500.0), &mut warnings);
+            assert!(warnings.is_empty(), "{name}");
+        }
+        assert!(!crate::telemetry_schema::is_ox_tank_pressure(
+            crate::telemetry_schema::data_type("BATTERY_VOLTAGE")
+        ));
     }
 }

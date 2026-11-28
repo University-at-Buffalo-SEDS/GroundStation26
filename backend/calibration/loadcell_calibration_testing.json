@@ -1,5 +1,11 @@
 {
-  "version": 1,
+  "kg50_input": "amp2",
+  "kg50_input_stamp_ms": 1794125432750,
+  "kg50_input_profiles": {},
+  "noise": {},
+  "temperature_captures": {},
+  "thermal": {},
+  "version": 2,
   "full_mass_kg": 10.0,
   "ch1": {
     "m": 1.0,
@@ -96,6 +102,15 @@
         "e": null,
         "x0": null
       }
+    },
+    "kg50": {
+      "linear": {
+        "m": 1.0,
+        "b": 0.0
+      },
+      "zero_raw": null,
+      "points": [],
+      "fit": null
     }
   }
 }

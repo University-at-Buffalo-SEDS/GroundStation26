@@ -47,8 +47,7 @@ FLIGHT_COMMANDS = {
     "RevokeValidateMeasms": 9,
     "DeployParachute": 12,
     "ExpandParachute": 13,
-    "EvaluationRelax": 14,
-    "EvaluationFocus": 15,
+    # 14 and 15 (EvaluationRelax/Focus) are retired; the FC refuses them.
     "EvaluationAbort": 16,
     "ReinitSensors": 17,
     "ReinitBarometer": 18,

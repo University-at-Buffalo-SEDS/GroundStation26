@@ -169,19 +169,18 @@ impl LanDiscovery {
                         self.peers[slot] = Some((source.ip(), now));
                     }
                 }
-                TcpMode::Client if !connected && self.settle.is_some_and(|until| now <= until) => {
-                    if self
+                TcpMode::Client if !connected && self.settle.is_some_and(|until| now <= until)
+                    && self
                         .query
                         .is_some_and(|query| message.compatible_offer(query))
                         && self
                             .best
                             .as_ref()
                             .is_none_or(|(id, _)| message.identity < *id)
-                    {
+                    => {
                         self.best =
                             Some((message.identity, SocketAddr::new(source.ip(), message.port)));
                     }
-                }
                 _ => {}
             }
         }

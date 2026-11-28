@@ -1,0 +1,42 @@
+{
+  "summary": {
+    "motor": "UB SEDS N2O hybrid, HRAP design curve as flown by the OpenRocket model SWEET_V6",
+    "source": "tools/flight_profile/vehicle/SWEET_V6.ork, simulation IREC_STANDARDREPORT (OpenRocket 24.12), Time/Thrust/Motor mass columns; the motor file itself is not in the .ork",
+    "ork_motor_entry": {
+      "manufacturer": "Midland",
+      "designation": "Midland",
+      "diameter_m": 0.101,
+      "length_m": 1.73,
+      "digest": "0550de3962a09c17953d0f41b2781f51"
+    },
+    "total_impulse_ns": 10964.3,
+    "peak_thrust_n": 5678.1,
+    "peak_thrust_s": 0.5,
+    "burn_time_s": 3.3,
+    "burn_time_definition": "time thrust >= 5% of peak (0.1-3.4 s)",
+    "thrust_zero_s": 4.0,
+    "thrust_note": "OpenRocket logs burnout at 4.0 s; the last non-zero vertex is 3.9 s (40 N)",
+    "average_thrust_n": 3322.5,
+    "propellant_mass_kg": 9.0,
+    "propellant_mass_other_sims_kg": [
+      6.5,
+      9.0
+    ],
+    "propellant_note": "OpenRocket carries 9.0 kg of motor mass to 0 at burnout in IREC_STANDARDREPORT (and in the current configuration); TESTFIRE_NOTFULLOXTANK and Simulations 1-3 use the same curve with 6.5 kg. The mass falls in proportion to the burnt impulse (max deviation 0.09 %), the same rule as flightsim.Motor. Whether it is N2O alone or N2O plus the fuel grain is not stated in the file.",
+    "delivered_isp_s": 124.2,
+    "motor_hardware": {
+      "mass_kg": 14.3199,
+      "what": "EntireMotor_nofuel mass object in the Oxidizer Tank tube (comment: the mass of the entire motor without fuel, paired with the .rse thrust file); part of the 40.84 kg stage override",
+      "cg_from_nose_m": 3.6093
+    },
+    "combustion_chamber_tube": {
+      "name": "Combustion Chamber",
+      "length_m": 0.720725,
+      "outer_diameter_m": 0.1014,
+      "wall_m": 0.005742,
+      "material": "Aluminum",
+      "mass_override_kg": 0.0
+    },
+    "not_in_the_ork": "grain dimensions, nozzle throat/exit, injector, O/F and chamber pressure: the .ork models the motor only as a thrust curve, a propellant mass and a hardware mass object"
+  }
+}

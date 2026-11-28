@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 
 ROOT=Path(__file__).resolve().parents[1]
+sys.path.insert(0,str(ROOT))  # run_groundstation imports backend.build
 spec=importlib.util.spec_from_file_location("gs_launcher",ROOT/"run_groundstation.py")
 launcher=importlib.util.module_from_spec(spec)
 spec.loader.exec_module(launcher)

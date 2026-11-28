@@ -1,0 +1,14 @@
+{
+  "pdf": {
+    "bytes": 234326,
+    "filename": "telemetry-report.pdf",
+    "generated_ms": 1767225600000,
+    "path": "exports/report.pdf"
+  },
+  "xlsx": {
+    "bytes": 88916,
+    "filename": "telemetry-report.xlsx",
+    "generated_ms": 1767225600000,
+    "path": "exports/report.xlsx"
+  }
+}

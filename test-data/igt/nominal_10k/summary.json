@@ -1,0 +1,71 @@
+{
+  "motor": {
+    "curve": "motors/testfire_20261116.csv",
+    "total_impulse_ns": 14413.5,
+    "scaled": true,
+    "peak_thrust_n": 4125.8,
+    "burn_s_5pct_peak": 7.08,
+    "propellant_kg": 10.51
+  },
+  "mass_kg": {
+    "dry": 40.84,
+    "liftoff": 51.35,
+    "burnout": 41.26
+  },
+  "ignition_s": 10.0,
+  "liftoff_s": 10.152,
+  "rail_exit_s": 10.776,
+  "rail_exit_mps": 34.8,
+  "burnout_s": 19.392,
+  "burnout_5pct_peak_s": 17.263,
+  "max_speed_mps": 220.4,
+  "max_speed_s": 15.82,
+  "max_mach": 0.663,
+  "max_boost_accel_g": 8.78,
+  "max_accel_any_g": 15.38,
+  "max_imu_axis_mps2": 144.2,
+  "drogue_shock_g": 9.61,
+  "main_shock_g": 8.89,
+  "landing_shock_g": 15.38,
+  "apogee_s": 36.579,
+  "apogee_m_agl": 3047.7,
+  "apogee_ft_agl": 9999,
+  "apogee_m_msl": 3937.8,
+  "drogue_s": 37.779,
+  "drogue_alt_m": 3040.8,
+  "drogue_rate_mps": 25.2,
+  "main_trigger_s": 140.647,
+  "main_s": 140.947,
+  "main_alt_m": 450.1,
+  "main_rate_mps": 6.2,
+  "landing_s": 207.912,
+  "landing_mps": 6.56,
+  "tipover_s": 209.258,
+  "data_end_s": 239.31,
+  "landing_drift_m": 996.4,
+  "landing_bearing_deg": 90.7,
+  "rows": {
+    "IMU": 10296,
+    "BARO": 11968,
+    "GPS": 2277
+  },
+  "bytes": {
+    "BARO0.CSV": 334475,
+    "GPS0.CSV": 86455,
+    "IMU0.CSV": 535614
+  },
+  "total_bytes": 956544,
+  "seed": 1,
+  "noise": true,
+  "site": [
+    31.758,
+    -102.046,
+    890.016
+  ],
+  "wind": {
+    "mps": 4.0,
+    "from_deg": 300.0,
+    "gust_sigma_mps": 1.0
+  },
+  "glitches": []
+}

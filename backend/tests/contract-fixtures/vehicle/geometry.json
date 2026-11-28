@@ -1,0 +1,710 @@
+{
+  "cg_m": 2.667,
+  "cp_m": 3.21295,
+  "diameter_m": 0.15646,
+  "fins": [
+    {
+      "angle_offset_deg": 0.0,
+      "cant_deg": 0.0,
+      "color": "#0000ff",
+      "count": 3,
+      "cross_section": "rounded",
+      "material": "Carbon fiber",
+      "name": "Fin set",
+      "planform": [
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.08255,
+          0.17463
+        ],
+        [
+          0.22066,
+          0.17463
+        ],
+        [
+          0.25082,
+          0.0
+        ]
+      ],
+      "root_chord_m": 0.250825,
+      "root_radius_m": 0.078232,
+      "span_m": 0.174625,
+      "sweep_m": 0.08255,
+      "thickness_m": 0.006604,
+      "tip_chord_m": 0.138113,
+      "x_m": 3.96113
+    }
+  ],
+  "internals": [
+    {
+      "inner_radius_m": 0.075,
+      "kind": "innertube",
+      "material": "Fiberglass",
+      "name": "Upper-Middle Coupler",
+      "outer_radius_m": 0.076001,
+      "role": "coupler",
+      "x0_m": 0.818163,
+      "x1_m": 1.021163
+    },
+    {
+      "inner_radius_m": 0.075,
+      "kind": "innertube",
+      "material": "Fiberglass",
+      "name": "Upper-Middle Coupler",
+      "outer_radius_m": 0.076001,
+      "role": "coupler",
+      "x0_m": 1.376964,
+      "x1_m": 1.579963
+    },
+    {
+      "inner_radius_m": 0.075,
+      "kind": "innertube",
+      "material": "Fiberglass",
+      "name": "Middle-lower Coupler",
+      "outer_radius_m": 0.076,
+      "role": "coupler",
+      "x0_m": 1.890813,
+      "x1_m": 2.220813
+    },
+    {
+      "inner_radius_m": 0.0,
+      "kind": "bulkhead",
+      "material": "Aluminum (Al)",
+      "name": "CO2 Bulkhead",
+      "outer_radius_m": 0.076001,
+      "role": "bulkhead",
+      "x0_m": 1.643063,
+      "x1_m": 1.652583
+    },
+    {
+      "inner_radius_m": 0.0,
+      "kind": "bulkhead",
+      "material": "Aluminum (Al)",
+      "name": "DITW Bulkhead",
+      "outer_radius_m": 0.076001,
+      "role": "bulkhead",
+      "x0_m": 2.38443,
+      "x1_m": 2.39395
+    },
+    {
+      "inner_radius_m": 0.066675,
+      "kind": "tubecoupler",
+      "material": "Aluminum",
+      "name": "Forward Closure",
+      "outer_radius_m": 0.073025,
+      "role": "coupler",
+      "x0_m": 2.727325,
+      "x1_m": 2.752725
+    },
+    {
+      "inner_radius_m": 0.073025,
+      "kind": "tubecoupler",
+      "material": "Aluminum",
+      "name": "Tube Coupler",
+      "outer_radius_m": 0.076233,
+      "role": "coupler",
+      "x0_m": 2.651125,
+      "x1_m": 2.752725
+    },
+    {
+      "inner_radius_m": 0.066675,
+      "kind": "tubecoupler",
+      "material": "Aluminum",
+      "name": "Aft-Closure",
+      "outer_radius_m": 0.073025,
+      "role": "coupler",
+      "x0_m": 3.570605,
+      "x1_m": 3.596005
+    },
+    {
+      "inner_radius_m": 0.044958,
+      "kind": "innertube",
+      "material": "Aluminum",
+      "name": "Combustion Chamber",
+      "outer_radius_m": 0.0507,
+      "role": "motor_mount",
+      "x0_m": 3.665449,
+      "x1_m": 4.386174
+    },
+    {
+      "inner_radius_m": 0.0,
+      "kind": "centeringring",
+      "material": "Aluminum",
+      "name": "Lower Centering Ring",
+      "outer_radius_m": 0.076232,
+      "role": "centering_ring",
+      "x0_m": 4.20243,
+      "x1_m": 4.211955
+    },
+    {
+      "inner_radius_m": 0.0,
+      "kind": "centeringring",
+      "material": "Fiberglass",
+      "name": "Middle Centering Ring",
+      "outer_radius_m": 0.076232,
+      "role": "centering_ring",
+      "x0_m": 4.078605,
+      "x1_m": 4.084955
+    },
+    {
+      "inner_radius_m": 0.0,
+      "kind": "centeringring",
+      "material": "Fiberglass",
+      "name": "Upper Centering Ring",
+      "outer_radius_m": 0.076232,
+      "role": "centering_ring",
+      "x0_m": 3.951605,
+      "x1_m": 3.957955
+    },
+    {
+      "inner_radius_m": 0.073024,
+      "kind": "tubecoupler",
+      "material": "Aluminum",
+      "name": "Tube Coupler",
+      "outer_radius_m": 0.076232,
+      "role": "coupler",
+      "x0_m": 3.570605,
+      "x1_m": 3.672205
+    }
+  ],
+  "length_m": 4.38658,
+  "motor": {
+    "designation": "Midland",
+    "diameter_m": 0.101,
+    "length_m": 1.73,
+    "manufacturer": "Midland",
+    "mount": "Combustion Chamber",
+    "x0_m": 2.656174,
+    "x1_m": 4.386174
+  },
+  "nose": {
+    "length_m": 0.5334,
+    "radius_m": 0.078232,
+    "shape": "haack",
+    "shape_parameter": 0.0,
+    "shoulder_length_m": 0.0508,
+    "shoulder_radius_m": 0.076001
+  },
+  "nozzle": {
+    "estimated": true,
+    "exit_radius_m": 0.035067,
+    "length_m": 0.077148,
+    "throat_radius_m": 0.01578,
+    "x_m": 4.386174
+  },
+  "parts": [
+    {
+      "name": "stage-1",
+      "x0_m": 0.0,
+      "x1_m": 4.38658
+    },
+    {
+      "name": "nose",
+      "x0_m": 0.0,
+      "x1_m": 0.5334
+    },
+    {
+      "name": "airframe-upper",
+      "x0_m": 0.5334,
+      "x1_m": 2.055813
+    },
+    {
+      "name": "airframe-join",
+      "x0_m": 1.890813,
+      "x1_m": 2.220813
+    },
+    {
+      "name": "airframe-lower",
+      "x0_m": 2.055813,
+      "x1_m": 4.38658
+    },
+    {
+      "name": "gimbal-pivot",
+      "x0_m": 3.665449,
+      "x1_m": 3.665449
+    },
+    {
+      "name": "engine",
+      "x0_m": 3.665449,
+      "x1_m": 4.386174
+    },
+    {
+      "name": "motor-flame",
+      "x0_m": 4.386174,
+      "x1_m": 4.386174
+    },
+    {
+      "name": "fin-pivot-0",
+      "x0_m": 3.96113,
+      "x1_m": 4.211955
+    },
+    {
+      "name": "fin-pivot-1",
+      "x0_m": 3.96113,
+      "x1_m": 4.211955
+    },
+    {
+      "name": "fin-pivot-2",
+      "x0_m": 3.96113,
+      "x1_m": 4.211955
+    },
+    {
+      "name": "drogue-parachute",
+      "x0_m": 2.055813,
+      "x1_m": 2.055813
+    },
+    {
+      "name": "main-parachute",
+      "x0_m": 2.055813,
+      "x1_m": 2.055813
+    }
+  ],
+  "profile": [
+    [
+      0.0,
+      0.0
+    ],
+    [
+      0.00064,
+      0.00066
+    ],
+    [
+      0.00257,
+      0.00186
+    ],
+    [
+      0.00577,
+      0.00341
+    ],
+    [
+      0.01025,
+      0.00525
+    ],
+    [
+      0.01599,
+      0.00731
+    ],
+    [
+      0.02297,
+      0.00957
+    ],
+    [
+      0.03118,
+      0.01201
+    ],
+    [
+      0.0406,
+      0.0146
+    ],
+    [
+      0.05121,
+      0.01732
+    ],
+    [
+      0.06298,
+      0.02016
+    ],
+    [
+      0.07589,
+      0.02309
+    ],
+    [
+      0.08989,
+      0.0261
+    ],
+    [
+      0.10497,
+      0.02918
+    ],
+    [
+      0.12108,
+      0.03231
+    ],
+    [
+      0.13818,
+      0.03547
+    ],
+    [
+      0.15623,
+      0.03865
+    ],
+    [
+      0.17519,
+      0.04183
+    ],
+    [
+      0.19501,
+      0.04501
+    ],
+    [
+      0.21565,
+      0.04816
+    ],
+    [
+      0.23706,
+      0.05126
+    ],
+    [
+      0.25918,
+      0.05432
+    ],
+    [
+      0.28196,
+      0.0573
+    ],
+    [
+      0.30534,
+      0.06019
+    ],
+    [
+      0.32928,
+      0.06298
+    ],
+    [
+      0.3537,
+      0.06564
+    ],
+    [
+      0.37856,
+      0.06815
+    ],
+    [
+      0.40379,
+      0.0705
+    ],
+    [
+      0.42934,
+      0.07266
+    ],
+    [
+      0.45513,
+      0.07458
+    ],
+    [
+      0.48112,
+      0.07623
+    ],
+    [
+      0.50723,
+      0.07752
+    ],
+    [
+      0.5334,
+      0.07823
+    ],
+    [
+      0.91916,
+      0.07823
+    ],
+    [
+      1.47796,
+      0.07823
+    ],
+    [
+      2.05581,
+      0.07823
+    ],
+    [
+      2.75273,
+      0.07823
+    ],
+    [
+      2.75527,
+      0.0762
+    ],
+    [
+      3.56807,
+      0.0762
+    ],
+    [
+      3.57061,
+      0.07823
+    ],
+    [
+      4.23736,
+      0.07823
+    ],
+    [
+      4.24668,
+      0.07785
+    ],
+    [
+      4.25601,
+      0.07715
+    ],
+    [
+      4.26533,
+      0.07625
+    ],
+    [
+      4.27466,
+      0.07519
+    ],
+    [
+      4.28399,
+      0.074
+    ],
+    [
+      4.29331,
+      0.07268
+    ],
+    [
+      4.30264,
+      0.07125
+    ],
+    [
+      4.31197,
+      0.06971
+    ],
+    [
+      4.32129,
+      0.06807
+    ],
+    [
+      4.33062,
+      0.06634
+    ],
+    [
+      4.33995,
+      0.06451
+    ],
+    [
+      4.34927,
+      0.06259
+    ],
+    [
+      4.3586,
+      0.06057
+    ],
+    [
+      4.36793,
+      0.05846
+    ],
+    [
+      4.37725,
+      0.05627
+    ],
+    [
+      4.38658,
+      0.05397
+    ]
+  ],
+  "rail_guides": [
+    {
+      "name": "Top Rail Button (Magnetic)",
+      "x_m": 2.39161
+    },
+    {
+      "name": "Bottom Rail Button (Magnetic)",
+      "x_m": 4.224858
+    }
+  ],
+  "recovery": [
+    {
+      "cd": 0.55,
+      "deploy_altitude_m": null,
+      "deploy_delay_s": 0.5,
+      "deploy_event": "apogee",
+      "diameter_m": 1.778,
+      "kind": "parachute",
+      "line_count": 16,
+      "line_length_m": 6.096,
+      "name": "Reefed Parachute",
+      "packed_radius_m": 0.0702,
+      "role": "drogue",
+      "separation_x_m": 2.055813,
+      "x0_m": 1.741888,
+      "x1_m": 2.046288
+    },
+    {
+      "cd": 1.4,
+      "deploy_altitude_m": 457.2,
+      "deploy_delay_s": 0.0,
+      "deploy_event": "altitude",
+      "diameter_m": 3.556,
+      "kind": "parachute",
+      "line_count": 16,
+      "line_length_m": 6.096,
+      "name": "Main Parachute",
+      "packed_radius_m": 0.0702,
+      "role": "main",
+      "separation_x_m": 2.055813,
+      "x0_m": 1.741888,
+      "x1_m": 2.046288
+    }
+  ],
+  "schema": "gs26.vehicle_geometry",
+  "sections": [
+    {
+      "color": "#0000ff",
+      "kind": "nosecone",
+      "material": "Fiberglass",
+      "name": "Nose cone",
+      "r0_m": 0.0,
+      "r1_m": 0.078232,
+      "role": "nose",
+      "shape": "haack",
+      "shape_parameter": 0.0,
+      "x0_m": 0.0,
+      "x1_m": 0.5334
+    },
+    {
+      "color": "#0000ff",
+      "kind": "bodytube",
+      "material": "Carbon fiber",
+      "name": "Avionics Tube",
+      "r0_m": 0.078232,
+      "r1_m": 0.078232,
+      "role": "avionics",
+      "shape": null,
+      "shape_parameter": null,
+      "x0_m": 0.5334,
+      "x1_m": 0.919163
+    },
+    {
+      "color": "#0000ff",
+      "kind": "bodytube",
+      "material": "Carbon fiber",
+      "name": "Payload Tube",
+      "r0_m": 0.078232,
+      "r1_m": 0.078232,
+      "role": "payload",
+      "shape": null,
+      "shape_parameter": null,
+      "x0_m": 0.919163,
+      "x1_m": 1.477962
+    },
+    {
+      "color": "#0000ff",
+      "kind": "bodytube",
+      "material": "Carbon fiber",
+      "name": "Recovery Tube",
+      "r0_m": 0.078232,
+      "r1_m": 0.078232,
+      "role": "recovery",
+      "shape": null,
+      "shape_parameter": null,
+      "x0_m": 1.477962,
+      "x1_m": 2.055813
+    },
+    {
+      "color": "#0000ff",
+      "kind": "bodytube",
+      "material": "Carbon fiber",
+      "name": "DITW Container",
+      "r0_m": 0.078232,
+      "r1_m": 0.078232,
+      "role": "airframe",
+      "shape": null,
+      "shape_parameter": null,
+      "x0_m": 2.055813,
+      "x1_m": 2.752725
+    },
+    {
+      "color": null,
+      "kind": "transition",
+      "material": "Cardboard",
+      "name": "Transition (DITW->Ox)",
+      "r0_m": 0.078232,
+      "r1_m": 0.0762,
+      "role": "airframe",
+      "shape": "conical",
+      "shape_parameter": null,
+      "x0_m": 2.752725,
+      "x1_m": 2.755265
+    },
+    {
+      "color": null,
+      "kind": "bodytube",
+      "material": "Aluminum (Al)",
+      "name": "Oxidizer Tank",
+      "r0_m": 0.0762,
+      "r1_m": 0.0762,
+      "role": "tank",
+      "shape": null,
+      "shape_parameter": null,
+      "x0_m": 2.755265,
+      "x1_m": 3.568065
+    },
+    {
+      "color": null,
+      "kind": "transition",
+      "material": "Cardboard",
+      "name": "Transition (Ox->LowerBody)",
+      "r0_m": 0.0762,
+      "r1_m": 0.078232,
+      "role": "airframe",
+      "shape": "conical",
+      "shape_parameter": null,
+      "x0_m": 3.568065,
+      "x1_m": 3.570605
+    },
+    {
+      "color": null,
+      "kind": "bodytube",
+      "material": "Carbon fiber",
+      "name": "Lower Body Tube",
+      "r0_m": 0.078232,
+      "r1_m": 0.078232,
+      "role": "motor",
+      "shape": null,
+      "shape_parameter": null,
+      "x0_m": 3.570605,
+      "x1_m": 4.237355
+    },
+    {
+      "color": null,
+      "kind": "transition",
+      "material": "Carbon fiber",
+      "name": "Boattail",
+      "r0_m": 0.078232,
+      "r1_m": 0.053975,
+      "role": "boattail",
+      "shape": "haack",
+      "shape_parameter": 0.0,
+      "x0_m": 4.237355,
+      "x1_m": 4.38658
+    }
+  ],
+  "separations": [
+    {
+      "aft": "DITW Container",
+      "fore": "Recovery Tube",
+      "x_m": 2.055813
+    }
+  ],
+  "source": {
+    "creator": "OpenRocket 24.12",
+    "designer": "Alex Post, UBSEDS Dynamics Lead",
+    "file": "SWEET_V6.ork",
+    "hash": "fnv1a64:878767445dd4f32d",
+    "kind": "default",
+    "rocket": "SWEET_V6"
+  },
+  "span_m": 0.50571,
+  "stability_cal": 3.49,
+  "svg": {
+    "body": "M0 0L0.00064 -0.00066L0.00257 -0.00186L0.00577 -0.00341L0.01025 -0.00525L0.01599 -0.00731L0.02297 -0.00957L0.03118 -0.01201L0.0406 -0.0146L0.05121 -0.01732L0.06298 -0.02016L0.07589 -0.02309L0.08989 -0.0261L0.10497 -0.02918L0.12108 -0.03231L0.13818 -0.03547L0.15623 -0.03865L0.17519 -0.04183L0.19501 -0.04501L0.21565 -0.04816L0.23706 -0.05126L0.25918 -0.05432L0.28196 -0.0573L0.30534 -0.06019L0.32928 -0.06298L0.3537 -0.06564L0.37856 -0.06815L0.40379 -0.0705L0.42934 -0.07266L0.45513 -0.07458L0.48112 -0.07623L0.50723 -0.07752L0.5334 -0.07823L0.91916 -0.07823L1.47796 -0.07823L2.05581 -0.07823L2.75273 -0.07823L2.75527 -0.0762L3.56807 -0.0762L3.57061 -0.07823L4.23736 -0.07823L4.24668 -0.07785L4.25601 -0.07715L4.26533 -0.07625L4.27466 -0.07519L4.28399 -0.074L4.29331 -0.07268L4.30264 -0.07125L4.31197 -0.06971L4.32129 -0.06807L4.33062 -0.06634L4.33995 -0.06451L4.34927 -0.06259L4.3586 -0.06057L4.36793 -0.05846L4.37725 -0.05627L4.38658 -0.05397L4.38658 0.05397L4.37725 0.05627L4.36793 0.05846L4.3586 0.06057L4.34927 0.06259L4.33995 0.06451L4.33062 0.06634L4.32129 0.06807L4.31197 0.06971L4.30264 0.07125L4.29331 0.07268L4.28399 0.074L4.27466 0.07519L4.26533 0.07625L4.25601 0.07715L4.24668 0.07785L4.23736 0.07823L3.57061 0.07823L3.56807 0.0762L2.75527 0.0762L2.75273 0.07823L2.05581 0.07823L1.47796 0.07823L0.91916 0.07823L0.5334 0.07823L0.50723 0.07752L0.48112 0.07623L0.45513 0.07458L0.42934 0.07266L0.40379 0.0705L0.37856 0.06815L0.3537 0.06564L0.32928 0.06298L0.30534 0.06019L0.28196 0.0573L0.25918 0.05432L0.23706 0.05126L0.21565 0.04816L0.19501 0.04501L0.17519 0.04183L0.15623 0.03865L0.13818 0.03547L0.12108 0.03231L0.10497 0.02918L0.08989 0.0261L0.07589 0.02309L0.06298 0.02016L0.05121 0.01732L0.0406 0.0146L0.03118 0.01201L0.02297 0.00957L0.01599 0.00731L0.01025 0.00525L0.00577 0.00341L0.00257 0.00186L0.00064 0.00066L0 0Z",
+    "fins": "M3.96113 -0.07823L4.04368 -0.25286L4.18179 -0.25286L4.21195 -0.07823ZM3.96113 0.03912L4.04368 0.12643L4.18179 0.12643L4.21195 0.03912ZM3.96113 0.03912L4.04368 0.12643L4.18179 0.12643L4.21195 0.03912Z",
+    "view_box": [
+      0.0,
+      -0.25286,
+      4.38658,
+      0.50571
+    ]
+  },
+  "tanks": [
+    {
+      "external": true,
+      "name": "Oxidizer Tank",
+      "radius_m": 0.0762,
+      "x0_m": 2.755265,
+      "x1_m": 3.568065
+    }
+  ],
+  "version": 1,
+  "warnings": []
+}

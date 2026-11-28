@@ -1,0 +1,1329 @@
+//! DAQ live input faults (DAQ_INPUT_HEALTH): decode, operator alerts and the
+//! DAQ input-health block under Board status.
+//!
+//! These are warnings. Nothing here gates an operator command: interlocks
+//! that already depend on a sensor (e.g. fill mass from a railed load cell,
+//! which the live conversion withholds) keep their own behaviour.
+//!
+//! Wire format (DAQ-Board Core/Inc/daq_input_faults.h), version 3, 27 UInt32
+//! words (version 2 sent the first 18, version 1 the first 10):
+//! 0 version | flags, 1 active | latched masks, 2-5 u16 episode counters,
+//! 6 VMAIN min|now, 7 chamber min|now, 8 P6 imbalance max|common now,
+//! 9 supply level|chamber level; all in mV, 0xFFFF = no reading.
+//! 10-13 noise (uV, u16, 0xFFFF none) | drift (uV/min, i16, 0x8000 none) of
+//! KG1000, selected KG50, chamber PT, excitation; 14 excitation min|now (mV);
+//! 15 MCP3564R frames skipped | slot items skipped; 16 scans restarted |
+//! device recoveries; 17 latest fast-scan end | slot end (us in the frame).
+//! Version 3 (28 words) adds faults 8 VDDA_HIGH / 9 VDDA_LOW (bits 8/9 of word 1's
+//! masks) and: 18 ADC over-range now (bits 0-9) | latched since the previous
+//! report (bits 16-25); 19 direction of the now bits (set = below -full
+//! scale); 20-24 per-channel over-range conversion counters since boot, u16,
+//! wrapping (CH0|CH1, CH2|CH3, CH4|CH5, CH6|CH7, die temperature|P6 x16);
+//! 25 VDDA max since the previous report | now (mV, 0xFFFF none); 26 episode
+//! counters of faults 8 | 9; 27 applied MCP3564R reference mV (low 16) |
+//! bit 16 from the station this boot, bit 17 restored from flash (neither:
+//! the compiled nominal 2.4 V).
+use crate::types::{DaqAdcChannelStatus, DaqInputFaultStatus, DaqInputHealthStatus, Volts};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Mutex, OnceLock};
+
+pub const WORDS: usize = 28;
+pub const WORDS_V2: usize = 18;
+pub const WORDS_V1: usize = 10;
+const VERSION: u32 = 3;
+const NO_MV: u16 = 0xFFFF;
+/// Re-alert on a fault no sooner than this after its last alert, so an input
+/// that flaps cannot flood the alert list (same holdoff as the rail alert).
+pub const ALERT_HOLDOFF_MS: i64 = 30_000;
+/// Supply dips are counted over this window in the alert text.
+pub const DIP_WINDOW_MS: i64 = 60_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fault {
+    SupplyLow = 0,
+    Kg1000HighRail,
+    Kg1000LowRail,
+    Kg50HighRail,
+    Kg50LowRail,
+    P6LegImbalance,
+    P6CommonMode,
+    ChamberNoSignal,
+    /// STM32 VDDA (+3V3A, from VREFINT) above 3.45 V (clears below 3.42 V).
+    VddaHigh,
+    /// VDDA below 3.15 V (clears above 3.18 V).
+    VddaLow,
+}
+
+pub const FAULTS: [Fault; 10] = [
+    Fault::SupplyLow,
+    Fault::Kg1000HighRail,
+    Fault::Kg1000LowRail,
+    Fault::Kg50HighRail,
+    Fault::Kg50LowRail,
+    Fault::P6LegImbalance,
+    Fault::P6CommonMode,
+    Fault::ChamberNoSignal,
+    Fault::VddaHigh,
+    Fault::VddaLow,
+];
+
+impl Fault {
+    pub fn bit(self) -> u16 {
+        1 << self as u16
+    }
+    pub fn key(self) -> &'static str {
+        match self {
+            Fault::SupplyLow => "supply_low",
+            Fault::Kg1000HighRail => "kg1000_high_rail",
+            Fault::Kg1000LowRail => "kg1000_low_rail",
+            Fault::Kg50HighRail => "kg50_high_rail",
+            Fault::Kg50LowRail => "kg50_low_rail",
+            Fault::P6LegImbalance => "p6_leg_imbalance",
+            Fault::P6CommonMode => "p6_common_mode",
+            Fault::ChamberNoSignal => "chamber_no_signal",
+            Fault::VddaHigh => "vdda_high",
+            Fault::VddaLow => "vdda_low",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Fault::SupplyLow => "DAQ supply (VMAIN) low",
+            Fault::Kg1000HighRail => "1000 kg load cell at ADC full scale",
+            Fault::Kg1000LowRail => "1000 kg load cell at amplifier low rail",
+            Fault::Kg50HighRail => "50 kg load cell at high rail",
+            Fault::Kg50LowRail => "50 kg load cell at low rail",
+            Fault::P6LegImbalance => "50 kg P6 sense legs disagree",
+            Fault::P6CommonMode => "50 kg P6 bridge excitation",
+            Fault::ChamberNoSignal => "Chamber pressure transducer no signal",
+            Fault::VddaHigh => "DAQ +3V3A (VDDA) high",
+            Fault::VddaLow => "DAQ +3V3A (VDDA) low",
+        }
+    }
+    pub fn advice(self) -> &'static str {
+        match self {
+            Fault::SupplyLow => "Check the DAQ power/ground connector; every load-cell and chamber reading shifts while VMAIN is low.",
+            Fault::Kg1000HighRail => "Check the P7 load-cell wiring and the DAQ supply.",
+            Fault::Kg1000LowRail => "Open bridge lead: check the P7 load-cell connector.",
+            Fault::Kg50HighRail | Fault::Kg50LowRail => "Check the 50 kg load-cell wiring and the DAQ supply.",
+            Fault::P6LegImbalance => "One sense lead is intermittent: check the P6 connector (S+ is P6/3).",
+            Fault::P6CommonMode => "Both legs moved together: bridge excitation or both sense leads lost; check P6.",
+            Fault::ChamberNoSignal => "Check P4 wiring (signal P4/3) and +12VA excitation on P4/6. If no chamber PT is connected, mark it not installed.",
+            Fault::VddaHigh => "Most likely clamp current injected by a saturated analog input (e.g. KG1000 over range): bring the input back in range; if it persists with every input in range, check the +3V3A regulator.",
+            Fault::VddaLow => "Check the DAQ +3V3A regulator and its load; ADC1 supply readings are corrected by the measured VDDA.",
+        }
+    }
+    /// Live-sample rail alert (b15b54c) owning the same condition, if any.
+    fn rail_sensor(self) -> Option<&'static str> {
+        match self {
+            Fault::Kg1000HighRail | Fault::Kg1000LowRail => Some(crate::loadcell::RAW_LOADCELL_DATA_TYPE_1000KG),
+            Fault::Kg50HighRail | Fault::Kg50LowRail => Some(crate::loadcell::RAW_LOADCELL_DATA_TYPE_50KG),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Report {
+    /// Wire version (1, 2 or 3).
+    pub version: u8,
+    pub kg50_p6: bool,
+    pub chamber_seen: bool,
+    pub active: u16,
+    pub latched: u16,
+    pub episodes: [u16; 10],
+    pub vmain_min_mv: Option<u16>,
+    pub vmain_mv: Option<u16>,
+    pub chamber_min_mv: Option<u16>,
+    pub chamber_mv: Option<u16>,
+    pub p6_imbalance_max_mv: Option<u16>,
+    pub p6_common_mv: Option<u16>,
+    pub supply_low_mv: u16,
+    pub chamber_floor_mv: u16,
+    /// Version 2 and later (None from version-1 firmware).
+    pub v2: Option<ReportV2>,
+    /// Version 3 (None from older firmware).
+    pub v3: Option<ReportV3>,
+}
+
+/// Number of over-range channels reported by version 3.
+pub const ADC_CHANNELS: usize = 10;
+
+/// DAQ_INPUT_HEALTH v3 over-range bits: (key, label). Bit n = MCP3564R CH n
+/// for n = 0..7, 8 = die temperature, 9 = the P6 differential KG50 scan
+/// (PGA x16, +-150 mV full scale).
+pub const ADC_CHANNEL_NAMES: [(&str, &str); ADC_CHANNELS] = [
+    ("kg1000", "KG1000 (CH0)"),
+    ("kg50_amp2", "KG50 AMP2 (CH1)"),
+    ("p6_plus", "P6 S+ leg (CH2)"),
+    ("p6_minus", "P6 S\u{2212} leg (CH3)"),
+    ("ch4", "CH4"),
+    ("ch5", "CH5"),
+    ("chamber", "Chamber PT (CH6)"),
+    ("ch7", "CH7 / HVAIN2"),
+    ("temperature", "ADC die temperature"),
+    ("kg50_p6", "KG50 P6 (\u{d7}16)"),
+];
+/// Chamber PT bit (DAQ_CHAMBER_ADC_CHANNEL default 6).
+pub const CHAMBER_BIT: u8 = 6;
+/// Tank-pressure transducers mapped to a DAQ ADC channel. None today: the
+/// tank PTs are on the ValveBoard. Any bit listed here alerts CRITICAL
+/// whenever it goes over range.
+pub const TANK_PRESSURE_BITS: [u8; 0] = [];
+/// VDDA/AVDD maximum operating voltage of both the STM32U5 and the MCP3564R
+/// (MCP3564R AVDD absolute maximum 4.0 V).
+pub const VDDA_OPERATING_MAX_MV: u16 = 3_600;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReportV3 {
+    /// Channel's most recent conversion over range.
+    pub over_now: u16,
+    /// Over range at some point since the previous report.
+    pub over_latched: u16,
+    /// Direction of the now bits: set = below -full scale.
+    pub over_low: u16,
+    /// Over-range conversions since DAQ boot, u16 wrapping.
+    pub over_counts: [u16; ADC_CHANNELS],
+    pub vdda_max_mv: Option<u16>,
+    pub vdda_mv: Option<u16>,
+    /// Applied MCP3564R reference, mV.
+    pub mcp_vref_mv: u16,
+    pub mcp_vref_source: VrefSource,
+}
+
+/// Where the DAQ's applied MCP3564R reference came from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VrefSource {
+    Station,
+    Flash,
+    #[default]
+    Default,
+}
+
+impl VrefSource {
+    pub fn key(self) -> &'static str {
+        match self {
+            VrefSource::Station => "station",
+            VrefSource::Flash => "flash",
+            VrefSource::Default => "default",
+        }
+    }
+}
+
+/// Reported and station references may differ this much (mV) ...
+pub const VREF_MISMATCH_MV: u16 = 5;
+/// ... for this long before the station warns.
+pub const VREF_MISMATCH_HOLD_MS: i64 = 10_000;
+
+/// Noise and drift of one channel over the DAQ's last 1 s / 60 s.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct ChannelNoise {
+    pub noise_uv: Option<u16>,
+    pub drift_uv_per_min: Option<i16>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReportV2 {
+    /// KG1000, selected KG50, chamber PT, excitation monitor.
+    pub noise: [ChannelNoise; 4],
+    pub excitation_min_mv: Option<u16>,
+    pub excitation_mv: Option<u16>,
+    pub frames_skipped: u16,
+    pub slots_skipped: u16,
+    pub scans_restarted: u16,
+    pub device_recoveries: u16,
+    pub fast_scan_end_us: u16,
+    pub slot_end_us: u16,
+}
+
+fn channel_noise(word: u32) -> ChannelNoise {
+    let noise = word as u16;
+    let drift = (word >> 16) as u16 as i16;
+    ChannelNoise {
+        noise_uv: (noise != 0xFFFF).then_some(noise),
+        drift_uv_per_min: (drift != i16::MIN).then_some(drift),
+    }
+}
+
+fn mv(value: u32) -> Option<u16> {
+    let value = value as u16;
+    (value != NO_MV).then_some(value)
+}
+
+fn volts(mv: u16) -> String {
+    let v = f32::from(mv) / 1000.0;
+    if v < 0.1 { format!("{v:.2} V") } else { format!("{v:.1} V") }
+}
+
+impl Report {
+    pub fn decode(words: &[u32]) -> Option<Self> {
+        let version = words.first()? & 0xFF;
+        let shape = match version {
+            1 => WORDS_V1,
+            2 => WORDS_V2,
+            VERSION => WORDS,
+            _ => return None,
+        };
+        if words.len() != shape || words[0] & !0x3FF != 0 {
+            return None;
+        }
+        let v2 = (version >= 2).then(|| ReportV2 {
+            noise: [channel_noise(words[10]), channel_noise(words[11]), channel_noise(words[12]), channel_noise(words[13])],
+            excitation_min_mv: mv(words[14]),
+            excitation_mv: mv(words[14] >> 16),
+            frames_skipped: words[15] as u16,
+            slots_skipped: (words[15] >> 16) as u16,
+            scans_restarted: words[16] as u16,
+            device_recoveries: (words[16] >> 16) as u16,
+            fast_scan_end_us: words[17] as u16,
+            slot_end_us: (words[17] >> 16) as u16,
+        });
+        let v3 = (version >= 3).then(|| {
+            let mut over_counts = [0u16; ADC_CHANNELS];
+            for (i, count) in over_counts.iter_mut().enumerate() {
+                *count = (words[20 + i / 2] >> (16 * (i & 1))) as u16;
+            }
+            ReportV3 {
+                over_now: words[18] as u16 & 0x3FF,
+                over_latched: (words[18] >> 16) as u16 & 0x3FF,
+                over_low: words[19] as u16 & 0x3FF,
+                over_counts,
+                vdda_max_mv: mv(words[25]),
+                vdda_mv: mv(words[25] >> 16),
+                mcp_vref_mv: words[27] as u16,
+                mcp_vref_source: if words[27] & (1 << 16) != 0 {
+                    VrefSource::Station
+                } else if words[27] & (1 << 17) != 0 {
+                    VrefSource::Flash
+                } else {
+                    VrefSource::Default
+                },
+            }
+        });
+        let mut episodes = [0u16; 10];
+        for (i, count) in episodes.iter_mut().enumerate().take(8) {
+            *count = (words[2 + i / 2] >> (16 * (i & 1))) as u16;
+        }
+        let fault_mask = if version >= 3 {
+            episodes[8] = words[26] as u16;
+            episodes[9] = (words[26] >> 16) as u16;
+            0x3FF
+        } else {
+            0xFF
+        };
+        Some(Self {
+            version: version as u8,
+            kg50_p6: words[0] & 0x100 != 0,
+            chamber_seen: words[0] & 0x200 != 0,
+            active: words[1] as u16 & fault_mask,
+            latched: (words[1] >> 16) as u16 & fault_mask,
+            episodes,
+            vmain_min_mv: mv(words[6]),
+            vmain_mv: mv(words[6] >> 16),
+            chamber_min_mv: mv(words[7]),
+            chamber_mv: mv(words[7] >> 16),
+            p6_imbalance_max_mv: mv(words[8]),
+            p6_common_mv: mv(words[8] >> 16),
+            supply_low_mv: words[9] as u16,
+            chamber_floor_mv: (words[9] >> 16) as u16,
+            v2,
+            v3,
+        })
+    }
+
+    /// `chamber_pt_installed`: the station's setting; without a chamber PT the
+    /// chamber check is not shown.
+    pub fn status(&self, received_age_ms: u64, chamber_pt_installed: bool) -> DaqInputHealthStatus {
+        DaqInputHealthStatus {
+            received_age_ms,
+            faults: FAULTS
+                .iter()
+                .filter(|fault| {
+                    // P6 checks apply only while P6 is the selected KG50 input,
+                    // the chamber check only once a reading arrived and while
+                    // a chamber PT is installed.
+                    match fault {
+                        Fault::P6LegImbalance | Fault::P6CommonMode => self.kg50_p6,
+                        Fault::ChamberNoSignal => self.chamber_seen && chamber_pt_installed,
+                        Fault::VddaHigh | Fault::VddaLow => self.v3.is_some(),
+                        _ => true,
+                    }
+                })
+                .map(|fault| DaqInputFaultStatus {
+                    key: fault.key().into(),
+                    label: fault.label().into(),
+                    active: self.active & fault.bit() != 0,
+                    latched: self.latched & fault.bit() != 0,
+                    episodes: self.episodes[*fault as usize],
+                    advice: fault.advice().into(),
+                })
+                .collect(),
+            kg50_p6: self.kg50_p6,
+            chamber_pt_installed,
+            vmain_mv: self.vmain_mv,
+            vmain_min_mv: self.vmain_min_mv,
+            chamber_mv: self.chamber_mv,
+            chamber_min_mv: self.chamber_min_mv,
+            p6_imbalance_max_mv: self.p6_imbalance_max_mv,
+            p6_common_mv: self.p6_common_mv,
+            supply_low_mv: self.supply_low_mv,
+            chamber_floor_mv: self.chamber_floor_mv,
+            kg1000_noise: self.v2.as_ref().map(|v| v.noise[0]),
+            kg50_noise: self.v2.as_ref().map(|v| v.noise[1]),
+            chamber_noise: self.v2.as_ref().map(|v| v.noise[2]),
+            excitation_noise: self.v2.as_ref().map(|v| v.noise[3]),
+            excitation_mv: self.v2.as_ref().and_then(|v| v.excitation_mv),
+            excitation_min_mv: self.v2.as_ref().and_then(|v| v.excitation_min_mv),
+            adc_frames_skipped: self.v2.as_ref().map(|v| v.frames_skipped),
+            adc_slots_skipped: self.v2.as_ref().map(|v| v.slots_skipped),
+            adc_scans_restarted: self.v2.as_ref().map(|v| v.scans_restarted),
+            adc_device_recoveries: self.v2.as_ref().map(|v| v.device_recoveries),
+            adc_fast_scan_end_us: self.v2.as_ref().map(|v| v.fast_scan_end_us),
+            adc_slot_end_us: self.v2.as_ref().map(|v| v.slot_end_us),
+            adc_channels: Vec::new(),
+            vdda_v: self.v3.as_ref().and_then(|v| v.vdda_mv).map(|mv| Volts(f32::from(mv) / 1000.0)),
+            vdda_max_v: self.v3.as_ref().and_then(|v| v.vdda_max_mv).map(|mv| Volts(f32::from(mv) / 1000.0)),
+            mcp_vref_v: self.v3.as_ref().map(|v| Volts(f32::from(v.mcp_vref_mv) / 1000.0)),
+            mcp_vref_source: self.v3.as_ref().map(|v| v.mcp_vref_source.key().to_string()),
+        }
+    }
+
+    /// Over-range bits (now or latched) in this report.
+    pub fn over_range_bits(&self) -> u16 {
+        self.v3.as_ref().map_or(0, |v| v.over_now | v.over_latched)
+    }
+
+    /// Labels of the channels over range in this report, or "no ADC channel
+    /// over range".
+    fn over_range_names(&self) -> String {
+        let bits = self.over_range_bits();
+        let names: Vec<&str> =
+            (0..ADC_CHANNELS).filter(|i| bits & (1 << i) != 0).map(|i| ADC_CHANNEL_NAMES[i].1).collect();
+        if names.is_empty() { "no ADC channel over range".into() } else { format!("{} over range", names.join(", ")) }
+    }
+
+    fn kg50_input(&self) -> &'static str {
+        if self.kg50_p6 { "P6 differential" } else { "AMP2/P8" }
+    }
+
+    /// Plain-language operator text for `fault`. `brief` when the DAQ saw it
+    /// only between reports, too short to activate; `dips` counts supply
+    /// dips in the last DIP_WINDOW_MS.
+    pub fn alert_text(&self, fault: Fault, brief: bool, dips: u32) -> String {
+        let count = |n: u32, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
+        match fault {
+            Fault::SupplyLow => {
+                let low = self.vmain_min_mv.or(self.vmain_mv).map_or_else(|| "below its limit".into(), volts);
+                let mut text = format!(
+                    "DAQ supply dropped to {low} ({} in 60 s, limit {}) — check DAQ power/ground connector. Load-cell and chamber readings shift while it is low.",
+                    count(dips.max(1), "dip"),
+                    volts(self.supply_low_mv)
+                );
+                if (self.active | self.latched) & Fault::VddaHigh.bit() != 0 {
+                    text.push_str(" +3V3A (VDDA) is high at the same time: the VMAIN reading is now VDDA-corrected (the earlier ~11 V dips were most likely a VDDA measurement artifact).");
+                }
+                text
+            }
+            Fault::Kg1000HighRail | Fault::Kg1000LowRail | Fault::Kg50HighRail | Fault::Kg50LowRail => {
+                let (cell, rail) = match fault {
+                    Fault::Kg1000HighRail => ("1000 kg load cell (P7)".to_string(), "ADC full-scale rail"),
+                    Fault::Kg1000LowRail => ("1000 kg load cell (P7)".to_string(), "amplifier low rail"),
+                    Fault::Kg50HighRail => (format!("50 kg load cell ({})", self.kg50_input()), "high rail"),
+                    _ => (format!("50 kg load cell ({})", self.kg50_input()), "low rail"),
+                };
+                let when = if brief { "briefly hit" } else { "is at" };
+                format!("{cell} input {when} its {rail} on the DAQ — {}", fault.advice())
+            }
+            Fault::P6LegImbalance => {
+                let by = self.p6_imbalance_max_mv.map_or_else(String::new, |mv| format!(" by {}", volts(mv)));
+                let when = if brief { "briefly disagreed" } else { "disagree" };
+                format!(
+                    "50 kg load cell P6 sense legs {when}{by} — one lead is intermittent; check the P6 connector (S+ is P6/3). The 50 kg weight spikes while this lasts."
+                )
+            }
+            Fault::P6CommonMode => {
+                let at = self.p6_common_mv.map_or_else(String::new, |mv| format!(" ({} mean, expected about 1.14 V)", volts(mv)));
+                format!("50 kg load cell P6 legs moved together{at} — bridge excitation or both sense leads lost; check P6.")
+            }
+            Fault::ChamberNoSignal => {
+                let reads = self.chamber_mv.or(self.chamber_min_mv).map_or_else(|| "near 0 V".into(), volts);
+                // The DAQ raises this only in the launch burn window (T0 + 1.5 s
+                // to T0 + 5 s) for the installed 0-5 V PX309, which reads 0 V
+                // when vented; at rest it is never reported.
+                format!(
+                    "Chamber pressure transducer reads {reads} — no signal during the burn; check P4 wiring (signal P4/3) and +12VA excitation on P4/6 (if no chamber PT is connected, mark it not installed)."
+                )
+            }
+            Fault::VddaHigh => {
+                let v3 = self.v3.as_ref();
+                let mv = v3.and_then(|v| v.vdda_max_mv.max(v.vdda_mv));
+                let at = mv.map_or_else(|| "above 3.45 V".into(), |mv| format!("{:.2} V", f32::from(mv) / 1000.0));
+                let what = if brief { "was briefly high" } else { "high" };
+                if mv.is_some_and(|mv| mv > VDDA_OPERATING_MAX_MV) {
+                    format!(
+                        "DAQ +3V3A {what} ({at}): exceeds the 3.6 V operating limit; hardware stress risk. Likely clamp injection from a saturated analog front end ({}).",
+                        self.over_range_names()
+                    )
+                } else {
+                    format!(
+                        "DAQ +3V3A {what} ({at}): likely clamp injection from a saturated analog front end (KG1000 over range) — now {}.",
+                        self.over_range_names()
+                    )
+                }
+            }
+            Fault::VddaLow => {
+                let at = self
+                    .v3
+                    .as_ref()
+                    .and_then(|v| v.vdda_mv)
+                    .map_or_else(|| "below 3.15 V".into(), |mv| format!("{:.2} V", f32::from(mv) / 1000.0));
+                format!("DAQ +3V3A low ({at}) — {}", Fault::VddaLow.advice())
+            }
+        }
+    }
+
+    /// VDDA above the 3.6 V operating limit in this report.
+    pub fn vdda_over_operating_limit(&self) -> bool {
+        self.v3
+            .as_ref()
+            .and_then(|v| v.vdda_max_mv.max(v.vdda_mv))
+            .is_some_and(|mv| mv > VDDA_OPERATING_MAX_MV)
+    }
+}
+
+/// An operator alert raised from a DAQ_INPUT_HEALTH report. Derefs to its
+/// text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Alert {
+    /// CRITICAL (station error) rather than a warning.
+    pub critical: bool,
+    pub text: String,
+}
+
+impl std::ops::Deref for Alert {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
+impl std::fmt::Display for Alert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+/// Station context for an alert decision.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Context {
+    /// Station setting: a chamber PT is connected.
+    pub chamber_pt_installed: bool,
+    /// The station's launch clock puts `now` inside the burn window
+    /// ([`in_burn_window`]).
+    pub in_burn: bool,
+    /// The station's MCP3564R reference setting, mV (None: not checked).
+    pub station_mcp_vref_mv: Option<u16>,
+}
+
+/// The burn window around T0 on the station's launch clock: from 1 s before
+/// T0 (igniter and pilot-valve lead) to 20 s after (the longest planned
+/// hybrid burn is well under 10 s; the margin covers late ignition and the
+/// tail-off). A chamber PT over range inside it is an overpressure or a
+/// sensor fault and alerts CRITICAL.
+pub const BURN_WINDOW_BEFORE_T0_MS: i64 = 1_000;
+pub const BURN_WINDOW_AFTER_T0_MS: i64 = 20_000;
+
+pub fn in_burn_window(t0_ms: Option<i64>, now_ms: i64) -> bool {
+    t0_ms.is_some_and(|t0| now_ms >= t0 - BURN_WINDOW_BEFORE_T0_MS && now_ms <= t0 + BURN_WINDOW_AFTER_T0_MS)
+}
+
+/// Over-range channels are listed this long after their last over-range
+/// conversion.
+pub const ADC_LIST_WINDOW_MS: i64 = 600_000;
+/// `count_recent` covers this window.
+pub const ADC_RECENT_WINDOW_MS: i64 = 60_000;
+
+/// Station-side history of one ADC channel's over-range conversions.
+#[derive(Clone, Debug, Default)]
+struct AdcChannel {
+    total: u64,
+    /// (time, new conversions) over the last ADC_RECENT_WINDOW_MS.
+    recent: VecDeque<(i64, u64)>,
+    first_ms: Option<i64>,
+    last_ms: Option<i64>,
+    now: bool,
+    low: bool,
+    latched: bool,
+    last_alert_ms: Option<i64>,
+}
+
+/// Per-DAQ alert debounce: one alert per new episode, at most once per
+/// ALERT_HOLDOFF_MS per fault (and per ADC channel), while a fault stays
+/// active no repeat. A warning that becomes critical (VDDA above 3.6 V)
+/// alerts again once.
+#[derive(Default)]
+pub struct AlertTracker {
+    previous: Option<Report>,
+    previous_ms: Option<i64>,
+    last_alert_ms: [Option<i64>; 10],
+    /// (time, new dips) for the supply dip count.
+    dips: VecDeque<(i64, u32)>,
+    adc: [AdcChannel; ADC_CHANNELS],
+    /// The current VDDA_HIGH episode already alerted at critical level.
+    vdda_critical_sent: bool,
+    /// Reported reference differing from the station setting since.
+    vref_mismatch_since: Option<i64>,
+    vref_mismatch_sent: bool,
+    vref_last_alert_ms: Option<i64>,
+}
+
+impl AlertTracker {
+    /// Alerts to raise for `report`, received at `now_ms`. `claim_rail(sensor)`
+    /// returns true when the live-sample rail alert has not already told the
+    /// operator (and records that this alert did), so a rail is never
+    /// announced twice. Without a chamber PT installed (station setting) the
+    /// chamber no-signal fault is never announced.
+    #[cfg(test)]
+    pub fn observe(
+        &mut self,
+        report: &Report,
+        now_ms: i64,
+        chamber_pt_installed: bool,
+        claim_rail: impl FnMut(&str) -> bool,
+    ) -> Vec<Alert> {
+        self.observe_in(report, now_ms, Context { chamber_pt_installed, ..Context::default() }, claim_rail)
+    }
+
+    pub fn observe_in(
+        &mut self,
+        report: &Report,
+        now_ms: i64,
+        context: Context,
+        mut claim_rail: impl FnMut(&str) -> bool,
+    ) -> Vec<Alert> {
+        let chamber_pt_installed = context.chamber_pt_installed;
+        let mut alerts = Vec::new();
+        let previous = self.previous.take();
+        let previous_ms = self.previous_ms.replace(now_ms);
+        // A DAQ reboot restarts its counters: count only what is latched now.
+        let restarted = previous.as_ref().is_none_or(|p| {
+            report.episodes.iter().zip(p.episodes.iter()).any(|(now, before)| now < before)
+                || p.version != report.version
+        });
+        let new_episodes = |fault: Fault| -> u32 {
+            let i = fault as usize;
+            match &previous {
+                Some(p) if !restarted => u32::from(report.episodes[i].wrapping_sub(p.episodes[i])),
+                _ => u32::from(report.latched & fault.bit() != 0),
+            }
+        };
+        self.dips.retain(|(at, _)| now_ms.saturating_sub(*at) < DIP_WINDOW_MS && *at <= now_ms);
+        let supply_new = new_episodes(Fault::SupplyLow);
+        if supply_new > 0 {
+            self.dips.push_back((now_ms, supply_new));
+        }
+        let dips: u32 = self.dips.iter().map(|(_, n)| n).sum();
+        let was_active = previous.as_ref().map_or(0, |p| p.active);
+        for fault in FAULTS {
+            let active = report.active & fault.bit() != 0;
+            let started = active && was_active & fault.bit() == 0;
+            let brief = !active && new_episodes(fault) > 0;
+            if fault == Fault::VddaHigh {
+                if !active && !brief {
+                    self.vdda_critical_sent = false;
+                }
+                // Escalation: an alerted VDDA_HIGH episode that now exceeds
+                // the operating limit alerts once more, critical.
+                if (active || brief) && report.vdda_over_operating_limit() && !self.vdda_critical_sent {
+                    self.vdda_critical_sent = true;
+                    self.last_alert_ms[fault as usize] = Some(now_ms);
+                    alerts.push(Alert { critical: true, text: report.alert_text(fault, brief, dips) });
+                    continue;
+                }
+            }
+            // A chamber or excitation reading is a steady condition: only an
+            // active (debounced) fault is worth an alert.
+            if !(started || brief && !matches!(fault, Fault::ChamberNoSignal | Fault::P6CommonMode)) {
+                continue;
+            }
+            if fault == Fault::ChamberNoSignal && !chamber_pt_installed {
+                continue;
+            }
+            let i = fault as usize;
+            if let Some(sensor) = fault.rail_sensor() {
+                if !claim_rail(sensor) {
+                    continue;
+                }
+            } else if self.last_alert_ms[i]
+                .is_some_and(|last| now_ms >= last && now_ms - last < ALERT_HOLDOFF_MS)
+            {
+                continue;
+            }
+            self.last_alert_ms[i] = Some(now_ms);
+            alerts.push(Alert { critical: false, text: report.alert_text(fault, brief, dips) });
+        }
+        alerts.extend(self.observe_adc(report, previous.as_ref(), restarted, previous_ms, now_ms, context));
+        alerts.extend(self.observe_vref(report, now_ms, context));
+        self.previous = Some(report.clone());
+        alerts
+    }
+
+    /// Over-range bookkeeping and alerts for a version-3 report.
+    fn observe_adc(
+        &mut self,
+        report: &Report,
+        previous: Option<&Report>,
+        restarted: bool,
+        previous_ms: Option<i64>,
+        now_ms: i64,
+        context: Context,
+    ) -> Vec<Alert> {
+        let mut alerts = Vec::new();
+        let Some(v3) = report.v3.as_ref() else {
+            for channel in &mut self.adc {
+                channel.now = false;
+                channel.latched = false;
+                channel.first_ms = None;
+            }
+            return alerts;
+        };
+        let before = previous.and_then(|p| p.v3.as_ref());
+        for (bit, channel) in self.adc.iter_mut().enumerate() {
+            let mask = 1u16 << bit;
+            let now = v3.over_now & mask != 0;
+            let latched = v3.over_latched & mask != 0;
+            // Counters wrap modulo 2^16; after a DAQ reboot (counters back
+            // near zero) everything counted since boot is new.
+            let new = match before {
+                Some(b) if !restarted => u64::from(v3.over_counts[bit].wrapping_sub(b.over_counts[bit])),
+                _ => u64::from(v3.over_counts[bit]),
+            };
+            let new = if new == 0 && (now || latched) { 1 } else { new };
+            channel.recent.retain(|(at, _)| *at <= now_ms && now_ms - *at < ADC_RECENT_WINDOW_MS);
+            if new > 0 {
+                channel.total = channel.total.saturating_add(new);
+                channel.recent.push_back((now_ms, new));
+            }
+            let seen = now || latched || new > 0;
+            let started = seen && channel.first_ms.is_none();
+            if started {
+                // It began after the previous report (within one report
+                // interval); without one, now.
+                channel.first_ms = Some(previous_ms.filter(|p| *p <= now_ms).unwrap_or(now_ms));
+            }
+            if seen {
+                channel.last_ms = Some(now_ms);
+            }
+            channel.now = now;
+            channel.latched = latched;
+            if now {
+                channel.low = v3.over_low & mask != 0;
+            }
+            if started {
+                let due = channel
+                    .last_alert_ms
+                    .is_none_or(|last| now_ms < last || now_ms - last >= ALERT_HOLDOFF_MS);
+                let critical = (bit as u8 == CHAMBER_BIT && context.in_burn && context.chamber_pt_installed)
+                    || TANK_PRESSURE_BITS.contains(&(bit as u8));
+                // A critical over range is never held off.
+                if due || critical {
+                    channel.last_alert_ms = Some(now_ms);
+                    let first = channel.first_ms.unwrap_or(now_ms);
+                    alerts.push(Alert {
+                        critical,
+                        text: adc_alert_text(bit, channel.low, now, now_ms - first, new, critical),
+                    });
+                }
+            }
+            if !now {
+                // Back in range (or only latched between reports): the
+                // episode ends.
+                channel.first_ms = None;
+            }
+        }
+        alerts
+    }
+
+    /// One warning when the DAQ's applied reference differs from the
+    /// station's setting by more than VREF_MISMATCH_MV for VREF_MISMATCH_HOLD_MS.
+    fn observe_vref(&mut self, report: &Report, now_ms: i64, context: Context) -> Option<Alert> {
+        let (Some(v3), Some(station)) = (report.v3.as_ref(), context.station_mcp_vref_mv) else {
+            self.vref_mismatch_since = None;
+            return None;
+        };
+        if v3.mcp_vref_mv.abs_diff(station) <= VREF_MISMATCH_MV {
+            self.vref_mismatch_since = None;
+            self.vref_mismatch_sent = false;
+            return None;
+        }
+        let since = *self.vref_mismatch_since.get_or_insert(now_ms);
+        let due = self.vref_last_alert_ms.is_none_or(|last| now_ms < last || now_ms - last >= ALERT_HOLDOFF_MS);
+        if self.vref_mismatch_sent || now_ms - since < VREF_MISMATCH_HOLD_MS || !due {
+            return None;
+        }
+        self.vref_mismatch_sent = true;
+        self.vref_last_alert_ms = Some(now_ms);
+        Some(Alert {
+            critical: false,
+            text: format!(
+                "DAQ MCP3564R reference is {:.3} V ({}) but the station setting is {:.3} V — every DAQ load-cell and chamber volt is scaled by the wrong reference until the DAQ applies the station value (check the DAQ link and the MCP3564R reference setting).",
+                f32::from(v3.mcp_vref_mv) / 1000.0,
+                match v3.mcp_vref_source {
+                    VrefSource::Station => "from the station",
+                    VrefSource::Flash => "restored from flash",
+                    VrefSource::Default => "compiled nominal",
+                },
+                f32::from(station) / 1000.0
+            ),
+        })
+    }
+
+    /// Channels over range now or within ADC_LIST_WINDOW_MS of `now_ms`.
+    pub fn adc_channels(&self, now_ms: i64) -> Vec<DaqAdcChannelStatus> {
+        self.adc
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.now || c.last_ms.is_some_and(|last| now_ms.saturating_sub(last) < ADC_LIST_WINDOW_MS))
+            .map(|(bit, c)| DaqAdcChannelStatus {
+                key: ADC_CHANNEL_NAMES[bit].0.into(),
+                label: ADC_CHANNEL_NAMES[bit].1.into(),
+                bit: bit as u8,
+                over_range_now: c.now,
+                low: c.low,
+                latched: c.latched,
+                count_total: c.total,
+                count_recent: c
+                    .recent
+                    .iter()
+                    .filter(|(at, _)| *at <= now_ms && now_ms - *at < ADC_RECENT_WINDOW_MS)
+                    .map(|(_, n)| n)
+                    .sum(),
+                first_over_range_ms: c.first_ms,
+                last_over_range_ms: c.last_ms,
+            })
+            .collect()
+    }
+}
+
+/// "DAQ ADC over range: KG1000 (CH0) for 1.0 s (above +full scale, 812
+/// conversions)".
+fn adc_alert_text(bit: usize, low: bool, now: bool, for_ms: i64, conversions: u64, critical: bool) -> String {
+    let label = ADC_CHANNEL_NAMES[bit].1;
+    let side = if low { "below \u{2212}full scale" } else { "above +full scale" };
+    let duration = if now {
+        format!("for {:.1} s", for_ms.max(0) as f64 / 1000.0)
+    } else {
+        "briefly".to_string()
+    };
+    let n = format!("{conversions} conversion{}", if conversions == 1 { "" } else { "s" });
+    let mut text = format!("DAQ ADC over range: {label} {duration} ({side}, {n})");
+    if critical {
+        if bit as u8 == CHAMBER_BIT {
+            text.push_str(" during the burn — overpressure or sensor fault. Chamber pressure is not measured while it lasts.");
+        } else {
+            text.push_str(" — tank pressure is not measured: overpressure or sensor fault.");
+        }
+    } else {
+        text.push_str(" — its value is shown as OVR, not a number, until it returns to range.");
+    }
+    text
+}
+
+static TRACKERS: OnceLock<Mutex<HashMap<String, AlertTracker>>> = OnceLock::new();
+
+/// Alerts for a DAQ_INPUT_HEALTH report from `sender`, debounced per sender.
+pub fn observe_alerts(
+    sender: &str,
+    report: &Report,
+    now_ms: i64,
+    context: Context,
+    claim_rail: impl FnMut(&str) -> bool,
+) -> Vec<Alert> {
+    TRACKERS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .entry(crate::types::canonical_sender_id(sender.trim()).to_owned())
+        .or_default()
+        .observe_in(report, now_ms, context, claim_rail)
+}
+
+/// The over-range channel list for `sender` (empty before any v3 report).
+pub fn adc_channels(sender: &str, now_ms: i64) -> Vec<DaqAdcChannelStatus> {
+    TRACKERS
+        .get()
+        .and_then(|t| t.lock().ok().and_then(|t| t.get(crate::types::canonical_sender_id(sender.trim())).map(|t| t.adc_channels(now_ms))))
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Words as the DAQ builds them (daq_input_faults_report).
+    fn words(active: u16, latched: u16, episodes: [u16; 8], vmain: (u16, u16), chamber: (u16, u16), p6: (u16, u16), flags: u32) -> Vec<u32> {
+        let mut w = vec![1 | flags, u32::from(active) | (u32::from(latched) << 16), 0, 0, 0, 0];
+        for (i, n) in episodes.iter().enumerate() {
+            w[2 + i / 2] |= u32::from(*n) << (16 * (i & 1));
+        }
+        w.push(u32::from(vmain.0) | (u32::from(vmain.1) << 16));
+        w.push(u32::from(chamber.0) | (u32::from(chamber.1) << 16));
+        w.push(u32::from(p6.0) | (u32::from(p6.1) << 16));
+        w.push(12_500 | (50 << 16));
+        w
+    }
+    const NONE: (u16, u16) = (NO_MV, NO_MV);
+    const HEALTHY: (u16, u16) = (14_180, 14_200);
+
+    fn decode(w: &[u32]) -> Report {
+        Report::decode(w).unwrap()
+    }
+
+    #[test]
+    fn decode_reads_version_2_noise_excitation_and_frame_counters() {
+        let mut w = words(0, 0, [0; 8], HEALTHY, (8, 17), NONE, 0x200);
+        w[0] = 2 | 0x200;
+        // KG1000 48 uV noise, +600 uV/min; KG50 unknown; chamber 120 uV, -3 uV/min;
+        // no excitation monitor.
+        w.extend([48 | (600 << 16), 0x8000_FFFF, 120 | (u32::from(-3i16 as u16) << 16), 0x8000_FFFF]);
+        w.extend([0xFFFF_FFFF, 2 | (7 << 16), 1 | (0 << 16), 770 | (930 << 16)]);
+        let r = decode(&w);
+        let v2 = r.v2.clone().unwrap();
+        assert_eq!(v2.noise[0], ChannelNoise { noise_uv: Some(48), drift_uv_per_min: Some(600) });
+        assert_eq!(v2.noise[1], ChannelNoise::default());
+        assert_eq!(v2.noise[2], ChannelNoise { noise_uv: Some(120), drift_uv_per_min: Some(-3) });
+        assert_eq!((v2.excitation_min_mv, v2.excitation_mv), (None, None));
+        assert_eq!((v2.frames_skipped, v2.slots_skipped, v2.scans_restarted, v2.device_recoveries), (2, 7, 1, 0));
+        assert_eq!((v2.fast_scan_end_us, v2.slot_end_us), (770, 930));
+        let status = r.status(0, true);
+        assert_eq!(status.kg1000_noise.unwrap().noise_uv, Some(48));
+        assert_eq!(status.adc_slots_skipped, Some(7));
+        assert!(Report::decode(&w[..10]).is_none(), "version 2 must carry 18 words");
+        // Version-1 firmware still decodes, without the version-2 block.
+        assert!(decode(&words(0, 0, [0; 8], HEALTHY, NONE, NONE, 0)).v2.is_none());
+    }
+
+    #[test]
+    fn decode_reads_every_field_and_rejects_other_shapes() {
+        let mut episodes = [0u16; 8];
+        episodes[0] = 53;
+        episodes[7] = 1;
+        episodes[5] = 0xFFFF;
+        let w = words(0x81, 0xA1, episodes, (11_030, 11_100), (8, 17), (229, 1_137), 0x300);
+        let r = decode(&w);
+        assert!(r.kg50_p6 && r.chamber_seen);
+        assert_eq!((r.active, r.latched), (0x81, 0xA1));
+        assert_eq!(r.episodes[..8], episodes);
+        assert_eq!((r.vmain_min_mv, r.vmain_mv), (Some(11_030), Some(11_100)));
+        assert_eq!((r.chamber_min_mv, r.chamber_mv), (Some(8), Some(17)));
+        assert_eq!((r.p6_imbalance_max_mv, r.p6_common_mv), (Some(229), Some(1_137)));
+        assert_eq!((r.supply_low_mv, r.chamber_floor_mv), (12_500, 50));
+        let r = decode(&words(0, 0, [0; 8], NONE, NONE, NONE, 0));
+        assert_eq!((r.vmain_mv, r.chamber_mv, r.p6_common_mv), (None, None, None));
+        assert!(Report::decode(&w[..9]).is_none());
+        let mut bad = w.clone();
+        bad[0] = 4;
+        assert!(Report::decode(&bad).is_none(), "unknown version");
+        bad[0] = 3;
+        assert!(Report::decode(&bad).is_none(), "version 3 needs 28 words");
+        bad[0] = 2;
+        assert!(Report::decode(&bad).is_none(), "version 2 needs 18 words");
+        bad[0] = 1 | 0x400;
+        assert!(Report::decode(&bad).is_none(), "unknown flag");
+    }
+
+    #[test]
+    fn status_lists_only_the_checks_that_apply() {
+        let r = decode(&words(1, 1, [3, 0, 0, 0, 0, 0, 0, 0], (11_030, 11_100), NONE, NONE, 0));
+        let status = r.status(250, true);
+        let keys: Vec<_> = status.faults.iter().map(|f| f.key.as_str()).collect();
+        assert_eq!(keys, ["supply_low", "kg1000_high_rail", "kg1000_low_rail", "kg50_high_rail", "kg50_low_rail"]);
+        assert!(status.faults[0].active && status.faults[0].latched && status.faults[0].episodes == 3);
+        assert_eq!(status.received_age_ms, 250);
+        let status = decode(&words(0, 0, [0; 8], HEALTHY, (8, 17), (4, 1_137), 0x300)).status(0, true);
+        assert_eq!(status.faults.len(), 8);
+        assert_eq!(status.p6_common_mv, Some(1_137));
+    }
+
+    #[test]
+    fn alert_text_is_plain_language_with_values_and_next_step() {
+        let r = decode(&words(1, 1, [14, 0, 0, 0, 0, 0, 0, 0], (11_060, 11_100), (8, 12), (229, 1_137), 0x300));
+        assert_eq!(
+            r.alert_text(Fault::SupplyLow, false, 14),
+            "DAQ supply dropped to 11.1 V (14 dips in 60 s, limit 12.5 V) — check DAQ power/ground connector. Load-cell and chamber readings shift while it is low."
+        );
+        assert!(r.alert_text(Fault::SupplyLow, true, 1).contains("(1 dip in 60 s"));
+        let chamber = r.alert_text(Fault::ChamberNoSignal, false, 0);
+        assert_eq!(chamber, "Chamber pressure transducer reads 0.01 V — no signal during the burn; check P4 wiring (signal P4/3) and +12VA excitation on P4/6 (if no chamber PT is connected, mark it not installed).");
+        assert!(!chamber.contains("vented"), "the DAQ no longer reports a vented transducer at rest");
+        assert!(chamber.contains("+12VA excitation on P4/6"));
+        let p6 = r.alert_text(Fault::P6LegImbalance, true, 0);
+        assert!(p6.contains("briefly disagreed by 0.2 V") && p6.contains("P6/3"), "{p6}");
+        assert!(r.alert_text(Fault::P6CommonMode, false, 0).contains("1.1 V mean"));
+        let rail = r.alert_text(Fault::Kg1000LowRail, false, 0);
+        assert_eq!(rail, "1000 kg load cell (P7) input is at its amplifier low rail on the DAQ — Open bridge lead: check the P7 load-cell connector.");
+        assert!(r.alert_text(Fault::Kg50HighRail, true, 0).starts_with("50 kg load cell (P6 differential) input briefly hit its high rail"));
+    }
+
+    fn observe(t: &mut AlertTracker, w: &[u32], now: i64) -> Vec<String> {
+        t.observe(&decode(w), now, true, |_| true).into_iter().map(|a| a.text).collect()
+    }
+
+    #[test]
+    fn supply_dips_alert_once_per_holdoff_with_the_running_count() {
+        let mut t = AlertTracker::default();
+        assert!(observe(&mut t, &words(0, 0, [0; 8], HEALTHY, NONE, NONE, 0), 0).is_empty());
+        let mut n = [0u16; 8];
+        n[0] = 1;
+        // A one-sample dip between reports: counted, latched, not active.
+        let alerts = observe(&mut t, &words(0, 1, n, (11_060, 14_180), NONE, NONE, 0), 1_000);
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].starts_with("DAQ supply dropped to 11.1 V (1 dip in 60 s"), "{}", alerts[0]);
+        // More dips inside the holdoff: no repeat.
+        for (i, at) in (2_000..30_000).step_by(2_000).enumerate() {
+            n[0] = 2 + i as u16;
+            assert!(observe(&mut t, &words(0, 1, n, (11_050, 14_200), NONE, NONE, 0), at).is_empty());
+        }
+        // After the holdoff, the alert carries the 60 s count.
+        n[0] += 1;
+        let alerts = observe(&mut t, &words(0, 1, n, (11_040, 14_200), NONE, NONE, 0), 31_000);
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].contains(&format!("({} dips in 60 s", n[0])), "{}", alerts[0]);
+        // Quiet reports raise nothing.
+        assert!(observe(&mut t, &words(0, 0, n, HEALTHY, NONE, NONE, 0), 32_000).is_empty());
+    }
+
+    #[test]
+    fn an_active_fault_alerts_once_and_not_again_while_it_stays_active() {
+        let mut t = AlertTracker::default();
+        let mut n = [0u16; 8];
+        n[7] = 1;
+        let chamber = words(0x80, 0x80, n, HEALTHY, (8, 12), NONE, 0x200);
+        let first = observe(&mut t, &chamber, 0);
+        assert_eq!(first.len(), 1);
+        assert!(first[0].starts_with("Chamber pressure transducer reads 0.01 V"));
+        for at in (1_000..200_000).step_by(1_000) {
+            assert!(observe(&mut t, &chamber, at).is_empty(), "still the same episode at {at}");
+        }
+        // Cleared, then back after the holdoff: a new alert.
+        let clear = words(0, 0, n, HEALTHY, (1_200, 1_250), NONE, 0x200);
+        assert!(observe(&mut t, &clear, 200_000).is_empty());
+        n[7] = 2;
+        assert_eq!(observe(&mut t, &words(0x80, 0x80, n, HEALTHY, (8, 9), NONE, 0x200), 260_000).len(), 1);
+    }
+
+    #[test]
+    fn without_a_chamber_pt_installed_the_chamber_fault_is_neither_listed_nor_announced() {
+        let mut n = [0u16; 8];
+        n[7] = 1;
+        // The 2026-11-16 fire: no chamber PT connected, CH6 at 0.01 V in the burn.
+        let chamber = words(0x81, 0x81, [1, 0, 0, 0, 0, 0, 0, 1], (11_050, 11_100), (8, 12), NONE, 0x200);
+        let mut t = AlertTracker::default();
+        let alerts = t.observe(&decode(&chamber), 0, false, |_| true);
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
+        assert!(alerts[0].starts_with("DAQ supply dropped"), "other faults still alert: {alerts:?}");
+        for at in (1_000..60_000).step_by(1_000) {
+            assert!(t.observe(&decode(&chamber), at, false, |_| true).is_empty());
+        }
+        let status = decode(&chamber).status(0, false);
+        assert!(!status.chamber_pt_installed);
+        assert!(status.faults.iter().all(|f| f.key != "chamber_no_signal"));
+        assert_eq!(status.chamber_mv, Some(12), "the reading is still shown");
+        // Installed: the same report is listed and announced.
+        let status = decode(&chamber).status(0, true);
+        assert!(status.chamber_pt_installed);
+        assert!(status.faults.iter().any(|f| f.key == "chamber_no_signal" && f.active));
+        let alerts = AlertTracker::default().observe(&decode(&words(0x80, 0x80, n, HEALTHY, (8, 12), NONE, 0x200)), 0, true, |_| true);
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].contains("no signal during the burn") && alerts[0].contains("mark it not installed"));
+    }
+
+    #[test]
+    fn a_brief_chamber_or_excitation_dip_is_not_an_alert() {
+        let mut t = AlertTracker::default();
+        observe(&mut t, &words(0, 0, [0; 8], HEALTHY, (1_000, 1_000), (4, 1_137), 0x300), 0);
+        let mut n = [0u16; 8];
+        n[6] = 1;
+        n[7] = 1;
+        assert!(observe(&mut t, &words(0, 0xC0, n, HEALTHY, (30, 1_000), (4, 1_137), 0x300), 1_000).is_empty());
+    }
+
+    #[test]
+    fn rail_reports_defer_to_the_live_sample_rail_alert() {
+        let mut t = AlertTracker::default();
+        observe(&mut t, &words(0, 0, [0; 8], HEALTHY, NONE, NONE, 0), 0);
+        let mut n = [0u16; 8];
+        n[1] = 1;
+        let railed = words(0x02, 0x02, n, HEALTHY, NONE, NONE, 0);
+        // The station already alerted from the live KG1000 samples.
+        let mut asked = Vec::new();
+        let alerts = t.observe(&decode(&railed), 1_000, true, |sensor| {
+            asked.push(sensor.to_string());
+            false
+        });
+        assert!(alerts.is_empty());
+        assert_eq!(asked, ["KG1000"]);
+        // A brief rail the live stream never showed is announced once.
+        n[1] = 2;
+        let brief = words(0, 0x02, n, HEALTHY, NONE, NONE, 0);
+        let alerts = t.observe(&decode(&brief), 2_000, true, |sensor| sensor == "KG1000");
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].contains("briefly hit its ADC full-scale rail"), "{}", alerts[0]);
+    }
+
+    #[test]
+    fn a_daq_reboot_restarts_counting_without_a_burst() {
+        let mut t = AlertTracker::default();
+        let mut n = [0u16; 8];
+        n[0] = 40;
+        observe(&mut t, &words(0, 0, n, HEALTHY, NONE, NONE, 0), 0);
+        // Rebooted: counters back near zero, nothing latched.
+        n[0] = 0;
+        assert!(observe(&mut t, &words(0, 0, n, HEALTHY, NONE, NONE, 0), 1_000).is_empty());
+        n[0] = 1;
+        let alerts = observe(&mut t, &words(0, 1, n, (11_100, 14_200), NONE, NONE, 0), 2_000);
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].contains("(1 dip in 60 s"), "{}", alerts[0]);
+    }
+
+    /// The test-fire pattern: dips every few seconds over 2 minutes give one
+    /// alert per 30 s, each with the dips of the last minute.
+    #[test]
+    fn fire_dip_pattern_is_debounced() {
+        let dips_at = [327.0, 327.5, 340.5, 344.0, 351.0, 351.5, 352.0, 352.7, 353.2, 354.7, 356.7, 371.0, 374.0, 379.0,
+            380.7, 381.5, 382.0, 400.5, 405.0, 408.0, 409.0, 410.7, 411.5, 413.0, 413.7, 414.7, 415.7, 420.2, 421.2,
+            423.0, 424.0, 425.2, 428.0, 429.0, 429.5, 431.2, 431.7, 434.7, 443.0, 443.5, 445.0, 449.0, 451.0];
+        let mut t = AlertTracker::default();
+        let mut count = 0u16;
+        let mut alerts = Vec::new();
+        for second in 320..460 {
+            let new = dips_at.iter().filter(|d| **d >= f64::from(second) && **d < f64::from(second + 1)).count() as u16;
+            count += new;
+            let mut n = [0u16; 8];
+            n[0] = count;
+            let latched = u16::from(new > 0);
+            let w = words(0, latched, n, (if new > 0 { 11_050 } else { 14_180 }, 14_200), NONE, NONE, 0);
+            alerts.extend(observe(&mut t, &w, i64::from(second) * 1_000));
+        }
+        assert!((4..=6).contains(&alerts.len()), "{alerts:#?}");
+        assert!(alerts.iter().all(|a| a.starts_with("DAQ supply dropped to 11.1 V")));
+        assert!(alerts.iter().any(|a| a.contains("dips in 60 s") && !a.contains("(1 dip")), "{alerts:#?}");
+    }
+
+    /// A version-3 report: the v2 words of `words(..)` plus words 18-26.
+    fn v3w(active: u16, latched: u16, now: u16, over_latched: u16, low: u16, counts: [u16; 10], vdda: (u16, u16)) -> Vec<u32> {
+        let mut w = words(0, 0, [0; 8], HEALTHY, NONE, NONE, 0);
+        w[0] = 3;
+        w[1] = u32::from(active) | (u32::from(latched) << 16);
+        w.extend([0x8000_FFFF; 4]);
+        w.extend([0xFFFF_FFFF, 0, 0, 0]);
+        w.push(u32::from(now) | (u32::from(over_latched) << 16));
+        w.push(u32::from(low));
+        for pair in counts.chunks(2) {
+            w.push(u32::from(pair[0]) | (u32::from(pair[1]) << 16));
+        }
+        w.push(u32::from(vdda.0) | (u32::from(vdda.1) << 16));
+        w.push(0);
+        w.push(2_200 | (1 << 16));
+        assert_eq!(w.len(), WORDS);
+        w
+    }
+    const OK_VDDA: (u16, u16) = (3_302, 3_300);
+
+    #[test]
+    fn decode_reads_version_3_over_range_counters_and_vdda() {
+        let mut counts = [0u16; 10];
+        counts[0] = 812;
+        counts[9] = 0xFFFF;
+        let mut w = v3w(0x301, 0x300, 0x201, 0x241, 0x200, counts, (3_512, 3_470));
+        w[26] = 2 | (5 << 16);
+        let r = decode(&w);
+        assert_eq!(r.version, 3);
+        assert_eq!((r.active, r.latched), (0x301, 0x300), "fault bits 8 and 9 are kept");
+        assert_eq!((r.episodes[8], r.episodes[9]), (2, 5));
+        let v3 = r.v3.clone().unwrap();
+        assert_eq!((v3.over_now, v3.over_latched, v3.over_low), (0x201, 0x241, 0x200));
+        assert_eq!(v3.over_counts, counts);
+        assert_eq!((v3.vdda_max_mv, v3.vdda_mv), (Some(3_512), Some(3_470)));
+        assert!(r.v2.is_some(), "words 0-17 are exactly v2");
+        let status = r.status(0, true);
+        assert_eq!(status.vdda_v, Some(Volts(3.47)));
+        assert_eq!(status.vdda_max_v, Some(Volts(3.512)));
+        let keys: Vec<_> = status.faults.iter().map(|f| f.key.as_str()).collect();
+        assert!(keys.contains(&"vdda_high") && keys.contains(&"vdda_low"));
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["vdda_v"].as_f64().map(|v| (v * 1000.0).round()), Some(3470.0));
+        assert!(json["adc_channels"].as_array().unwrap().is_empty());
+        // No reading.
+        let r = decode(&v3w(0, 0, 0, 0, 0, [0; 10], (NO_MV, NO_MV)));
+        assert_eq!(r.status(0, true).vdda_v, None);
+        // v1 and v2 carry no over-range information and no VDDA faults.
+        let v2 = &w[..WORDS_V2];
+        let mut v2 = v2.to_vec();
+        v2[0] = 2;
+        v2[1] = 0x01 | (0x01 << 16);
+        let r = decode(&v2);
+        assert!(r.v3.is_none() && r.over_range_bits() == 0);
+        assert!(r.status(0, true).faults.iter().all(|f| !f.key.starts_with("vdda")));
+        assert!(decode(&words(0, 0, [0; 8], HEALTHY, NONE, NONE, 0)).v3.is_none());
+        assert!(Report::decode(&w[..WORDS_V2]).is_none(), "version 3 must carry 28 words");
+        let mut v2_high = v2.clone();
+        v2_high[1] = 0x100 | (0x100 << 16);
+        assert_eq!(decode(&v2_high).active, 0, "bits above 7 mean nothing before version 3");
+    }
+
+    #[test]
+    fn over_range_counters_accumulate_across_wrap_and_reboot() {
+        let mut t = AlertTracker::default();
+        let mut counts = [0u16; 10];
+        counts[0] = 65_000;
+        t.observe(&decode(&v3w(0, 0, 1, 1, 0, counts, OK_VDDA)), 0, true, |_| true);
+        counts[0] = 500; // wrapped: 65536 - 65000 + 500 new conversions
+        t.observe(&decode(&v3w(0, 0, 1, 1, 0, counts, OK_VDDA)), 1_000, true, |_| true);
+        let ch = t.adc_channels(1_000);
+        assert_eq!(ch.len(), 1);
+        assert_eq!(ch[0].key, "kg1000");
+        assert_eq!(ch[0].label, "KG1000 (CH0)");
+        assert_eq!(ch[0].count_total, 65_000 + 1_036);
+        assert_eq!(ch[0].count_recent, 65_000 + 1_036);
+        assert_eq!(ch[0].first_over_range_ms, Some(0));
+        assert!(ch[0].over_range_now && ch[0].latched && !ch[0].low);
+        // A DAQ reboot (fault episode counters back to 0): counts since boot are new.
+        let mut w = v3w(0, 0, 0, 0, 0, counts, OK_VDDA);
+        let mut eps = w.clone();
+        eps[2] = 7;
+        t.observe(&decode(&eps), 2_000, true, |_| true);
+        w[20] = 30;
+        t.observe(&decode(&w), 3_000, true, |_| true);
+        let ch = t.adc_channels(3_000);
+        assert_eq!(ch[0].count_total, 66_036 + 30);
+        assert!(!ch[0].over_range_now && ch[0].first_over_range_ms.is_none());
+        assert_eq!(ch[0].last_over_range_ms, Some(3_000));
+        // The recent count covers 60 s; the list keeps it 10 minutes.
+        assert_eq!(t.adc_channels(64_000)[0].count_recent, 0);
+        assert_eq!(t.adc_channels(64_000)[0].count_total, 66_066);
+        assert!(t.adc_channels(3_000 + ADC_LIST_WINDOW_MS).is_empty());
+    }
+
+    #[test]
+    fn over_range_warns_once_per_episode_with_holdoff() {
+        let mut t = AlertTracker::default();
+        let quiet = v3w(0, 0, 0, 0, 0, [0; 10], OK_VDDA);
+        assert!(t.observe(&decode(&quiet), 0, true, |_| true).is_empty());
+        let mut counts = [0u16; 10];
+        counts[0] = 812;
+        let alerts = t.observe(&decode(&v3w(0, 0, 1, 1, 0, counts, OK_VDDA)), 1_000, true, |_| true);
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
+        assert!(!alerts[0].critical);
+        assert_eq!(
+            alerts[0].text,
+            "DAQ ADC over range: KG1000 (CH0) for 1.0 s (above +full scale, 812 conversions) — its value is shown as OVR, not a number, until it returns to range."
+        );
+        // Still over range: no repeat.
+        for at in (2_000..20_000).step_by(1_000) {
+            counts[0] += 1000;
+            assert!(t.observe(&decode(&v3w(0, 0, 1, 1, 0, counts, OK_VDDA)), at, true, |_| true).is_empty());
+        }
+        // Clears, comes back inside the holdoff: no alert; after it: alert.
+        assert!(t.observe(&decode(&v3w(0, 0, 0, 0, 0, counts, OK_VDDA)), 20_000, true, |_| true).is_empty());
+        assert!(t.adc_channels(20_000)[0].first_over_range_ms.is_none(), "cleared");
+        counts[0] += 5;
+        assert!(t.observe(&decode(&v3w(0, 0, 1, 1, 1, counts, OK_VDDA)), 25_000, true, |_| true).is_empty());
+        assert!(t.observe(&decode(&v3w(0, 0, 0, 0, 0, counts, OK_VDDA)), 26_000, true, |_| true).is_empty());
+        counts[0] += 3;
+        let alerts = t.observe(&decode(&v3w(0, 0, 0, 1, 0, counts, OK_VDDA)), 60_000, true, |_| true);
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].starts_with("DAQ ADC over range: KG1000 (CH0) briefly"), "{}", alerts[0].text);
+        // Below -full scale.
+        let alerts = t.observe(&decode(&v3w(0, 0, 1 << 1, 1 << 1, 1 << 1, counts, OK_VDDA)), 61_000, true, |_| true);
+        assert!(alerts[0].contains("KG50 AMP2 (CH1)") && alerts[0].contains("below \u{2212}full scale"), "{}", alerts[0].text);
+    }
+
+    #[test]
+    fn chamber_over_range_in_the_burn_is_critical() {
+        let chamber = 1u16 << CHAMBER_BIT;
+        let report = decode(&v3w(0, 0, chamber, chamber, 0, [0; 10], OK_VDDA));
+        let ctx = |in_burn, installed| Context { chamber_pt_installed: installed, in_burn, ..Context::default() };
+        let alerts = AlertTracker::default().observe_in(&report, 0, ctx(true, true), |_| true);
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].critical);
+        assert!(alerts[0].contains("Chamber PT (CH6)") && alerts[0].contains("overpressure or sensor fault"), "{}", alerts[0].text);
+        // Outside the burn (or with no PT installed): a warning.
+        let alerts = AlertTracker::default().observe_in(&report, 0, ctx(false, true), |_| true);
+        assert!(!alerts[0].critical);
+        let alerts = AlertTracker::default().observe_in(&report, 0, ctx(true, false), |_| true);
+        assert!(!alerts[0].critical);
+        // The burn window around T0.
+        assert!(in_burn_window(Some(10_000), 9_000) && in_burn_window(Some(10_000), 30_000));
+        assert!(!in_burn_window(Some(10_000), 8_999) && !in_burn_window(Some(10_000), 30_001));
+        assert!(!in_burn_window(None, 0));
+    }
+
+    #[test]
+    fn vdda_high_names_the_correlated_channel_and_escalates_above_3v6() {
+        let high = Fault::VddaHigh.bit();
+        let mut t = AlertTracker::default();
+        t.observe(&decode(&v3w(0, 0, 0, 0, 0, [0; 10], OK_VDDA)), 0, true, |_| true);
+        let mut counts = [0u16; 10];
+        counts[0] = 40;
+        let alerts = t.observe(&decode(&v3w(high, high, 1, 1, 0, counts, (3_480, 3_470))), 1_000, true, |_| true);
+        let vdda: Vec<_> = alerts.iter().filter(|a| a.contains("+3V3A")).collect();
+        assert_eq!(vdda.len(), 1, "{alerts:?}");
+        assert!(!vdda[0].critical);
+        assert_eq!(
+            vdda[0].text,
+            "DAQ +3V3A high (3.48 V): likely clamp injection from a saturated analog front end (KG1000 over range) — now KG1000 (CH0) over range."
+        );
+        // Rising past 3.6 V in the same episode: one critical alert.
+        let alerts = t.observe(&decode(&v3w(high, high, 1, 1, 0, counts, (3_650, 3_610))), 2_000, true, |_| true);
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
+        assert!(alerts[0].critical);
+        assert!(alerts[0].contains("3.65 V") && alerts[0].contains("exceeds the 3.6 V operating limit; hardware stress risk"));
+        assert!(t.observe(&decode(&v3w(high, high, 1, 1, 0, counts, (3_650, 3_610))), 3_000, true, |_| true).is_empty());
+        // With no channel over range the text says so.
+        let r = decode(&v3w(high, high, 0, 0, 0, [0; 10], (3_460, 3_455)));
+        assert!(r.alert_text(Fault::VddaHigh, false, 0).contains("no ADC channel over range"));
+        let low = decode(&v3w(Fault::VddaLow.bit(), Fault::VddaLow.bit(), 0, 0, 0, [0; 10], (3_120, 3_100)));
+        let alerts = AlertTracker::default().observe(&low, 0, true, |_| true);
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].starts_with("DAQ +3V3A low (3.10 V)"), "{}", alerts[0].text);
+    }
+
+    #[test]
+    fn word_27_reference_decodes_and_a_lasting_mismatch_warns_once() {
+        let mut w = v3w(0, 0, 0, 0, 0, [0; 10], OK_VDDA);
+        let r = decode(&w);
+        assert_eq!(r.v3.as_ref().map(|v| (v.mcp_vref_mv, v.mcp_vref_source)), Some((2_200, VrefSource::Station)));
+        let status = r.status(0, true);
+        assert_eq!(status.mcp_vref_v, Some(Volts(2.2)));
+        assert_eq!(status.mcp_vref_source.as_deref(), Some("station"));
+        w[27] = 2_400 | (1 << 17);
+        assert_eq!(decode(&w).status(0, true).mcp_vref_source.as_deref(), Some("flash"));
+        w[27] = 2_400;
+        assert_eq!(decode(&w).status(0, true).mcp_vref_source.as_deref(), Some("default"));
+        // DAQ still on the nominal 2.4 V, station set to 2.2 V.
+        let ctx = Context { station_mcp_vref_mv: Some(2_200), ..Context::default() };
+        let mut t = AlertTracker::default();
+        let report = decode(&w);
+        for at in (0..10_000).step_by(1_000) {
+            assert!(t.observe_in(&report, at, ctx, |_| true).is_empty(), "not yet 10 s at {at}");
+        }
+        let alerts = t.observe_in(&report, 10_000, ctx, |_| true);
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].starts_with("DAQ MCP3564R reference is 2.400 V (compiled nominal) but the station setting is 2.200 V"), "{}", alerts[0].text);
+        assert!(t.observe_in(&report, 60_000, ctx, |_| true).is_empty(), "once per mismatch");
+        // Within 5 mV: fine.
+        w[27] = 2_204 | (1 << 16);
+        assert!(t.observe_in(&decode(&w), 70_000, ctx, |_| true).is_empty());
+        assert!(t.observe_in(&decode(&w), 90_000, ctx, |_| true).is_empty());
+    }
+
+    #[test]
+    fn supply_low_text_notes_the_vdda_corrected_vmain_when_vdda_is_high() {
+        let mut w = v3w(0x101, 0x101, 1, 1, 0, [0; 10], (3_500, 3_480));
+        w[6] = 11_060 | (11_100 << 16);
+        let text = decode(&w).alert_text(Fault::SupplyLow, false, 1);
+        assert!(text.contains("VMAIN reading is now VDDA-corrected") && text.contains("VDDA measurement artifact"), "{text}");
+        w[1] = 1 | (1 << 16);
+        assert!(!decode(&w).alert_text(Fault::SupplyLow, false, 1).contains("VDDA"));
+    }
+}

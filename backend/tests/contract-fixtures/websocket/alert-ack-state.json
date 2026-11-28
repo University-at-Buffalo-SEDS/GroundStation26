@@ -1,0 +1,8 @@
+{
+  "data": {
+    "error_ack_timestamp_ms": 1767225602000,
+    "history_cleared_through_ms": 1767225600000,
+    "warning_ack_timestamp_ms": 1767225601000
+  },
+  "ty": "AlertAckState"
+}

@@ -1,0 +1,202 @@
+format: hybrid_sim_fixed_motor_replay_preset_v1
+name: Current-single-port-motor-baseline
+case_snapshot_si:
+  name: Current single-port motor baseline
+  status: provisional
+  environment:
+    ambient_pressure_pa: 101325.35318040226
+    ambient_temperature_k: 293.15
+    gravity_m_s2: 9.80665
+  constraints:
+    max_thrust_n: 8006.798907468899
+    target_oxidizer_mass_kg: 8.0
+    max_oxidizer_mass_kg: 10.0
+    nominal_max_chamber_pressure_pa: 5515805.834534691
+    vehicle_outer_diameter_m: 0.15239999999999998
+    max_grain_outer_diameter_m: 0.127
+    max_grain_length_m: 0.3302
+  tank:
+    straight_inner_diameter_m: 0.14604999999999999
+    straight_length_m: 0.9175749999999999
+    closure_volume_m3: 0.00046893222342399987
+    initial_oxidizer_mass_kg: 8.0
+    initial_temperature_k: 293.15
+    initial_pressure_pa: null
+    wall_mass_kg: null
+    wall_specific_heat_j_kg_k: null
+    heat_transfer_coefficient_w_m2_k: null
+  feed:
+    valve:
+      effective_area_m2: 0.000506707479099144
+      discharge_coefficient: null
+      opening_time_s: null
+      closing_pressure_pa: 758423.30224852
+    injector:
+      hole_count: 127
+      hole_diameter_m: 0.001016
+      plate_thickness_m: 0.00635
+      discharge_coefficient: null
+      model: calibrated_orifice
+    prechamber_length_m: 0.08128
+    prechamber_diameter_m: 0.08473439999999999
+    postchamber_length_m: 0.16800829999999997
+    vapor_tail:
+      model: hem
+      equivalent_cd_area_m2: 6.38084014152e-05
+      source: 'Explicit uncalibrated screening prior: liquid restrictions in series
+        with Cd_valve=0.70 and Cd_injector=0.63. Replace with a vapor-tail cold-flow
+        fit.'
+      minimum_tank_mass_kg: 0.0001
+  grain:
+    geometry: circular_port
+    length_m: 0.3302
+    initial_port_diameter_m: 0.0508
+    outer_diameter_m: 0.0849884
+    paraffin_density_kg_m3: 900.0
+    initial_paraffin_mass_kg: 0.9185698997680249
+    abs_matrix_mass_kg: 0.18828841998026977
+    inventory_basis: matrix_geometry
+    regression:
+      law: power_flux
+      coefficient: null
+      flux_exponent: null
+      axial_exponent: 0.0
+  chamber:
+    inner_diameter_m: 0.08889999999999999
+    liner_thickness_m: 0.0019049999999999998
+    initial_pressure_pa: 101325.35318040226
+    combustion_efficiency: null
+    characteristic_velocity_efficiency: null
+  nozzle:
+    material: graphite
+    inlet_diameter_m: 0.07962899999999999
+    throat_diameter_m: 0.041909999999999996
+    throat_length_m: 0.00508
+    exit_diameter_m: 0.075946
+    converging_half_angle_rad: 0.7853981633974483
+    diverging_half_angle_rad: 0.22689280275926285
+    throat_erosion_model: none
+  thermochemistry:
+    provider: nasa_cea_local
+    fuel_name: paraffin_surrogate
+    fuel_carbon_atoms: 25.0
+    fuel_hydrogen_atoms: 52.0
+    fuel_heat_of_formation_cal_mol: -163540.0
+    oxidizer_name: N2O
+  simulation:
+    mode: quasi_steady_transient
+    maximum_time_s: 20.0
+    output_step_s: 0.01
+    relative_tolerance: 1.0e-06
+    absolute_tolerance: 1.0e-08
+    nonequilibrium_tank:
+      solver_method: BDF
+      maximum_internal_step_s: null
+      wall_liquid_heat_transfer_coefficient_w_m2_k: null
+      wall_vapor_heat_transfer_coefficient_w_m2_k: null
+      interface_liquid_heat_transfer_coefficient_w_m2_k: null
+      interface_vapor_heat_transfer_coefficient_w_m2_k: null
+      ambient_heat_transfer_coefficient_w_m2_k: 0.0
+      total_internal_wall_area_m2: null
+      external_wall_area_m2: null
+      interface_area_m2: null
+      minimum_phase_mass_kg: 1.0e-05
+      source: null
+  ignition:
+    model: disabled
+    valve_command_time_s: 0.0
+    lightoff_delay_s: 0.0
+    lightoff_ramp_time_s: 0.0
+    puck_outer_diameter_m: 0.08534399999999999
+    puck_inner_diameter_m: 0.0508
+    puck_thickness_m: 0.00635
+    puck_mass_kg: null
+    source: User-reported RNX-71V annular puck geometry; mass and lightoff trace are
+      unmeasured.
+nozzle_candidate_si:
+  throat_diameter_m: 0.041656
+  expansion_ratio: 3.25
+  diverging_half_angle_rad: 0.22689280275926285
+  converging_half_angle_rad: 0.7853981633974483
+  throat_length_m: 0.00508
+  fuel_geometry_key: null
+calibration_si:
+  valve_discharge_coefficient: 0.7
+  injector_discharge_coefficient: 0.63
+  regression_coefficient_si: 3.04e-05
+  regression_flux_exponent: 0.681
+  characteristic_velocity_efficiency: 0.8
+  nozzle_efficiency: 1.0
+simulation_options_si:
+  maximum_time_s: 20.0
+  time_step_s: 0.01
+  pressure_scan_points: 96
+  root_relative_tolerance: 1.0e-06
+  maximum_control_fraction_increment: 0.02
+  absolute_tolerance: 1.0e-08
+nozzle_constraints_si:
+  max_exit_diameter_m: 0.075946
+  max_internal_length_m: 0.1016
+  min_contraction_ratio: 2.0
+  max_peak_chamber_pressure_pa: 5515805.834534691
+  max_peak_thrust_n: 8006.798907468899
+  max_oxidizer_flux_kg_m2_s: null
+  min_burn_duration_s: null
+  max_burn_duration_s: null
+  min_of_ratio: null
+  max_of_ratio: null
+n2o_cea_enthalpy_reference_si:
+  coolprop_reference_specific_enthalpy_j_kg: 468564.4615666685
+  cea_gas_formation_enthalpy_j_mol: 81600.0
+  molecular_mass_kg_mol: 0.0440128
+cea_surface:
+  member: artifacts/cea_surface.npz
+  sha256: 3468ce637523dcc4de86fcd3bef586d965555dc7b57c318a4b16f7a3d551e8d1
+  size_bytes: 13515636
+  source_name: liquid_n2o_cea_multi_ee33ceb8d1aa61c391a5.npz
+grain_recipe:
+  kind: shielding_aware_literal_v1
+  base_geometry:
+    kind: circular_port_v1
+    length_m: 0.3302
+    initial_port_radius_m: 0.0254
+    outer_radius_m: 0.0424942
+    fuel_density_kg_m3: 900.0
+  paraffin_density_kg_m3: 900.0
+  abs_density_kg_m3: 1020.0
+  axial_mapping_mode: repeat
+  angular_samples: 720
+  radial_bin_width_m: 0.0003458840000000001
+  initial_port_boundary_mode: literal_inner_wall
+  runtime_identity_sha256: f71b59037e2f298136065a02e566da366ac6ee80ca8d6a24a32321b64f0f2c71
+abs_regression_si:
+  coefficient_si: 1.17870168746e-05
+  flux_exponent: 0.799
+  axial_exponent: 0.0
+  reference_length_m: 1.0
+literal_replay:
+  source_name: gyroid fuel matrix.gcode.3mf
+  axial_mapping_mode: repeat
+  common_profile_bin_width_m: 0.00035
+  common_subcell_samples: 2
+  raw_source:
+    member: artifacts/literal_source.bin
+    sha256: 90235bbdbffedbb876b2b26c6ab29a5c754f07ca8123ad5ccc2b59cd4d26c08d
+    size_bytes: 1450973
+    source_name: gyroid fuel matrix.gcode.3mf
+  material_field:
+    member: artifacts/literal_material_field.npz
+    sha256: 6d21522c2dfc963bd6e8d7cd5f34d234d2a8f036107daca8036360902e005724
+    size_bytes: 868990
+    source_name: literal_material_field.npz
+  material_field_source_sha256: 90235bbdbffedbb876b2b26c6ab29a5c754f07ca8123ad5ccc2b59cd4d26c08d
+  material_field_format: hybrid-sim-packed-material-field-v5
+provenance:
+  source: confirmed_optimizer_finalist
+  evidence: full-resolution feasible
+packaging:
+  nasa_cea_executable_included: false
+  nasa_cea_libraries_included: false
+  case_source_path_included: false
+  external_lightoff_schedule_supported: false
+fingerprint_sha256: 19dab2f331853ce2d3cded66463a852674cc3be4342983bdb9d5cba02a079a9b

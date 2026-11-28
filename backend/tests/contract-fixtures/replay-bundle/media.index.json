@@ -1,0 +1,91 @@
+{
+  "clips": [
+    {
+      "bytes": 1100,
+      "end_ms": 1767225600000,
+      "file": "2025-12-31_17-59-00-000000.mp4",
+      "kind": "video",
+      "media_type": "video/mp4",
+      "path": "media/video/pad/2025-12-31_17-59-00-000000.mp4",
+      "start_ms": 1767225540000,
+      "stream": "pad",
+      "timing": "name_local_time_and_last_write"
+    },
+    {
+      "bytes": 1000,
+      "end_ms": 1767225660000,
+      "file": "2025-12-31_18-00-00-000000.mp4",
+      "kind": "video",
+      "media_type": "video/mp4",
+      "path": "media/video/pad/2025-12-31_18-00-00-000000.mp4",
+      "start_ms": 1767225600000,
+      "stream": "pad",
+      "timing": "name_local_time_and_last_write"
+    },
+    {
+      "bytes": 6444,
+      "end_ms": 1767225630200,
+      "file": "1767225630000-7.wav",
+      "kind": "voice",
+      "media_type": "audio/wav",
+      "path": "media/voice/crew/1767225630000-7.wav",
+      "start_ms": 1767225630000,
+      "stream": "crew",
+      "timing": "name_unix_ms_and_length"
+    },
+    {
+      "bytes": 1100,
+      "end_ms": 1767225720000,
+      "file": "2025-12-31_18-01-00-000000.mp4",
+      "kind": "video",
+      "media_type": "video/mp4",
+      "path": "media/video/pad/2025-12-31_18-01-00-000000.mp4",
+      "start_ms": 1767225660000,
+      "stream": "pad",
+      "timing": "name_local_time_and_last_write"
+    },
+    {
+      "bytes": 1200,
+      "end_ms": 1767225780000,
+      "file": "2025-12-31_18-02-00-000000.mp4",
+      "kind": "video",
+      "media_type": "video/mp4",
+      "path": "media/video/pad/2025-12-31_18-02-00-000000.mp4",
+      "start_ms": 1767225720000,
+      "stream": "pad",
+      "timing": "name_local_time_and_last_write"
+    },
+    {
+      "bytes": 1300,
+      "end_ms": 1767225840000,
+      "file": "2025-12-31_18-03-00-000000.mp4",
+      "kind": "video",
+      "media_type": "video/mp4",
+      "path": "media/video/pad/2025-12-31_18-03-00-000000.mp4",
+      "start_ms": 1767225780000,
+      "stream": "pad",
+      "timing": "name_local_time_and_last_write"
+    }
+  ],
+  "version": 1,
+  "video": {
+    "budget_bytes": 33554432,
+    "bytes": 5700,
+    "candidates": 5,
+    "complete": true,
+    "included": 5,
+    "recorded": true,
+    "requested": true,
+    "skipped": []
+  },
+  "voice": {
+    "budget_bytes": 8388608,
+    "bytes": 6444,
+    "candidates": 1,
+    "complete": true,
+    "included": 1,
+    "recorded": true,
+    "requested": true,
+    "skipped": []
+  }
+}

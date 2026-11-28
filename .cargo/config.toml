@@ -5,3 +5,11 @@ RELIABLE_RETRANSMIT_MS = "100"
 IPHONEOS_DEPLOYMENT_TARGET = "13.0"
 CARGO_TARGET_AARCH64_APPLE_IOS_DEPLOYMENT_TARGET = "13.0"
 CARGO_TARGET_AARCH64_APPLE_IOS_SIM_DEPLOYMENT_TARGET = "13.0"
+
+# Raspberry Pi station builds: link with lld, much faster than the default
+# GNU ld on this binary and with the same generated code (the release profile
+# is unchanged). The explicit target also lets a cross build from another host
+# use the same settings. Install with `sudo apt install clang lld`.
+[target.aarch64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=--target=aarch64-unknown-linux-gnu"]

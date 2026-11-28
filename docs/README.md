@@ -16,6 +16,30 @@ independently.
 - [Model animations](backend/model-animations.md): single-stage default and backend
   binding configuration; custom multi-stage profiles remain supported.
 - [GSE sequences](backend/gse-sequences.md): grouped control and equipment scene.
+- [Per-account client settings](backend/client-settings.md): watch companion preferences
+  synced to the signed-in account.
+- [Watch direct link](backend/watch-direct.md): watch tokens, the compact watch status and
+  watch-eligible page actions.
+- [Vehicle geometry](vehicle-geometry.md): the airframe the dashboard draws, generated
+  from the station's OpenRocket design and served at `GET /api/vehicle/geometry`.
+- [Live diagrams](live-diagrams.md): one declarative view per station mode (flight,
+  test fire, ground test) plus the network overview, the mode mapping, full screen,
+  the valve/flow rules and the programme scenes.
+- [Stream manager](media/stream-manager.md): studio layouts, scenes and sources (cameras,
+  live diagrams, telemetry views, overlays), cut/fade takes and the programme page.
+- [Raw stream feed](backend/raw-stream-feed.md): read-only WebSocket/NDJSON feed of every
+  telemetry stream for overlays and external scripts; stream viewer tokens.
+- [Replay bundles](backend/replay-bundle.md): `.gsreplay` export of one recording for replay with no station.
+- [Flight plans and loss-of-signal prediction](flight-plans.md): manual flight/burn simulations kept
+  as predicted flights, and the drift prediction that guides recovery when the rocket goes quiet.
+- [Frontend contract fixtures](backend/contract-fixtures.md): real replies the UI decodes;
+  how to regenerate and run them.
+- [Station mode switch](backend/station-modes.md): switch build and simulation
+  from the UI by a controlled restart, on the primary and the RRLS.
+- [Always-on recording](backend/rolling-recording.md): the rolling ring, protected
+  event captures, disk policy and the recordings API.
+- [Station power](backend/host-power.md): admin power off / reboot and the one-time
+  host helper setup.
 
 - `docs/frontend/api.md`
   Frontend-facing API contract, endpoint details, websocket message shapes, bootstrap flow, and backend expectations.
@@ -39,6 +63,8 @@ independently.
 5. Use `docs/backend/i2c.md` when changing the Linux-to-Pico I2C transport.
 
 - [Application administration](application-administration.md): account roles, permissions and session revocation.
+- [Personnel proximity lock](proximity-lock.md): opt-in lock on arming and filling while people are near the rocket; on-device geofencing, stale policy, override, RRLS.
+- [Recovery search coverage](backend/recovery-search.md): opt-in searcher tracks, swath coverage of the predicted landing area, uncovered spots.
 - [Optional RRLS radio voice](rrls-radio-voice.md): opt-in push-to-talk and radio budget.
 - [Pico-Fi over Ethernet](picofi-ethernet.md): TCP client/server setup.
 

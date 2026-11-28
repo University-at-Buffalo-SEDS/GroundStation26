@@ -36,6 +36,7 @@
     },
     {
       "username": "rylan",
+      "roles": ["admin"],
       "password": {
         "algorithm": "pbkdf2_sha256",
         "iterations": 120000,
