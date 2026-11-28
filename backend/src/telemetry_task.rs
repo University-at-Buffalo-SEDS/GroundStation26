@@ -123,6 +123,23 @@ pub(crate) fn launch_goes_to_flight_computer() -> bool {
     !crate::runtime_mode::is_test_fire()
 }
 
+/// One operator FC command (Deploy/Expand, sensor re-inits, Kalman). An
+/// operator press is held, not queued, while an earlier FC command could drop
+/// it (Deploy/Expand).
+fn send_operator_flight_command(state: &Arc<AppState>, router: &Arc<Router>, cmd: &TelemetryCommand, operator_claim: bool) {
+    let Some(cmd_id) = hitl_flight_command_id(cmd) else { return };
+    let result = if operator_claim {
+        crate::operator_command_resend::submit_operator_flight_command(state, router, cmd_id)
+    } else {
+        queue_locally_routed_flight_command(state, router, "FC operator command", &[cmd_id])
+            .map(|()| flush_command_tx(router, "FC operator command tx"))
+    };
+    if let Err(e) = result {
+        log_telemetry_error("failed to log FC operator command", e);
+    }
+    gs_debug_println!("FC operator command sent: {:?} ({cmd_id})", cmd);
+}
+
 pub(crate) fn hitl_flight_command_id(cmd: &TelemetryCommand) -> Option<u8> {
     Some(match cmd {
         TelemetryCommand::DeployParachute => FlightComputerCommands::DeployParachute as u8,
@@ -130,6 +147,9 @@ pub(crate) fn hitl_flight_command_id(cmd: &TelemetryCommand) -> Option<u8> {
         TelemetryCommand::ReinitSensors => FlightComputerCommands::ReinitSensors as u8,
         TelemetryCommand::ReinitBarometer => FlightComputerCommands::ReinitBarometer as u8,
         TelemetryCommand::ReinitIMU => FlightComputerCommands::ReinitIMU as u8,
+        TelemetryCommand::KalmanStop => FlightComputerCommands::KalmanStop as u8,
+        TelemetryCommand::KalmanReset => FlightComputerCommands::KalmanReset as u8,
+        TelemetryCommand::KalmanStart => FlightComputerCommands::KalmanStart as u8,
         TelemetryCommand::DisableIMU => FlightComputerCommands::DisableIMU as u8,
         TelemetryCommand::Postinit => FlightComputerCommands::Postinit as u8,
         TelemetryCommand::AdvanceFlightState => FlightComputerCommands::AdvanceFlightState as u8,
@@ -1746,24 +1766,22 @@ pub async fn telemetry_task(
                         }
                         TelemetryCommand::DeployParachute
                         | TelemetryCommand::ExpandParachute
-                        | TelemetryCommand::ReinitSensors
+                        | TelemetryCommand::KalmanStart if crate::runtime_mode::is_hitl() => {
+                            send_operator_flight_command(&state, &router, &cmd, _operator_claim.is_some());
+                        }
+                        // Sensor re-inits and Kalman stop/reset: every mode with an FC.
+                        TelemetryCommand::ReinitSensors
                         | TelemetryCommand::ReinitBarometer
                         | TelemetryCommand::ReinitIMU
-                        | TelemetryCommand::DisableIMU if crate::runtime_mode::is_hitl() => {
-                            if let Some(cmd_id) = hitl_flight_command_id(&cmd) {
-                                // An operator press is held, not queued, while an
-                                // earlier FC command could drop it (Deploy/Expand).
-                                let result = if _operator_claim.is_some() {
-                                    crate::operator_command_resend::submit_operator_flight_command(&state, &router, cmd_id)
-                                } else {
-                                    queue_locally_routed_flight_command(&state, &router, "HITL flight command", &[cmd_id])
-                                        .map(|()| flush_command_tx(&router, "HITL flight command tx"))
-                                };
-                                if let Err(e) = result {
-                                    log_telemetry_error("failed to log HITL flight command", e);
-                                }
-                                gs_debug_println!("HITL flight command sent: {:?} ({cmd_id})", cmd);
+                        | TelemetryCommand::DisableIMU
+                        | TelemetryCommand::KalmanStop
+                        | TelemetryCommand::KalmanReset if !crate::runtime_mode::is_test_fire() => {
+                            // The station Launch may have been sent since the press.
+                            if let Some(reason) = crate::fc_kalman::refusal(&state, &cmd) {
+                                emit_notification_warning(&state, format!("{}: {reason}", crate::sequences::command_name(&cmd)));
+                                continue;
                             }
+                            send_operator_flight_command(&state, &router, &cmd, _operator_claim.is_some());
                         }
                         TelemetryCommand::IgtDryRun | TelemetryCommand::IgtExit => {
                             match crate::igt::command_gate(&state, &cmd) {
@@ -4092,6 +4110,9 @@ mod tests {
         assert_eq!(FlightComputerCommands::RewindFlightState as u8, 22);
         assert_eq!(FlightComputerCommands::IgtEnter as u8, 29);
         assert_eq!(FlightComputerCommands::FcSdRetry as u8, 33);
+        assert_eq!(FlightComputerCommands::KalmanStop as u8, 34);
+        assert_eq!(FlightComputerCommands::KalmanReset as u8, 35);
+        assert_eq!(FlightComputerCommands::KalmanStart as u8, 36);
     }
 
     #[tokio::test]
@@ -4227,6 +4248,9 @@ mod tests {
                 TelemetryCommand::ReinitIMU,
                 FlightComputerCommands::ReinitIMU as u8,
             ),
+            (TelemetryCommand::KalmanStop, FlightComputerCommands::KalmanStop as u8),
+            (TelemetryCommand::KalmanReset, FlightComputerCommands::KalmanReset as u8),
+            (TelemetryCommand::KalmanStart, FlightComputerCommands::KalmanStart as u8),
             (
                 TelemetryCommand::DisableIMU,
                 FlightComputerCommands::DisableIMU as u8,
@@ -4301,6 +4325,9 @@ mod tests {
             FlightComputerCommands::AdvanceFlightState,
             FlightComputerCommands::RewindFlightState,
             FlightComputerCommands::FcSdRetry,
+            FlightComputerCommands::KalmanStop,
+            FlightComputerCommands::KalmanReset,
+            FlightComputerCommands::KalmanStart,
         ]
         .into_iter()
         .filter(|command| {
@@ -4309,6 +4336,7 @@ mod tests {
                     command,
                     FlightComputerCommands::AdvanceFlightState
                         | FlightComputerCommands::RewindFlightState
+                        | FlightComputerCommands::KalmanStart
                 )
         }) {
             let (db_tx, _db_rx) = mpsc::channel(8);

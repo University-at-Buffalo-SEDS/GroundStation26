@@ -48,7 +48,7 @@ const SAFING: &[&str] = &[
     "RetractPlumbing", "ResetSim", "ResetTClock", "ToggleAvBayUnderglow", "ToggleFlightBuzzer",
     "FcSdRetry", "RewindFlightState", "ResetFlightState", "ResetLaunchLatch", "DeployParachute",
     "ExpandParachute", "IgtExit", "IgtDryRun", "IgtEnter", "ReinitSensors", "ReinitBarometer",
-    "ReinitIMU", "DisableIMU",
+    "ReinitIMU", "DisableIMU", "KalmanStop", "KalmanReset",
     "ToggleButtonInterlock", "ToggleLaunchInterlock", "ToggleSupplyInterlock",
 ];
 
@@ -56,7 +56,7 @@ const SAFING: &[&str] = &[
 fn classes_cover_arming_fill_and_launch_and_never_safing() {
     let opening = |_: &str| true;
     let closing = |_: &str| false;
-    for name in ["Postinit", "AdvanceFlightState", "IgtLivePyro"] {
+    for name in ["Postinit", "AdvanceFlightState", "IgtLivePyro", "KalmanStart"] {
         assert_eq!(classify(name, opening), Some(ActionClass::Arming), "{name}");
     }
     for name in ["StartFill", "ContinueFillSequence", "NitrogenTest", "Turbocharge"] {

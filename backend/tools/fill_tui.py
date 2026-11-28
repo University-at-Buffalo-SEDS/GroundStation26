@@ -229,6 +229,8 @@ def build_command_groups(include_hitl: bool) -> list[tuple[str, list[CommandSpec
                             "FlightComputerCommands"),
                 CommandSpec("ReinitIMU", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 19, "FlightComputerCommands"),
                 CommandSpec("FcSdRetry", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 33, "FlightComputerCommands"),
+                CommandSpec("KalmanStop", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 34, "FlightComputerCommands"),
+                CommandSpec("KalmanReset", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 35, "FlightComputerCommands"),
                 CommandSpec("DisableIMU", FLIGHT_COMMAND_TYPE, FLIGHT_CONTROLLER_ENDPOINT, 20, "FlightComputerCommands"),
             ]
         )

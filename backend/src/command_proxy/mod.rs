@@ -2778,6 +2778,9 @@ pub(crate) fn command_catalog() -> &'static [&'static str] {
         "ToggleSupplyInterlock",
         "ToggleBoardStateProofInterlock",
         "ClearGseAbort",
+        "KalmanStop",
+        "KalmanReset",
+        "KalmanStart",
     ]
 }
 /// Proxy-only operations: catalog entries that are primary HTTP actions rather

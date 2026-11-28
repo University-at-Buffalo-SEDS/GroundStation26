@@ -109,6 +109,7 @@ mod los_predict;
 mod valve_report_health;
 mod mission_sync;
 mod fc_command_gate;
+mod fc_kalman;
 mod ab_command_gate;
 mod network_health;
 mod network_stamp;

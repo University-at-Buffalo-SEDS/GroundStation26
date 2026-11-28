@@ -1,7 +1,7 @@
 {
   "source": "FlightComputer26/Core/Inc/fcstructs.h",
-  "revision": "c2b93d7a89514aed90b37a3029bdd33f716ac1f4",
-  "source_sha256": "b1d26e85963cc140a1f95093af3eff75715fe2011f7184db56a1dcadbd242a68",
+  "revision": "4254271933ebfa81d994aedd50b68f89b933f8b9",
+  "source_sha256": "bbb88133059a833a9510e4c16c0d8607fec4e5d661b1d84459bc4a1cdd476f56",
   "global_states": [
     "Startup",
     "Idle",
@@ -54,6 +54,9 @@
     "Compat_IGT_Live_Pyro",
     "Compat_IGT_Dry_Run",
     "Compat_IGT_Exit",
-    "Compat_SD_Retry"
+    "Compat_SD_Retry",
+    "Compat_Kalman_Stop",
+    "Compat_Kalman_Reset",
+    "Compat_Kalman_Start"
   ]
 }

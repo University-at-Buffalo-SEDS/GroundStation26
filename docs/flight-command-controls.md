@@ -6,16 +6,49 @@ The station sends the FC one-byte commands on its compatibility protocol
 
 | Group | Control | Command | Wire byte | FC decree | Where |
 | --- | --- | --- | --- | --- | --- |
-| Sensors | Reinit Sensors | `ReinitSensors` | 17 | `Reinit_Sensors` | HITL layout; FC accepts in any flight state |
-| Sensors | Reinit Barometer | `ReinitBarometer` | 18 | `Reinit_Barometer` | HITL layout; any flight state |
-| Sensors | Reinit IMU | `ReinitIMU` (formerly `EnableIMU`) | 19 | `Reinit_IMU` | HITL layout; any flight state |
-| Sensors | Disable IMU | `DisableIMU` | 20 | `Disable_IMU` | HITL layout; any flight state |
+| Sensors | Reinit Sensors | `ReinitSensors` | 17 | `Reinit_Sensors` | every mode with an FC; FC accepts in any flight state |
+| Sensors | Reinit Barometer | `ReinitBarometer` | 18 | `Reinit_Barometer` | every mode with an FC; any flight state |
+| Sensors | Reinit IMU | `ReinitIMU` (formerly `EnableIMU`) | 19 | `Reinit_IMU` | every mode with an FC; any flight state |
+| Sensors | Disable IMU | `DisableIMU` | 20 | `Disable_IMU` | every mode with an FC; any flight state |
 | Recovery | Deploy drogue | `DeployParachute` | 12 | `Deploy_Parachute` | HITL layout; manual, any flight state (unchanged) |
 | Recovery | Deploy main (reef release) | `ExpandParachute` | 13 | `Expand_Parachute` | HITL layout; manual, any flight state (unchanged) |
+| Kalman filter | Kalman: stop | `KalmanStop` | 34 | `Kalman_Stop` | every mode with an FC; confirmed; refused after the station's Launch |
+| Kalman filter | Kalman: reset | `KalmanReset` | 35 | `Kalman_Reset` | every mode with an FC; confirmed; refused after the station's Launch |
+| Kalman filter | Kalman: start (HITL) | `KalmanStart` | 36 | `Kalman_Start` | HITL only |
 | Logging | Retry FC SD | `FcSdRetry` | 33 | `SD_Retry` | every mode with an FC (below) |
 | Flight state | State +1 / State -1 | `AdvanceFlightState` / `RewindFlightState` | 21 / 22 | `Advance_State` / `Rewind_State` | HITL only (test fire steps the station's own state) |
 | Ground test | Enter / LIVE PYRO / Dry-run / Exit | `IgtEnter` .. `IgtExit` | 29..32 | `IGT_*` | integrated ground test mode (and HITL with the replay); below |
 | Sequence | none (no button) | `Postinit`, `Launch` | 0, 1 | `Postinit_Signal`, `Launch_Signal` | sent by the station's launch sequence |
+
+Every mode with an FC (normal, testing, HITL, integrated ground test) gets
+the sensor, Kalman stop/reset and SD controls in its layout, added at load
+after the last Flight computer action when a layout lacks them; HITL also
+gets Kalman: start. The sensor commands keep the existing operator gates
+and authority.
+
+## Kalman filter commands
+
+For a false launch detection (the FC evaluating a flight while the vehicle
+is on the pad) and for HITL; FlightComputer26 `docs/kalman-commands.md` has
+the FC side. None of them resets anything to Startup or changes the
+station's state, fill or valves.
+
+- Kalman: stop: the FC stops an evaluation no station Launch started,
+  disarms its backup drogue timer and returns its own flight state to the
+  pad state; no automatic deployment can come from it. Manual Deploy and
+  Abort are unchanged.
+- Kalman: reset: the FC clears the stopped estimator's memory so the next
+  start begins from scratch; it refuses while the estimator runs.
+- Kalman: start (HITL only): the FC starts its estimator as an internal
+  Launch does.
+
+A real flight is never stoppable by accident: the station refuses Stop and
+Reset (`fc_kalman::refusal`, also in the action policy and at dispatch) once
+its own Launch was sent (a Launch attempt on the launch journal, the Launch
+latch, or a Launch sequence command in flight) until Reset all boards clears
+that, and the FC refuses both for a flight a station Launch admitted. Stop
+and Reset ask for confirmation (the layout's `confirm` text, served by the
+backend). The proximity lock treats Kalman: start like Postinit (arming).
 
 Reset all boards (board recovery op 3, `RESET_STARTUP_ANY`) returns the FC to
 Startup from any state. That reset also cancels the FC's evaluation (what the

@@ -45,6 +45,12 @@ pub enum TelemetryCommand {
     ReinitBarometer,
     ReinitIMU,
     DisableIMU,
+    /// Kalman: stop / reset (FC bytes 34/35), every mode with an FC; refused
+    /// once the station's Launch was sent (`fc_kalman`).
+    KalmanStop,
+    KalmanReset,
+    /// Kalman: start (FC byte 36), HITL only.
+    KalmanStart,
     AdvanceFlightState,
     RewindFlightState,
     StartFill,
@@ -131,14 +137,16 @@ const NORMAL_CLIENT_COMMANDS: &[&str] = &[
     "Postinit", "Launch", "Dump", "Abort", "NormallyOpen", "Pilot", "Igniter",
     "RetractPlumbing", "Nitrogen", "NitrogenClose", "Nitrous", "NitrousClose",
     "ResetSim", "ContinueFillSequence", "ToggleAvBayUnderglow", "ToggleFlightBuzzer",
-    "ResetTClock", "StartFill", "PauseFill", "CancelFill", "ValveSelfTest", "NitrogenTest",
+    "ResetTClock", "ReinitSensors", "ReinitBarometer", "ReinitIMU", "DisableIMU", "KalmanStop",
+    "KalmanReset", "StartFill", "PauseFill", "CancelFill", "ValveSelfTest", "NitrogenTest",
     "Turbocharge", "FcSdRetry",
 ];
 const IGT_CLIENT_COMMANDS: &[&str] = &[
     "Postinit", "Launch", "Dump", "Abort", "NormallyOpen", "Pilot", "Igniter",
     "RetractPlumbing", "Nitrogen", "NitrogenClose", "Nitrous", "NitrousClose",
     "ResetSim", "ContinueFillSequence", "ToggleAvBayUnderglow", "ToggleFlightBuzzer",
-    "ResetTClock", "StartFill", "PauseFill", "CancelFill", "ValveSelfTest", "NitrogenTest",
+    "ResetTClock", "ReinitSensors", "ReinitBarometer", "ReinitIMU", "DisableIMU", "KalmanStop",
+    "KalmanReset", "StartFill", "PauseFill", "CancelFill", "ValveSelfTest", "NitrogenTest",
     "Turbocharge", "IgtEnter", "IgtLivePyro", "IgtDryRun", "IgtExit", "FcSdRetry",
 ];
 const TEST_FIRE_CLIENT_COMMANDS: &[&str] = &[
@@ -157,8 +165,8 @@ const HITL_CLIENT_COMMANDS: &[&str] = &[
     "ToggleBoardStateProofInterlock", "TogglePhysicalLaunchMode", "ToggleAvBayUnderglow",
     "ToggleFlightBuzzer", "ResetLaunchLatch", "ResetFlightState", "ResetTClock",
     "DeployParachute", "ExpandParachute",
-    "ReinitSensors", "ReinitBarometer", "ReinitIMU", "DisableIMU",
-    "AdvanceFlightState", "RewindFlightState", "StartFill", "PauseFill", "CancelFill", "ValveSelfTest", "NitrogenTest", "Turbocharge",
+    "ReinitSensors", "ReinitBarometer", "ReinitIMU", "DisableIMU", "KalmanStop", "KalmanReset",
+    "KalmanStart", "AdvanceFlightState", "RewindFlightState", "StartFill", "PauseFill", "CancelFill", "ValveSelfTest", "NitrogenTest", "Turbocharge",
     "IgtEnter", "IgtLivePyro", "IgtDryRun", "IgtExit", "FcSdRetry",
 ];
 pub(crate) fn client_command_names(mode: crate::station_mode::Mode) -> &'static [&'static str] {
@@ -184,7 +192,13 @@ impl TelemetryCommand {
             | TelemetryCommand::IgtDryRun
             | TelemetryCommand::IgtExit => matches!(mode, Mode::IntegratedGroundTest | Mode::Hitl),
             // The FC is present in every mode but test fire.
-            TelemetryCommand::FcSdRetry => mode != Mode::TestFire,
+            TelemetryCommand::FcSdRetry
+            | TelemetryCommand::ReinitSensors
+            | TelemetryCommand::ReinitBarometer
+            | TelemetryCommand::ReinitIMU
+            | TelemetryCommand::DisableIMU
+            | TelemetryCommand::KalmanStop
+            | TelemetryCommand::KalmanReset => mode != Mode::TestFire,
             TelemetryCommand::OperatorPhase { .. }
             | TelemetryCommand::IgniterSequence
             | TelemetryCommand::ToggleButtonInterlock
@@ -199,10 +213,7 @@ impl TelemetryCommand {
             | TelemetryCommand::ResetFlightState
             | TelemetryCommand::DeployParachute
             | TelemetryCommand::ExpandParachute
-            | TelemetryCommand::ReinitSensors
-            | TelemetryCommand::ReinitBarometer
-            | TelemetryCommand::ReinitIMU
-            | TelemetryCommand::DisableIMU
+            | TelemetryCommand::KalmanStart
             => mode == Mode::Hitl,
             _ => true,
         }

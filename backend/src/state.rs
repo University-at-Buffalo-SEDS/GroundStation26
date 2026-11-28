@@ -2198,6 +2198,7 @@ impl AppState {
         if !crate::rrls::is_rrls() {
             crate::board_abort::block_policy(self, &mut local);
             crate::fc_command_gate::block_policy(self, &mut local);
+            crate::fc_kalman::block_policy(self, &mut local);
             crate::ignition_pair::project_fresh_proof(self, &mut local);
             crate::operator_phase::project(self,&mut local);
             crate::operator_phase::project_reset_flight_state(self, &mut local);
@@ -2503,6 +2504,10 @@ impl AppState {
     /// Applies the current software-action policy to decide whether a command can run.
     pub fn is_command_allowed(&self, cmd: &TelemetryCommand) -> bool {
         if crate::sequence_access::refusal(self, cmd).is_some() {
+            return false;
+        }
+        // Kalman stop/reset after a station Launch, Kalman start outside HITL.
+        if crate::fc_kalman::refusal(self, cmd).is_some() {
             return false;
         }
         // Ground test controls (integrated ground test, or HITL with the

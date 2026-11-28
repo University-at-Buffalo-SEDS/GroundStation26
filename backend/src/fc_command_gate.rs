@@ -29,9 +29,9 @@ const REASONS: [(u32, &str); 5] = [
 const WATCHDOG_INHIBIT: u32 = 16;
 /// Flight commands the FC refuses while it holds its sequence. Only Deploy and
 /// Expand pass that hold (FC control_thread.c fc_recovery_command_admissible).
-const HELD_COMMANDS: [&str; 9] = [
+const HELD_COMMANDS: [&str; 12] = [
     "Postinit", "Launch", "GroundStationLaunch", "ReinitSensors", "ReinitBarometer", "ReinitIMU",
-    "DisableIMU", "AdvanceFlightState", "RewindFlightState",
+    "DisableIMU", "KalmanStop", "KalmanReset", "KalmanStart", "AdvanceFlightState", "RewindFlightState",
 ];
 /// A report older than this no longer describes the FC (reports every 5 s).
 const REPORT_FRESH: Duration = Duration::from_secs(12);

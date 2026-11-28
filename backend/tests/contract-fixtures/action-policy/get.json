@@ -99,6 +99,42 @@
     {
       "actuated": null,
       "blink": "none",
+      "cmd": "ReinitSensors",
+      "enabled": true
+    },
+    {
+      "actuated": null,
+      "blink": "none",
+      "cmd": "ReinitBarometer",
+      "enabled": true
+    },
+    {
+      "actuated": null,
+      "blink": "none",
+      "cmd": "ReinitIMU",
+      "enabled": true
+    },
+    {
+      "actuated": null,
+      "blink": "none",
+      "cmd": "DisableIMU",
+      "enabled": true
+    },
+    {
+      "actuated": null,
+      "blink": "none",
+      "cmd": "KalmanStop",
+      "enabled": true
+    },
+    {
+      "actuated": null,
+      "blink": "none",
+      "cmd": "KalmanReset",
+      "enabled": true
+    },
+    {
+      "actuated": null,
+      "blink": "none",
       "cmd": "FcSdRetry",
       "disabled_reason": "No recent FC BOARD_HEALTH; Retry FC SD needs the FC's current SD status.",
       "enabled": false

@@ -663,6 +663,20 @@ const BOARDS: &[Spec] = &[
         enforced_in: &["ActuatorBoard26/Core/Src/main_task.c:300", "ValveBoard26/Core/Src/main_thread.c:214"],
         config_keys: &[],
     },
+    // FC control_thread.c kalman_stop/kalman_reset/kalman_start; fc_recovery_owner.c fc_recovery_request_kf_stop
+    Spec {
+        id: "fc-kalman-commands",
+        title: "FC Kalman filter stop, reset and start",
+        summary: "Kalman: stop recovers from a false launch detection: the FC stops a flight evaluation no station Launch started, disarms its backup drogue timer and returns its own flight state to the pad state, so no automatic deployment can come from it. Kalman: reset clears the stopped estimator's memory. Neither changes the station's state, fill, valves or outputs, nor resets anything to Startup. Manual Deploy and Abort are unchanged.",
+        details: &[
+            "Stop and Reset are refused once the station's Launch was sent (a Launch attempt on the launch journal, the Launch latch or a Launch sequence command in flight) until Reset all boards clears it. The FC also refuses them for a flight a station Launch admitted, so a real flight is never stopped this way.",
+            "The FC refuses Reset while the estimator runs (stop it first). Both ask for confirmation.",
+            "Kalman: start exists in HITL only: the FC starts its estimator as an internal Launch does, from Postinit or Armed, without admitting a station flight; it refuses it after a reset or Stop until the station Launch starts the next flight.",
+        ],
+        modes: NOT_TEST_FIRE,
+        enforced_in: &["backend/src/fc_kalman.rs:refusal", "FlightComputer26/Core/Src/control_thread.c:kalman_stop", "FlightComputer26/Core/Src/fc_recovery_owner.c:fc_recovery_request_kf_stop"],
+        config_keys: &[],
+    },
     // FC recovery.c:273-297,643-669,868-871; fcconfig.h:143-144
     Spec {
         id: "board-fc-sensor-abort",

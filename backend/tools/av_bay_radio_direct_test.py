@@ -46,6 +46,9 @@ FLIGHT_COMMANDS = {
     "ReinitIMU": 19,
     "DisableIMU": 20,
     "FcSdRetry": 33,
+    "KalmanStop": 34,
+    "KalmanReset": 35,
+    "KalmanStart": 36,
 }
 
 

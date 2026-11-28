@@ -1125,6 +1125,9 @@ pub fn command_name(cmd: &TelemetryCommand) -> &'static str {
         TelemetryCommand::ReinitSensors => "ReinitSensors",
         TelemetryCommand::ReinitBarometer => "ReinitBarometer",
         TelemetryCommand::ReinitIMU => "ReinitIMU",
+        TelemetryCommand::KalmanStop => "KalmanStop",
+        TelemetryCommand::KalmanReset => "KalmanReset",
+        TelemetryCommand::KalmanStart => "KalmanStart",
         TelemetryCommand::DisableIMU => "DisableIMU",
         TelemetryCommand::AdvanceFlightState => "AdvanceFlightState",
         TelemetryCommand::RewindFlightState => "RewindFlightState",
@@ -1179,6 +1182,12 @@ fn all_command_names_default() -> Vec<&'static str> {
         "ContinueFillSequence",
         "Postinit",
         "Launch",
+        "ReinitSensors",
+        "ReinitBarometer",
+        "ReinitIMU",
+        "DisableIMU",
+        "KalmanStop",
+        "KalmanReset",
         "FcSdRetry",
     ];
     if crate::flight_sim::sim_mode_enabled() {
@@ -1221,6 +1230,9 @@ fn all_command_names_hitl() -> Vec<&'static str> {
         "ReinitBarometer",
         "ReinitIMU",
         "DisableIMU",
+        "KalmanStop",
+        "KalmanReset",
+        "KalmanStart",
         "AdvanceFlightState",
         "RewindFlightState",
         "FcSdRetry",
@@ -1303,7 +1315,7 @@ pub(crate) fn control_section(cmd: &str) -> Option<ControlSection> {
         }
         "Postinit" | "AdvanceFlightState" | "RewindFlightState" | "DeployParachute"
         | "ExpandParachute" | "ReinitSensors" | "ReinitBarometer" | "ReinitIMU" | "DisableIMU"
-        | "FcSdRetry" => FlightComputer,
+        | "KalmanStop" | "KalmanReset" | "KalmanStart" | "FcSdRetry" => FlightComputer,
         "ToggleAvBayUnderglow" | "ToggleFlightBuzzer" => AvBay,
         "IgtEnter" | "IgtLivePyro" | "IgtDryRun" | "IgtExit" => GroundTest,
         // RecoverStation is an HTTP action (board_recovery::coordinator::station_recover),

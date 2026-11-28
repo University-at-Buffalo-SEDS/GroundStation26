@@ -246,7 +246,8 @@ pub enum ActionClass {
 /// not listed and so never refused.
 pub fn classify(name: &str, opens: impl Fn(&str) -> bool) -> Option<ActionClass> {
     match name {
-        "Postinit" | "AdvanceFlightState" | "IgtLivePyro" => Some(ActionClass::Arming),
+        // Kalman: start starts flight evaluation like Launch does on the FC.
+        "Postinit" | "AdvanceFlightState" | "IgtLivePyro" | "KalmanStart" => Some(ActionClass::Arming),
         "StartFill" | "ContinueFillSequence" | "NitrogenTest" | "Turbocharge" => Some(ActionClass::Fill),
         "Nitrogen" | "Nitrous" | "Pilot" => opens(name).then_some(ActionClass::ManualValves),
         "Launch" | "GroundStationLaunch" | "IgniterSequence" => Some(ActionClass::Launch),
@@ -257,7 +258,7 @@ pub fn classify(name: &str, opens: impl Fn(&str) -> bool) -> Option<ActionClass>
 
 /// Every command name the lock can refuse (toggles in their opening direction).
 pub const CLASSIFIED: &[&str] = &[
-    "Postinit", "AdvanceFlightState", "IgtLivePyro", "StartFill", "ContinueFillSequence", "NitrogenTest",
+    "Postinit", "AdvanceFlightState", "IgtLivePyro", "KalmanStart", "StartFill", "ContinueFillSequence", "NitrogenTest",
     "Turbocharge", "Nitrogen", "Nitrous", "Launch", "GroundStationLaunch",
     "IgniterSequence", "Igniter", "Pilot",
 ];

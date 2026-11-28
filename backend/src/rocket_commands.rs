@@ -35,6 +35,13 @@ pub enum FlightComputerCommands {
     IgtExit = 32,
     /// Re-attempt the SD mount and log file (FC `SD_Retry`, both images).
     FcSdRetry = 33,
+    /// Kalman: stop (FC `Kalman_Stop`): stop an evaluation no station Launch
+    /// started (a false launch detection) without changing the global state.
+    KalmanStop = 34,
+    /// Kalman: reset (FC `Kalman_Reset`): clear the stopped estimator's memory.
+    KalmanReset = 35,
+    /// Kalman: start (FC `Kalman_Start`), HITL only: start flight evaluation.
+    KalmanStart = 36,
 }
 
 #[repr(u8)]
@@ -100,6 +107,9 @@ mod flight_command_wire_tests {
             (IgtDryRun, "Compat_IGT_Dry_Run"),
             (IgtExit, "Compat_IGT_Exit"),
             (FcSdRetry, "Compat_SD_Retry"),
+            (KalmanStop, "Compat_Kalman_Stop"),
+            (KalmanReset, "Compat_Kalman_Reset"),
+            (KalmanStart, "Compat_Kalman_Start"),
         ]);
         for (command, expected) in cases {
             assert_eq!(contract["remote_commands_compat"][command as usize], expected);
@@ -129,6 +139,6 @@ mod flight_command_wire_tests {
         for (byte, expected) in retired {
             assert_eq!(contract["remote_commands_compat"][byte], expected);
         }
-        assert_eq!(contract["remote_commands_compat"].as_array().unwrap().len(), 34);
+        assert_eq!(contract["remote_commands_compat"].as_array().unwrap().len(), 37);
     }
 }

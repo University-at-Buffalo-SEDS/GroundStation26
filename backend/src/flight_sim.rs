@@ -2036,6 +2036,21 @@ mod tests {
     }
 
     #[test]
+    fn fc_operator_commands_are_forwarded_not_simulated() {
+        crate::mode_suite!(Testing);
+        use crate::types::TelemetryCommand::*;
+        // Sensor re-inits and Kalman stop/reset exist in testing mode: the
+        // telemetry task sends them to the FC; the model never absorbs them.
+        let mut sim = super::FlightSimState::new();
+        let (valves, state) = (sim.valves.clone(), sim.flight_state);
+        for command in [ReinitSensors, ReinitBarometer, ReinitIMU, DisableIMU, KalmanStop, KalmanReset] {
+            assert!(!sim.apply_command(&command, 1_000), "absorbed {command:?}");
+            assert_eq!(sim.valves, valves);
+            assert_eq!(sim.flight_state, state);
+        }
+    }
+
+    #[test]
     fn backend_sequence_commands_are_not_consumed_by_the_flight_simulator() {
         crate::mode_suite!(Testing);
         use crate::types::TelemetryCommand::*;

@@ -470,6 +470,7 @@ fn command_for(byte: u8) -> Option<TelemetryCommand> {
     use TelemetryCommand::*;
     [
         DeployParachute, ExpandParachute, ReinitSensors, ReinitBarometer, ReinitIMU, DisableIMU,
+        KalmanStop, KalmanReset, KalmanStart,
     ]
     .into_iter()
     .find(|cmd| crate::telemetry_task::hitl_flight_command_id(cmd) == Some(byte))

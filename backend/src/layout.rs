@@ -596,6 +596,19 @@ pub struct ActionSpec {
     /// [`crate::sequences::control_section`]; a layout file cannot override it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub section: Option<crate::sequences::ControlSection>,
+    /// The confirmation the client shows before sending this command,
+    /// assigned at load (for example [`crate::fc_kalman::confirmation`]); a
+    /// layout file cannot override it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm: Option<ActionConfirm>,
+}
+
+/// A command's confirmation dialog: title, message and confirm button.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActionConfirm {
+    pub title: String,
+    pub message: String,
+    pub button: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -926,6 +939,7 @@ pub(crate) fn relabel_legacy_barometer(layout: &mut serde_json::Value) -> bool {
 fn assign_control_sections(layout: &mut LayoutConfig) {
     for action in &mut layout.actions_tab.actions {
         action.section = crate::sequences::control_section(&action.cmd);
+        action.confirm = crate::fc_kalman::confirmation(&action.cmd);
     }
 }
 
@@ -982,8 +996,10 @@ fn apply_runtime_layout_overrides(layout: &mut LayoutConfig, mode: crate::statio
     if matches!(mode, crate::station_mode::Mode::IntegratedGroundTest | crate::station_mode::Mode::Hitl) {
         ensure_igt_actions(layout);
     }
-    // Retry FC SD wherever the FC is present (every mode but test fire).
+    // The FC sensor, Kalman and SD controls wherever the FC is present
+    // (every mode but test fire); Kalman: start in HITL only.
     if mode != crate::station_mode::Mode::TestFire {
+        ensure_fc_operator_actions(layout, mode == crate::station_mode::Mode::Hitl);
         ensure_fc_sd_retry_action(layout);
     }
     // Radio test mode (radio_reject_test): an HTTP action on the primary,
@@ -1031,6 +1047,7 @@ fn apply_runtime_layout_overrides(layout: &mut LayoutConfig, mode: crate::statio
             spacer_row_before: false,
             spacer_row_after: true,
             section: None,
+            confirm: None,
         },
     );
 }
@@ -1065,6 +1082,43 @@ fn ensure_igt_actions(layout: &mut LayoutConfig) {
                 "border": border, "bg": bg, "fg": fg, "illuminated": true
             }))
             .expect("valid ground test action"),
+        );
+    }
+}
+
+/// The FC operator controls every mode with an FC offers (labels as the
+/// HITL layout names them), appended after the last Flight computer action.
+const FC_OPERATOR_ACTIONS: [(&str, &str); 6] = [
+    ("ReinitSensors", "Reinit Sensors"),
+    ("ReinitBarometer", "Reinit Barometer"),
+    ("ReinitIMU", "Reinit IMU"),
+    ("DisableIMU", "Disable IMU"),
+    (crate::fc_kalman::STOP, "Kalman: stop"),
+    (crate::fc_kalman::RESET, "Kalman: reset"),
+];
+
+fn ensure_fc_operator_actions(layout: &mut LayoutConfig, hitl: bool) {
+    let start = [(crate::fc_kalman::START, "Kalman: start (HITL)")];
+    let wanted = FC_OPERATOR_ACTIONS.iter().chain(if hitl { start.iter() } else { [].iter() });
+    for (cmd, label) in wanted {
+        let actions = &mut layout.actions_tab.actions;
+        if actions.iter().any(|action| action.cmd == *cmd) {
+            continue;
+        }
+        let last_fc = actions.iter().rposition(|action| {
+            crate::sequences::control_section(&action.cmd) == Some(crate::sequences::ControlSection::FlightComputer)
+        });
+        let (index, group) = match last_fc {
+            Some(index) => (index + 1, actions[index].group.clone()),
+            None => (actions.len(), "Flight controls".to_string()),
+        };
+        actions.insert(
+            index,
+            serde_json::from_value(serde_json::json!({
+                "cmd": cmd, "label": label, "group": group,
+                "border": "#38bdf8", "bg": "#0b1220", "fg": "#e0f2fe"
+            }))
+            .expect("valid FC operator action"),
         );
     }
 }
@@ -1343,6 +1397,34 @@ mod tests {
         assert!(!layout.actions_tab.actions.is_empty());
         assert!(!layout.data_tab.tabs.is_empty());
         assert!(!layout.state_tab.states.is_empty());
+    }
+
+    #[test]
+    fn fc_operator_controls_per_mode_with_kalman_confirmations() {
+        use crate::station_mode::Mode;
+        for mode in [Mode::Normal, Mode::Testing, Mode::IntegratedGroundTest, Mode::Hitl, Mode::TestFire] {
+            let layout = load_layout_file(&default_layout_path(mode), mode).unwrap();
+            let action = |cmd: &str| layout.actions_tab.actions.iter().find(|a| a.cmd == cmd).cloned();
+            let fc = mode != Mode::TestFire;
+            for cmd in ["ReinitSensors", "ReinitBarometer", "ReinitIMU", "DisableIMU", "KalmanStop", "KalmanReset", "FcSdRetry"] {
+                assert_eq!(action(cmd).is_some(), fc, "{mode:?} {cmd}");
+            }
+            assert_eq!(action("KalmanStart").is_some(), mode == Mode::Hitl, "{mode:?} KalmanStart");
+            // Deploy drogue / main stay HITL only.
+            assert_eq!(action("DeployParachute").is_some(), mode == Mode::Hitl, "{mode:?} DeployParachute");
+            if fc {
+                for cmd in ["KalmanStop", "KalmanReset"] {
+                    let confirm = action(cmd).unwrap().confirm.expect("Kalman stop/reset ask first");
+                    assert!(!confirm.title.is_empty() && !confirm.button.is_empty(), "{cmd}");
+                }
+                assert!(action("ReinitSensors").unwrap().confirm.is_none());
+                assert_eq!(action("KalmanStop").unwrap().label, "Kalman: stop");
+            }
+        }
+        let hitl = load_layout_file(&default_layout_path(Mode::Hitl), Mode::Hitl).unwrap();
+        let start = hitl.actions_tab.actions.iter().find(|a| a.cmd == "KalmanStart").unwrap();
+        assert_eq!(start.label, "Kalman: start (HITL)");
+        assert!(start.confirm.is_none());
     }
 
     #[test]
