@@ -219,6 +219,101 @@ class ConnectTimeoutTests(unittest.TestCase):
         probe.assert_not_called()
 
 
+class LoginTimeoutTests(unittest.TestCase):
+    """The server drops a login left at the password prompt (LoginGraceTime)."""
+
+    def _remote(self, spec: str = "rylan@builder") -> "remote_build.Remote":
+        remote = remote_build.Remote(spec)
+        remote.check_reachable = lambda: None  # type: ignore[method-assign]
+        return remote
+
+    @staticmethod
+    def _done(code: int) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess([], code)
+
+    def _logins(self, run) -> list:
+        return [c for c in run.call_args_list if c.args[0][-1] == "true"]
+
+    def test_warns_about_the_login_window_before_the_prompt(self) -> None:
+        remote = self._remote()
+        with patch.object(remote, "master_up", return_value=False), \
+                patch.object(remote_build.subprocess, "run", return_value=self._done(0)), \
+                patch("builtins.print") as said:
+            remote.connect()
+        text = " ".join(str(c.args[0]) for c in said.call_args_list)
+        self.assertIn("within about 2 minutes", text)
+
+    def test_closed_login_is_offered_again_then_succeeds(self) -> None:
+        remote = self._remote()
+        with patch.object(remote, "master_up", return_value=False), \
+                patch.object(remote_build.subprocess, "run",
+                             side_effect=[self._done(255), self._done(0)]) as run, \
+                patch("builtins.print") as said:
+            remote.connect()
+        self.assertEqual(len(self._logins(run)), 2)
+        text = " ".join(str(c.args[0]) for c in said.call_args_list)
+        self.assertIn("server closed the login", text)
+        self.assertIn("2 of 3", text)
+
+    def test_gives_up_after_three_logins_with_reason_and_key_advice(self) -> None:
+        remote = self._remote()
+        with patch.object(remote, "master_up", return_value=False), \
+                patch.object(remote_build.subprocess, "run", return_value=self._done(255)) as run, \
+                patch("builtins.print"):
+            with self.assertRaises(SystemExit) as stop:
+                remote.connect()
+        self.assertEqual(len(self._logins(run)), 3)
+        message = str(stop.exception)
+        self.assertIn("login timeout", message)
+        self.assertIn("ssh-copy-id rylan@builder", message)
+
+    def test_exit_255_with_a_live_shared_connection_is_not_retried(self) -> None:
+        remote = self._remote()
+        with patch.object(remote, "master_up", side_effect=[False, True]), \
+                patch.object(remote_build.subprocess, "run", return_value=self._done(255)) as run, \
+                patch("builtins.print"):
+            with self.assertRaises(SystemExit):
+                remote.connect()
+        self.assertEqual(len(self._logins(run)), 1)
+
+    def test_other_failures_stop_without_retry_or_traceback(self) -> None:
+        remote = self._remote()
+        with patch.object(remote, "master_up", return_value=False), \
+                patch.object(remote_build.subprocess, "run", return_value=self._done(1)) as run, \
+                patch("builtins.print"):
+            with self.assertRaises(SystemExit) as stop:
+                remote.connect()
+        self.assertEqual(len(self._logins(run)), 1)
+        self.assertIn("ssh exit 1", str(stop.exception))
+
+    def test_password_in_the_host_is_not_retried(self) -> None:
+        remote = self._remote("rylan:pw@builder")
+        with patch.object(remote, "master_up", return_value=False), \
+                patch.object(remote_build.subprocess, "run", return_value=self._done(255)) as run, \
+                patch("builtins.print"):
+            with self.assertRaises(SystemExit):
+                remote.connect()
+        self.assertEqual(len(self._logins(run)), 1)
+
+    def test_ctrl_c_stops_at_once(self) -> None:
+        remote = self._remote()
+        with patch.object(remote, "master_up", return_value=False), \
+                patch.object(remote_build.subprocess, "run", side_effect=KeyboardInterrupt) as run, \
+                patch("builtins.print"):
+            with self.assertRaises(KeyboardInterrupt):
+                remote.connect()
+        self.assertEqual(run.call_count, 1)
+
+    def test_master_check_uses_the_shared_control_path(self) -> None:
+        remote = self._remote()
+        with patch.object(remote_build.subprocess, "run", return_value=self._done(0)) as run:
+            self.assertTrue(remote.master_up())
+        argv = run.call_args.args[0]
+        self.assertIn("-O", argv)
+        self.assertEqual(argv[argv.index("-O") + 1], "check")
+        self.assertTrue(any(a.startswith("ControlPath=") for a in argv))
+
+
 class BuildWrapperTests(unittest.TestCase):
     def test_backend_build_uses_remote_when_requested(self) -> None:
         import importlib.util

@@ -119,6 +119,13 @@ exit "$rc"
 """
 
 
+# OpenSSH's default LoginGraceTime: the server drops a login still at the
+# password prompt after this long.
+LOGIN_GRACE_S = 120
+# Logins offered in all when the server closes one at the password prompt.
+LOGIN_ATTEMPTS = 3
+
+
 def connect_timeout_s() -> int:
     """Seconds to wait for the remote host to answer (GS_REMOTE_CONNECT_TIMEOUT, default 10)."""
     try:
@@ -262,11 +269,45 @@ class Remote:
     def pull(self, remote: str, local: Path, delete: bool = False) -> None:
         self.rsync(f"{self.destination}:{remote}", str(local), [], delete=delete)
 
+    def master_up(self) -> bool:
+        """True when the shared control connection is authenticated and running."""
+        try:
+            return subprocess.run(["ssh", *self.ssh_options(), "-O", "check", self.destination],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=self.env(),
+                                  timeout=connect_timeout_s()).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+
     def connect(self) -> None:
-        """Authenticate once; later ssh and rsync calls reuse this connection."""
+        """Authenticate once; later ssh and rsync calls reuse this connection.
+
+        The server drops a login left at the password prompt after its
+        LoginGraceTime (OpenSSH default 120 s), and ssh only notices once the
+        password is sent. That closed login (exit 255, no shared connection
+        up) is offered again, up to LOGIN_ATTEMPTS in all, when ssh prompts on
+        the terminal. Ctrl-C stops at once."""
         print(f"Connecting to {self.destination} for the remote build...", flush=True)
         self.check_reachable()
-        subprocess.run(["ssh", *self.ssh_options(), self.destination, "true"], env=self.env(), check=True)
+        interactive = self.password is None
+        attempts = LOGIN_ATTEMPTS if interactive else 1
+        for attempt in range(1, attempts + 1):
+            if interactive and not self.master_up():
+                print(f"If asked for {self.destination}'s password, enter it within about "
+                      f"{LOGIN_GRACE_S // 60} minutes: the server closes a login left waiting longer.",
+                      flush=True)
+            result = subprocess.run(["ssh", *self.ssh_options(), self.destination, "true"], env=self.env())
+            if result.returncode == 0:
+                return
+            if result.returncode != 255 or self.master_up():
+                raise SystemExit(f"Remote build login to {self.destination} failed (ssh exit {result.returncode}).")
+            if attempt < attempts:
+                print(f"The server closed the login (likely its login timeout of about "
+                      f"{LOGIN_GRACE_S // 60} minutes at the password prompt). "
+                      f"Try again ({attempt + 1} of {attempts}); Ctrl-C stops.", flush=True)
+        raise SystemExit(
+            f"Remote build login to {self.destination} failed: the server closed the login before it "
+            f"completed, most likely its login timeout (about {LOGIN_GRACE_S // 60} minutes at the password "
+            f"prompt). Use SSH key auth so no password is needed: ssh-copy-id {self.destination}")
 
     def close(self) -> None:
         # The shared connection is left to ControlPersist: the other parallel
